@@ -119,8 +119,13 @@ if [ "$GN_OS" = "android" ] && ! grep -q "target_os" .gclient 2>/dev/null; then
 fi
 REF="${WEBRTC_COMMIT:-}"
 [ -z "$REF" ] && REF="$WEBRTC_BRANCH"
-echo "==> gclient sync -> src@$REF"
-gclient sync --no-history --shallow -r "src@$REF" -D
+# Release builds live on branch-heads/*, which a default checkout does not
+# fetch — add the refspec and sync --with_branch_heads.
+if ! git -C src config --get-all remote.origin.fetch | grep -q branch-heads; then
+  git -C src config --add remote.origin.fetch '+refs/branch-heads/*:refs/remotes/branch-heads/*'
+fi
+echo "==> gclient sync -> src@$REF (--with_branch_heads)"
+gclient sync --with_branch_heads --no-history --shallow -r "src@$REF" -D
 RESOLVED="$(git -C src rev-parse HEAD)"
 echo "==> resolved WebRTC commit: $RESOLVED  (lock this in WEBRTC_VERSION:WEBRTC_COMMIT)"
 

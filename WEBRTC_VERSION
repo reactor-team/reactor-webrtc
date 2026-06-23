@@ -11,7 +11,7 @@
 #                  can be locked here for reproducibility.
 # REACTOR_PATCH_LEVEL — bump when ./patches change without a milestone change.
 
-WEBRTC_MILESTONE=m132
-WEBRTC_BRANCH=branch-heads/6834
-WEBRTC_COMMIT=
+WEBRTC_MILESTONE=branch-heads/7907
+WEBRTC_BRANCH=branch-heads/7907
+WEBRTC_COMMIT=a5ddff6086d96fd2356ad6c521525ea2803f7988
 REACTOR_PATCH_LEVEL=0
