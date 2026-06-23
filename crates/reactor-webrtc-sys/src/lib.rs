@@ -189,12 +189,20 @@ extern "C" {
         track: *mut MediaStreamTrack,
     ) -> c_int;
     /// Attach a frame sink to a (received) video track. `on_frame(userdata,
-    /// width, height)` fires per decoded frame until the track is destroyed.
+    /// bgra, width, height)` fires per decoded frame (BGRA, `width*height*4`
+    /// bytes, valid only during the call) until the track is destroyed.
     pub fn reactor_webrtc_video_track_add_sink(
         track: *mut MediaStreamTrack,
         userdata: *mut c_void,
-        on_frame: extern "C" fn(userdata: *mut c_void, width: c_int, height: c_int),
+        on_frame: extern "C" fn(
+            userdata: *mut c_void,
+            bgra: *const u8,
+            width: c_int,
+            height: c_int,
+        ),
     );
+    /// Kind of a track handle: 0 = audio, 1 = video, -1 = unknown.
+    pub fn reactor_webrtc_media_stream_track_kind(track: *mut MediaStreamTrack) -> c_int;
     /// Destroy a track handle (detaches any sink, releases the track + source).
     pub fn reactor_webrtc_media_stream_track_destroy(track: *mut MediaStreamTrack);
 
@@ -216,13 +224,16 @@ extern "C" {
         sample_rate: c_int,
         channels: c_int,
     );
-    /// Attach a sink to a (received) audio track. `on_audio(userdata,
-    /// sample_rate, channels, frames)` fires per 10ms block until destroyed.
+    /// Attach a sink to a (received) audio track. `on_audio(userdata, pcm,
+    /// sample_rate, channels, frames)` fires per 10ms block — `pcm` is
+    /// interleaved i16 (`frames*channels` samples, valid only during the call)
+    /// — until the track is destroyed.
     pub fn reactor_webrtc_audio_track_add_sink(
         track: *mut MediaStreamTrack,
         userdata: *mut c_void,
         on_audio: extern "C" fn(
             userdata: *mut c_void,
+            pcm: *const i16,
             sample_rate: c_int,
             channels: c_int,
             frames: c_int,

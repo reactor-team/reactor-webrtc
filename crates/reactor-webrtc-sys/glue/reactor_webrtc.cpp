@@ -57,6 +57,7 @@
 #include "rtc_base/thread.h"
 #include "rtc_base/time_utils.h"
 #include "third_party/libyuv/include/libyuv/convert.h"
+#include "third_party/libyuv/include/libyuv/convert_argb.h"
 
 // ── C ABI types (must match crates/reactor-webrtc-sys/src/lib.rs) ─────────────
 
@@ -172,37 +173,50 @@ class FrameAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
   std::thread play_thread_;
 };
 
-// Bridges decoded frames from a (remote) audio track to a C callback.
+// Bridges decoded frames from a (remote) audio track to a C callback. WebRTC
+// audio-sink data is interleaved int16 PCM (bits_per_sample == 16).
 class AudioFrameSink : public webrtc::AudioTrackSinkInterface {
  public:
   AudioFrameSink(void* userdata,
-                 void (*on_audio)(void*, int, int, int))
+                 void (*on_audio)(void*, const int16_t*, int, int, int))
       : userdata_(userdata), on_audio_(on_audio) {}
-  void OnData(const void* /*audio_data*/, int /*bits_per_sample*/,
-              int sample_rate, size_t number_of_channels,
-              size_t number_of_frames) override {
+  void OnData(const void* audio_data, int /*bits_per_sample*/, int sample_rate,
+              size_t number_of_channels, size_t number_of_frames) override {
     if (on_audio_)
-      on_audio_(userdata_, sample_rate, static_cast<int>(number_of_channels),
+      on_audio_(userdata_, static_cast<const int16_t*>(audio_data), sample_rate,
+                static_cast<int>(number_of_channels),
                 static_cast<int>(number_of_frames));
   }
 
  private:
   void* userdata_;
-  void (*on_audio_)(void*, int, int, int);
+  void (*on_audio_)(void*, const int16_t*, int, int, int);
 };
 
-// Bridges decoded frames from a (remote) video track to a C callback.
+// Bridges decoded frames from a (remote) video track to a C callback,
+// converting to BGRA (width*height*4) on the way out.
 class FrameSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
  public:
-  FrameSink(void* userdata, void (*on_frame)(void*, int, int))
+  FrameSink(void* userdata, void (*on_frame)(void*, const uint8_t*, int, int))
       : userdata_(userdata), on_frame_(on_frame) {}
   void OnFrame(const webrtc::VideoFrame& frame) override {
-    if (on_frame_) on_frame_(userdata_, frame.width(), frame.height());
+    if (!on_frame_) return;
+    webrtc::scoped_refptr<webrtc::I420BufferInterface> i420 =
+        frame.video_frame_buffer()->ToI420();
+    if (!i420) return;
+    const int w = i420->width(), h = i420->height();
+    bgra_.resize(static_cast<size_t>(w) * h * 4);
+    // libyuv "ARGB" is B,G,R,A in memory == our BGRA byte order.
+    libyuv::I420ToARGB(i420->DataY(), i420->StrideY(), i420->DataU(),
+                       i420->StrideU(), i420->DataV(), i420->StrideV(),
+                       bgra_.data(), w * 4, w, h);
+    on_frame_(userdata_, bgra_.data(), w, h);
   }
 
  private:
   void* userdata_;
-  void (*on_frame_)(void*, int, int);
+  void (*on_frame_)(void*, const uint8_t*, int, int);
+  std::vector<uint8_t> bgra_;
 };
 
 // A track handle (the `MediaStreamTrack` in the Rust API). For a local track
@@ -705,9 +719,9 @@ void reactor_webrtc_factory_push_audio_frame(void* factory, const int16_t* pcm,
 
 // Attach a frame sink to a (received) audio track. `on_audio(userdata,
 // sample_rate, channels, frames)` fires per 10ms block until destroyed.
-void reactor_webrtc_audio_track_add_sink(void* track, void* userdata,
-                                         void (*on_audio)(void*, int, int,
-                                                          int)) {
+void reactor_webrtc_audio_track_add_sink(
+    void* track, void* userdata,
+    void (*on_audio)(void*, const int16_t*, int, int, int)) {
   auto* h = reinterpret_cast<ReactorMediaStreamTrack*>(track);
   if (!h || !h->track || h->track->kind() != "audio") return;
   h->audio_sink = std::make_unique<AudioFrameSink>(userdata, on_audio);
@@ -717,13 +731,24 @@ void reactor_webrtc_audio_track_add_sink(void* track, void* userdata,
 
 // Attach a frame sink to a (video) track. `on_frame(userdata, width, height)`
 // fires per decoded frame. The sink lives until the track handle is destroyed.
-void reactor_webrtc_video_track_add_sink(void* track, void* userdata,
-                                         void (*on_frame)(void*, int, int)) {
+void reactor_webrtc_video_track_add_sink(
+    void* track, void* userdata,
+    void (*on_frame)(void*, const uint8_t*, int, int)) {
   auto* h = reinterpret_cast<ReactorMediaStreamTrack*>(track);
   if (!h || !h->track || h->track->kind() != "video") return;
   h->sink = std::make_unique<FrameSink>(userdata, on_frame);
   static_cast<webrtc::VideoTrackInterface*>(h->track.get())
       ->AddOrUpdateSink(h->sink.get(), webrtc::VideoSinkWants());
+}
+
+// Kind of a track handle: 0 = audio, 1 = video, -1 = unknown.
+int reactor_webrtc_media_stream_track_kind(void* track) {
+  auto* h = reinterpret_cast<ReactorMediaStreamTrack*>(track);
+  if (!h || !h->track) return -1;
+  const std::string kind = h->track->kind();
+  if (kind == "audio") return 0;
+  if (kind == "video") return 1;
+  return -1;
 }
 
 // Destroy a track handle (detaches any sink and releases the track + source).

@@ -6,28 +6,29 @@
 //! - **`reactor-sdk-core`** — the native client SDK core (C ABI), and
 //! - **`reactor-runtime`** — the server (replacing GStreamer).
 //!
-//! ## Design goal: drop-in for the PoC
+//! ## Shape
 //!
-//! The public surface intentionally mirrors the shape `reactor-sdk-core`
-//! already consumed from LiveKit's `libwebrtc` crate (factory → peer connection
-//! → transceivers/tracks → data channels, plus native video/audio sources &
-//! sinks and frame I/O). Swapping the dependency should be a path change, not a
-//! rewrite. We do **not** depend on any LiveKit crate.
+//! [`PeerConnectionFactory`] → [`PeerConnection`] (with a closure-based
+//! [`PeerConnectionObserver`]) → SDP offer/answer, ICE, [`Track`]s (audio +
+//! video send/receive) and [`DataChannel`]s. RAII throughout: dropping a handle
+//! releases the native object. We do **not** depend on any LiveKit crate.
 //!
-//! ## Status
-//!
-//! **M1 scaffold.** Types and signatures are laid out; most bodies are
-//! `unimplemented!()` pending the native build (`webrtc-build/`) and the
-//! generated FFI. `cargo check` works without a native library; building a real
-//! binary requires a prebuilt (see `reactor-webrtc-sys`'s build script).
+//! Building a real binary/test requires a native `libwebrtc` (set
+//! `REACTOR_WEBRTC_LIB_DIR` / `REACTOR_WEBRTC_PREBUILT_URL`); `cargo check`
+//! works without one.
 
 mod config;
 mod media;
+mod observer;
 mod peer_connection;
 pub mod platform;
 
+use std::ffi::CString;
+use std::os::raw::c_int;
+
 pub use config::{ContinualGatheringPolicy, IceServer, IceTransportsType, RtcConfiguration};
-pub use media::{AudioFrame, AudioTrack, MediaKind, VideoFrame, VideoTrack};
+pub use media::{AudioFrame, MediaKind, Track, VideoFrame};
+pub use observer::PeerConnectionObserver;
 pub use peer_connection::{
     DataChannel, IceCandidate, PeerConnection, PeerConnectionState, SdpType, SessionDescription,
     TransceiverDirection,
@@ -62,47 +63,115 @@ impl std::error::Error for Error {}
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Entry point: creates peer connections and owns the audio device module.
-///
-/// Mirrors the PoC's `PeerConnectionFactory` (incl. `acquire_platform_adm` /
-/// `set_adm_playout_enabled`, and the synthetic/headless ADM behaviour).
+/// Entry point: creates peer connections and tracks, and owns the audio device
+/// module (synthetic by default, or the platform device).
 pub struct PeerConnectionFactory {
     raw: *mut reactor_webrtc_sys::PeerConnectionFactory,
 }
 
-// SAFETY (TODO M1): the C++ factory is internally thread-safe; confirm and
-// document the exact guarantees once the native layer is wired.
+// SAFETY: the native factory is internally thread-safe (it owns the WebRTC
+// signaling/worker/network threads).
 unsafe impl Send for PeerConnectionFactory {}
 unsafe impl Sync for PeerConnectionFactory {}
 
 impl PeerConnectionFactory {
-    /// Create the factory (initializes the WebRTC threads + ADM).
+    /// Create a factory using the **synthetic** audio device module — no audio
+    /// hardware; feed audio with [`PeerConnectionFactory::push_audio_frame`].
     pub fn new() -> Result<Self> {
-        let raw = unsafe { reactor_webrtc_sys::reactor_webrtc_factory_create() };
+        Self::create(false)
+    }
+
+    /// Create a factory using the **platform** audio device module (real
+    /// mic/speaker, e.g. CoreAudio on macOS).
+    pub fn with_platform_adm() -> Result<Self> {
+        Self::create(true)
+    }
+
+    fn create(use_platform_adm: bool) -> Result<Self> {
+        let raw = unsafe {
+            reactor_webrtc_sys::reactor_webrtc_factory_create_with_adm(use_platform_adm as c_int)
+        };
         if raw.is_null() {
-            return Err(Error::Webrtc("factory_create returned null".into()));
+            return Err(Error::Webrtc("factory creation returned null".into()));
         }
         Ok(Self { raw })
     }
 
-    /// Create a peer connection with the given configuration.
-    pub fn create_peer_connection(&self, _config: &RtcConfiguration) -> Result<PeerConnection> {
-        // TODO(M1): serialize config → JSON, call sys create, wrap the handle.
-        unimplemented!("M1: PeerConnectionFactory::create_peer_connection")
+    /// Create a peer connection with the given configuration and observer.
+    pub fn create_peer_connection(
+        &self,
+        config: &RtcConfiguration,
+        observer: PeerConnectionObserver,
+    ) -> Result<PeerConnection> {
+        let state = observer.into_state();
+        let callbacks = state.callbacks();
+        let json = CString::new(config.to_json())
+            .map_err(|_| Error::Webrtc("config contains a NUL byte".into()))?;
+        let raw = unsafe {
+            reactor_webrtc_sys::reactor_webrtc_peer_connection_create(
+                self.raw,
+                json.as_ptr(),
+                &callbacks,
+            )
+        };
+        if raw.is_null() {
+            return Err(Error::Webrtc(
+                "peer connection creation returned null".into(),
+            ));
+        }
+        Ok(PeerConnection::new(raw, state))
     }
 
-    /// Acquire the platform Audio Device Module (real mic/speaker). On servers
-    /// and headless clients, leave this unacquired to use the synthetic ADM.
-    pub fn acquire_platform_adm(&self) {
-        unsafe { reactor_webrtc_sys::reactor_webrtc_factory_acquire_platform_adm(self.raw) }
+    /// Create a local video track backed by a push-able source
+    /// ([`Track::push_video_frame`]).
+    pub fn create_video_track(&self, id: &str) -> Result<Track> {
+        let cid = CString::new(id).map_err(|_| Error::Webrtc("id contains a NUL byte".into()))?;
+        let raw = unsafe {
+            reactor_webrtc_sys::reactor_webrtc_video_track_create(self.raw, cid.as_ptr())
+        };
+        if raw.is_null() {
+            return Err(Error::Webrtc("video track creation returned null".into()));
+        }
+        Ok(Track::from_raw(raw, MediaKind::Video))
     }
 
-    /// Route received audio to the platform speaker (vs. synthetic playout).
+    /// Create a local audio track. Its samples come from this factory's ADM —
+    /// feed it with [`PeerConnectionFactory::push_audio_frame`].
+    pub fn create_audio_track(&self, id: &str) -> Result<Track> {
+        let cid = CString::new(id).map_err(|_| Error::Webrtc("id contains a NUL byte".into()))?;
+        let raw = unsafe {
+            reactor_webrtc_sys::reactor_webrtc_audio_track_create(self.raw, cid.as_ptr())
+        };
+        if raw.is_null() {
+            return Err(Error::Webrtc("audio track creation returned null".into()));
+        }
+        Ok(Track::from_raw(raw, MediaKind::Audio))
+    }
+
+    /// Feed interleaved i16 PCM to the (synthetic) ADM, shared by all local
+    /// audio tracks. Typically called with ~10ms blocks (e.g. 480 frames @
+    /// 48kHz). No-op with the platform ADM.
+    pub fn push_audio_frame(&self, pcm: &[i16], sample_rate: u32, channels: u32) {
+        let channels = channels.max(1);
+        let samples_per_channel = (pcm.len() / channels as usize) as c_int;
+        unsafe {
+            reactor_webrtc_sys::reactor_webrtc_factory_push_audio_frame(
+                self.raw,
+                pcm.as_ptr(),
+                samples_per_channel,
+                sample_rate as c_int,
+                channels as c_int,
+            );
+        }
+    }
+
+    /// Enable/disable the synthetic ADM's playout pump (no-op for the platform
+    /// ADM). Disable to stay silent in send-only / headless scenarios.
     pub fn set_adm_playout_enabled(&self, enabled: bool) {
         unsafe {
             reactor_webrtc_sys::reactor_webrtc_factory_set_adm_playout_enabled(
                 self.raw,
-                enabled as std::os::raw::c_int,
+                enabled as c_int,
             )
         }
     }

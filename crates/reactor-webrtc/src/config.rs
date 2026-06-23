@@ -41,3 +41,18 @@ impl Default for RtcConfiguration {
         }
     }
 }
+
+impl RtcConfiguration {
+    /// Serialize to the JSON shape the sys layer understands. Its parser is
+    /// lenient — it scans for quoted `stun:`/`turn[s]:` URLs — so only the ICE
+    /// server URLs are emitted for now (policies are applied native-side later).
+    pub(crate) fn to_json(&self) -> String {
+        let urls: Vec<String> = self
+            .ice_servers
+            .iter()
+            .flat_map(|s| s.urls.iter())
+            .map(|u| format!("\"{}\"", u.replace(['"', '\\'], "")))
+            .collect();
+        format!("{{\"iceServers\":[{{\"urls\":[{}]}}]}}", urls.join(","))
+    }
+}

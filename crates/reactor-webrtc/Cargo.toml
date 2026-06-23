@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Safe, idiomatic Rust API over Reactor's owned libwebrtc build. The WebRTC engine shared by the client SDKs (reactor-sdk-core) and the server runtime."
+build = "build.rs"
 
 [lib]
 doctest = false

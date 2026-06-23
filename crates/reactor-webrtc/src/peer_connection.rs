@@ -1,10 +1,17 @@
 //! The peer connection and its associated signaling/data types.
-//!
-//! Mirrors the slice of LiveKit's `libwebrtc` API the PoC used in
-//! `reactor-sdk-core`'s peer transport.
 
-use crate::media::{AudioTrack, MediaKind, VideoTrack};
-use crate::Result;
+use std::ffi::{c_void, CStr, CString};
+use std::os::raw::{c_char, c_int};
+use std::sync::mpsc::{sync_channel, SyncSender};
+use std::time::Duration;
+
+use crate::media::Track;
+use crate::observer::ObserverState;
+use crate::{Error, Result};
+
+/// How long to wait for an async native op (create offer/answer, set
+/// description, add ICE candidate) to complete before giving up.
+const OP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// SDP description kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,6 +20,26 @@ pub enum SdpType {
     PrAnswer,
     Answer,
     Rollback,
+}
+
+impl SdpType {
+    fn as_str(self) -> &'static str {
+        match self {
+            SdpType::Offer => "offer",
+            SdpType::PrAnswer => "pranswer",
+            SdpType::Answer => "answer",
+            SdpType::Rollback => "rollback",
+        }
+    }
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "offer" => Some(SdpType::Offer),
+            "pranswer" => Some(SdpType::PrAnswer),
+            "answer" => Some(SdpType::Answer),
+            "rollback" => Some(SdpType::Rollback),
+            _ => None,
+        }
+    }
 }
 
 /// A session description (offer/answer).
@@ -39,7 +66,7 @@ pub enum TransceiverDirection {
     Inactive,
 }
 
-/// Aggregate connection state (maps to the PoC's `PeerConnectionState`).
+/// Aggregate connection state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerConnectionState {
     New,
@@ -50,96 +77,214 @@ pub enum PeerConnectionState {
     Closed,
 }
 
-/// A negotiated data channel.
-pub struct DataChannel {
-    // TODO(M1): read once send()/on_message() are implemented.
-    #[allow(dead_code)]
-    pub(crate) raw: *mut reactor_webrtc_sys::DataChannel,
+impl PeerConnectionState {
+    pub(crate) fn from_raw(state: c_int) -> Self {
+        match state {
+            0 => PeerConnectionState::New,
+            1 => PeerConnectionState::Connecting,
+            2 => PeerConnectionState::Connected,
+            3 => PeerConnectionState::Disconnected,
+            4 => PeerConnectionState::Failed,
+            _ => PeerConnectionState::Closed,
+        }
+    }
 }
 
-impl DataChannel {
-    /// Send a text/binary message over the channel.
-    pub fn send(&self, _data: &[u8], _binary: bool) -> Result<()> {
-        unimplemented!("M1: DataChannel::send")
-    }
+/// A negotiated data channel. Dropping it releases the native handle.
+pub struct DataChannel {
+    raw: *mut reactor_webrtc_sys::DataChannel,
+}
 
-    /// Register a message handler (invoked on a WebRTC thread).
-    pub fn on_message(&self, _cb: impl FnMut(&[u8], bool) + Send + 'static) {
-        unimplemented!("M1: DataChannel::on_message")
+// SAFETY: the native data channel is internally thread-safe.
+unsafe impl Send for DataChannel {}
+
+impl DataChannel {
+    pub(crate) fn from_raw(raw: *mut reactor_webrtc_sys::DataChannel) -> Self {
+        Self { raw }
     }
+}
+
+impl Drop for DataChannel {
+    fn drop(&mut self) {
+        unsafe { reactor_webrtc_sys::reactor_webrtc_data_channel_destroy(self.raw) }
+    }
+}
+
+// ── async-op bridges (block on a one-shot callback) ──────────────────────────
+
+type SdpTx = SyncSender<Result<SessionDescription>>;
+type CompleteTx = SyncSender<Result<()>>;
+
+extern "C" fn sdp_ok(ud: *mut c_void, ty: *const c_char, sdp: *const c_char) {
+    let tx = unsafe { &*(ud as *const SdpTx) };
+    let kind = unsafe { CStr::from_ptr(ty) }.to_string_lossy();
+    let sdp = unsafe { CStr::from_ptr(sdp) }
+        .to_string_lossy()
+        .into_owned();
+    let result = match SdpType::from_str(&kind) {
+        Some(kind) => Ok(SessionDescription { kind, sdp }),
+        None => Err(Error::Webrtc(format!("unknown sdp type: {kind}"))),
+    };
+    let _ = tx.try_send(result);
+}
+extern "C" fn sdp_err(ud: *mut c_void, message: *const c_char) {
+    let tx = unsafe { &*(ud as *const SdpTx) };
+    let msg = unsafe { CStr::from_ptr(message) }
+        .to_string_lossy()
+        .into_owned();
+    let _ = tx.try_send(Err(Error::Webrtc(msg)));
+}
+extern "C" fn complete_cb(ud: *mut c_void, error: *const c_char) {
+    let tx = unsafe { &*(ud as *const CompleteTx) };
+    let r = if error.is_null() {
+        Ok(())
+    } else {
+        Err(Error::Webrtc(
+            unsafe { CStr::from_ptr(error) }
+                .to_string_lossy()
+                .into_owned(),
+        ))
+    };
+    let _ = tx.try_send(r);
+}
+
+fn run_sdp(call: impl FnOnce(*mut c_void)) -> Result<SessionDescription> {
+    let (tx, rx) = sync_channel::<Result<SessionDescription>>(1);
+    let p = Box::into_raw(Box::new(tx));
+    call(p as *mut c_void);
+    let r = rx.recv_timeout(OP_TIMEOUT);
+    drop(unsafe { Box::from_raw(p) });
+    r.map_err(|_| Error::Webrtc("sdp operation timed out".into()))?
+}
+
+fn run_complete(call: impl FnOnce(*mut c_void)) -> Result<()> {
+    let (tx, rx) = sync_channel::<Result<()>>(1);
+    let p = Box::into_raw(Box::new(tx));
+    call(p as *mut c_void);
+    let r = rx.recv_timeout(OP_TIMEOUT);
+    drop(unsafe { Box::from_raw(p) });
+    r.map_err(|_| Error::Webrtc("operation timed out".into()))?
 }
 
 /// An `RTCPeerConnection`.
 pub struct PeerConnection {
-    pub(crate) raw: *mut reactor_webrtc_sys::PeerConnection,
+    raw: *mut reactor_webrtc_sys::PeerConnection,
+    // Keeps the observer closures alive for the connection's lifetime. The
+    // native side holds a pointer into this box.
+    _observer: Box<ObserverState>,
 }
 
-// SAFETY (TODO M1): confirm/​document thread-safety once the native layer is wired.
+// SAFETY: the native peer connection is internally thread-safe; observer
+// callbacks are serialized on the signaling thread and guarded by mutexes.
 unsafe impl Send for PeerConnection {}
 unsafe impl Sync for PeerConnection {}
 
 impl PeerConnection {
-    // ── Signaling ────────────────────────────────────────────────────────────
-    pub async fn create_offer(&self) -> Result<SessionDescription> {
-        unimplemented!("M1: PeerConnection::create_offer")
-    }
-    pub async fn set_local_description(&self, _sdp: SessionDescription) -> Result<()> {
-        unimplemented!("M1: PeerConnection::set_local_description")
-    }
-    pub async fn set_remote_description(&self, _sdp: SessionDescription) -> Result<()> {
-        unimplemented!("M1: PeerConnection::set_remote_description")
-    }
-    pub fn add_ice_candidate(&self, _candidate: IceCandidate) -> Result<()> {
-        unimplemented!("M1: PeerConnection::add_ice_candidate")
+    pub(crate) fn new(
+        raw: *mut reactor_webrtc_sys::PeerConnection,
+        observer: Box<ObserverState>,
+    ) -> Self {
+        Self {
+            raw,
+            _observer: observer,
+        }
     }
 
-    // ── Tracks / transceivers ────────────────────────────────────────────────
-    pub fn add_video_track(&self, _name: &str, _dir: TransceiverDirection) -> Result<VideoTrack> {
-        unimplemented!("M1: PeerConnection::add_video_track")
+    // ── Signaling (blocking on the native callback) ──────────────────────────
+    pub fn create_offer(&self) -> Result<SessionDescription> {
+        run_sdp(|ud| unsafe {
+            reactor_webrtc_sys::reactor_webrtc_peer_connection_create_offer(
+                self.raw, ud, sdp_ok, sdp_err,
+            )
+        })
     }
-    pub fn add_audio_track(&self, _name: &str, _dir: TransceiverDirection) -> Result<AudioTrack> {
-        unimplemented!("M1: PeerConnection::add_audio_track")
+    pub fn create_answer(&self) -> Result<SessionDescription> {
+        run_sdp(|ud| unsafe {
+            reactor_webrtc_sys::reactor_webrtc_peer_connection_create_answer(
+                self.raw, ud, sdp_ok, sdp_err,
+            )
+        })
+    }
+    pub fn set_local_description(&self, sdp: &SessionDescription) -> Result<()> {
+        self.set_description(sdp, true)
+    }
+    pub fn set_remote_description(&self, sdp: &SessionDescription) -> Result<()> {
+        self.set_description(sdp, false)
+    }
+    fn set_description(&self, sdp: &SessionDescription, local: bool) -> Result<()> {
+        let ty = CString::new(sdp.kind.as_str()).unwrap();
+        let body = CString::new(sdp.sdp.as_str())
+            .map_err(|_| Error::Webrtc("sdp contains a NUL byte".into()))?;
+        run_complete(|ud| unsafe {
+            if local {
+                reactor_webrtc_sys::reactor_webrtc_peer_connection_set_local_description(
+                    self.raw,
+                    ty.as_ptr(),
+                    body.as_ptr(),
+                    ud,
+                    complete_cb,
+                )
+            } else {
+                reactor_webrtc_sys::reactor_webrtc_peer_connection_set_remote_description(
+                    self.raw,
+                    ty.as_ptr(),
+                    body.as_ptr(),
+                    ud,
+                    complete_cb,
+                )
+            }
+        })
+    }
+    pub fn add_ice_candidate(&self, candidate: &IceCandidate) -> Result<()> {
+        let mid = CString::new(candidate.sdp_mid.clone().unwrap_or_default()).unwrap_or_default();
+        let cand = CString::new(candidate.candidate.as_str())
+            .map_err(|_| Error::Webrtc("candidate contains a NUL byte".into()))?;
+        let idx = candidate.sdp_mline_index.unwrap_or(0) as c_int;
+        run_complete(|ud| unsafe {
+            reactor_webrtc_sys::reactor_webrtc_peer_connection_add_ice_candidate(
+                self.raw,
+                mid.as_ptr(),
+                idx,
+                cand.as_ptr(),
+                ud,
+                complete_cb,
+            )
+        })
     }
 
-    // ── Frame injection (sendonly) ───────────────────────────────────────────
-    // NOTE: the sys layer now pushes video frames per-track
-    // (`reactor_webrtc_video_track_push_frame`) and audio frames per-factory via
-    // the ADM (`reactor_webrtc_factory_push_audio_frame`). The safe wrapper will
-    // expose these on the track/factory types; stubbed until the wrapper lands.
-    /// Push a BGRA frame (`width*height*4`) into a sendonly video track.
-    pub fn push_video_frame(&self, _track: &str, _bgra: &[u8], _width: u32, _height: u32) {
-        unimplemented!("M1: PeerConnection::push_video_frame (see VideoTrack)")
+    // ── Tracks / data channels ───────────────────────────────────────────────
+    /// Add a local track (creates a sendrecv transceiver).
+    pub fn add_track(&self, track: &Track) -> Result<()> {
+        let ok = unsafe {
+            reactor_webrtc_sys::reactor_webrtc_peer_connection_add_track(self.raw, track.raw())
+        };
+        if ok == 1 {
+            Ok(())
+        } else {
+            Err(Error::Webrtc("add_track failed".into()))
+        }
     }
-    /// Push interleaved i16 PCM into a sendonly audio track.
-    pub fn push_audio_frame(&self, _track: &str, _pcm: &[i16], _sample_rate: u32, _channels: u32) {
-        unimplemented!("M1: PeerConnection::push_audio_frame (see factory ADM)")
-    }
-
-    // ── Callbacks ────────────────────────────────────────────────────────────
-    pub fn on_connection_state_change(
-        &self,
-        _cb: impl FnMut(PeerConnectionState) + Send + 'static,
-    ) {
-        unimplemented!("M1: PeerConnection::on_connection_state_change")
-    }
-    pub fn on_ice_candidate(&self, _cb: impl FnMut(IceCandidate) + Send + 'static) {
-        unimplemented!("M1: PeerConnection::on_ice_candidate")
-    }
-    /// Fired when a remote track arrives; `MediaKind` distinguishes audio/video.
-    pub fn on_track(&self, _cb: impl FnMut(MediaKind, String) + Send + 'static) {
-        unimplemented!("M1: PeerConnection::on_track")
-    }
-    pub fn on_data_channel(&self, _cb: impl FnMut(DataChannel) + Send + 'static) {
-        unimplemented!("M1: PeerConnection::on_data_channel")
-    }
-
-    pub fn close(&self) {
-        unimplemented!("M1: PeerConnection::close")
+    /// Create an SDP-negotiated data channel.
+    pub fn create_data_channel(&self, label: &str) -> Result<DataChannel> {
+        let label =
+            CString::new(label).map_err(|_| Error::Webrtc("label has a NUL byte".into()))?;
+        let raw = unsafe {
+            reactor_webrtc_sys::reactor_webrtc_peer_connection_create_data_channel(
+                self.raw,
+                label.as_ptr(),
+            )
+        };
+        if raw.is_null() {
+            Err(Error::Webrtc("create_data_channel returned null".into()))
+        } else {
+            Ok(DataChannel::from_raw(raw))
+        }
     }
 }
 
 impl Drop for PeerConnection {
     fn drop(&mut self) {
+        // Destroy the native PC (stops callbacks) before the observer box drops.
         unsafe { reactor_webrtc_sys::reactor_webrtc_peer_connection_destroy(self.raw) }
     }
 }
