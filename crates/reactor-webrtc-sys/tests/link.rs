@@ -47,5 +47,13 @@ fn links_and_runs_libwebrtc() {
             lower.contains("vp8"),
             "expected VP8 among codecs, got: {codecs}"
         );
+
+        // Create a real PeerConnectionFactory (threads + media engine) and
+        // tear it down.
+        let factory = reactor_webrtc_sys::reactor_webrtc_factory_create();
+        assert!(!factory.is_null(), "PeerConnectionFactory creation failed");
+        println!("PeerConnectionFactory created OK ({factory:?})");
+        reactor_webrtc_sys::reactor_webrtc_factory_destroy(factory);
+        println!("PeerConnectionFactory destroyed OK");
     }
 }
