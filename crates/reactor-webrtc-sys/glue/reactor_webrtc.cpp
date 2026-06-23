@@ -14,7 +14,9 @@
 // rather than hand-written.
 
 #include <cstring>
+#include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -28,6 +30,8 @@
 #include "api/peer_connection_interface.h"
 #include "api/rtc_error.h"
 #include "api/scoped_refptr.h"
+#include "api/set_local_description_observer_interface.h"
+#include "api/set_remote_description_observer_interface.h"
 #include "api/video_codecs/builtin_video_decoder_factory.h"
 #include "api/video_codecs/builtin_video_encoder_factory.h"
 #include "api/video_codecs/video_encoder_factory.h"
@@ -117,12 +121,12 @@ struct ReactorPeerConnection {
   webrtc::scoped_refptr<webrtc::PeerConnectionInterface> pc;
 };
 
-// Forwards CreateOffer results to C callbacks.
-class CreateOfferObserver : public webrtc::CreateSessionDescriptionObserver {
+// Forwards CreateOffer/CreateAnswer results to C callbacks.
+class CreateSdpObserver : public webrtc::CreateSessionDescriptionObserver {
  public:
-  CreateOfferObserver(void* userdata,
-                      void (*on_success)(void*, const char*, const char*),
-                      void (*on_error)(void*, const char*))
+  CreateSdpObserver(void* userdata,
+                    void (*on_success)(void*, const char*, const char*),
+                    void (*on_error)(void*, const char*))
       : userdata_(userdata), on_success_(on_success), on_error_(on_error) {}
 
   void OnSuccess(webrtc::SessionDescriptionInterface* desc) override {
@@ -140,6 +144,38 @@ class CreateOfferObserver : public webrtc::CreateSessionDescriptionObserver {
   void* userdata_;
   void (*on_success_)(void*, const char*, const char*);
   void (*on_error_)(void*, const char*);
+};
+
+// Forwards SetLocalDescription completion to a C callback (null error = ok).
+class SetLocalDescObserver
+    : public webrtc::SetLocalDescriptionObserverInterface {
+ public:
+  SetLocalDescObserver(void* userdata, void (*on_complete)(void*, const char*))
+      : userdata_(userdata), on_complete_(on_complete) {}
+  void OnSetLocalDescriptionComplete(webrtc::RTCError error) override {
+    if (on_complete_)
+      on_complete_(userdata_, error.ok() ? nullptr : error.message());
+  }
+
+ private:
+  void* userdata_;
+  void (*on_complete_)(void*, const char*);
+};
+
+// Forwards SetRemoteDescription completion to a C callback (null error = ok).
+class SetRemoteDescObserver
+    : public webrtc::SetRemoteDescriptionObserverInterface {
+ public:
+  SetRemoteDescObserver(void* userdata, void (*on_complete)(void*, const char*))
+      : userdata_(userdata), on_complete_(on_complete) {}
+  void OnSetRemoteDescriptionComplete(webrtc::RTCError error) override {
+    if (on_complete_)
+      on_complete_(userdata_, error.ok() ? nullptr : error.message());
+  }
+
+ private:
+  void* userdata_;
+  void (*on_complete_)(void*, const char*);
 };
 
 // Lenient ICE-server extraction: pull quoted stun:/turn[s]: URLs out of the
@@ -282,10 +318,105 @@ void reactor_webrtc_peer_connection_create_offer(
     if (on_error) on_error(userdata, "no peer connection");
     return;
   }
-  auto observer = webrtc::make_ref_counted<CreateOfferObserver>(
-      userdata, on_success, on_error);
+  auto observer =
+      webrtc::make_ref_counted<CreateSdpObserver>(userdata, on_success, on_error);
   webrtc::PeerConnectionInterface::RTCOfferAnswerOptions options;
   rpc->pc->CreateOffer(observer.get(), options);
+}
+
+// Create an answer (current signaling state must have a remote offer). Result
+// delivered like create_offer.
+void reactor_webrtc_peer_connection_create_answer(
+    void* pc, void* userdata,
+    void (*on_success)(void* userdata, const char* type, const char* sdp),
+    void (*on_error)(void* userdata, const char* message)) {
+  auto* rpc = reinterpret_cast<ReactorPeerConnection*>(pc);
+  if (!rpc || !rpc->pc) {
+    if (on_error) on_error(userdata, "no peer connection");
+    return;
+  }
+  auto observer =
+      webrtc::make_ref_counted<CreateSdpObserver>(userdata, on_success, on_error);
+  webrtc::PeerConnectionInterface::RTCOfferAnswerOptions options;
+  rpc->pc->CreateAnswer(observer.get(), options);
+}
+
+// Parse (type, sdp) and apply it as the local description. `on_complete` fires
+// once with a null error on success.
+void reactor_webrtc_peer_connection_set_local_description(
+    void* pc, const char* type, const char* sdp, void* userdata,
+    void (*on_complete)(void* userdata, const char* error)) {
+  auto* rpc = reinterpret_cast<ReactorPeerConnection*>(pc);
+  if (!rpc || !rpc->pc) {
+    if (on_complete) on_complete(userdata, "no peer connection");
+    return;
+  }
+  const std::optional<webrtc::SdpType> t =
+      webrtc::SdpTypeFromString(type ? type : "");
+  if (!t) {
+    if (on_complete) on_complete(userdata, "invalid sdp type");
+    return;
+  }
+  std::unique_ptr<webrtc::SessionDescriptionInterface> desc =
+      webrtc::CreateSessionDescription(*t, sdp ? sdp : "");
+  if (!desc) {
+    if (on_complete) on_complete(userdata, "failed to parse sdp");
+    return;
+  }
+  rpc->pc->SetLocalDescription(
+      std::move(desc),
+      webrtc::make_ref_counted<SetLocalDescObserver>(userdata, on_complete));
+}
+
+// Parse (type, sdp) and apply it as the remote description.
+void reactor_webrtc_peer_connection_set_remote_description(
+    void* pc, const char* type, const char* sdp, void* userdata,
+    void (*on_complete)(void* userdata, const char* error)) {
+  auto* rpc = reinterpret_cast<ReactorPeerConnection*>(pc);
+  if (!rpc || !rpc->pc) {
+    if (on_complete) on_complete(userdata, "no peer connection");
+    return;
+  }
+  const std::optional<webrtc::SdpType> t =
+      webrtc::SdpTypeFromString(type ? type : "");
+  if (!t) {
+    if (on_complete) on_complete(userdata, "invalid sdp type");
+    return;
+  }
+  std::unique_ptr<webrtc::SessionDescriptionInterface> desc =
+      webrtc::CreateSessionDescription(*t, sdp ? sdp : "");
+  if (!desc) {
+    if (on_complete) on_complete(userdata, "failed to parse sdp");
+    return;
+  }
+  rpc->pc->SetRemoteDescription(
+      std::move(desc),
+      webrtc::make_ref_counted<SetRemoteDescObserver>(userdata, on_complete));
+}
+
+// Add a remote ICE candidate (from the peer's OnIceCandidate). `on_complete`
+// fires once with a null error on success.
+void reactor_webrtc_peer_connection_add_ice_candidate(
+    void* pc, const char* sdp_mid, int sdp_mline_index, const char* candidate,
+    void* userdata, void (*on_complete)(void* userdata, const char* error)) {
+  auto* rpc = reinterpret_cast<ReactorPeerConnection*>(pc);
+  if (!rpc || !rpc->pc) {
+    if (on_complete) on_complete(userdata, "no peer connection");
+    return;
+  }
+  webrtc::SdpParseError err;
+  std::unique_ptr<webrtc::IceCandidate> cand(webrtc::CreateIceCandidate(
+      sdp_mid ? sdp_mid : "", sdp_mline_index,
+      std::string(candidate ? candidate : ""), &err));
+  if (!cand) {
+    if (on_complete) on_complete(userdata, err.description.c_str());
+    return;
+  }
+  rpc->pc->AddIceCandidate(
+      std::move(cand), [userdata, on_complete](webrtc::RTCError error) {
+        if (on_complete)
+          on_complete(userdata, error.ok() ? nullptr : error.message());
+      });
 }
 
 // Create a (negotiated-by-SDP) data channel. Returns an opaque DataChannel

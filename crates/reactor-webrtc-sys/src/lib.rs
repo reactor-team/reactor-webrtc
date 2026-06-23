@@ -110,6 +110,42 @@ extern "C" {
         on_success: extern "C" fn(userdata: *mut c_void, ty: *const c_char, sdp: *const c_char),
         on_error: extern "C" fn(userdata: *mut c_void, message: *const c_char),
     );
+    /// Create an SDP answer (the signaling state must hold a remote offer).
+    /// Same callback contract as [`reactor_webrtc_peer_connection_create_offer`].
+    pub fn reactor_webrtc_peer_connection_create_answer(
+        pc: *mut PeerConnection,
+        userdata: *mut c_void,
+        on_success: extern "C" fn(userdata: *mut c_void, ty: *const c_char, sdp: *const c_char),
+        on_error: extern "C" fn(userdata: *mut c_void, message: *const c_char),
+    );
+
+    /// Apply `(type, sdp)` as the local description. `on_complete` fires once
+    /// (asynchronously) with a null `error` on success, or a message on failure.
+    pub fn reactor_webrtc_peer_connection_set_local_description(
+        pc: *mut PeerConnection,
+        ty: *const c_char,
+        sdp: *const c_char,
+        userdata: *mut c_void,
+        on_complete: extern "C" fn(userdata: *mut c_void, error: *const c_char),
+    );
+    /// Apply `(type, sdp)` as the remote description. Same contract as
+    /// [`reactor_webrtc_peer_connection_set_local_description`].
+    pub fn reactor_webrtc_peer_connection_set_remote_description(
+        pc: *mut PeerConnection,
+        ty: *const c_char,
+        sdp: *const c_char,
+        userdata: *mut c_void,
+        on_complete: extern "C" fn(userdata: *mut c_void, error: *const c_char),
+    );
+    /// Add a remote ICE candidate (typically from the peer's `on_ice_candidate`).
+    pub fn reactor_webrtc_peer_connection_add_ice_candidate(
+        pc: *mut PeerConnection,
+        sdp_mid: *const c_char,
+        sdp_mline_index: c_int,
+        candidate: *const c_char,
+        userdata: *mut c_void,
+        on_complete: extern "C" fn(userdata: *mut c_void, error: *const c_char),
+    );
 
     /// Create an SDP-negotiated data channel. Returns an opaque handle (which
     /// must be freed with [`reactor_webrtc_data_channel_destroy`]) or null.
