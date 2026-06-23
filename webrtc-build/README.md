@@ -55,14 +55,20 @@ staged output and run its test:
 ```bash
 REACTOR_WEBRTC_LIB_DIR=webrtc-build/out/mac-arm64-release/dist \
   cargo test -p reactor-webrtc-sys -- --nocapture
-# libwebrtc linked OK — 4 codecs: opus,G722,PCMU,PCMA
+# libwebrtc linked OK — 8 codecs: opus,G722,PCMU,PCMA,VP8,AV1,VP9,VP9
 ```
 
 This links the Rust test binary against `libwebrtc.a` + the platform
-frameworks and runs real WebRTC code (the builtin audio encoder factory).
-Note: the glue is compiled as **C++20** (this milestone's public headers use
-`std::span`). Without `REACTOR_WEBRTC_LIB_DIR`/`_PREBUILT_URL` the test is
-`cfg`-gated out, so a plain `cargo test`/`check` stays green.
+frameworks and runs real WebRTC code (the builtin audio **and video** encoder
+factories — VP8/VP9/AV1; H.264 is off via `rtc_use_h264=false`). Notes:
+
+- The glue is compiled as **C++20** (this milestone's public headers use
+  `std::span`).
+- `libwebrtc.a` is linked **whole-archive** because it is one monolithic
+  `complete_static_lib` with back-references between members; `-dead_strip`
+  trims what the FFI doesn't use.
+- Without `REACTOR_WEBRTC_LIB_DIR`/`_PREBUILT_URL` the test is `cfg`-gated out,
+  so a plain `cargo test`/`check` stays green.
 
 ## Target matrix
 

@@ -1,0 +1,17 @@
+diff --git a/BUILD.gn b/BUILD.gn
+index 4be196196f..bbe3542bad 100644
+--- a/BUILD.gn
++++ b/BUILD.gn
+@@ -536,6 +536,12 @@ if (!build_with_chromium) {
+ 
+     deps = [
+       "api:create_modular_peer_connection_factory",
++      # Reactor: builtin convenience codec factories (the umbrella otherwise
++      # leaves these "leaf" helpers out). Added by webrtc-build/build.sh.
++      "api/audio_codecs:builtin_audio_encoder_factory",
++      "api/audio_codecs:builtin_audio_decoder_factory",
++      "api/video_codecs:builtin_video_encoder_factory",
++      "api/video_codecs:builtin_video_decoder_factory",
+       "api:create_peerconnection_factory",
+       "api:enable_media",
+       "api:rtc_error",

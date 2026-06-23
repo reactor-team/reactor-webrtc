@@ -70,7 +70,12 @@ fn link(root: &Path) {
     compile_glue(&include_dir);
 
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
-    println!("cargo:rustc-link-lib=static=webrtc");
+    // libwebrtc.a is one monolithic archive (gn complete_static_lib) with
+    // back-references between members (e.g. the simulcast adapter references the
+    // software-fallback wrapper). A plain `-lwebrtc` leaves those unresolved
+    // because the linker won't revisit earlier members; +whole-archive loads
+    // every member, and the final `-dead_strip` drops what the FFI doesn't use.
+    println!("cargo:rustc-link-lib=static:+whole-archive=webrtc");
     link_system_deps();
 
     // A real lib is present: enable link-dependent tests/examples.
@@ -137,12 +142,16 @@ fn link_system_deps() {
                 "CoreMedia",
                 "CoreVideo",
                 "CoreGraphics",
+                "CoreImage",
                 "VideoToolbox",
                 "AVFoundation",
                 "AppKit",
                 "IOSurface",
+                "IOKit",
                 "Metal",
+                "QuartzCore",
                 "OpenGL",
+                "ScreenCaptureKit",
                 "Security",
                 "SystemConfiguration",
             ] {

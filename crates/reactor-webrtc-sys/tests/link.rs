@@ -36,10 +36,16 @@ fn links_and_runs_libwebrtc() {
 
         let codecs = CStr::from_ptr(buf.as_ptr() as *const c_char).to_string_lossy();
         println!("libwebrtc linked OK — {n} codecs: {codecs}");
+        let lower = codecs.to_lowercase();
         // Opus is always registered by the builtin audio encoder factory.
         assert!(
-            codecs.to_lowercase().contains("opus"),
+            lower.contains("opus"),
             "expected Opus among codecs, got: {codecs}"
+        );
+        // VP8 is always registered by the builtin video encoder factory.
+        assert!(
+            lower.contains("vp8"),
+            "expected VP8 among codecs, got: {codecs}"
         );
     }
 }
