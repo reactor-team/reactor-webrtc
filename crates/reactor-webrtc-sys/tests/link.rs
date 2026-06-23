@@ -28,8 +28,9 @@ use std::time::{Duration, Instant};
 use reactor_webrtc_sys::{
     reactor_webrtc_abi_version, reactor_webrtc_audio_track_add_sink,
     reactor_webrtc_audio_track_create, reactor_webrtc_data_channel_destroy,
-    reactor_webrtc_factory_create, reactor_webrtc_factory_destroy,
-    reactor_webrtc_factory_push_audio_frame, reactor_webrtc_media_stream_track_destroy,
+    reactor_webrtc_factory_create, reactor_webrtc_factory_create_with_adm,
+    reactor_webrtc_factory_destroy, reactor_webrtc_factory_push_audio_frame,
+    reactor_webrtc_factory_set_adm_playout_enabled, reactor_webrtc_media_stream_track_destroy,
     reactor_webrtc_peer_connection_add_ice_candidate, reactor_webrtc_peer_connection_add_track,
     reactor_webrtc_peer_connection_create, reactor_webrtc_peer_connection_create_answer,
     reactor_webrtc_peer_connection_create_data_channel,
@@ -205,6 +206,27 @@ fn links_and_runs_libwebrtc() {
         reactor_webrtc_peer_connection_destroy(pc);
         reactor_webrtc_factory_destroy(factory);
         println!("factory + peer connection lifecycle OK");
+    }
+}
+
+#[test]
+fn platform_adm_factory_lifecycle() {
+    // SAFETY: the platform-ADM path lets the media engine create the real
+    // device ADM (CoreAudio on macOS). We only construct/destroy here — no
+    // capture starts, so no microphone is opened.
+    unsafe {
+        let factory = reactor_webrtc_factory_create_with_adm(1);
+        assert!(!factory.is_null(), "platform-ADM factory creation failed");
+        // set_adm_playout_enabled is a no-op for the platform ADM but must not crash.
+        reactor_webrtc_factory_set_adm_playout_enabled(factory, 0);
+        let pc = reactor_webrtc_peer_connection_create(factory, ptr::null(), ptr::null());
+        assert!(
+            !pc.is_null(),
+            "peer connection creation failed (platform ADM)"
+        );
+        reactor_webrtc_peer_connection_destroy(pc);
+        reactor_webrtc_factory_destroy(factory);
+        println!("platform-ADM factory lifecycle OK");
     }
 }
 

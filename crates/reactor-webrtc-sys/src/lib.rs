@@ -91,7 +91,14 @@ extern "C" {
     pub fn reactor_webrtc_selftest(out: *mut c_char, cap: c_int) -> c_int;
 
     // ── Factory ──────────────────────────────────────────────────────────────
+    /// Create a factory with the synthetic (push-able) ADM — no audio hardware.
     pub fn reactor_webrtc_factory_create() -> *mut PeerConnectionFactory;
+    /// Create a factory choosing the audio device backend. `use_platform_adm`:
+    /// 0 → synthetic ADM (push PCM via [`reactor_webrtc_factory_push_audio_frame`]);
+    /// nonzero → the platform default ADM (real mic/speaker, e.g. CoreAudio).
+    pub fn reactor_webrtc_factory_create_with_adm(
+        use_platform_adm: c_int,
+    ) -> *mut PeerConnectionFactory;
     pub fn reactor_webrtc_factory_destroy(factory: *mut PeerConnectionFactory);
 
     /// Create a peer connection. `config_json` carries ICE servers / policies
@@ -222,8 +229,9 @@ extern "C" {
         ),
     );
 
-    // ── Audio Device Module (incl. synthetic/headless mode) ──────────────────
-    pub fn reactor_webrtc_factory_acquire_platform_adm(factory: *mut PeerConnectionFactory);
+    // ── Audio Device Module ───────────────────────────────────────────────────
+    /// Enable/disable the synthetic ADM's playout pump (no-op for the platform
+    /// ADM). Disable to stay fully silent in send-only / headless scenarios.
     pub fn reactor_webrtc_factory_set_adm_playout_enabled(
         factory: *mut PeerConnectionFactory,
         enabled: c_int,

@@ -113,9 +113,14 @@ class FrameAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
   bool RecordingIsInitialized() const override { return true; }
   bool Recording() const override { return true; }
 
+  // Gate the playout pump (e.g. to stay fully silent in send-only / headless
+  // scenarios). Enabled by default.
+  void SetPlayoutEnabled(bool enabled) { playout_enabled_.store(enabled); }
+
   // Playout pump: pulls (and discards) 10ms render blocks so the receive
   // pipeline runs and remote audio-track sinks are invoked.
   int32_t StartPlayout() override {
+    if (!playout_enabled_.load()) return 0;
     if (playing_.exchange(true)) return 0;
     play_thread_ = std::thread([this] { PlayoutLoop(); });
     return 0;
@@ -163,6 +168,7 @@ class FrameAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
   std::mutex mutex_;
   webrtc::AudioTransport* transport_ = nullptr;
   std::atomic<bool> playing_{false};
+  std::atomic<bool> playout_enabled_{true};
   std::thread play_thread_;
 };
 
@@ -407,11 +413,13 @@ int reactor_webrtc_selftest(char* out, int cap) {
 }
 
 // Create a PeerConnectionFactory: start the network/worker/signaling threads
-// and wire the builtin audio+video codec factories. The default ADM (nullptr)
-// is created by the media engine; a synthetic/headless ADM hook lands later.
-// Returns an opaque ReactorFactory* (the `PeerConnectionFactory` handle in the
-// Rust API), or nullptr on failure.
-void* reactor_webrtc_factory_create() {
+// and wire the builtin audio+video codec factories.
+//
+// `use_platform_adm`: 0 → our synthetic FrameAdm (push PCM, no hardware);
+// nonzero → pass a null ADM so the media engine creates the platform default
+// ADM (real mic/speaker, e.g. CoreAudio on macOS). Returns an opaque
+// ReactorFactory* (the `PeerConnectionFactory` handle), or nullptr.
+void* reactor_webrtc_factory_create_with_adm(int use_platform_adm) {
   auto f = std::make_unique<ReactorFactory>();
 
   f->network_thread = webrtc::Thread::CreateWithSocketServer();
@@ -422,10 +430,17 @@ void* reactor_webrtc_factory_create() {
     return nullptr;
   }
 
-  f->adm = webrtc::make_ref_counted<FrameAdm>();
+  // Synthetic ADM unless the platform default is requested (null → engine
+  // creates the real device ADM internally).
+  webrtc::scoped_refptr<webrtc::AudioDeviceModule> adm;
+  if (!use_platform_adm) {
+    f->adm = webrtc::make_ref_counted<FrameAdm>();
+    adm = f->adm;
+  }
+
   f->factory = webrtc::CreatePeerConnectionFactory(
       f->network_thread.get(), f->worker_thread.get(),
-      f->signaling_thread.get(), f->adm,
+      f->signaling_thread.get(), adm,
       webrtc::CreateBuiltinAudioEncoderFactory(),
       webrtc::CreateBuiltinAudioDecoderFactory(),
       webrtc::CreateBuiltinVideoEncoderFactory(),
@@ -435,6 +450,17 @@ void* reactor_webrtc_factory_create() {
     return nullptr;  // threads stopped by ReactorFactory's destructor
   }
   return f.release();
+}
+
+// Create a factory with the synthetic (push-able) ADM.
+void* reactor_webrtc_factory_create() {
+  return reactor_webrtc_factory_create_with_adm(0);
+}
+
+// Enable/disable the synthetic ADM's playout pump (no-op for the platform ADM).
+void reactor_webrtc_factory_set_adm_playout_enabled(void* factory, int enabled) {
+  auto* rf = reinterpret_cast<ReactorFactory*>(factory);
+  if (rf && rf->adm) rf->adm->SetPlayoutEnabled(enabled != 0);
 }
 
 // Destroy a factory created by reactor_webrtc_factory_create (releases the
