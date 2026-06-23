@@ -175,9 +175,9 @@ extern "C" {
         width: c_int,
         height: c_int,
     );
-    /// Add a local track to the peer connection (creates a sendrecv
-    /// transceiver). Returns 1 on success, 0 on failure.
-    pub fn reactor_webrtc_peer_connection_add_video_track(
+    /// Add a local audio or video track to the peer connection (creates a
+    /// sendrecv transceiver). Returns 1 on success, 0 on failure.
+    pub fn reactor_webrtc_peer_connection_add_track(
         pc: *mut PeerConnection,
         track: *mut MediaStreamTrack,
     ) -> c_int;
@@ -191,30 +191,42 @@ extern "C" {
     /// Destroy a track handle (detaches any sink, releases the track + source).
     pub fn reactor_webrtc_media_stream_track_destroy(track: *mut MediaStreamTrack);
 
+    // ── Audio tracks ─────────────────────────────────────────────────────────
+    /// Create a local audio track. Its samples come from the factory's ADM —
+    /// push PCM with [`reactor_webrtc_factory_push_audio_frame`]. Returns an
+    /// owned [`MediaStreamTrack`] handle or null.
+    pub fn reactor_webrtc_audio_track_create(
+        factory: *mut PeerConnectionFactory,
+        id: *const c_char,
+    ) -> *mut MediaStreamTrack;
+    /// Deliver interleaved i16 PCM to the factory's ADM (shared by all local
+    /// audio tracks). `samples_per_channel` is the frame count (e.g. 480 for
+    /// 10ms @ 48kHz).
+    pub fn reactor_webrtc_factory_push_audio_frame(
+        factory: *mut PeerConnectionFactory,
+        pcm: *const i16,
+        samples_per_channel: c_int,
+        sample_rate: c_int,
+        channels: c_int,
+    );
+    /// Attach a sink to a (received) audio track. `on_audio(userdata,
+    /// sample_rate, channels, frames)` fires per 10ms block until destroyed.
+    pub fn reactor_webrtc_audio_track_add_sink(
+        track: *mut MediaStreamTrack,
+        userdata: *mut c_void,
+        on_audio: extern "C" fn(
+            userdata: *mut c_void,
+            sample_rate: c_int,
+            channels: c_int,
+            frames: c_int,
+        ),
+    );
+
     // ── Audio Device Module (incl. synthetic/headless mode) ──────────────────
     pub fn reactor_webrtc_factory_acquire_platform_adm(factory: *mut PeerConnectionFactory);
     pub fn reactor_webrtc_factory_set_adm_playout_enabled(
         factory: *mut PeerConnectionFactory,
         enabled: c_int,
-    );
-
-    // ── Frame injection (sendonly) ───────────────────────────────────────────
-    /// Push a BGRA frame into a sendonly video track's source.
-    pub fn reactor_webrtc_push_video_frame(
-        pc: *mut PeerConnection,
-        track: *const c_char,
-        data: *const u8,
-        width: u32,
-        height: u32,
-    );
-    /// Push interleaved i16 PCM into a sendonly audio track's source.
-    pub fn reactor_webrtc_push_audio_frame(
-        pc: *mut PeerConnection,
-        track: *const c_char,
-        data: *const i16,
-        samples_per_channel: u32,
-        sample_rate: u32,
-        channels: u32,
     );
 
     // ── Platform bootstrap ───────────────────────────────────────────────────

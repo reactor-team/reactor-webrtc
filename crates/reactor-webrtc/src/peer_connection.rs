@@ -102,43 +102,17 @@ impl PeerConnection {
     }
 
     // ── Frame injection (sendonly) ───────────────────────────────────────────
+    // NOTE: the sys layer now pushes video frames per-track
+    // (`reactor_webrtc_video_track_push_frame`) and audio frames per-factory via
+    // the ADM (`reactor_webrtc_factory_push_audio_frame`). The safe wrapper will
+    // expose these on the track/factory types; stubbed until the wrapper lands.
     /// Push a BGRA frame (`width*height*4`) into a sendonly video track.
-    pub fn push_video_frame(&self, track: &str, bgra: &[u8], width: u32, height: u32) {
-        let cname = std::ffi::CString::new(track).unwrap_or_default();
-        let ptr = if bgra.is_empty() {
-            std::ptr::null()
-        } else {
-            bgra.as_ptr()
-        };
-        unsafe {
-            reactor_webrtc_sys::reactor_webrtc_push_video_frame(
-                self.raw,
-                cname.as_ptr(),
-                ptr,
-                width,
-                height,
-            )
-        }
+    pub fn push_video_frame(&self, _track: &str, _bgra: &[u8], _width: u32, _height: u32) {
+        unimplemented!("M1: PeerConnection::push_video_frame (see VideoTrack)")
     }
     /// Push interleaved i16 PCM into a sendonly audio track.
-    pub fn push_audio_frame(&self, track: &str, pcm: &[i16], sample_rate: u32, channels: u32) {
-        let cname = std::ffi::CString::new(track).unwrap_or_default();
-        let ptr = if pcm.is_empty() {
-            std::ptr::null()
-        } else {
-            pcm.as_ptr()
-        };
-        let spc = (pcm.len() as u32).checked_div(channels).unwrap_or(0);
-        unsafe {
-            reactor_webrtc_sys::reactor_webrtc_push_audio_frame(
-                self.raw,
-                cname.as_ptr(),
-                ptr,
-                spc,
-                sample_rate,
-                channels,
-            )
-        }
+    pub fn push_audio_frame(&self, _track: &str, _pcm: &[i16], _sample_rate: u32, _channels: u32) {
+        unimplemented!("M1: PeerConnection::push_audio_frame (see factory ADM)")
     }
 
     // ── Callbacks ────────────────────────────────────────────────────────────

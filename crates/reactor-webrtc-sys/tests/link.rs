@@ -2,7 +2,7 @@
 //! resolved (build.rs emits `cfg(have_libwebrtc)` then). They drive real WebRTC
 //! objects through the C++ glue: codec factories, a PeerConnectionFactory, and
 //! PeerConnections with the callback bridge — up to a full local loopback that
-//! negotiates, connects, and sends/receives real video frames.
+//! negotiates, connects, and sends/receives real audio + video.
 //!
 //! Run against a locally built lib:
 //!
@@ -26,18 +26,19 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use reactor_webrtc_sys::{
-    reactor_webrtc_abi_version, reactor_webrtc_data_channel_destroy, reactor_webrtc_factory_create,
-    reactor_webrtc_factory_destroy, reactor_webrtc_media_stream_track_destroy,
-    reactor_webrtc_peer_connection_add_ice_candidate,
-    reactor_webrtc_peer_connection_add_video_track, reactor_webrtc_peer_connection_create,
-    reactor_webrtc_peer_connection_create_answer,
+    reactor_webrtc_abi_version, reactor_webrtc_audio_track_add_sink,
+    reactor_webrtc_audio_track_create, reactor_webrtc_data_channel_destroy,
+    reactor_webrtc_factory_create, reactor_webrtc_factory_destroy,
+    reactor_webrtc_factory_push_audio_frame, reactor_webrtc_media_stream_track_destroy,
+    reactor_webrtc_peer_connection_add_ice_candidate, reactor_webrtc_peer_connection_add_track,
+    reactor_webrtc_peer_connection_create, reactor_webrtc_peer_connection_create_answer,
     reactor_webrtc_peer_connection_create_data_channel,
     reactor_webrtc_peer_connection_create_offer, reactor_webrtc_peer_connection_destroy,
     reactor_webrtc_peer_connection_set_local_description,
     reactor_webrtc_peer_connection_set_remote_description, reactor_webrtc_selftest,
     reactor_webrtc_video_track_add_sink, reactor_webrtc_video_track_create,
     reactor_webrtc_video_track_push_frame, MediaStreamTrack, PeerConnection,
-    PeerConnectionCallbacks,
+    PeerConnectionCallbacks, PeerConnectionFactory,
 };
 
 // PeerConnectionState::kConnected (enum order in peer_connection_interface.h).
@@ -102,9 +103,10 @@ unsafe fn run_complete(call: impl FnOnce(*mut c_void)) -> Result<(), String> {
 struct PcCtx {
     ice: Mutex<VecDeque<(String, i32, String)>>,
     connected: AtomicBool,
-    frames: AtomicU32,
-    // Received remote track handle (*mut MediaStreamTrack as usize), if any.
-    recv_track: Mutex<Option<usize>>,
+    video_frames: AtomicU32,
+    audio_frames: AtomicU32,
+    // Received remote track handles (*mut MediaStreamTrack as usize).
+    recv_tracks: Mutex<Vec<usize>>,
 }
 
 extern "C" fn ctx_on_ice(ud: *mut c_void, mid: *const c_char, idx: i32, cand: *const c_char) {
@@ -124,14 +126,22 @@ extern "C" fn ctx_on_conn(ud: *mut c_void, state: i32) {
         ctx.connected.store(true, Ordering::SeqCst);
     }
 }
-extern "C" fn ctx_on_frame(ud: *mut c_void, _width: c_int, _height: c_int) {
+extern "C" fn ctx_on_video(ud: *mut c_void, _width: c_int, _height: c_int) {
     let ctx = unsafe { &*(ud as *const PcCtx) };
-    ctx.frames.fetch_add(1, Ordering::SeqCst);
+    ctx.video_frames.fetch_add(1, Ordering::SeqCst);
+}
+extern "C" fn ctx_on_audio(ud: *mut c_void, _rate: c_int, _channels: c_int, _frames: c_int) {
+    let ctx = unsafe { &*(ud as *const PcCtx) };
+    ctx.audio_frames.fetch_add(1, Ordering::SeqCst);
 }
 extern "C" fn ctx_on_track(ud: *mut c_void, track: *mut MediaStreamTrack) {
     let ctx = unsafe { &*(ud as *const PcCtx) };
-    unsafe { reactor_webrtc_video_track_add_sink(track, ud, ctx_on_frame) };
-    *ctx.recv_track.lock().unwrap() = Some(track as usize);
+    // Only the kind-matching call attaches a sink; the other is a no-op.
+    unsafe {
+        reactor_webrtc_video_track_add_sink(track, ud, ctx_on_video);
+        reactor_webrtc_audio_track_add_sink(track, ud, ctx_on_audio);
+    }
+    ctx.recv_tracks.lock().unwrap().push(track as usize);
 }
 
 fn observer_for(ctx: &PcCtx) -> PeerConnectionCallbacks {
@@ -199,9 +209,9 @@ fn links_and_runs_libwebrtc() {
 }
 
 #[test]
-fn loopback_two_peers_exchange_video() {
-    // SAFETY: as above; this test drives a full offer/answer + ICE exchange
-    // between two in-process PeerConnections, then streams video one way.
+fn loopback_two_peers_exchange_media() {
+    // SAFETY: as above; drives a full offer/answer + ICE exchange between two
+    // in-process PeerConnections, then streams audio + video one way.
     unsafe {
         let factory = reactor_webrtc_factory_create();
         assert!(!factory.is_null(), "factory creation failed");
@@ -218,7 +228,7 @@ fn loopback_two_peers_exchange_video() {
             "peer connection creation failed"
         );
 
-        // A data channel + a video track give the offer something to negotiate.
+        // pc1 gets a data channel + a video track + an audio track to negotiate.
         let dc_label = CString::new("reactor").unwrap();
         let dc = reactor_webrtc_peer_connection_create_data_channel(pc1, dc_label.as_ptr());
         assert!(!dc.is_null(), "data channel creation failed");
@@ -227,9 +237,18 @@ fn loopback_two_peers_exchange_video() {
         let vtrack = reactor_webrtc_video_track_create(factory, vid_id.as_ptr());
         assert!(!vtrack.is_null(), "video track creation failed");
         assert_eq!(
-            reactor_webrtc_peer_connection_add_video_track(pc1, vtrack),
+            reactor_webrtc_peer_connection_add_track(pc1, vtrack),
             1,
-            "add video track failed"
+            "add video failed"
+        );
+
+        let aud_id = CString::new("reactor-audio").unwrap();
+        let atrack = reactor_webrtc_audio_track_create(factory, aud_id.as_ptr());
+        assert!(!atrack.is_null(), "audio track creation failed");
+        assert_eq!(
+            reactor_webrtc_peer_connection_add_track(pc1, atrack),
+            1,
+            "add audio failed"
         );
 
         // offer: pc1 → (local on pc1, remote on pc2)
@@ -239,6 +258,10 @@ fn loopback_two_peers_exchange_video() {
         assert!(
             osdp.contains("m=video"),
             "offer should include a video m-line"
+        );
+        assert!(
+            osdp.contains("m=audio"),
+            "offer should include an audio m-line"
         );
         let (oty, osdp) = (CString::new(oty).unwrap(), CString::new(osdp).unwrap());
         run_complete(|ud| {
@@ -287,28 +310,48 @@ fn loopback_two_peers_exchange_video() {
             )
         })
         .expect("pc1 set remote answer");
-        println!("SDP offer/answer exchange complete (video negotiated)");
+        println!("SDP offer/answer exchange complete (audio + video negotiated)");
 
-        // Push BGRA frames into pc1's track on a background thread.
+        // Push BGRA video + int16 PCM audio into pc1 on a background thread.
         let stop = Arc::new(AtomicBool::new(false));
         let pusher = {
             let stop = stop.clone();
-            let track = vtrack as usize;
+            let vtrack = vtrack as usize;
+            let factory = factory as usize;
             thread::spawn(move || {
-                let track = track as *mut MediaStreamTrack;
+                let vtrack = vtrack as *mut MediaStreamTrack;
+                let factory = factory as *mut PeerConnectionFactory;
                 let (w, h) = (320i32, 240i32);
                 let mut bgra = vec![0u8; (w * h * 4) as usize];
+                // 10ms of 48kHz stereo PCM.
+                let (rate, channels, spc) = (48000i32, 2i32, 480i32);
+                let mut pcm = vec![0i16; (spc * channels) as usize];
                 let mut tick: u8 = 0;
+                let mut i = 0u32;
                 while !stop.load(Ordering::SeqCst) {
+                    // Vary content slightly each iteration.
                     bgra.iter_mut().for_each(|b| *b = tick);
                     tick = tick.wrapping_add(7);
-                    reactor_webrtc_video_track_push_frame(track, bgra.as_ptr(), w, h);
-                    thread::sleep(Duration::from_millis(33));
+                    for (j, s) in pcm.iter_mut().enumerate() {
+                        *s = (((i as usize + j) % 256) as i16 - 128) * 64;
+                    }
+                    i = i.wrapping_add(1);
+                    reactor_webrtc_factory_push_audio_frame(
+                        factory,
+                        pcm.as_ptr(),
+                        spc,
+                        rate,
+                        channels,
+                    );
+                    if i % 3 == 0 {
+                        reactor_webrtc_video_track_push_frame(vtrack, bgra.as_ptr(), w, h);
+                    }
+                    thread::sleep(Duration::from_millis(10));
                 }
             })
         };
 
-        // Trickle ICE both ways and wait for connect + a received frame.
+        // Trickle ICE both ways; wait for connect + received audio & video.
         let (mut fwd1, mut fwd2) = (0usize, 0usize);
         let start = Instant::now();
         loop {
@@ -316,9 +359,9 @@ fn loopback_two_peers_exchange_video() {
             fwd2 += forward_candidates(&ctx2, pc1);
             let connected =
                 ctx1.connected.load(Ordering::SeqCst) && ctx2.connected.load(Ordering::SeqCst);
-            if (connected && ctx2.frames.load(Ordering::SeqCst) > 0)
-                || start.elapsed() > Duration::from_secs(15)
-            {
+            let media = ctx2.video_frames.load(Ordering::SeqCst) > 0
+                && ctx2.audio_frames.load(Ordering::SeqCst) > 0;
+            if (connected && media) || start.elapsed() > Duration::from_secs(20) {
                 break;
             }
             thread::sleep(Duration::from_millis(50));
@@ -326,23 +369,26 @@ fn loopback_two_peers_exchange_video() {
         stop.store(true, Ordering::SeqCst);
         pusher.join().unwrap();
 
-        let frames = ctx2.frames.load(Ordering::SeqCst);
+        let (v, a) = (
+            ctx2.video_frames.load(Ordering::SeqCst),
+            ctx2.audio_frames.load(Ordering::SeqCst),
+        );
         assert!(
             ctx1.connected.load(Ordering::SeqCst) && ctx2.connected.load(Ordering::SeqCst),
             "loopback did not connect (candidates forwarded {fwd1}+{fwd2})",
         );
-        assert!(frames > 0, "pc2 received no video frames");
-        println!(
-            "loopback connected ✅ — pc2 received {frames} video frame(s) (forwarded {fwd1}+{fwd2} candidates)"
-        );
+        assert!(v > 0, "pc2 received no video frames");
+        assert!(a > 0, "pc2 received no audio frames");
+        println!("loopback connected ✅ — pc2 received {v} video + {a} audio frame(s)");
 
-        // Teardown: received track(s) first, then local track, channel, pcs.
+        // Teardown: received tracks first, then local tracks, channel, pcs.
         for ctx in [&ctx1, &ctx2] {
-            if let Some(p) = *ctx.recv_track.lock().unwrap() {
+            for p in ctx.recv_tracks.lock().unwrap().drain(..) {
                 reactor_webrtc_media_stream_track_destroy(p as *mut MediaStreamTrack);
             }
         }
         reactor_webrtc_media_stream_track_destroy(vtrack);
+        reactor_webrtc_media_stream_track_destroy(atrack);
         reactor_webrtc_data_channel_destroy(dc);
         reactor_webrtc_peer_connection_destroy(pc1);
         reactor_webrtc_peer_connection_destroy(pc2);

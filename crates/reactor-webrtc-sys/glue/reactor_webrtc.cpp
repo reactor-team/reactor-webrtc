@@ -13,18 +13,25 @@
 // description / add-ice-candidate) lands next and will eventually be generated
 // rather than hand-written.
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
+#include "api/audio/audio_device.h"
+#include "api/audio/audio_device_defines.h"
 #include "api/audio_codecs/audio_encoder_factory.h"
 #include "api/audio_codecs/builtin_audio_decoder_factory.h"
 #include "api/audio_codecs/builtin_audio_encoder_factory.h"
+#include "api/audio_options.h"
 #include "api/create_peerconnection_factory.h"
 #include "api/data_channel_interface.h"
 #include "api/jsep.h"
@@ -45,6 +52,7 @@
 #include "api/video_codecs/builtin_video_encoder_factory.h"
 #include "api/video_codecs/video_encoder_factory.h"
 #include "media/base/video_broadcaster.h"
+#include "modules/audio_device/include/audio_device_default.h"
 #include "pc/video_track_source.h"
 #include "rtc_base/thread.h"
 #include "rtc_base/time_utils.h"
@@ -88,6 +96,95 @@ class FrameSource : public webrtc::VideoTrackSource {
   webrtc::VideoBroadcaster broadcaster_;
 };
 
+// A custom AudioDeviceModule we push PCM into (capture) and which pumps the
+// receive path (playout) so remote audio-track sinks fire — no real audio
+// hardware. AudioDeviceModuleDefault stubs the ~40 ADM methods; we override the
+// capture/playout bits.
+class FrameAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
+                     webrtc::AudioDeviceModule> {
+ public:
+  ~FrameAdm() override { StopPlayout(); }
+
+  int32_t RegisterAudioCallback(webrtc::AudioTransport* transport) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    transport_ = transport;
+    return 0;
+  }
+  bool RecordingIsInitialized() const override { return true; }
+  bool Recording() const override { return true; }
+
+  // Playout pump: pulls (and discards) 10ms render blocks so the receive
+  // pipeline runs and remote audio-track sinks are invoked.
+  int32_t StartPlayout() override {
+    if (playing_.exchange(true)) return 0;
+    play_thread_ = std::thread([this] { PlayoutLoop(); });
+    return 0;
+  }
+  int32_t StopPlayout() override {
+    if (!playing_.exchange(false)) return 0;
+    if (play_thread_.joinable()) play_thread_.join();
+    return 0;
+  }
+  bool Playing() const override { return playing_.load(); }
+
+  // Deliver interleaved int16 PCM (samples_per_channel frames) to the engine.
+  void PushPcm(const int16_t* pcm, size_t samples_per_channel,
+               uint32_t sample_rate, size_t channels) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!transport_ || !pcm || channels == 0) return;
+    uint32_t new_mic_level = 0;
+    transport_->RecordedDataIsAvailable(
+        pcm, samples_per_channel, sizeof(int16_t) * channels, channels,
+        sample_rate, /*totalDelayMS=*/0, /*clockDrift=*/0, /*currentMicLevel=*/0,
+        /*keyPressed=*/false, new_mic_level);
+  }
+
+ private:
+  void PlayoutLoop() {
+    const uint32_t rate = 48000;
+    const size_t channels = 2;
+    const size_t frames = rate / 100;  // 10ms
+    std::vector<int16_t> scratch(frames * channels);
+    while (playing_.load()) {
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (transport_) {
+          size_t out = 0;
+          int64_t elapsed = 0, ntp = 0;
+          transport_->NeedMorePlayData(frames, sizeof(int16_t) * channels,
+                                       channels, rate, scratch.data(), out,
+                                       &elapsed, &ntp);
+        }
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+  }
+
+  std::mutex mutex_;
+  webrtc::AudioTransport* transport_ = nullptr;
+  std::atomic<bool> playing_{false};
+  std::thread play_thread_;
+};
+
+// Bridges decoded frames from a (remote) audio track to a C callback.
+class AudioFrameSink : public webrtc::AudioTrackSinkInterface {
+ public:
+  AudioFrameSink(void* userdata,
+                 void (*on_audio)(void*, int, int, int))
+      : userdata_(userdata), on_audio_(on_audio) {}
+  void OnData(const void* /*audio_data*/, int /*bits_per_sample*/,
+              int sample_rate, size_t number_of_channels,
+              size_t number_of_frames) override {
+    if (on_audio_)
+      on_audio_(userdata_, sample_rate, static_cast<int>(number_of_channels),
+                static_cast<int>(number_of_frames));
+  }
+
+ private:
+  void* userdata_;
+  void (*on_audio_)(void*, int, int, int);
+};
+
 // Bridges decoded frames from a (remote) video track to a C callback.
 class FrameSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
  public:
@@ -109,6 +206,7 @@ struct ReactorMediaStreamTrack {
   webrtc::scoped_refptr<FrameSource> source;
   webrtc::scoped_refptr<webrtc::MediaStreamTrackInterface> track;
   std::unique_ptr<FrameSink> sink;
+  std::unique_ptr<AudioFrameSink> audio_sink;
 };
 
 // Owns the three WebRTC threads alongside the factory. The threads must outlive
@@ -118,6 +216,7 @@ struct ReactorFactory {
   std::unique_ptr<webrtc::Thread> network_thread;
   std::unique_ptr<webrtc::Thread> worker_thread;
   std::unique_ptr<webrtc::Thread> signaling_thread;
+  webrtc::scoped_refptr<FrameAdm> adm;
   webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> factory;
 };
 
@@ -323,10 +422,11 @@ void* reactor_webrtc_factory_create() {
     return nullptr;
   }
 
+  f->adm = webrtc::make_ref_counted<FrameAdm>();
   f->factory = webrtc::CreatePeerConnectionFactory(
       f->network_thread.get(), f->worker_thread.get(),
-      f->signaling_thread.get(),
-      /*default_adm=*/nullptr, webrtc::CreateBuiltinAudioEncoderFactory(),
+      f->signaling_thread.get(), f->adm,
+      webrtc::CreateBuiltinAudioEncoderFactory(),
       webrtc::CreateBuiltinAudioDecoderFactory(),
       webrtc::CreateBuiltinVideoEncoderFactory(),
       webrtc::CreateBuiltinVideoDecoderFactory(),
@@ -542,13 +642,51 @@ void reactor_webrtc_video_track_push_frame(void* track, const uint8_t* bgra,
   h->source->PushFrame(frame);
 }
 
-// Add a (local) track to the peer connection, creating a sendrecv transceiver.
-// Returns 1 on success, 0 on failure.
-int reactor_webrtc_peer_connection_add_video_track(void* pc, void* track) {
+// Add a (local) audio or video track to the peer connection, creating a
+// sendrecv transceiver. Returns 1 on success, 0 on failure.
+int reactor_webrtc_peer_connection_add_track(void* pc, void* track) {
   auto* rpc = reinterpret_cast<ReactorPeerConnection*>(pc);
   auto* h = reinterpret_cast<ReactorMediaStreamTrack*>(track);
   if (!rpc || !rpc->pc || !h || !h->track) return 0;
   return rpc->pc->AddTrack(h->track, {"reactor-stream"}).ok() ? 1 : 0;
+}
+
+// Create a local audio track. Its samples come from the factory's ADM (push
+// PCM with reactor_webrtc_factory_push_audio_frame). Returns an owned
+// MediaStreamTrack handle or nullptr.
+void* reactor_webrtc_audio_track_create(void* factory, const char* id) {
+  auto* rf = reinterpret_cast<ReactorFactory*>(factory);
+  if (!rf || !rf->factory) return nullptr;
+  webrtc::scoped_refptr<webrtc::AudioSourceInterface> source =
+      rf->factory->CreateAudioSource(webrtc::AudioOptions());
+  auto handle = std::make_unique<ReactorMediaStreamTrack>();
+  handle->track = rf->factory->CreateAudioTrack(id ? id : "", source.get());
+  if (!handle->track) return nullptr;
+  return handle.release();
+}
+
+// Deliver interleaved int16 PCM to the factory's ADM (shared by all local audio
+// tracks). `samples_per_channel` is the frame count (e.g. 480 for 10ms@48kHz).
+void reactor_webrtc_factory_push_audio_frame(void* factory, const int16_t* pcm,
+                                             int samples_per_channel,
+                                             int sample_rate, int channels) {
+  auto* rf = reinterpret_cast<ReactorFactory*>(factory);
+  if (!rf || !rf->adm || samples_per_channel <= 0 || channels <= 0) return;
+  rf->adm->PushPcm(pcm, static_cast<size_t>(samples_per_channel),
+                   static_cast<uint32_t>(sample_rate),
+                   static_cast<size_t>(channels));
+}
+
+// Attach a frame sink to a (received) audio track. `on_audio(userdata,
+// sample_rate, channels, frames)` fires per 10ms block until destroyed.
+void reactor_webrtc_audio_track_add_sink(void* track, void* userdata,
+                                         void (*on_audio)(void*, int, int,
+                                                          int)) {
+  auto* h = reinterpret_cast<ReactorMediaStreamTrack*>(track);
+  if (!h || !h->track || h->track->kind() != "audio") return;
+  h->audio_sink = std::make_unique<AudioFrameSink>(userdata, on_audio);
+  static_cast<webrtc::AudioTrackInterface*>(h->track.get())
+      ->AddSink(h->audio_sink.get());
 }
 
 // Attach a frame sink to a (video) track. `on_frame(userdata, width, height)`
@@ -565,9 +703,15 @@ void reactor_webrtc_video_track_add_sink(void* track, void* userdata,
 // Destroy a track handle (detaches any sink and releases the track + source).
 void reactor_webrtc_media_stream_track_destroy(void* track) {
   auto* h = reinterpret_cast<ReactorMediaStreamTrack*>(track);
-  if (h && h->track && h->sink && h->track->kind() == "video") {
-    static_cast<webrtc::VideoTrackInterface*>(h->track.get())
-        ->RemoveSink(h->sink.get());
+  if (h && h->track) {
+    if (h->sink && h->track->kind() == "video") {
+      static_cast<webrtc::VideoTrackInterface*>(h->track.get())
+          ->RemoveSink(h->sink.get());
+    }
+    if (h->audio_sink && h->track->kind() == "audio") {
+      static_cast<webrtc::AudioTrackInterface*>(h->track.get())
+          ->RemoveSink(h->audio_sink.get());
+    }
   }
   delete h;
 }
