@@ -1,0 +1,20 @@
+[package]
+name = "reactor-webrtc-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Low-level FFI bindings to Reactor's owned libwebrtc build. Not for direct use — see the safe `reactor-webrtc` crate."
+# `links` marks the native dependency and lets the build script publish metadata.
+links = "reactor_webrtc"
+build = "build.rs"
+
+[lib]
+doctest = false
+
+[dependencies]
+
+[build-dependencies]
+# Real prebuilt download + checksum verification will use these (wired later):
+# sha2 = "0.10"
+# ureq = { version = "2", default-features = false, features = ["tls"] }

@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rust:
+    name: check + fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      # API/dev mode: no native libwebrtc configured, so `check`/`clippy` build
+      # the Rust API surface without linking. A full build+test against a real
+      # prebuilt runs in a separate job once prebuilts are published (set
+      # REACTOR_WEBRTC_PREBUILT_URL / _SHA256).
+      - run: cargo fmt --all -- --check
+      - run: cargo check --workspace
+      - run: cargo clippy --workspace -- -D warnings

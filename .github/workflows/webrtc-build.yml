@@ -1,0 +1,43 @@
+# Heavy libwebrtc build matrix — produces the prebuilt archives consumed via
+# REACTOR_WEBRTC_PREBUILT_URL. Manual / scheduled only (builds take hours and
+# tens of GB; run on dedicated/self-hosted runners with sccache/RBE).
+#
+# SKELETON — wired to webrtc-build/ but not yet runnable end-to-end (M1).
+name: webrtc-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "build profile"
+        default: release
+        type: choice
+        options: [release, debug]
+  # Bumping WEBRTC_VERSION should rebuild everything:
+  push:
+    paths: ["WEBRTC_VERSION", "webrtc-build/**"]
+
+jobs:
+  build:
+    # TODO(M1): move to self-hosted/dedicated runners; this matrix is illustrative.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: linux,   arch: x64,    runner: ubuntu-latest }
+          - { os: linux,   arch: arm64,  runner: ubuntu-latest }
+          - { os: macos,   arch: arm64,  runner: macos-latest }
+          - { os: macos,   arch: x64,    runner: macos-latest }
+          - { os: ios,     arch: arm64,  runner: macos-latest }
+          - { os: android, arch: arm64,  runner: ubuntu-latest }
+          - { os: windows, arch: x64,    runner: windows-latest }
+          # - { os: visionos, arch: arm64, runner: macos-latest }  # when toolchain allows
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build libwebrtc
+        run: ./webrtc-build/build.sh ${{ matrix.os }} ${{ matrix.arch }} ${{ inputs.profile || 'release' }}
+      - name: Package + checksum
+        run: ./webrtc-build/package.sh ${{ matrix.os }} ${{ matrix.arch }} ${{ inputs.profile || 'release' }}
+      # TODO(M1): upload archives + .sha256 + SBOM to the artifact host/CDN and
+      # update the prebuilt index manifest.

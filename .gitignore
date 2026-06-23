@@ -1,0 +1,13 @@
+/target
+Cargo.lock
+# WebRTC build pipeline outputs (large) — never committed; published as
+# versioned prebuilt artifacts instead (see webrtc-build/).
+/webrtc-build/src/
+/webrtc-build/out/
+/webrtc-build/dist/
+/webrtc-build/depot_tools/
+*.a
+*.lib
+*.tar.gz
+*.tar.zst
+.DS_Store

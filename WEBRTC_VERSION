@@ -1,0 +1,9 @@
+# Pinned upstream Google WebRTC milestone for our owned build.
+# Format: a branch-heads milestone + the exact commit it resolves to.
+# TODO(M1): choose and lock the initial milestone (e.g. a recent stable mNNN),
+# then record the resolved commit hash here. Bumping this file triggers a
+# rebuild of all prebuilt artifacts (see webrtc-build/ and the CI workflow).
+
+WEBRTC_BRANCH=branch-heads/TODO
+WEBRTC_COMMIT=TODO
+REACTOR_PATCH_LEVEL=0

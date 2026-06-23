@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/reactor-webrtc-sys",
+    "crates/reactor-webrtc",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "LicenseRef-Reactor-Proprietary"
+repository = "https://github.com/reactor-team/reactor-webrtc"
+
+# The pinned upstream WebRTC milestone is tracked in ./WEBRTC_VERSION and baked
+# into the prebuilt artifacts produced by ./webrtc-build.
