@@ -1,43 +1,92 @@
-# Heavy libwebrtc build matrix — produces the prebuilt archives consumed via
-# REACTOR_WEBRTC_PREBUILT_URL. Manual / scheduled only (builds take hours and
-# tens of GB; run on dedicated/self-hosted runners with sccache/RBE).
+# Build our libwebrtc and publish the prebuilt archives consumed via
+# REACTOR_WEBRTC_PREBUILT_URL.
 #
-# SKELETON — wired to webrtc-build/ but not yet runnable end-to-end (M1).
+# A full WebRTC build is large + slow (fetch is tens of GB; compile is hours).
+# Hosted runners are tight on disk/time — treat this as a smoke build for
+# macOS arm64 and move the full matrix to dedicated/self-hosted runners
+# (sccache/RBE) for production.
+#
+#   • push to WEBRTC_VERSION / webrtc-build/** / this workflow → build macOS arm64.
+#   • workflow_dispatch (run_all=true)                         → build the full matrix.
 name: webrtc-build
 
 on:
   workflow_dispatch:
     inputs:
+      run_all:
+        description: "Build the full target matrix (otherwise macOS arm64 only)"
+        type: boolean
+        default: false
       profile:
-        description: "build profile"
-        default: release
+        description: "Build profile"
         type: choice
+        default: release
         options: [release, debug]
-  # Bumping WEBRTC_VERSION should rebuild everything:
   push:
-    paths: ["WEBRTC_VERSION", "webrtc-build/**"]
+    paths:
+      - "WEBRTC_VERSION"
+      - "webrtc-build/**"
+      - ".github/workflows/webrtc-build.yml"
+
+concurrency:
+  group: webrtc-build-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
-    # TODO(M1): move to self-hosted/dedicated runners; this matrix is illustrative.
+    # On push, only the `auto` target (macOS arm64) runs. workflow_dispatch with
+    # run_all=true runs every entry.
+    if: ${{ matrix.auto || (github.event_name == 'workflow_dispatch' && inputs.run_all) }}
+    name: ${{ matrix.os }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { os: linux,   arch: x64,    runner: ubuntu-latest }
-          - { os: linux,   arch: arm64,  runner: ubuntu-latest }
-          - { os: macos,   arch: arm64,  runner: macos-latest }
-          - { os: macos,   arch: x64,    runner: macos-latest }
-          - { os: ios,     arch: arm64,  runner: macos-latest }
-          - { os: android, arch: arm64,  runner: ubuntu-latest }
-          - { os: windows, arch: x64,    runner: windows-latest }
-          # - { os: visionos, arch: arm64, runner: macos-latest }  # when toolchain allows
-    runs-on: ${{ matrix.runner }}
+          - { os: mac,     arch: arm64, runner: macos-14,      auto: true }
+          - { os: mac,     arch: x64,   runner: macos-13,      auto: false }
+          - { os: ios,     arch: arm64, runner: macos-14,      auto: false }
+          - { os: linux,   arch: x64,   runner: ubuntu-latest, auto: false }
+          - { os: linux,   arch: arm64, runner: ubuntu-latest, auto: false }
+          - { os: android, arch: arm64, runner: ubuntu-latest, auto: false }
+          - { os: win,     arch: x64,   runner: windows-latest, auto: false }
     steps:
       - uses: actions/checkout@v4
+
+      - name: Free disk space (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/.ghcup /opt/hostedtoolcache/CodeQL || true
+          df -h
+
+      - name: Disk before
+        run: df -h || true
+
       - name: Build libwebrtc
         run: ./webrtc-build/build.sh ${{ matrix.os }} ${{ matrix.arch }} ${{ inputs.profile || 'release' }}
+
       - name: Package + checksum
-        run: ./webrtc-build/package.sh ${{ matrix.os }} ${{ matrix.arch }} ${{ inputs.profile || 'release' }}
-      # TODO(M1): upload archives + .sha256 + SBOM to the artifact host/CDN and
-      # update the prebuilt index manifest.
+        run: |
+          command -v zstd >/dev/null || (sudo apt-get update && sudo apt-get install -y zstd) || brew install zstd || true
+          ./webrtc-build/package.sh ${{ matrix.os }} ${{ matrix.arch }} ${{ inputs.profile || 'release' }}
+
+      - name: Disk after
+        if: always()
+        run: df -h || true
+
+      - name: Upload prebuilt
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reactor-webrtc-${{ matrix.os }}-${{ matrix.arch }}
+          path: |
+            webrtc-build/dist/*.tar.zst
+            webrtc-build/dist/*.sha256
+            webrtc-build/dist/*.manifest.json
+          if-no-files-found: error
+          retention-days: 7
+      # TODO(M1): instead of upload-artifact, publish to the CDN/S3 host that
+      # REACTOR_WEBRTC_PREBUILT_URL points at, and merge the per-target manifests
+      # into the prebuilt index. Add SBOM generation here too.

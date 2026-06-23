@@ -1,9 +1,17 @@
 # Pinned upstream Google WebRTC milestone for our owned build.
-# Format: a branch-heads milestone + the exact commit it resolves to.
-# TODO(M1): choose and lock the initial milestone (e.g. a recent stable mNNN),
-# then record the resolved commit hash here. Bumping this file triggers a
-# rebuild of all prebuilt artifacts (see webrtc-build/ and the CI workflow).
+#
+# Bumping this file triggers a rebuild of all prebuilt artifacts (see
+# webrtc-build/ and the webrtc-build CI workflow).
+#
+# WEBRTC_BRANCH  — a branch-heads milestone ref (verify the number against
+#                  https://chromiumdash.appspot.com/branches — the number maps
+#                  to a Chrome/WebRTC milestone, e.g. m132).
+# WEBRTC_COMMIT  — the exact commit the branch resolved to. Leave empty to sync
+#                  to the branch head; build.sh prints the resolved commit so it
+#                  can be locked here for reproducibility.
+# REACTOR_PATCH_LEVEL — bump when ./patches change without a milestone change.
 
-WEBRTC_BRANCH=branch-heads/TODO
-WEBRTC_COMMIT=TODO
+WEBRTC_MILESTONE=m132
+WEBRTC_BRANCH=branch-heads/6834
+WEBRTC_COMMIT=
 REACTOR_PATCH_LEVEL=0
