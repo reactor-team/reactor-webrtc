@@ -92,6 +92,7 @@ fn compile_glue(include_dir: &Path) {
         .file("glue/reactor_webrtc.cpp")
         .include(include_dir)
         .include(include_dir.join("third_party/abseil-cpp"))
+        .include(include_dir.join("third_party/libyuv/include"))
         // WebRTC (this milestone) requires C++20 — its public headers use
         // std::span etc.
         .std("c++20")

@@ -74,6 +74,9 @@ pub struct PeerConnectionCallbacks {
     pub on_data_channel:
         Option<extern "C" fn(userdata: *mut c_void, data_channel: *mut DataChannel)>,
     pub on_renegotiation_needed: Option<extern "C" fn(userdata: *mut c_void)>,
+    /// A remote track was added. `track` is an owned handle the receiver must
+    /// free with [`reactor_webrtc_media_stream_track_destroy`].
+    pub on_track: Option<extern "C" fn(userdata: *mut c_void, track: *mut MediaStreamTrack)>,
 }
 
 extern "C" {
@@ -155,6 +158,38 @@ extern "C" {
     ) -> *mut DataChannel;
     /// Release a data channel handle.
     pub fn reactor_webrtc_data_channel_destroy(data_channel: *mut DataChannel);
+
+    // ── Video tracks ─────────────────────────────────────────────────────────
+    /// Create a local video track backed by a push-able source. Returns an
+    /// owned [`MediaStreamTrack`] handle (free with
+    /// [`reactor_webrtc_media_stream_track_destroy`]) or null.
+    pub fn reactor_webrtc_video_track_create(
+        factory: *mut PeerConnectionFactory,
+        id: *const c_char,
+    ) -> *mut MediaStreamTrack;
+    /// Push a BGRA frame (`width * height * 4` bytes) into a local video track's
+    /// source; converted to I420 and timestamped internally.
+    pub fn reactor_webrtc_video_track_push_frame(
+        track: *mut MediaStreamTrack,
+        bgra: *const u8,
+        width: c_int,
+        height: c_int,
+    );
+    /// Add a local track to the peer connection (creates a sendrecv
+    /// transceiver). Returns 1 on success, 0 on failure.
+    pub fn reactor_webrtc_peer_connection_add_video_track(
+        pc: *mut PeerConnection,
+        track: *mut MediaStreamTrack,
+    ) -> c_int;
+    /// Attach a frame sink to a (received) video track. `on_frame(userdata,
+    /// width, height)` fires per decoded frame until the track is destroyed.
+    pub fn reactor_webrtc_video_track_add_sink(
+        track: *mut MediaStreamTrack,
+        userdata: *mut c_void,
+        on_frame: extern "C" fn(userdata: *mut c_void, width: c_int, height: c_int),
+    );
+    /// Destroy a track handle (detaches any sink, releases the track + source).
+    pub fn reactor_webrtc_media_stream_track_destroy(track: *mut MediaStreamTrack);
 
     // ── Audio Device Module (incl. synthetic/headless mode) ──────────────────
     pub fn reactor_webrtc_factory_acquire_platform_adm(factory: *mut PeerConnectionFactory);

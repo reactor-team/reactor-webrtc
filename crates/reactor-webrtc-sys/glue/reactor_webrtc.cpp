@@ -13,12 +13,14 @@
 // description / add-ice-candidate) lands next and will eventually be generated
 // rather than hand-written.
 
+#include <cstdint>
 #include <cstring>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "api/audio_codecs/audio_encoder_factory.h"
 #include "api/audio_codecs/builtin_audio_decoder_factory.h"
@@ -27,15 +29,26 @@
 #include "api/data_channel_interface.h"
 #include "api/jsep.h"
 #include "api/make_ref_counted.h"
+#include "api/media_stream_interface.h"
 #include "api/peer_connection_interface.h"
 #include "api/rtc_error.h"
+#include "api/rtp_receiver_interface.h"
+#include "api/rtp_transceiver_interface.h"
 #include "api/scoped_refptr.h"
 #include "api/set_local_description_observer_interface.h"
 #include "api/set_remote_description_observer_interface.h"
+#include "api/video/i420_buffer.h"
+#include "api/video/video_frame.h"
+#include "api/video/video_sink_interface.h"
+#include "api/video/video_source_interface.h"
 #include "api/video_codecs/builtin_video_decoder_factory.h"
 #include "api/video_codecs/builtin_video_encoder_factory.h"
 #include "api/video_codecs/video_encoder_factory.h"
+#include "media/base/video_broadcaster.h"
+#include "pc/video_track_source.h"
 #include "rtc_base/thread.h"
+#include "rtc_base/time_utils.h"
+#include "third_party/libyuv/include/libyuv/convert.h"
 
 // ── C ABI types (must match crates/reactor-webrtc-sys/src/lib.rs) ─────────────
 
@@ -51,10 +64,52 @@ struct ReactorPcCallbacks {
                            int sdp_mline_index, const char* candidate);
   void (*on_data_channel)(void* userdata, void* data_channel);
   void (*on_renegotiation_needed)(void* userdata);
+  // A remote track was added; `track` is an owned MediaStreamTrack handle the
+  // receiver must free with reactor_webrtc_media_stream_track_destroy.
+  void (*on_track)(void* userdata, void* track);
 };
 }  // extern "C"
 
 namespace {
+
+// A video source we can push externally-produced frames into. VideoBroadcaster
+// fans frames out to the connected encoder sink(s).
+class FrameSource : public webrtc::VideoTrackSource {
+ public:
+  FrameSource() : webrtc::VideoTrackSource(/*remote=*/false) {}
+  void PushFrame(const webrtc::VideoFrame& frame) { broadcaster_.OnFrame(frame); }
+
+ protected:
+  webrtc::VideoSourceInterface<webrtc::VideoFrame>* source() override {
+    return &broadcaster_;
+  }
+
+ private:
+  webrtc::VideoBroadcaster broadcaster_;
+};
+
+// Bridges decoded frames from a (remote) video track to a C callback.
+class FrameSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
+ public:
+  FrameSink(void* userdata, void (*on_frame)(void*, int, int))
+      : userdata_(userdata), on_frame_(on_frame) {}
+  void OnFrame(const webrtc::VideoFrame& frame) override {
+    if (on_frame_) on_frame_(userdata_, frame.width(), frame.height());
+  }
+
+ private:
+  void* userdata_;
+  void (*on_frame_)(void*, int, int);
+};
+
+// A track handle (the `MediaStreamTrack` in the Rust API). For a local track
+// `source` is set and frames can be pushed; for a remote track (from OnTrack)
+// `source` is null and `sink` is attached to receive frames.
+struct ReactorMediaStreamTrack {
+  webrtc::scoped_refptr<FrameSource> source;
+  webrtc::scoped_refptr<webrtc::MediaStreamTrackInterface> track;
+  std::unique_ptr<FrameSink> sink;
+};
 
 // Owns the three WebRTC threads alongside the factory. The threads must outlive
 // the factory, so declare `factory` last: members are destroyed in reverse
@@ -104,6 +159,20 @@ class ReactorPcObserver : public webrtc::PeerConnectionObserver {
   void OnRenegotiationNeeded() override { fire_renegotiation(); }
   void OnNegotiationNeededEvent(uint32_t /*event_id*/) override {
     fire_renegotiation();
+  }
+  void OnTrack(
+      webrtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver)
+      override {
+    if (!cb_.on_track || !transceiver) return;
+    webrtc::scoped_refptr<webrtc::RtpReceiverInterface> receiver =
+        transceiver->receiver();
+    if (!receiver) return;
+    webrtc::scoped_refptr<webrtc::MediaStreamTrackInterface> track =
+        receiver->track();
+    if (!track) return;
+    auto* handle = new ReactorMediaStreamTrack();
+    handle->track = std::move(track);
+    cb_.on_track(cb_.userdata, handle);
   }
 
  private:
@@ -437,6 +506,70 @@ void* reactor_webrtc_peer_connection_create_data_channel(void* pc,
 void reactor_webrtc_data_channel_destroy(void* data_channel) {
   delete reinterpret_cast<webrtc::scoped_refptr<webrtc::DataChannelInterface>*>(
       data_channel);
+}
+
+// ── Video tracks ──────────────────────────────────────────────────────────────
+
+// Create a local video track backed by a push-able source. Returns an opaque
+// MediaStreamTrack handle (free with reactor_webrtc_media_stream_track_destroy)
+// or nullptr.
+void* reactor_webrtc_video_track_create(void* factory, const char* id) {
+  auto* rf = reinterpret_cast<ReactorFactory*>(factory);
+  if (!rf || !rf->factory) return nullptr;
+  auto handle = std::make_unique<ReactorMediaStreamTrack>();
+  handle->source = webrtc::make_ref_counted<FrameSource>();
+  handle->track = rf->factory->CreateVideoTrack(handle->source, id ? id : "");
+  if (!handle->track) return nullptr;
+  return handle.release();
+}
+
+// Push a BGRA frame (width*height*4 bytes) into a local video track's source.
+// Converted to I420 and timestamped here.
+void reactor_webrtc_video_track_push_frame(void* track, const uint8_t* bgra,
+                                           int width, int height) {
+  auto* h = reinterpret_cast<ReactorMediaStreamTrack*>(track);
+  if (!h || !h->source || !bgra || width <= 0 || height <= 0) return;
+  webrtc::scoped_refptr<webrtc::I420Buffer> buffer =
+      webrtc::I420Buffer::Create(width, height);
+  // libyuv "ARGB" is B,G,R,A in memory == our BGRA byte order.
+  libyuv::ARGBToI420(bgra, width * 4, buffer->MutableDataY(), buffer->StrideY(),
+                     buffer->MutableDataU(), buffer->StrideU(),
+                     buffer->MutableDataV(), buffer->StrideV(), width, height);
+  webrtc::VideoFrame frame = webrtc::VideoFrame::Builder()
+                                 .set_video_frame_buffer(buffer)
+                                 .set_timestamp_us(webrtc::TimeMicros())
+                                 .build();
+  h->source->PushFrame(frame);
+}
+
+// Add a (local) track to the peer connection, creating a sendrecv transceiver.
+// Returns 1 on success, 0 on failure.
+int reactor_webrtc_peer_connection_add_video_track(void* pc, void* track) {
+  auto* rpc = reinterpret_cast<ReactorPeerConnection*>(pc);
+  auto* h = reinterpret_cast<ReactorMediaStreamTrack*>(track);
+  if (!rpc || !rpc->pc || !h || !h->track) return 0;
+  return rpc->pc->AddTrack(h->track, {"reactor-stream"}).ok() ? 1 : 0;
+}
+
+// Attach a frame sink to a (video) track. `on_frame(userdata, width, height)`
+// fires per decoded frame. The sink lives until the track handle is destroyed.
+void reactor_webrtc_video_track_add_sink(void* track, void* userdata,
+                                         void (*on_frame)(void*, int, int)) {
+  auto* h = reinterpret_cast<ReactorMediaStreamTrack*>(track);
+  if (!h || !h->track || h->track->kind() != "video") return;
+  h->sink = std::make_unique<FrameSink>(userdata, on_frame);
+  static_cast<webrtc::VideoTrackInterface*>(h->track.get())
+      ->AddOrUpdateSink(h->sink.get(), webrtc::VideoSinkWants());
+}
+
+// Destroy a track handle (detaches any sink and releases the track + source).
+void reactor_webrtc_media_stream_track_destroy(void* track) {
+  auto* h = reinterpret_cast<ReactorMediaStreamTrack*>(track);
+  if (h && h->track && h->sink && h->track->kind() == "video") {
+    static_cast<webrtc::VideoTrackInterface*>(h->track.get())
+        ->RemoveSink(h->sink.get());
+  }
+  delete h;
 }
 
 }  // extern "C"
