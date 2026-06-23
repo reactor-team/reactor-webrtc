@@ -4,7 +4,10 @@
 //! in one of three modes, in priority order:
 //!
 //!   1. `REACTOR_WEBRTC_LIB_DIR=/path`  — link a locally-built/extracted lib
-//!      directory (used by contributors building WebRTC from source).
+//!      directory (used by contributors building WebRTC from source). The dir
+//!      is either a packaged layout (`<dir>/lib/libwebrtc.a` + `<dir>/include`)
+//!      or a bare dir containing `libwebrtc.a` (headers then come from
+//!      `REACTOR_WEBRTC_INCLUDE_DIR`).
 //!   2. `REACTOR_WEBRTC_PREBUILT_URL=...` (+ `REACTOR_WEBRTC_PREBUILT_SHA256`)
 //!      — download our prebuilt archive for this target, verify the checksum,
 //!      extract into `OUT_DIR`, and link it. This is the default production path.
@@ -12,6 +15,10 @@
 //!      `cargo check` and rlib builds of the API succeed without a native lib.
 //!      Any final binary/test that actually calls into WebRTC must set one of
 //!      the env vars above, or linking will fail.
+//!
+//! When a native lib is resolved we also compile the C++ glue in `glue/` (the
+//! FFI implementation) and emit `cfg(have_libwebrtc)` so link-dependent tests
+//! compile only when there is something to link against.
 //!
 //! The prebuilt archives themselves are produced and published by
 //! `../../webrtc-build` (depot_tools + gn/ninja, pinned to ./WEBRTC_VERSION).
@@ -21,8 +28,11 @@ use std::path::{Path, PathBuf};
 
 fn main() {
     println!("cargo:rerun-if-env-changed=REACTOR_WEBRTC_LIB_DIR");
+    println!("cargo:rerun-if-env-changed=REACTOR_WEBRTC_INCLUDE_DIR");
     println!("cargo:rerun-if-env-changed=REACTOR_WEBRTC_PREBUILT_URL");
     println!("cargo:rerun-if-env-changed=REACTOR_WEBRTC_PREBUILT_SHA256");
+    // Gate link-dependent tests/examples on an actual native lib being present.
+    println!("cargo:rustc-check-cfg=cfg(have_libwebrtc)");
 
     if let Ok(dir) = env::var("REACTOR_WEBRTC_LIB_DIR") {
         link(Path::new(&dir));
@@ -43,28 +53,132 @@ fn main() {
     );
 }
 
-/// Emit the linker directives for a directory that contains our `libwebrtc`
-/// static library plus any per-target system dependencies.
-fn link(lib_dir: &Path) {
+/// Resolve `(lib_dir, include_dir)` from the configured root, link the static
+/// lib + its system dependencies, and compile the C++ glue against the headers.
+fn link(root: &Path) {
+    // Packaged layout (webrtc-build/package.sh): <root>/lib + <root>/include.
+    // Bare layout: <root> holds libwebrtc.a directly.
+    let (lib_dir, include_dir) = if root.join("lib/libwebrtc.a").is_file() {
+        (root.join("lib"), root.join("include"))
+    } else {
+        let inc = env::var("REACTOR_WEBRTC_INCLUDE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| root.join("include"));
+        (root.to_path_buf(), inc)
+    };
+
+    compile_glue(&include_dir);
+
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
     println!("cargo:rustc-link-lib=static=webrtc");
+    link_system_deps();
 
-    // Per-target system libraries/frameworks libwebrtc needs at final link.
-    // TODO(M1): fill these in per target as the prebuilts land (mirrors what
-    // webrtc-sys linked: c++ runtime + platform A/V/network frameworks).
-    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    match target_os.as_str() {
-        "macos" | "ios" => {
-            // e.g. -lc++ + Foundation/AVFoundation/CoreMedia/VideoToolbox/...
+    // A real lib is present: enable link-dependent tests/examples.
+    println!("cargo:rustc-cfg=have_libwebrtc");
+}
+
+/// Compile `glue/*.cpp` against the WebRTC public headers (+ vendored abseil).
+fn compile_glue(include_dir: &Path) {
+    println!("cargo:rerun-if-changed=glue/reactor_webrtc.cpp");
+
+    let mut build = cc::Build::new();
+    build
+        .cpp(true)
+        .file("glue/reactor_webrtc.cpp")
+        .include(include_dir)
+        .include(include_dir.join("third_party/abseil-cpp"))
+        // WebRTC (this milestone) requires C++20 — its public headers use
+        // std::span etc.
+        .std("c++20")
+        .warnings(false);
+
+    // WebRTC headers branch on these platform macros (mirrors gn's defines).
+    match env::var("CARGO_CFG_TARGET_OS").unwrap_or_default().as_str() {
+        "macos" => {
+            build
+                .define("WEBRTC_POSIX", None)
+                .define("WEBRTC_MAC", None);
+        }
+        "ios" => {
+            build
+                .define("WEBRTC_POSIX", None)
+                .define("WEBRTC_MAC", None)
+                .define("WEBRTC_IOS", None);
         }
         "android" => {
-            // e.g. -lc++_static -lc++abi -lEGL -lOpenSLES + JNI companion
+            build
+                .define("WEBRTC_POSIX", None)
+                .define("WEBRTC_LINUX", None)
+                .define("WEBRTC_ANDROID", None);
         }
         "linux" => {
-            // e.g. -lstdc++ -ldl -lpthread -lm
+            build
+                .define("WEBRTC_POSIX", None)
+                .define("WEBRTC_LINUX", None);
         }
         "windows" => {
-            // e.g. winmm, secur32, ole32, ...
+            build.define("WEBRTC_WIN", None);
+        }
+        _ => {}
+    }
+    build.compile("reactor_webrtc_glue");
+}
+
+/// Per-target system libraries/frameworks libwebrtc needs at final link.
+fn link_system_deps() {
+    match env::var("CARGO_CFG_TARGET_OS").unwrap_or_default().as_str() {
+        "macos" => {
+            println!("cargo:rustc-link-lib=c++");
+            for fw in [
+                "Foundation",
+                "CoreFoundation",
+                "CoreAudio",
+                "AudioToolbox",
+                "CoreMedia",
+                "CoreVideo",
+                "CoreGraphics",
+                "VideoToolbox",
+                "AVFoundation",
+                "AppKit",
+                "IOSurface",
+                "Metal",
+                "OpenGL",
+                "Security",
+                "SystemConfiguration",
+            ] {
+                println!("cargo:rustc-link-lib=framework={fw}");
+            }
+        }
+        "ios" => {
+            println!("cargo:rustc-link-lib=c++");
+            for fw in [
+                "Foundation",
+                "CoreFoundation",
+                "CoreAudio",
+                "AudioToolbox",
+                "CoreMedia",
+                "CoreVideo",
+                "CoreGraphics",
+                "VideoToolbox",
+                "AVFoundation",
+                "Metal",
+            ] {
+                println!("cargo:rustc-link-lib=framework={fw}");
+            }
+        }
+        "android" => {
+            // -lc++_static -lc++abi -lEGL -lGLESv2 -lOpenSLES + JNI companion.
+        }
+        "linux" => {
+            println!("cargo:rustc-link-lib=dylib=stdc++");
+            for l in ["dl", "pthread", "m"] {
+                println!("cargo:rustc-link-lib=dylib={l}");
+            }
+        }
+        "windows" => {
+            for l in ["winmm", "secur32", "ole32", "ws2_32", "dmoguids", "msdmo"] {
+                println!("cargo:rustc-link-lib=dylib={l}");
+            }
         }
         _ => {}
     }

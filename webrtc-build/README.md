@@ -46,6 +46,24 @@ brew install zstd
 
 The first `fetch` downloads tens of GB and the compile takes a while.
 
+### Verify the build actually links (real-link proof)
+
+`reactor-webrtc-sys` compiles a small C++ glue (`crates/reactor-webrtc-sys/glue/`)
+against the built lib and exposes a self-test. Point the sys crate at the
+staged output and run its test:
+
+```bash
+REACTOR_WEBRTC_LIB_DIR=webrtc-build/out/mac-arm64-release/dist \
+  cargo test -p reactor-webrtc-sys -- --nocapture
+# libwebrtc linked OK — 4 codecs: opus,G722,PCMU,PCMA
+```
+
+This links the Rust test binary against `libwebrtc.a` + the platform
+frameworks and runs real WebRTC code (the builtin audio encoder factory).
+Note: the glue is compiled as **C++20** (this milestone's public headers use
+`std::span`). Without `REACTOR_WEBRTC_LIB_DIR`/`_PREBUILT_URL` the test is
+`cfg`-gated out, so a plain `cargo test`/`check` stays green.
+
 ## Target matrix
 
 `linux x64/arm64` · `macos arm64/x64` · `ios device+sim` ·
@@ -59,9 +77,13 @@ runners (sccache/RBE) because hosted runners are tight on disk/time.
 - ✅ `gn args` + `build.sh` (fetch→patch→gn→ninja→assemble) and `package.sh`
   (headers + archive + checksum + manifest) implemented.
 - ✅ CI wired: macOS arm64 on push, full matrix on dispatch.
-- ⏳ TODO: verify/lock the milestone in `WEBRTC_VERSION`; first green macOS arm64
-  build; publish to the CDN host + index manifest (replace `upload-artifact`);
-  the patch series (namespace, ADM, Android Java); SBOM.
+- ✅ First green macOS arm64 build (`branch-heads/7907`, commit locked in
+  `WEBRTC_VERSION`); 100 MB `libwebrtc.a`, 62 MB packaged archive.
+- ✅ Real-link proof: `reactor-webrtc-sys` glue links + runs against the lib
+  (see "Verify the build actually links" above).
+- ⏳ TODO: implement the prebuilt download+checksum (`build.rs` mode 2); publish
+  to the CDN host + index manifest (replace `upload-artifact`); the patch series
+  (namespace, ADM, Android Java); SBOM.
 
 > Upstream WebRTC build docs (and LiveKit's open build scripts as *reference
 > only*, not a dependency) inform this recipe.

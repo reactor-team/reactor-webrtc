@@ -15,6 +15,8 @@ doctest = false
 [dependencies]
 
 [build-dependencies]
+# Compiles the C++ glue (glue/*.cpp) against the WebRTC headers.
+cc = "1"
 # Real prebuilt download + checksum verification will use these (wired later):
 # sha2 = "0.10"
 # ureq = { version = "2", default-features = false, features = ["tls"] }

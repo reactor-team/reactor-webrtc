@@ -54,6 +54,13 @@ extern "C" {
     /// ABI version of this native build. The safe crate asserts compatibility.
     pub fn reactor_webrtc_abi_version() -> u32;
 
+    /// Link/run self-test: builds the builtin audio+video encoder factories and
+    /// writes a comma-separated, NUL-terminated list of supported codec names
+    /// into `out` (capped at `cap`); returns the total codec count. A non-zero
+    /// return proves real libwebrtc code linked and executed. (M1 scaffold —
+    /// will be removed once the full object surface lands.)
+    pub fn reactor_webrtc_selftest(out: *mut c_char, cap: c_int) -> c_int;
+
     // ── Factory ──────────────────────────────────────────────────────────────
     pub fn reactor_webrtc_factory_create() -> *mut PeerConnectionFactory;
     pub fn reactor_webrtc_factory_destroy(factory: *mut PeerConnectionFactory);
