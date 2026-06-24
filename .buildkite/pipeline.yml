@@ -11,6 +11,12 @@
 # Mirrors cpp_sdk / py-sdk: heavy work on self-hosted queues, with steps that
 # need not-yet-provisioned hardware marked `skip:` so the shape stays visible.
 #
+# A WebRTC build needs a *dedicated* large agent (~80GB disk, lots of RAM/cores)
+# — NOT the shared `heavy`/`arm64` service-build queues, which would starve
+# other jobs and lack disk. These steps target dedicated `webrtc-*` queues and
+# stay `skip:`ed until those agents are provisioned. See .buildkite/AGENTS.md
+# for the exact spec + how to register this pipeline.
+#
 # Per-target prebuilts (lib + headers + .sha256 + manifest + CycloneDX SBOM) are
 # uploaded as Buildkite artifacts; the publish-to-CDN step runs on `main`.
 
@@ -31,8 +37,9 @@ steps:
       - "webrtc-build/dist/*.manifest.json"
       - "webrtc-build/dist/*.sbom.json"
     agents:
-      queue: heavy
+      queue: webrtc-linux
     timeout_in_minutes: 360
+    skip: "Enable once a webrtc-linux build agent (~80GB disk) is provisioned — see AGENTS.md."
 
   # ── Linux arm64 (native on an arm64 agent) ─────────────────────────────────
   - key: webrtc-linux-arm64
@@ -47,8 +54,9 @@ steps:
       - "webrtc-build/dist/*.manifest.json"
       - "webrtc-build/dist/*.sbom.json"
     agents:
-      queue: arm64
+      queue: webrtc-linux-arm64
     timeout_in_minutes: 360
+    skip: "Enable once a webrtc-linux-arm64 build agent (~80GB disk) is provisioned — see AGENTS.md."
 
   # ── Android arm64 (cross-compiled on a Linux agent; no on-host test run) ───
   - key: webrtc-android-arm64
@@ -62,8 +70,9 @@ steps:
       - "webrtc-build/dist/*.manifest.json"
       - "webrtc-build/dist/*.sbom.json"
     agents:
-      queue: heavy
+      queue: webrtc-linux
     timeout_in_minutes: 360
+    skip: "Enable once a webrtc-linux build agent (NDK fetched by gclient; ~80GB disk) is provisioned — see AGENTS.md."
 
   # ── macOS arm64 (native: build + package + lib-linked tests) ───────────────
   - key: webrtc-macos-arm64
@@ -78,7 +87,7 @@ steps:
       - "webrtc-build/dist/*.manifest.json"
       - "webrtc-build/dist/*.sbom.json"
     agents:
-      queue: macos
+      queue: webrtc-macos
     timeout_in_minutes: 360
     skip: "Enable once a macOS arm64 build agent (Xcode + large disk) is provisioned."
 
@@ -94,7 +103,7 @@ steps:
       - "webrtc-build/dist/*.manifest.json"
       - "webrtc-build/dist/*.sbom.json"
     agents:
-      queue: macos
+      queue: webrtc-macos
     timeout_in_minutes: 360
     skip: "Enable once a macOS build agent is provisioned (shares the macOS queue)."
 
@@ -110,7 +119,7 @@ steps:
       - "webrtc-build/dist/*.manifest.json"
       - "webrtc-build/dist/*.sbom.json"
     agents:
-      queue: windows
+      queue: webrtc-windows
     timeout_in_minutes: 360
     skip: "Enable once a Windows build agent (VS toolchain + large disk) is provisioned."
 
