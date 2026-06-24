@@ -28,12 +28,16 @@
 
 #include "api/audio/audio_device.h"
 #include "api/audio/audio_device_defines.h"
+#include "api/audio/audio_processing.h"
+#include "api/audio/builtin_audio_processing_builder.h"
 #include "api/audio_codecs/audio_encoder_factory.h"
 #include "api/audio_codecs/builtin_audio_decoder_factory.h"
 #include "api/audio_codecs/builtin_audio_encoder_factory.h"
 #include "api/audio_options.h"
 #include "api/create_peerconnection_factory.h"
 #include "api/data_channel_interface.h"
+#include "api/environment/environment.h"
+#include "api/environment/environment_factory.h"
 #include "api/jsep.h"
 #include "api/make_ref_counted.h"
 #include "api/media_stream_interface.h"
@@ -492,7 +496,22 @@ void* reactor_webrtc_factory_create_with_adm(int use_platform_adm) {
   // Synthetic ADM unless the platform default is requested (null → engine
   // creates the real device ADM internally).
   webrtc::scoped_refptr<webrtc::AudioDeviceModule> adm;
-  if (!use_platform_adm) {
+  webrtc::scoped_refptr<webrtc::AudioProcessing> apm;
+  if (use_platform_adm) {
+    // Real mic capture → enable the standard capture-processing chain:
+    // AEC3 + noise suppression + AGC + high-pass filter. (Bandwidth estimation
+    // / GoogCC is always compiled in and active for media.) The synthetic ADM
+    // path stays passthrough (bit-exact PCM push, e.g. server forwarding).
+    webrtc::AudioProcessing::Config apm_config;
+    apm_config.echo_canceller.enabled = true;
+    apm_config.noise_suppression.enabled = true;
+    apm_config.noise_suppression.level =
+        webrtc::AudioProcessing::Config::NoiseSuppression::kHigh;
+    apm_config.gain_controller1.enabled = true;
+    apm_config.high_pass_filter.enabled = true;
+    apm = webrtc::BuiltinAudioProcessingBuilder(apm_config)
+              .Build(webrtc::CreateEnvironment());
+  } else {
     f->adm = webrtc::make_ref_counted<FrameAdm>();
     adm = f->adm;
   }
@@ -504,7 +523,7 @@ void* reactor_webrtc_factory_create_with_adm(int use_platform_adm) {
       webrtc::CreateBuiltinAudioDecoderFactory(),
       webrtc::CreateBuiltinVideoEncoderFactory(),
       webrtc::CreateBuiltinVideoDecoderFactory(),
-      /*audio_mixer=*/nullptr, /*audio_processing=*/nullptr);
+      /*audio_mixer=*/nullptr, /*audio_processing=*/apm);
   if (!f->factory) {
     return nullptr;  // threads stopped by ReactorFactory's destructor
   }

@@ -18,8 +18,19 @@ committed (see `../.gitignore`).
 3. **Configure + compile** — `gn gen` with our args (below) + `ninja -C … webrtc`
    → a single static `obj/libwebrtc.a`.
 4. **Package** — `package.sh` stages the lib + mirrors the public headers, makes
-   a `.tar.zst` + `.sha256`, and writes a per-target `*.manifest.json` for the
-   prebuilt index that `REACTOR_WEBRTC_PREBUILT_URL` points at.
+   a `.tar.zst` + `.sha256`, writes a per-target `*.manifest.json` for the
+   prebuilt index that `REACTOR_WEBRTC_PREBUILT_URL` points at, and generates a
+   CycloneDX `*.sbom.json` (`sbom.sh`) of the third_party components actually
+   compiled into the lib (∧ `Shipped: yes`) with their versions + licenses.
+
+## Audio/network processing in the pipeline
+
+- **Bandwidth estimation** (GoogCC / send-side BWE) is compiled into the
+  umbrella and active for media by default.
+- **AEC3 + noise suppression + AGC + high-pass filter** are enabled (via a
+  `BuiltinAudioProcessingBuilder` APM) for the **platform-ADM** factory
+  (`with_platform_adm`, real mic). The **synthetic** ADM stays passthrough
+  (bit-exact PCM push, e.g. server forwarding) — no APM.
 
 ## gn args (implemented in `build.sh::gn_args`)
 

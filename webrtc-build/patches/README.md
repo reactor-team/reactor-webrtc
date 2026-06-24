@@ -13,7 +13,19 @@
   software-fallback wrapper, …) into the single `libwebrtc.a`, exposing
   `webrtc::CreateBuiltinVideo{Encoder,Decoder}Factory()` to consumers.
 
-## Planned
+## Planned (not yet validated — need their target builds)
 
-- namespace/symbol prefixing, synthetic/headless ADM, Android Java namespace
-  (replacing `livekit.org.webrtc`), controlled BoringSSL exposure.
+- **symbol isolation** — keep WebRTC's C++ symbols from clashing when a
+  consumer also links another libwebrtc. The cdylib (`reactor-sdk-core`) already
+  exports only `reactor_webrtc_*`; for static-lib consumers the plan is hidden
+  visibility + a localize pass. Exercise on the Linux/Windows builds.
+- **Android Java namespace** — repackage WebRTC's `org.webrtc` Java +
+  `JNI_OnLoad`/registration into our namespace (the PoC used LiveKit's
+  `livekit.org.webrtc`; we must not). This is a tree-wide rename applied during
+  the Android build — author + validate once the Android target is wired.
+- controlled BoringSSL exposure; synthetic/headless ADM is implemented in the
+  glue (not a patch).
+
+> Note: the synthetic ADM, the builtin codec factories (0001), and the audio
+> processing chain (AEC3 + noise suppression + AGC, enabled for the platform
+> ADM) are wired in the glue / build, not as upstream patches.

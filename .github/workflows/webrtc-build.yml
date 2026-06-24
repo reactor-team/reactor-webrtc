@@ -98,6 +98,7 @@ jobs:
             webrtc-build/dist/*.tar.zst
             webrtc-build/dist/*.sha256
             webrtc-build/dist/*.manifest.json
+            webrtc-build/dist/*.sbom.json
           if-no-files-found: error
           retention-days: 7
       # TODO(M1): publish to the CDN/S3 host that REACTOR_WEBRTC_PREBUILT_URL

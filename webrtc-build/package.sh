@@ -66,3 +66,6 @@ cat > "$DIST/$NAME.manifest.json" <<EOF
 }
 EOF
 echo "   manifest: $DIST/$NAME.manifest.json"
+
+# ── SBOM (CycloneDX) ──────────────────────────────────────────────────────────
+"$HERE/sbom.sh" "$OS" "$ARCH" "$PROFILE" || echo "package.sh: SBOM generation skipped"
