@@ -265,7 +265,9 @@ fn download_prebuilt(url: &str, sha256: Option<&str>) -> PathBuf {
     }
 
     if !out.join("lib/libwebrtc.a").is_file() {
-        panic!("reactor-webrtc-sys: extracted prebuilt has no lib/libwebrtc.a (bad archive layout?)");
+        panic!(
+            "reactor-webrtc-sys: extracted prebuilt has no lib/libwebrtc.a (bad archive layout?)"
+        );
     }
     out
 }
@@ -282,9 +284,16 @@ fn run(cmd: &mut std::process::Command, what: &str) {
 /// Compute a file's sha256 via `sha256sum` (Linux) or `shasum -a 256` (macOS).
 fn sha256_file(path: &Path) -> String {
     for (bin, args) in [("sha256sum", &[][..]), ("shasum", &["-a", "256"][..])] {
-        if let Ok(out) = std::process::Command::new(bin).args(args).arg(path).output() {
+        if let Ok(out) = std::process::Command::new(bin)
+            .args(args)
+            .arg(path)
+            .output()
+        {
             if out.status.success() {
-                if let Some(hex) = String::from_utf8_lossy(&out.stdout).split_whitespace().next() {
+                if let Some(hex) = String::from_utf8_lossy(&out.stdout)
+                    .split_whitespace()
+                    .next()
+                {
                     return hex.to_lowercase();
                 }
             }
