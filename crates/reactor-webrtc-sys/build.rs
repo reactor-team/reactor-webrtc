@@ -194,16 +194,106 @@ fn link_system_deps() {
     }
 }
 
-/// Download + verify our prebuilt archive and extract it into `OUT_DIR`.
+/// Download our prebuilt archive (`.tar.zst`, the layout `package.sh` /
+/// `publish.sh` produce: `lib/` + `include/`), verify its sha256, and extract
+/// it into `OUT_DIR`. Returns the extracted root (packaged layout) for `link`.
+///
+/// Shells out to `curl` + `tar`/`zstd` (no extra Rust build-deps, so dev-mode
+/// `cargo check` stays fast). For a private-repo release asset, set
+/// `REACTOR_WEBRTC_PREBUILT_TOKEN` (a `repo`-scoped token) — `curl` follows the
+/// GitHub redirect and drops the auth header on the cross-host hop.
 fn download_prebuilt(url: &str, sha256: Option<&str>) -> PathBuf {
-    let out = PathBuf::from(env::var("OUT_DIR").unwrap()).join("libwebrtc");
-    // TODO(M1): fetch `url`, verify `sha256`, extract into `out`. Kept network-
-    // free in the scaffold; the archive format/layout is produced by
-    // ../../webrtc-build/package.sh and indexed in its manifest.
-    let _ = (url, sha256, &out);
-    panic!(
-        "reactor-webrtc-sys: prebuilt download not implemented yet (M1). \
-         Use REACTOR_WEBRTC_LIB_DIR to link a locally built libwebrtc, \
-         or build prebuilts with ../../webrtc-build."
-    );
+    let out_root = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let out = out_root.join("libwebrtc");
+    let archive = out_root.join("prebuilt.tar.zst");
+
+    // Cached from a previous build of this OUT_DIR.
+    if out.join("lib/libwebrtc.a").is_file() {
+        return out;
+    }
+
+    // ── download ──────────────────────────────────────────────────────────
+    let mut curl = std::process::Command::new("curl");
+    curl.args(["-fSL", "--retry", "3", "--retry-delay", "2", "-o"])
+        .arg(&archive)
+        .arg(url);
+    if let Ok(token) = env::var("REACTOR_WEBRTC_PREBUILT_TOKEN") {
+        // For a private GitHub release asset, point the URL at the API asset
+        // endpoint (…/releases/assets/<id>); `Accept: application/octet-stream`
+        // makes it 302 to the signed download (auth dropped on the cross-host
+        // hop). Harmless for plain CDN URLs.
+        curl.arg("-H")
+            .arg(format!("Authorization: Bearer {token}"))
+            .arg("-H")
+            .arg("Accept: application/octet-stream");
+    }
+    run(&mut curl, "download prebuilt (curl)");
+
+    // ── verify sha256 ─────────────────────────────────────────────────────
+    if let Some(expected) = sha256 {
+        let got = sha256_file(&archive);
+        let expected = expected.trim().to_lowercase();
+        if got != expected {
+            panic!("reactor-webrtc-sys: prebuilt sha256 mismatch\n  expected {expected}\n  got      {got}");
+        }
+    } else {
+        println!("cargo:warning=reactor-webrtc-sys: REACTOR_WEBRTC_PREBUILT_SHA256 not set — skipping integrity check");
+    }
+
+    // ── extract (lib/ + include/) ─────────────────────────────────────────
+    let _ = std::fs::remove_dir_all(&out);
+    std::fs::create_dir_all(&out).expect("create extract dir");
+    // Modern tar (bsdtar / GNU ≥1.31) auto-detects zstd; fall back to a
+    // `zstd | tar` pipe otherwise.
+    let direct = std::process::Command::new("tar")
+        .arg("-xf")
+        .arg(&archive)
+        .arg("-C")
+        .arg(&out)
+        .status();
+    let ok = matches!(direct, Ok(s) if s.success());
+    if !ok {
+        let pipe = format!(
+            "zstd -dc {} | tar -x -C {}",
+            shell_quote(&archive),
+            shell_quote(&out)
+        );
+        run(
+            std::process::Command::new("sh").arg("-c").arg(&pipe),
+            "extract prebuilt (zstd | tar)",
+        );
+    }
+
+    if !out.join("lib/libwebrtc.a").is_file() {
+        panic!("reactor-webrtc-sys: extracted prebuilt has no lib/libwebrtc.a (bad archive layout?)");
+    }
+    out
+}
+
+/// Run a command, panicking with context on failure.
+fn run(cmd: &mut std::process::Command, what: &str) {
+    match cmd.status() {
+        Ok(s) if s.success() => {}
+        Ok(s) => panic!("reactor-webrtc-sys: {what} failed ({s})"),
+        Err(e) => panic!("reactor-webrtc-sys: {what} could not start: {e}"),
+    }
+}
+
+/// Compute a file's sha256 via `sha256sum` (Linux) or `shasum -a 256` (macOS).
+fn sha256_file(path: &Path) -> String {
+    for (bin, args) in [("sha256sum", &[][..]), ("shasum", &["-a", "256"][..])] {
+        if let Ok(out) = std::process::Command::new(bin).args(args).arg(path).output() {
+            if out.status.success() {
+                if let Some(hex) = String::from_utf8_lossy(&out.stdout).split_whitespace().next() {
+                    return hex.to_lowercase();
+                }
+            }
+        }
+    }
+    panic!("reactor-webrtc-sys: need `sha256sum` or `shasum` to verify the prebuilt");
+}
+
+/// Minimal single-quote shell escaping for a path passed to `sh -c`.
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
 }
