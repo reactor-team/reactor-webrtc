@@ -23,8 +23,10 @@ reactor-webrtc/
 ├── webrtc-build/               our build pipeline (depot_tools + gn/ninja)
 │   ├── build.sh                fetch + configure + compile libwebrtc per target
 │   ├── package.sh              archive + checksum + manifest for prebuilts
+│   ├── sbom.sh                 CycloneDX SBOM of the compiled third_party deps
 │   └── patches/                our deterministic patch series
-└── .github/workflows/          CI (Rust) + the heavy WebRTC build matrix
+├── .github/workflows/ci.yml    fast public checks (fmt / check / clippy)
+└── .buildkite/pipeline.yml     heavy per-target libwebrtc builds (self-hosted)
 ```
 
 ## How the native library is resolved

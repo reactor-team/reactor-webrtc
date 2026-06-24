@@ -85,15 +85,21 @@ factories — VP8/VP9/AV1; H.264 is off via `rtc_use_h264=false`). Notes:
 
 `linux x64/arm64` · `macos arm64/x64` · `ios device+sim` ·
 `android arm64/armv7/x86_64` · `windows x64` · `visionos device+sim`
-(as the toolchain allows). CI builds **macOS arm64 on push**; the full matrix
-runs via `workflow_dispatch (run_all=true)` — move it to dedicated/self-hosted
-runners (sccache/RBE) because hosted runners are tight on disk/time.
+(as the toolchain allows).
+
+**CI split** (mirrors cpp_sdk / py-sdk): the fast public checks (fmt / check /
+clippy, dev-mode) run on GitHub Actions (`.github/workflows/ci.yml`). The heavy
+per-target libwebrtc builds + lib-linked tests run on **Buildkite**
+(`.buildkite/pipeline.yml`) on Reactor's self-hosted queues (`heavy`, `arm64`,
+`macos`, `windows`) — a ~30GB+ checkout + multi-hour compile that hosted GitHub
+runners can't fit. Steps needing not-yet-provisioned agents are `skip:`-marked.
 
 ## Status
 
 - ✅ `gn args` + `build.sh` (fetch→patch→gn→ninja→assemble) and `package.sh`
   (headers + archive + checksum + manifest) implemented.
-- ✅ CI wired: macOS arm64 on push, full matrix on dispatch.
+- ✅ CI: fast checks on GitHub Actions; heavy per-target builds + lib-linked
+  tests on Buildkite (`.buildkite/pipeline.yml`, self-hosted queues).
 - ✅ First green macOS arm64 build (`branch-heads/7907`, commit locked in
   `WEBRTC_VERSION`); 100 MB `libwebrtc.a`, 62 MB packaged archive.
 - ✅ Real-link proof: `reactor-webrtc-sys` glue links + runs against the lib
