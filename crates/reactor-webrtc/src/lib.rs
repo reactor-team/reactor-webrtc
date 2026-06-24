@@ -30,8 +30,8 @@ pub use config::{ContinualGatheringPolicy, IceServer, IceTransportsType, RtcConf
 pub use media::{AudioFrame, MediaKind, Track, VideoFrame};
 pub use observer::PeerConnectionObserver;
 pub use peer_connection::{
-    DataChannel, IceCandidate, PeerConnection, PeerConnectionState, SdpType, SessionDescription,
-    TransceiverDirection,
+    DataChannel, IceCandidate, IceGatheringState, PeerConnection, PeerConnectionState, SdpType,
+    SessionDescription, Transceiver, TransceiverDirection,
 };
 
 /// The ABI version of the linked native build. Used to assert that the safe

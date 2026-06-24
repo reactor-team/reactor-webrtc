@@ -6,7 +6,7 @@ use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use crate::media::Track;
+use crate::media::{MediaKind, Track};
 use crate::observer::ObserverState;
 use crate::{Error, Result};
 
@@ -65,6 +65,91 @@ pub enum TransceiverDirection {
     SendOnly,
     RecvOnly,
     Inactive,
+}
+
+impl TransceiverDirection {
+    fn to_raw(self) -> c_int {
+        match self {
+            TransceiverDirection::SendRecv => 0,
+            TransceiverDirection::SendOnly => 1,
+            TransceiverDirection::RecvOnly => 2,
+            TransceiverDirection::Inactive => 3,
+        }
+    }
+}
+
+/// ICE gathering state (delivered to
+/// [`PeerConnectionObserver::on_ice_gathering_change`](crate::PeerConnectionObserver)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IceGatheringState {
+    New,
+    Gathering,
+    Complete,
+}
+
+impl IceGatheringState {
+    pub(crate) fn from_raw(state: c_int) -> Self {
+        match state {
+            1 => IceGatheringState::Gathering,
+            2 => IceGatheringState::Complete,
+            _ => IceGatheringState::New,
+        }
+    }
+}
+
+/// A transceiver: one bidirectional media "slot" in the peer connection. Its
+/// `mid` (available after `set_local_description`) maps it to an SDP m-section.
+pub struct Transceiver {
+    raw: *mut reactor_webrtc_sys::RtpTransceiver,
+}
+
+// SAFETY: the native transceiver is internally thread-safe.
+unsafe impl Send for Transceiver {}
+unsafe impl Sync for Transceiver {}
+
+impl Transceiver {
+    pub(crate) fn from_raw(raw: *mut reactor_webrtc_sys::RtpTransceiver) -> Self {
+        Self { raw }
+    }
+
+    /// The transceiver's mid, once assigned (after `set_local_description`).
+    pub fn mid(&self) -> Option<String> {
+        let mut buf = [0u8; 256];
+        let n = unsafe {
+            reactor_webrtc_sys::reactor_webrtc_rtp_transceiver_mid(
+                self.raw,
+                buf.as_mut_ptr() as *mut c_char,
+                buf.len() as c_int,
+            )
+        };
+        if n < 0 {
+            None
+        } else {
+            Some(
+                unsafe { CStr::from_ptr(buf.as_ptr() as *const c_char) }
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        }
+    }
+
+    /// Attach a local track to this transceiver's sender (for sendonly/sendrecv).
+    pub fn set_track(&self, track: &Track) -> Result<()> {
+        let ok = unsafe {
+            reactor_webrtc_sys::reactor_webrtc_rtp_transceiver_set_track(self.raw, track.raw())
+        };
+        if ok == 1 {
+            Ok(())
+        } else {
+            Err(Error::Webrtc("transceiver set_track failed".into()))
+        }
+    }
+}
+
+impl Drop for Transceiver {
+    fn drop(&mut self) {
+        unsafe { reactor_webrtc_sys::reactor_webrtc_rtp_transceiver_destroy(self.raw) }
+    }
 }
 
 /// Aggregate connection state.
@@ -361,6 +446,35 @@ impl PeerConnection {
             Err(Error::Webrtc("add_track failed".into()))
         }
     }
+    /// Add a transceiver of `kind` with an explicit `direction` (e.g. recvonly
+    /// to receive a remote track, sendonly to publish). Returns the transceiver
+    /// so its `mid` can be read after `set_local_description`.
+    pub fn add_transceiver(
+        &self,
+        kind: MediaKind,
+        direction: TransceiverDirection,
+    ) -> Result<Transceiver> {
+        let media_kind = match kind {
+            MediaKind::Audio => 0,
+            MediaKind::Video => 1,
+            MediaKind::Unknown => {
+                return Err(Error::Webrtc("add_transceiver needs audio or video".into()))
+            }
+        };
+        let raw = unsafe {
+            reactor_webrtc_sys::reactor_webrtc_peer_connection_add_transceiver(
+                self.raw,
+                media_kind,
+                direction.to_raw(),
+            )
+        };
+        if raw.is_null() {
+            Err(Error::Webrtc("add_transceiver failed".into()))
+        } else {
+            Ok(Transceiver::from_raw(raw))
+        }
+    }
+
     /// Create an SDP-negotiated data channel.
     pub fn create_data_channel(&self, label: &str) -> Result<DataChannel> {
         let label =

@@ -225,6 +225,31 @@ extern "C" {
     );
     /// Kind of a track handle: 0 = audio, 1 = video, -1 = unknown.
     pub fn reactor_webrtc_media_stream_track_kind(track: *mut MediaStreamTrack) -> c_int;
+
+    // ── Transceivers ─────────────────────────────────────────────────────────
+    /// Add a transceiver of `media_kind` (0=audio, 1=video) with `direction`
+    /// (0=sendrecv, 1=sendonly, 2=recvonly, 3=inactive). Returns an owned
+    /// [`RtpTransceiver`] handle (free with [`reactor_webrtc_rtp_transceiver_destroy`]).
+    pub fn reactor_webrtc_peer_connection_add_transceiver(
+        pc: *mut PeerConnection,
+        media_kind: c_int,
+        direction: c_int,
+    ) -> *mut RtpTransceiver;
+    /// Write the transceiver's mid into `out` (capped at `cap`); returns the mid
+    /// length, or -1 if there is no mid yet (before set_local_description).
+    pub fn reactor_webrtc_rtp_transceiver_mid(
+        transceiver: *mut RtpTransceiver,
+        out: *mut c_char,
+        cap: c_int,
+    ) -> c_int;
+    /// Attach (or clear, with null) a local track on the transceiver's sender.
+    /// Returns 1 on success, 0 on failure.
+    pub fn reactor_webrtc_rtp_transceiver_set_track(
+        transceiver: *mut RtpTransceiver,
+        track: *mut MediaStreamTrack,
+    ) -> c_int;
+    /// Release a transceiver handle.
+    pub fn reactor_webrtc_rtp_transceiver_destroy(transceiver: *mut RtpTransceiver);
     /// Destroy a track handle (detaches any sink, releases the track + source).
     pub fn reactor_webrtc_media_stream_track_destroy(track: *mut MediaStreamTrack);
 

@@ -41,9 +41,12 @@
 #include "api/jsep.h"
 #include "api/make_ref_counted.h"
 #include "api/media_stream_interface.h"
+#include "api/media_types.h"
 #include "api/peer_connection_interface.h"
 #include "api/rtc_error.h"
 #include "api/rtp_receiver_interface.h"
+#include "api/rtp_sender_interface.h"
+#include "api/rtp_transceiver_direction.h"
 #include "api/rtp_transceiver_interface.h"
 #include "api/scoped_refptr.h"
 #include "api/set_local_description_observer_interface.h"
@@ -277,6 +280,11 @@ class ReactorDcObserver : public webrtc::DataChannelObserver {
 struct ReactorDataChannel {
   webrtc::scoped_refptr<webrtc::DataChannelInterface> channel;
   std::unique_ptr<ReactorDcObserver> observer;
+};
+
+// A transceiver handle (the `RtpTransceiver` in the Rust API).
+struct ReactorTransceiver {
+  webrtc::scoped_refptr<webrtc::RtpTransceiverInterface> tc;
 };
 
 // Owns the three WebRTC threads alongside the factory. The threads must outlive
@@ -836,6 +844,53 @@ int reactor_webrtc_media_stream_track_kind(void* track) {
   if (kind == "audio") return 0;
   if (kind == "video") return 1;
   return -1;
+}
+
+// ── Transceivers ──────────────────────────────────────────────────────────────
+
+// Add a transceiver of `media_kind` (0=audio, 1=video) with `direction`
+// (0=sendrecv, 1=sendonly, 2=recvonly, 3=inactive). Returns an opaque
+// RtpTransceiver handle (free with reactor_webrtc_rtp_transceiver_destroy).
+void* reactor_webrtc_peer_connection_add_transceiver(void* pc, int media_kind,
+                                                     int direction) {
+  auto* rpc = reinterpret_cast<ReactorPeerConnection*>(pc);
+  if (!rpc || !rpc->pc) return nullptr;
+  webrtc::MediaType mt =
+      media_kind == 0 ? webrtc::MediaType::AUDIO : webrtc::MediaType::VIDEO;
+  webrtc::RtpTransceiverInit init;
+  init.direction = static_cast<webrtc::RtpTransceiverDirection>(direction);
+  auto result = rpc->pc->AddTransceiver(mt, init);
+  if (!result.ok()) return nullptr;
+  return new ReactorTransceiver{result.MoveValue()};
+}
+
+// Write the transceiver's mid into `out` (NUL-terminated, capped at `cap`).
+// Returns the mid length, or -1 if there is no mid yet (before SLD).
+int reactor_webrtc_rtp_transceiver_mid(void* transceiver, char* out, int cap) {
+  auto* h = reinterpret_cast<ReactorTransceiver*>(transceiver);
+  if (!h || !h->tc) return -1;
+  const std::optional<std::string> mid = h->tc->mid();
+  if (!mid) return -1;
+  if (out && cap > 0) {
+    std::strncpy(out, mid->c_str(), static_cast<size_t>(cap) - 1);
+    out[cap - 1] = '\0';
+  }
+  return static_cast<int>(mid->size());
+}
+
+// Attach (or clear, with null) a local track on the transceiver's sender.
+// Returns 1 on success, 0 on failure.
+int reactor_webrtc_rtp_transceiver_set_track(void* transceiver, void* track) {
+  auto* h = reinterpret_cast<ReactorTransceiver*>(transceiver);
+  if (!h || !h->tc) return 0;
+  auto* t = reinterpret_cast<ReactorMediaStreamTrack*>(track);
+  webrtc::MediaStreamTrackInterface* raw = (t && t->track) ? t->track.get() : nullptr;
+  return h->tc->sender()->SetTrack(raw) ? 1 : 0;
+}
+
+// Destroy a transceiver handle (releases our reference).
+void reactor_webrtc_rtp_transceiver_destroy(void* transceiver) {
+  delete reinterpret_cast<ReactorTransceiver*>(transceiver);
 }
 
 // Destroy a track handle (detaches any sink and releases the track + source).

@@ -9,9 +9,10 @@ use std::os::raw::{c_char, c_int};
 use std::sync::Mutex;
 
 use crate::media::{MediaKind, Track};
-use crate::peer_connection::{DataChannel, IceCandidate, PeerConnectionState};
+use crate::peer_connection::{DataChannel, IceCandidate, IceGatheringState, PeerConnectionState};
 
 type StateCb = Box<dyn FnMut(PeerConnectionState) + Send>;
+type GatheringCb = Box<dyn FnMut(IceGatheringState) + Send>;
 type IceCb = Box<dyn FnMut(IceCandidate) + Send>;
 type TrackCb = Box<dyn FnMut(MediaKind, Track) + Send>;
 type DataChannelCb = Box<dyn FnMut(DataChannel) + Send>;
@@ -21,6 +22,7 @@ type DataChannelCb = Box<dyn FnMut(DataChannel) + Send>;
 #[derive(Default)]
 pub struct PeerConnectionObserver {
     on_connection_state_change: Option<StateCb>,
+    on_ice_gathering_change: Option<GatheringCb>,
     on_ice_candidate: Option<IceCb>,
     on_track: Option<TrackCb>,
     on_data_channel: Option<DataChannelCb>,
@@ -36,6 +38,13 @@ impl PeerConnectionObserver {
         cb: impl FnMut(PeerConnectionState) + Send + 'static,
     ) -> Self {
         self.on_connection_state_change = Some(Box::new(cb));
+        self
+    }
+    pub fn on_ice_gathering_change(
+        mut self,
+        cb: impl FnMut(IceGatheringState) + Send + 'static,
+    ) -> Self {
+        self.on_ice_gathering_change = Some(Box::new(cb));
         self
     }
     pub fn on_ice_candidate(mut self, cb: impl FnMut(IceCandidate) + Send + 'static) -> Self {
@@ -54,6 +63,7 @@ impl PeerConnectionObserver {
     pub(crate) fn into_state(self) -> Box<ObserverState> {
         Box::new(ObserverState {
             conn: self.on_connection_state_change.map(Mutex::new),
+            gathering: self.on_ice_gathering_change.map(Mutex::new),
             ice: self.on_ice_candidate.map(Mutex::new),
             track: self.on_track.map(Mutex::new),
             data_channel: self.on_data_channel.map(Mutex::new),
@@ -65,6 +75,7 @@ impl PeerConnectionObserver {
 /// by the owning [`crate::PeerConnection`].
 pub(crate) struct ObserverState {
     conn: Option<Mutex<StateCb>>,
+    gathering: Option<Mutex<GatheringCb>>,
     ice: Option<Mutex<IceCb>>,
     track: Option<Mutex<TrackCb>>,
     data_channel: Option<Mutex<DataChannelCb>>,
@@ -78,7 +89,7 @@ impl ObserverState {
             userdata: self as *const ObserverState as *mut c_void,
             on_signaling_change: None,
             on_connection_change: self.conn.as_ref().map(|_| tramp_conn as _),
-            on_ice_gathering_change: None,
+            on_ice_gathering_change: self.gathering.as_ref().map(|_| tramp_gathering as _),
             on_ice_candidate: self.ice.as_ref().map(|_| tramp_ice as _),
             on_data_channel: self.data_channel.as_ref().map(|_| tramp_data_channel as _),
             on_renegotiation_needed: None,
@@ -100,6 +111,15 @@ extern "C" fn tramp_conn(ud: *mut c_void, state: c_int) {
     if let Some(m) = &st.conn {
         if let Ok(mut cb) = m.lock() {
             cb(PeerConnectionState::from_raw(state));
+        }
+    }
+}
+
+extern "C" fn tramp_gathering(ud: *mut c_void, state: c_int) {
+    let st = unsafe { &*(ud as *const ObserverState) };
+    if let Some(m) = &st.gathering {
+        if let Ok(mut cb) = m.lock() {
+            cb(IceGatheringState::from_raw(state));
         }
     }
 }
