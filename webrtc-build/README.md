@@ -18,10 +18,15 @@ committed (see `../.gitignore`).
 3. **Configure + compile** — `gn gen` with our args (below) + `ninja -C … webrtc`
    → a single static `obj/libwebrtc.a`.
 4. **Package** — `package.sh` stages the lib + mirrors the public headers, makes
-   a `.tar.zst` + `.sha256`, writes a per-target `*.manifest.json` for the
-   prebuilt index that `REACTOR_WEBRTC_PREBUILT_URL` points at, and generates a
-   CycloneDX `*.sbom.json` (`sbom.sh`) of the third_party components actually
+   a `.tar.zst` + `.sha256`, writes a per-target `*.manifest.json`, and generates
+   a CycloneDX `*.sbom.json` (`sbom.sh`) of the third_party components actually
    compiled into the lib (∧ `Shipped: yes`) with their versions + licenses.
+5. **Publish** — `publish.sh` cuts a **GitHub Release** (tag
+   `webrtc-<milestone>-<commit>-p<patch>`) and uploads every per-target asset.
+   `reactor-webrtc-sys` (build.rs mode 2) consumes them via their stable
+   release-download URLs:
+   `…/releases/download/<tag>/reactor-webrtc-<os>-<arch>-<profile>.tar.zst`
+   (+ the matching `.sha256`).
 
 ## Audio/network processing in the pipeline
 
@@ -105,7 +110,7 @@ runners can't fit. Steps needing not-yet-provisioned agents are `skip:`-marked.
 - ✅ Real-link proof: `reactor-webrtc-sys` glue links + runs against the lib
   (see "Verify the build actually links" above).
 - ⏳ TODO: implement the prebuilt download+checksum (`build.rs` mode 2); publish
-  to the CDN host + index manifest (replace `upload-artifact`); the patch series
+  via GitHub Releases (`publish.sh`, wired in the Buildkite publish step); the patch series
   (namespace, ADM, Android Java); SBOM.
 
 > Upstream WebRTC build docs (and LiveKit's open build scripts as *reference

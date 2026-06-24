@@ -123,12 +123,13 @@ steps:
     timeout_in_minutes: 360
     skip: "Enable once a Windows build agent (VS toolchain + large disk) is provisioned."
 
-  # ── Publish prebuilts to the CDN (main only) ───────────────────────────────
-  # Downloads the per-target artifacts and pushes them to the host that
-  # REACTOR_WEBRTC_PREBUILT_URL points at, merging the per-target manifests into
-  # the prebuilt index. AWS access via Buildkite OIDC (no static keys).
+  # ── Publish prebuilts as a GitHub Release (main only) ──────────────────────
+  # Downloads every target's Buildkite artifacts and publishes them as a
+  # GitHub Release on this repo (tag webrtc-<milestone>-<commit>-p<patch>).
+  # reactor-webrtc-sys (build.rs mode 2) consumes the assets by their stable
+  # release-download URLs. Needs a GITHUB_TOKEN secret with `repo` scope.
   - key: webrtc-publish
-    label: ":package: Publish prebuilts + index"
+    label: ":package: Publish prebuilts (GitHub Release)"
     if: 'build.branch == "main"'
     depends_on:
       - webrtc-linux-x64
@@ -137,6 +138,8 @@ steps:
     commands:
       - buildkite-agent artifact download "webrtc-build/dist/*" .
       - ./webrtc-build/publish.sh
+    secrets:
+      - GITHUB_TOKEN
     agents:
       queue: default
-    skip: "Enable once the prebuilt CDN/S3 host + webrtc-build/publish.sh land (M1)."
+    skip: "Enable with the build agents — publishes a GitHub Release once the per-target builds produce artifacts."

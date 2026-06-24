@@ -44,9 +44,9 @@ In the Buildkite dashboard (or via the Buildkite Terraform provider / API):
 2. Steps source: **"Read steps from repository"** → `.buildkite/pipeline.yml`.
 3. Add the GitHub webhook so pushes/PRs trigger builds (the fast public checks
    stay on GitHub Actions; this pipeline is the heavy lane).
-4. Secrets/OIDC for the (currently skipped) publish step: an AWS IAM role for
-   the `reactor-webrtc` prebuilt bucket, assumed via the
-   `aws-assume-role-with-web-identity` plugin (mirrors reactor-cli).
+4. Secret for the (currently skipped) publish step: a `GITHUB_TOKEN` with
+   `repo` scope (Buildkite Settings → Secrets) — `publish.sh` uses `gh` to cut
+   a GitHub Release with the per-target prebuilts as assets.
 
 ## Enabling a target
 
