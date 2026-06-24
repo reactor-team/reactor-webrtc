@@ -163,6 +163,28 @@ extern "C" {
         pc: *mut PeerConnection,
         label: *const c_char,
     ) -> *mut DataChannel;
+    /// Send bytes over a data channel. Returns 1 on success, 0 on failure.
+    pub fn reactor_webrtc_data_channel_send(
+        data_channel: *mut DataChannel,
+        data: *const u8,
+        len: usize,
+        binary: c_int,
+    ) -> c_int;
+    /// Register data-channel callbacks. `on_message(userdata, data, len,
+    /// binary)` fires per message (`data` valid only during the call);
+    /// `on_open`/`on_close` on state transitions. Replaces any prior observer.
+    pub fn reactor_webrtc_data_channel_register_observer(
+        data_channel: *mut DataChannel,
+        userdata: *mut c_void,
+        on_message: extern "C" fn(
+            userdata: *mut c_void,
+            data: *const u8,
+            len: usize,
+            binary: c_int,
+        ),
+        on_open: extern "C" fn(userdata: *mut c_void),
+        on_close: extern "C" fn(userdata: *mut c_void),
+    );
     /// Release a data channel handle.
     pub fn reactor_webrtc_data_channel_destroy(data_channel: *mut DataChannel);
 

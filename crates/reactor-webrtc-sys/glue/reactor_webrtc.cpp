@@ -54,6 +54,7 @@
 #include "media/base/video_broadcaster.h"
 #include "modules/audio_device/include/audio_device_default.h"
 #include "pc/video_track_source.h"
+#include "rtc_base/copy_on_write_buffer.h"
 #include "rtc_base/thread.h"
 #include "rtc_base/time_utils.h"
 #include "third_party/libyuv/include/libyuv/convert.h"
@@ -229,6 +230,51 @@ struct ReactorMediaStreamTrack {
   std::unique_ptr<AudioFrameSink> audio_sink;
 };
 
+// Bridges data-channel events to C callbacks.
+class ReactorDcObserver : public webrtc::DataChannelObserver {
+ public:
+  ReactorDcObserver(webrtc::DataChannelInterface* channel, void* userdata,
+                    void (*on_message)(void*, const uint8_t*, size_t, int),
+                    void (*on_open)(void*), void (*on_close)(void*))
+      : channel_(channel),
+        userdata_(userdata),
+        on_message_(on_message),
+        on_open_(on_open),
+        on_close_(on_close) {}
+
+  void OnStateChange() override {
+    switch (channel_->state()) {
+      case webrtc::DataChannelInterface::kOpen:
+        if (on_open_) on_open_(userdata_);
+        break;
+      case webrtc::DataChannelInterface::kClosed:
+        if (on_close_) on_close_(userdata_);
+        break;
+      default:
+        break;
+    }
+  }
+  void OnMessage(const webrtc::DataBuffer& buffer) override {
+    if (on_message_)
+      on_message_(userdata_, buffer.data.cdata(), buffer.data.size(),
+                  buffer.binary ? 1 : 0);
+  }
+
+ private:
+  webrtc::DataChannelInterface* channel_;  // not owned
+  void* userdata_;
+  void (*on_message_)(void*, const uint8_t*, size_t, int);
+  void (*on_open_)(void*);
+  void (*on_close_)(void*);
+};
+
+// A data-channel handle (the `DataChannel` in the Rust API): the channel plus
+// its (optional) registered observer.
+struct ReactorDataChannel {
+  webrtc::scoped_refptr<webrtc::DataChannelInterface> channel;
+  std::unique_ptr<ReactorDcObserver> observer;
+};
+
 // Owns the three WebRTC threads alongside the factory. The threads must outlive
 // the factory, so declare `factory` last: members are destroyed in reverse
 // declaration order, releasing the factory before the threads stop.
@@ -270,9 +316,8 @@ class ReactorPcObserver : public webrtc::PeerConnectionObserver {
   void OnDataChannel(
       webrtc::scoped_refptr<webrtc::DataChannelInterface> dc) override {
     if (!cb_.on_data_channel) return;
-    cb_.on_data_channel(
-        cb_.userdata,
-        new webrtc::scoped_refptr<webrtc::DataChannelInterface>(std::move(dc)));
+    cb_.on_data_channel(cb_.userdata,
+                        new ReactorDataChannel{std::move(dc), nullptr});
   }
   // Forward both the legacy and the spec-compliant negotiation signals.
   void OnRenegotiationNeeded() override { fire_renegotiation(); }
@@ -635,17 +680,40 @@ void* reactor_webrtc_peer_connection_create_data_channel(void* pc,
   auto* rpc = reinterpret_cast<ReactorPeerConnection*>(pc);
   if (!rpc || !rpc->pc) return nullptr;
   webrtc::DataChannelInit init;
-  auto result =
-      rpc->pc->CreateDataChannelOrError(label ? label : "", &init);
+  auto result = rpc->pc->CreateDataChannelOrError(label ? label : "", &init);
   if (!result.ok()) return nullptr;
-  return new webrtc::scoped_refptr<webrtc::DataChannelInterface>(
-      result.MoveValue());
+  return new ReactorDataChannel{result.MoveValue(), nullptr};
 }
 
-// Destroy a DataChannel handle (releases our reference).
+// Send bytes over a data channel. Returns 1 on success, 0 on failure.
+int reactor_webrtc_data_channel_send(void* data_channel, const uint8_t* data,
+                                     size_t len, int binary) {
+  auto* h = reinterpret_cast<ReactorDataChannel*>(data_channel);
+  if (!h || !h->channel) return 0;
+  webrtc::CopyOnWriteBuffer buffer(data, len);
+  return h->channel->Send(webrtc::DataBuffer(buffer, binary != 0)) ? 1 : 0;
+}
+
+// Register callbacks for a data channel. `on_message(userdata, data, len,
+// binary)` fires per message; `on_open`/`on_close` on state transitions. Any
+// pointer may be null. Replaces a previously registered observer.
+void reactor_webrtc_data_channel_register_observer(
+    void* data_channel, void* userdata,
+    void (*on_message)(void*, const uint8_t*, size_t, int),
+    void (*on_open)(void*), void (*on_close)(void*)) {
+  auto* h = reinterpret_cast<ReactorDataChannel*>(data_channel);
+  if (!h || !h->channel) return;
+  if (h->observer) h->channel->UnregisterObserver();
+  h->observer = std::make_unique<ReactorDcObserver>(
+      h->channel.get(), userdata, on_message, on_open, on_close);
+  h->channel->RegisterObserver(h->observer.get());
+}
+
+// Destroy a DataChannel handle (unregisters its observer, releases the channel).
 void reactor_webrtc_data_channel_destroy(void* data_channel) {
-  delete reinterpret_cast<webrtc::scoped_refptr<webrtc::DataChannelInterface>*>(
-      data_channel);
+  auto* h = reinterpret_cast<ReactorDataChannel*>(data_channel);
+  if (h && h->channel && h->observer) h->channel->UnregisterObserver();
+  delete h;
 }
 
 // ── Video tracks ──────────────────────────────────────────────────────────────

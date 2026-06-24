@@ -3,6 +3,7 @@
 use std::ffi::{c_void, CStr, CString};
 use std::os::raw::{c_char, c_int};
 use std::sync::mpsc::{sync_channel, SyncSender};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::media::Track;
@@ -90,22 +91,118 @@ impl PeerConnectionState {
     }
 }
 
+type MessageCb = Box<dyn for<'a> FnMut(&'a [u8], bool) + Send>;
+type EventCb = Box<dyn FnMut() + Send>;
+
+// Heap-pinned data-channel callback state addressed by the sys `userdata`.
+#[derive(Default)]
+struct DcObserverState {
+    on_message: Option<Mutex<MessageCb>>,
+    on_open: Option<Mutex<EventCb>>,
+    on_close: Option<Mutex<EventCb>>,
+}
+
+extern "C" fn dc_on_message(ud: *mut c_void, data: *const u8, len: usize, binary: c_int) {
+    let st = unsafe { &*(ud as *const DcObserverState) };
+    if let Some(m) = &st.on_message {
+        let bytes = unsafe { std::slice::from_raw_parts(data, len) };
+        if let Ok(mut cb) = m.lock() {
+            cb(bytes, binary != 0);
+        }
+    }
+}
+extern "C" fn dc_on_open(ud: *mut c_void) {
+    let st = unsafe { &*(ud as *const DcObserverState) };
+    if let Some(m) = &st.on_open {
+        if let Ok(mut cb) = m.lock() {
+            cb();
+        }
+    }
+}
+extern "C" fn dc_on_close(ud: *mut c_void) {
+    let st = unsafe { &*(ud as *const DcObserverState) };
+    if let Some(m) = &st.on_close {
+        if let Ok(mut cb) = m.lock() {
+            cb();
+        }
+    }
+}
+
 /// A negotiated data channel. Dropping it releases the native handle.
 pub struct DataChannel {
     raw: *mut reactor_webrtc_sys::DataChannel,
+    // Keeps the callback closures alive while the native observer is registered.
+    observer: Option<Box<DcObserverState>>,
 }
 
-// SAFETY: the native data channel is internally thread-safe.
+// SAFETY: the native data channel is internally thread-safe; callbacks are
+// serialized on the signaling thread and guarded by mutexes.
 unsafe impl Send for DataChannel {}
+unsafe impl Sync for DataChannel {}
 
 impl DataChannel {
     pub(crate) fn from_raw(raw: *mut reactor_webrtc_sys::DataChannel) -> Self {
-        Self { raw }
+        Self {
+            raw,
+            observer: None,
+        }
+    }
+
+    /// Send bytes over the channel (`binary` selects the message type).
+    pub fn send(&self, data: &[u8], binary: bool) -> Result<()> {
+        let ok = unsafe {
+            reactor_webrtc_sys::reactor_webrtc_data_channel_send(
+                self.raw,
+                data.as_ptr(),
+                data.len(),
+                binary as c_int,
+            )
+        };
+        if ok == 1 {
+            Ok(())
+        } else {
+            Err(Error::Webrtc("data channel send failed".into()))
+        }
+    }
+
+    /// Set the message handler. The closure runs on a WebRTC thread.
+    pub fn on_message(&mut self, cb: impl for<'a> FnMut(&'a [u8], bool) + Send + 'static) {
+        self.observer
+            .get_or_insert_with(Default::default)
+            .on_message = Some(Mutex::new(Box::new(cb)));
+        self.reregister();
+    }
+    /// Set the open handler (fires when the channel becomes open).
+    pub fn on_open(&mut self, cb: impl FnMut() + Send + 'static) {
+        self.observer.get_or_insert_with(Default::default).on_open = Some(Mutex::new(Box::new(cb)));
+        self.reregister();
+    }
+    /// Set the close handler.
+    pub fn on_close(&mut self, cb: impl FnMut() + Send + 'static) {
+        self.observer.get_or_insert_with(Default::default).on_close =
+            Some(Mutex::new(Box::new(cb)));
+        self.reregister();
+    }
+
+    fn reregister(&mut self) {
+        if let Some(state) = &self.observer {
+            let ud = &**state as *const DcObserverState as *mut c_void;
+            unsafe {
+                reactor_webrtc_sys::reactor_webrtc_data_channel_register_observer(
+                    self.raw,
+                    ud,
+                    dc_on_message,
+                    dc_on_open,
+                    dc_on_close,
+                );
+            }
+        }
     }
 }
 
 impl Drop for DataChannel {
     fn drop(&mut self) {
+        // Unregisters the native observer before the closure box is freed.
         unsafe { reactor_webrtc_sys::reactor_webrtc_data_channel_destroy(self.raw) }
     }
 }
