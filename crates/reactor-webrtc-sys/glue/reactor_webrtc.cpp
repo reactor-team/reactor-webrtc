@@ -859,10 +859,23 @@ void reactor_webrtc_audio_track_add_sink(
     void* track, void* userdata,
     void (*on_audio)(void*, const int16_t*, int, int, int)) {
   auto* h = reinterpret_cast<ReactorMediaStreamTrack*>(track);
-  if (!h || !h->track || h->track->kind() != "audio") return;
+  if (!h || !h->track) {
+    if (audio_debug()) fprintf(stderr, "[reactor-webrtc] add_audio_sink: null track\n");
+    return;
+  }
+  if (h->track->kind() != "audio") {
+    if (audio_debug())
+      fprintf(stderr, "[reactor-webrtc] add_audio_sink: track kind=%s (not audio) — skipped\n",
+              h->track->kind().c_str());
+    return;
+  }
   h->audio_sink = std::make_unique<AudioFrameSink>(userdata, on_audio);
-  static_cast<webrtc::AudioTrackInterface*>(h->track.get())
-      ->AddSink(h->audio_sink.get());
+  auto* at = static_cast<webrtc::AudioTrackInterface*>(h->track.get());
+  at->AddSink(h->audio_sink.get());
+  if (audio_debug())
+    fprintf(stderr,
+            "[reactor-webrtc] add_audio_sink: AddSink OK (track=%p enabled=%d state=%d)\n",
+            static_cast<void*>(at), at->enabled(), static_cast<int>(at->state()));
 }
 
 // Attach a frame sink to a (video) track. `on_frame(userdata, width, height)`
