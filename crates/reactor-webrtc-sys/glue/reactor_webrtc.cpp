@@ -190,12 +190,19 @@ class FrameAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
           transport_->NeedMorePlayData(frames, sizeof(int16_t) * channels,
                                        channels, rate, scratch.data(), out,
                                        &elapsed, &ntp);
-          if (out > 0) ++produced;
+          // out is just the requested frame count echoed back; measure the
+          // mixed peak to tell real incoming audio from silence.
+          int16_t peak = 0;
+          for (size_t i = 0; i < out * channels && i < scratch.size(); ++i) {
+            int16_t v = scratch[i] < 0 ? -scratch[i] : scratch[i];
+            if (v > peak) peak = v;
+          }
+          if (peak > 0) ++produced;
           if (audio_debug() && ++pulls % 200 == 1)
             fprintf(stderr,
-                    "[reactor-webrtc] ADM playout pump: %llu pulls, %llu produced "
-                    "samples (last out=%zu)\n",
-                    (unsigned long long)pulls, (unsigned long long)produced, out);
+                    "[reactor-webrtc] ADM playout pump: %llu pulls, %llu non-silent, "
+                    "last peak=%d (out=%zu)\n",
+                    (unsigned long long)pulls, (unsigned long long)produced, peak, out);
         }
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
