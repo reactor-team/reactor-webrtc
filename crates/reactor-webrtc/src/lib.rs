@@ -63,6 +63,22 @@ impl std::error::Error for Error {}
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Which audio device module a [`PeerConnectionFactory`] uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AdmMode {
+    /// Headless, no audio hardware: the app pushes mic PCM via
+    /// [`PeerConnectionFactory::push_audio_frame`] and receives decoded audio
+    /// through the track sinks ([`Track::on_audio_frame`]). Right for servers /
+    /// app-driven media.
+    #[default]
+    Synthetic,
+    /// The platform audio device (CoreAudio / ALSA / WASAPI): real mic capture +
+    /// speaker playout, with the AEC/NS/AGC processing chain enabled. Right for
+    /// desktop client apps. (On Android the platform ADM needs the app Context;
+    /// fall back to `Synthetic` there.)
+    Platform,
+}
+
 /// Entry point: creates peer connections and tracks, and owns the audio device
 /// module (synthetic by default, or the platform device).
 pub struct PeerConnectionFactory {
@@ -75,16 +91,23 @@ unsafe impl Send for PeerConnectionFactory {}
 unsafe impl Sync for PeerConnectionFactory {}
 
 impl PeerConnectionFactory {
+    /// Create a factory with the given [`AdmMode`].
+    pub fn with_adm(mode: AdmMode) -> Result<Self> {
+        Self::create(matches!(mode, AdmMode::Platform))
+    }
+
     /// Create a factory using the **synthetic** audio device module — no audio
     /// hardware; feed audio with [`PeerConnectionFactory::push_audio_frame`].
+    /// (Shorthand for [`with_adm(AdmMode::Synthetic)`](PeerConnectionFactory::with_adm).)
     pub fn new() -> Result<Self> {
-        Self::create(false)
+        Self::with_adm(AdmMode::Synthetic)
     }
 
     /// Create a factory using the **platform** audio device module (real
-    /// mic/speaker, e.g. CoreAudio on macOS).
+    /// mic/speaker, e.g. CoreAudio on macOS). Shorthand for
+    /// [`with_adm(AdmMode::Platform)`](PeerConnectionFactory::with_adm).
     pub fn with_platform_adm() -> Result<Self> {
-        Self::create(true)
+        Self::with_adm(AdmMode::Platform)
     }
 
     fn create(use_platform_adm: bool) -> Result<Self> {
