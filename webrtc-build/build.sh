@@ -124,6 +124,10 @@ REF="${WEBRTC_COMMIT:-}"
 if ! git -C src config --get-all remote.origin.fetch | grep -q branch-heads; then
   git -C src config --add remote.origin.fetch '+refs/branch-heads/*:refs/remotes/branch-heads/*'
 fi
+# A previous build leaves our patch series applied (modified tracked files);
+# gclient sync refuses a dirty tree, so reset it first. Step 3 re-applies the
+# patches after the sync.
+if [ -d src/.git ]; then git -C src reset --hard >/dev/null 2>&1 || true; fi
 echo "==> gclient sync -> src@$REF (--with_branch_heads)"
 gclient sync --with_branch_heads --no-history --shallow -r "src@$REF" -D
 RESOLVED="$(git -C src rev-parse HEAD)"
