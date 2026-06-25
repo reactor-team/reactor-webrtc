@@ -16,6 +16,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -89,6 +91,13 @@ struct ReactorPcCallbacks {
 
 namespace {
 
+// Opt-in audio path tracing (REACTOR_WEBRTC_AUDIO_DEBUG=1) → stderr. Off by
+// default. Used to pinpoint capture (push) vs playout-pump vs sink delivery.
+bool audio_debug() {
+  static const bool on = std::getenv("REACTOR_WEBRTC_AUDIO_DEBUG") != nullptr;
+  return on;
+}
+
 // A video source we can push externally-produced frames into. VideoBroadcaster
 // fans frames out to the connected encoder sink(s).
 class FrameSource : public webrtc::VideoTrackSource {
@@ -117,6 +126,9 @@ class FrameAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
   int32_t RegisterAudioCallback(webrtc::AudioTransport* transport) override {
     std::lock_guard<std::mutex> lock(mutex_);
     transport_ = transport;
+    if (audio_debug())
+      fprintf(stderr, "[reactor-webrtc] ADM RegisterAudioCallback transport=%p\n",
+              static_cast<void*>(transport));
     return 0;
   }
   bool RecordingIsInitialized() const override { return true; }
@@ -129,6 +141,9 @@ class FrameAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
   // Playout pump: pulls (and discards) 10ms render blocks so the receive
   // pipeline runs and remote audio-track sinks are invoked.
   int32_t StartPlayout() override {
+    if (audio_debug())
+      fprintf(stderr, "[reactor-webrtc] ADM StartPlayout (enabled=%d already=%d)\n",
+              playout_enabled_.load(), playing_.load());
     if (!playout_enabled_.load()) return 0;
     if (playing_.exchange(true)) return 0;
     play_thread_ = std::thread([this] { PlayoutLoop(); });
@@ -146,6 +161,12 @@ class FrameAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
                uint32_t sample_rate, size_t channels) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!transport_ || !pcm || channels == 0) return;
+    if (audio_debug()) {
+      static uint64_t n = 0;
+      if (++n % 500 == 1)
+        fprintf(stderr, "[reactor-webrtc] ADM PushPcm #%llu (%zu frames %u Hz %zu ch)\n",
+                (unsigned long long)n, samples_per_channel, sample_rate, channels);
+    }
     uint32_t new_mic_level = 0;
     transport_->RecordedDataIsAvailable(
         pcm, samples_per_channel, sizeof(int16_t) * channels, channels,
@@ -159,6 +180,7 @@ class FrameAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
     const size_t channels = 2;
     const size_t frames = rate / 100;  // 10ms
     std::vector<int16_t> scratch(frames * channels);
+    uint64_t pulls = 0, produced = 0;
     while (playing_.load()) {
       {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -168,6 +190,12 @@ class FrameAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
           transport_->NeedMorePlayData(frames, sizeof(int16_t) * channels,
                                        channels, rate, scratch.data(), out,
                                        &elapsed, &ntp);
+          if (out > 0) ++produced;
+          if (audio_debug() && ++pulls % 200 == 1)
+            fprintf(stderr,
+                    "[reactor-webrtc] ADM playout pump: %llu pulls, %llu produced "
+                    "samples (last out=%zu)\n",
+                    (unsigned long long)pulls, (unsigned long long)produced, out);
         }
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -190,6 +218,12 @@ class AudioFrameSink : public webrtc::AudioTrackSinkInterface {
       : userdata_(userdata), on_audio_(on_audio) {}
   void OnData(const void* audio_data, int /*bits_per_sample*/, int sample_rate,
               size_t number_of_channels, size_t number_of_frames) override {
+    if (audio_debug()) {
+      static uint64_t n = 0;
+      if (++n % 100 == 1)
+        fprintf(stderr, "[reactor-webrtc] audio sink OnData #%llu (%d Hz %zu ch %zu frames)\n",
+                (unsigned long long)n, sample_rate, number_of_channels, number_of_frames);
+    }
     if (on_audio_)
       on_audio_(userdata_, static_cast<const int16_t*>(audio_data), sample_rate,
                 static_cast<int>(number_of_channels),
