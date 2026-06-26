@@ -16,11 +16,15 @@ ROOT="$(cd "$HERE/.." && pwd)"
 # shellcheck disable=SC1090
 source "$ROOT/WEBRTC_VERSION"
 
+# iOS/visionOS: device and simulator differ by target environment (IOS_ENV).
+VARIANT=""
+case "$OS" in ios|visionos) VARIANT="-${IOS_ENV:-device}" ;; esac
+
 SRC="$HERE/src/src"
-OUT="$HERE/out/$OS-$ARCH-$PROFILE"
+OUT="$HERE/out/$OS-$ARCH$VARIANT-$PROFILE"
 DIST="$HERE/dist"
 STAGE="$OUT/dist"
-NAME="reactor-webrtc-${OS}-${ARCH}-${PROFILE}"
+NAME="reactor-webrtc-${OS}-${ARCH}${VARIANT}-${PROFILE}"
 
 [ -f "$STAGE/lib/libwebrtc.a" ] || { echo "package.sh: build first (no libwebrtc.a)" >&2; exit 1; }
 

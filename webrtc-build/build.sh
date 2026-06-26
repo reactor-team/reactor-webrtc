@@ -23,7 +23,11 @@ source "$ROOT/WEBRTC_VERSION"
 
 DEPOT="$HERE/depot_tools"
 SRC="$HERE/src"                       # gclient root (.gclient + src/)
-OUT="$HERE/out/$OS-$ARCH-$PROFILE"
+# iOS/visionOS device and simulator share os+arch but differ by target
+# environment, so fold IOS_ENV into the target slug to keep their outputs apart.
+VARIANT=""
+case "$OS" in ios|visionos) VARIANT="-${IOS_ENV:-device}" ;; esac
+OUT="$HERE/out/$OS-$ARCH$VARIANT-$PROFILE"
 
 # ── arch → gn target_cpu ──────────────────────────────────────────────────────
 case "$ARCH" in

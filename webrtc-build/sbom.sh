@@ -16,10 +16,13 @@ ROOT="$(cd "$HERE/.." && pwd)"
 # shellcheck disable=SC1090
 source "$ROOT/WEBRTC_VERSION"
 
+VARIANT=""
+case "$OS" in ios|visionos) VARIANT="-${IOS_ENV:-device}" ;; esac
+
 SRC="$HERE/src/src"
-OUT_OBJ="$HERE/out/$OS-$ARCH-$PROFILE/obj/third_party"
+OUT_OBJ="$HERE/out/$OS-$ARCH$VARIANT-$PROFILE/obj/third_party"
 DIST="$HERE/dist"
-NAME="reactor-webrtc-${OS}-${ARCH}-${PROFILE}"
+NAME="reactor-webrtc-${OS}-${ARCH}${VARIANT}-${PROFILE}"
 OUT="$DIST/$NAME.sbom.json"
 mkdir -p "$DIST"
 
