@@ -8,7 +8,9 @@
 #   • workflow_dispatch → pick `targets`; set `publish=true` to cut a Release.
 #
 # Host coverage (cross-compile aware):
-#   • macos-14 (Apple Silicon + Xcode) → mac arm64, mac x64, iOS device + sim.
+#   • macos-15 (Apple Silicon + Xcode 16) → mac arm64, mac x64, iOS device + sim.
+#       macos-15 ships MacOSX15.sdk; protobuf's `constinit fixed_address_empty_string`
+#       needs libc++'s constexpr allocator, absent from the MacOSX14.5.sdk on macos-14.
 #   • ubuntu-latest                    → linux x64, android (NDK via gclient).
 #   • ubuntu-24.04-arm                 → linux arm64 (native, runs tests).
 #   • windows-latest                   → win x64.
@@ -51,10 +53,10 @@ jobs:
     steps:
       - id: gen
         run: |
-          mac_arm='{"os":"mac","arch":"arm64","runner":"macos-14"}'
-          mac_x64='{"os":"mac","arch":"x64","runner":"macos-14"}'
-          ios_dev='{"os":"ios","arch":"arm64","runner":"macos-14","ios_env":"device"}'
-          ios_sim='{"os":"ios","arch":"arm64","runner":"macos-14","ios_env":"simulator"}'
+          mac_arm='{"os":"mac","arch":"arm64","runner":"macos-15"}'
+          mac_x64='{"os":"mac","arch":"x64","runner":"macos-15"}'
+          ios_dev='{"os":"ios","arch":"arm64","runner":"macos-15","ios_env":"device"}'
+          ios_sim='{"os":"ios","arch":"arm64","runner":"macos-15","ios_env":"simulator"}'
           linux_x64='{"os":"linux","arch":"x64","runner":"ubuntu-latest"}'
           linux_arm='{"os":"linux","arch":"arm64","runner":"ubuntu-24.04-arm"}'
           android='{"os":"android","arch":"arm64","runner":"ubuntu-latest"}'
@@ -99,6 +101,17 @@ jobs:
           sudo docker image prune --all --force || true
           sudo swapoff -a || true && sudo rm -f /mnt/swapfile || true
           df -h
+
+      - name: Select newest Xcode (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          # protobuf's `constinit fixed_address_empty_string` needs libc++'s
+          # constexpr std::allocator::allocate (Xcode 16 / MacOSX15.sdk+). Pin the
+          # newest installed Xcode so the SDK matches what builds locally.
+          latest="$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1)"
+          [ -n "$latest" ] && sudo xcode-select -s "$latest/Contents/Developer"
+          xcodebuild -version
+          echo "SDK: $(xcrun --sdk macosx --show-sdk-version) at $(xcrun --show-sdk-path)"
 
       - name: Build libwebrtc
         run: ./webrtc-build/build.sh ${{ matrix.os }} ${{ matrix.arch }} "$PROFILE"
