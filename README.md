@@ -25,8 +25,8 @@ reactor-webrtc/
 │   ├── package.sh              archive + checksum + manifest for prebuilts
 │   ├── sbom.sh                 CycloneDX SBOM of the compiled third_party deps
 │   └── patches/                our deterministic patch series
-├── .github/workflows/ci.yml    fast public checks (fmt / check / clippy)
-└── .buildkite/pipeline.yml     heavy per-target libwebrtc builds (self-hosted)
+├── .github/workflows/ci.yml             fast public checks (fmt / check / clippy)
+└── .github/workflows/webrtc-build.yml   heavy per-target libwebrtc builds + publish
 ```
 
 ## How the native library is resolved

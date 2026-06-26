@@ -92,26 +92,28 @@ factories — VP8/VP9/AV1; H.264 is off via `rtc_use_h264=false`). Notes:
 `android arm64/armv7/x86_64` · `windows x64` · `visionos device+sim`
 (as the toolchain allows).
 
-**CI split** (mirrors cpp_sdk / py-sdk): the fast public checks (fmt / check /
-clippy, dev-mode) run on GitHub Actions (`.github/workflows/ci.yml`). The heavy
-per-target libwebrtc builds + lib-linked tests run on **Buildkite**
-(`.buildkite/pipeline.yml`) on Reactor's self-hosted queues (`heavy`, `arm64`,
-`macos`, `windows`) — a ~30GB+ checkout + multi-hour compile that hosted GitHub
-runners can't fit. Steps needing not-yet-provisioned agents are `skip:`-marked.
+**CI split**: the fast public checks (fmt / check / clippy, dev-mode) run on
+GitHub Actions (`.github/workflows/ci.yml`). The heavy per-target libwebrtc
+builds + lib-linked tests also run on **GitHub Actions**
+(`.github/workflows/webrtc-build.yml`): a `targets`-driven matrix over
+`macos-14` (mac + iOS device/sim), `ubuntu-latest` (linux x64 + android),
+`ubuntu-24.04-arm` (linux arm64, native) and `windows-latest`. The ~30GB+
+checkout fits after the workflow's disk-cleanup step (and via larger/self-hosted
+runners where needed). `workflow_dispatch` with `publish=true` cuts a Release.
 
 ## Status
 
 - ✅ `gn args` + `build.sh` (fetch→patch→gn→ninja→assemble) and `package.sh`
   (headers + archive + checksum + manifest) implemented.
-- ✅ CI: fast checks on GitHub Actions; heavy per-target builds + lib-linked
-  tests on Buildkite (`.buildkite/pipeline.yml`, self-hosted queues).
+- ✅ CI: fast checks + heavy per-target builds + lib-linked tests on GitHub
+  Actions (`.github/workflows/ci.yml`, `.github/workflows/webrtc-build.yml`).
 - ✅ First green macOS arm64 build (`branch-heads/7907`, commit locked in
   `WEBRTC_VERSION`); 100 MB `libwebrtc.a`, 62 MB packaged archive.
 - ✅ Real-link proof: `reactor-webrtc-sys` glue links + runs against the lib
   (see "Verify the build actually links" above).
 - ⏳ TODO: implement the prebuilt download+checksum (`build.rs` mode 2); publish
-  via GitHub Releases (`publish.sh`, wired in the Buildkite publish step); the patch series
-  (namespace, ADM, Android Java); SBOM.
+  via GitHub Releases (`publish.sh`, wired into the workflow's publish job); the
+  patch series (namespace, ADM, Android Java); SBOM.
 
 > Upstream WebRTC build docs (and LiveKit's open build scripts as *reference
 > only*, not a dependency) inform this recipe.

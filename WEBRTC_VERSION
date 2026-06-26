@@ -1,7 +1,7 @@
 # Pinned upstream Google WebRTC milestone for our owned build.
 #
 # Bumping this file triggers a rebuild of all prebuilt artifacts (see
-# webrtc-build/ and the Buildkite webrtc build pipeline).
+# webrtc-build/ and .github/workflows/webrtc-build.yml).
 #
 # WEBRTC_BRANCH  — a branch-heads milestone ref (verify the number against
 #                  https://chromiumdash.appspot.com/branches — the number maps
