@@ -102,14 +102,18 @@ gn_args() {
       # This matches our C-ABI glue, which the sys crate compiles with the same
       # host toolchain. Requires host dev libraries (see the CI "Linux build
       # deps" step / your distro's -dev packages).
-      # gn otherwise assumes the *bundled* clang's version for compiler-rt paths
-      # (e.g. /usr/lib/clang/<ver>/); pin it to the host clang's major version.
-      local cver
+      # Point gn at the host LLVM. gn derives the clang resource dir (compiler-rt
+      # builtins etc.) as <clang_base_path>/lib/clang/<clang_version>/; on Ubuntu
+      # that tree lives under /usr/lib/llvm-<ver>, not /usr. Pin both so the
+      # builtins archive (from libclang-rt-dev) is found for the target triple.
+      local cver cbp
       cver="$(clang --version 2>/dev/null | sed -nE 's/.*clang version ([0-9]+).*/\1/p' | head -1)"
+      cbp="/usr"
+      [ -n "$cver" ] && [ -x "/usr/lib/llvm-$cver/bin/clang" ] && cbp="/usr/lib/llvm-$cver"
       args+=(
         "rtc_use_pipewire=false"
         "is_clang=true"
-        "clang_base_path=\"/usr\""
+        "clang_base_path=\"$cbp\""
         "clang_use_chrome_plugins=false"
         "use_sysroot=false"
         "use_custom_libcxx=false"
