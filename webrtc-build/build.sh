@@ -52,10 +52,12 @@ esac
 # ── gn args (the heart of the build) ──────────────────────────────────────────
 # Base args shared by every target, then per-OS additions. Rationale:
 #   is_component_build=false   → one static libwebrtc.a (what we ship)
-#   use_custom_libcxx=false    → link the *platform* libc++ so the lib interops
-#                                with our Rust/cc glue and the consuming app
-#                                (mixing WebRTC's bundled libc++ with the app's
-#                                is a classic source of crashes)
+#   use_custom_libcxx=false    → link the *platform* C++ stdlib so the lib
+#     (per OS)                    interops with our Rust/cc glue and the consuming
+#                                app (mixing WebRTC's bundled libc++ with the
+#                                app's is a classic source of crashes). Set
+#                                per-OS below, since the "platform" stdlib and
+#                                how we reach a modern one differs by target.
 #   rtc_include_tests/examples/tools=false → trim the build
 #   rtc_libvpx_build_vp9=true  → VP9 software codec
 #   treat_warnings_as_errors=false → tolerate upstream warnings across milestones
@@ -69,7 +71,6 @@ gn_args() {
     "rtc_enable_protobuf=true"
     "treat_warnings_as_errors=false"
     "use_rtti=true"
-    "use_custom_libcxx=false"
     "rtc_libvpx_build_vp9=true"
     "target_os=\"$GN_OS\""
     "target_cpu=\"$CPU\""
@@ -77,24 +78,42 @@ gn_args() {
   case "$GN_OS" in
     mac)
       # Hardware H.264 via VideoToolbox; no software OpenH264 needed.
-      args+=("rtc_use_h264=false" "symbol_level=1")
+      # Modern Xcode libc++ is the platform stdlib for both lib and glue.
+      args+=("rtc_use_h264=false" "use_custom_libcxx=false" "symbol_level=1")
       ;;
     ios)
       args+=(
         "ios_enable_code_signing=false"
         "rtc_enable_symbol_export=true"
         "rtc_use_h264=false"
+        "use_custom_libcxx=false"
         "target_environment=\"${IOS_ENV:-device}\""
       )
       ;;
     android)
-      args+=("symbol_level=1" "rtc_use_h264=false")
+      # NDK libc++ is the platform stdlib (matches the glue's NDK toolchain).
+      args+=("symbol_level=1" "rtc_use_h264=false" "use_custom_libcxx=false")
       ;;
     linux)
-      args+=("rtc_use_pipewire=false" "is_clang=true" "use_sysroot=true" "symbol_level=1")
+      # Use the *host* clang + host libstdc++, NOT the bundled toolchain:
+      #   • the bundled clang is x86_64-only → can't run on arm64 hosts;
+      #   • the pinned debian sysroot's libstdc++ is too old for WebRTC's C++20
+      #     (e.g. std::make_unique_for_overwrite).
+      # This matches our C-ABI glue, which the sys crate compiles with the same
+      # host toolchain. Requires host dev libraries (see the CI "Linux build
+      # deps" step / your distro's -dev packages).
+      args+=(
+        "rtc_use_pipewire=false"
+        "is_clang=true"
+        "clang_base_path=\"/usr\""
+        "clang_use_chrome_plugins=false"
+        "use_sysroot=false"
+        "use_custom_libcxx=false"
+        "symbol_level=1"
+      )
       ;;
     win)
-      args+=("symbol_level=1")
+      args+=("use_custom_libcxx=false" "symbol_level=1")
       ;;
   esac
   echo "${args[*]}"

@@ -116,6 +116,19 @@ jobs:
           xcodebuild -version
           echo "SDK: $(xcrun --sdk macosx --show-sdk-version) at $(xcrun --show-sdk-path)"
 
+      - name: Linux build deps
+        if: matrix.os == 'linux'
+        run: |
+          # use_sysroot=false → the host must provide clang/lld/llvm + the dev
+          # libraries the checkout's debian sysroot used to supply.
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang lld llvm nasm pkg-config \
+            libglib2.0-dev libasound2-dev libpulse-dev libudev-dev \
+            libx11-dev libxext-dev libxdamage-dev libxfixes-dev \
+            libxrandr-dev libxcomposite-dev libxtst-dev libxrender-dev \
+            libdrm-dev libgbm-dev
+
       - name: Build libwebrtc
         run: ./webrtc-build/build.sh ${{ matrix.os }} ${{ matrix.arch }} "$PROFILE"
 
