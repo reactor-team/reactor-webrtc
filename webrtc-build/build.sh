@@ -102,6 +102,10 @@ gn_args() {
       # This matches our C-ABI glue, which the sys crate compiles with the same
       # host toolchain. Requires host dev libraries (see the CI "Linux build
       # deps" step / your distro's -dev packages).
+      # gn otherwise assumes the *bundled* clang's version for compiler-rt paths
+      # (e.g. /usr/lib/clang/<ver>/); pin it to the host clang's major version.
+      local cver
+      cver="$(clang --version 2>/dev/null | sed -nE 's/.*clang version ([0-9]+).*/\1/p' | head -1)"
       args+=(
         "rtc_use_pipewire=false"
         "is_clang=true"
@@ -111,6 +115,7 @@ gn_args() {
         "use_custom_libcxx=false"
         "symbol_level=1"
       )
+      [ -n "$cver" ] && args+=("clang_version=\"$cver\"")
       ;;
     win)
       args+=("use_custom_libcxx=false" "symbol_level=1")
