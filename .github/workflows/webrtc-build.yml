@@ -40,7 +40,9 @@ on:
       - ".github/workflows/webrtc-build.yml"
 
 concurrency:
-  group: webrtc-build-${{ github.ref }}
+  # Key on the event too: a push (mac smoke) and a workflow_dispatch (chosen
+  # targets) on the same ref must not cancel each other.
+  group: webrtc-build-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
