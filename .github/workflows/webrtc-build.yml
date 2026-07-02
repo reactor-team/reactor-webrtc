@@ -119,15 +119,40 @@ jobs:
       - name: Linux build deps
         if: matrix.os == 'linux'
         run: |
+          set -euo pipefail
           # use_sysroot=false → the host must provide clang/lld/llvm + the dev
           # libraries the checkout's debian sysroot used to supply.
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            clang lld llvm libclang-rt-dev nasm pkg-config \
+            clang lld llvm nasm pkg-config \
             libglib2.0-dev libasound2-dev libpulse-dev libudev-dev \
             libx11-dev libxext-dev libxdamage-dev libxfixes-dev \
             libxrandr-dev libxcomposite-dev libxtst-dev libxrender-dev \
             libdrm-dev libgbm-dev
+          cver="$(clang --version | sed -nE 's/.*clang version ([0-9]+).*/\1/p' | head -1)"
+          sudo apt-get install -y --no-install-recommends "libclang-rt-${cver}-dev" \
+            || sudo apt-get install -y --no-install-recommends libclang-rt-dev
+          # gn expects compiler-rt builtins in a per-target dir
+          # (<resource>/lib/<triple>/libclang_rt.builtins.a, the Chromium clang
+          # layout); Ubuntu ships the flat layout (.../lib/linux/...-<arch>.a).
+          # Fail fast here (pre-build) if missing, else shim the per-target path.
+          base="/usr/lib/llvm-${cver}/lib/clang/${cver}/lib"
+          src="$(sudo find "/usr/lib/llvm-${cver}" -name 'libclang_rt.builtins*.a' 2>/dev/null | head -1)"
+          echo "compiler-rt builtins: ${src:-<none>}"
+          if [ -z "$src" ]; then
+            echo "::error::compiler-rt builtins not found after install"; exit 1
+          fi
+          case "$(uname -m)" in
+            x86_64)  triple=x86_64-unknown-linux-gnu ;;
+            aarch64) triple=aarch64-unknown-linux-gnu ;;
+            *)       triple="" ;;
+          esac
+          want="$base/$triple/libclang_rt.builtins.a"
+          if [ -n "$triple" ] && [ "$src" != "$want" ]; then
+            sudo mkdir -p "$base/$triple"
+            sudo ln -sf "$src" "$want"
+            echo "shimmed -> $want"
+          fi
 
       - name: Build libwebrtc
         run: ./webrtc-build/build.sh ${{ matrix.os }} ${{ matrix.arch }} "$PROFILE"
