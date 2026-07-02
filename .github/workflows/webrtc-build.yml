@@ -58,7 +58,8 @@ jobs:
           ios_dev='{"os":"ios","arch":"arm64","runner":"macos-15","ios_env":"device"}'
           ios_sim='{"os":"ios","arch":"arm64","runner":"macos-15","ios_env":"simulator"}'
           linux_x64='{"os":"linux","arch":"x64","runner":"ubuntu-latest"}'
-          linux_arm='{"os":"linux","arch":"arm64","runner":"ubuntu-24.04-arm"}'
+          # linux/arm64 is cross-compiled from x86_64 (no linux-arm64 bundled clang).
+          linux_arm='{"os":"linux","arch":"arm64","runner":"ubuntu-latest"}'
           android='{"os":"android","arch":"arm64","runner":"ubuntu-latest"}'
           win='{"os":"win","arch":"x64","runner":"windows-latest"}'
           t="${{ github.event.inputs.targets }}"
@@ -116,43 +117,22 @@ jobs:
           xcodebuild -version
           echo "SDK: $(xcrun --sdk macosx --show-sdk-version) at $(xcrun --show-sdk-path)"
 
-      - name: Linux build deps
-        if: matrix.os == 'linux'
+      # Native x86_64 uses the *host* libstdc++ (use_sysroot=false), so the host
+      # must supply the dev libraries the checkout's debian sysroot otherwise
+      # would. The bundled clang brings its own compiler-rt, so no clang/llvm
+      # host packages are needed. arm64 is cross-built against the sysroot and
+      # needs none of this.
+      - name: Linux build deps (native x64)
+        if: matrix.os == 'linux' && matrix.arch == 'x64'
         run: |
           set -euo pipefail
-          # use_sysroot=false → the host must provide clang/lld/llvm + the dev
-          # libraries the checkout's debian sysroot used to supply.
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            clang lld llvm nasm pkg-config \
+            nasm pkg-config \
             libglib2.0-dev libasound2-dev libpulse-dev libudev-dev \
             libx11-dev libxext-dev libxdamage-dev libxfixes-dev \
             libxrandr-dev libxcomposite-dev libxtst-dev libxrender-dev \
             libdrm-dev libgbm-dev
-          cver="$(clang --version | sed -nE 's/.*clang version ([0-9]+).*/\1/p' | head -1)"
-          sudo apt-get install -y --no-install-recommends "libclang-rt-${cver}-dev" \
-            || sudo apt-get install -y --no-install-recommends libclang-rt-dev
-          # gn expects compiler-rt builtins in a per-target dir
-          # (<resource>/lib/<triple>/libclang_rt.builtins.a, the Chromium clang
-          # layout); Ubuntu ships the flat layout (.../lib/linux/...-<arch>.a).
-          # Fail fast here (pre-build) if missing, else shim the per-target path.
-          base="/usr/lib/llvm-${cver}/lib/clang/${cver}/lib"
-          src="$(sudo find "/usr/lib/llvm-${cver}" -name 'libclang_rt.builtins*.a' 2>/dev/null | head -1)"
-          echo "compiler-rt builtins: ${src:-<none>}"
-          if [ -z "$src" ]; then
-            echo "::error::compiler-rt builtins not found after install"; exit 1
-          fi
-          case "$(uname -m)" in
-            x86_64)  triple=x86_64-unknown-linux-gnu ;;
-            aarch64) triple=aarch64-unknown-linux-gnu ;;
-            *)       triple="" ;;
-          esac
-          want="$base/$triple/libclang_rt.builtins.a"
-          if [ -n "$triple" ] && [ "$src" != "$want" ]; then
-            sudo mkdir -p "$base/$triple"
-            sudo ln -sf "$src" "$want"
-            echo "shimmed -> $want"
-          fi
 
       - name: Build libwebrtc
         run: ./webrtc-build/build.sh ${{ matrix.os }} ${{ matrix.arch }} "$PROFILE"
@@ -162,9 +142,10 @@ jobs:
           command -v zstd >/dev/null || (sudo apt-get update && sudo apt-get install -y zstd) || brew install zstd || true
           ./webrtc-build/package.sh ${{ matrix.os }} ${{ matrix.arch }} "$PROFILE"
 
-      # Run the lib-linked FFI/integration tests where the target runs natively.
+      # Run the lib-linked FFI/integration tests where the target runs natively
+      # (skip linux/arm64 — it is cross-built on an x86_64 runner).
       - name: Test (native targets)
-        if: (matrix.os == 'mac' && matrix.arch == 'arm64') || matrix.os == 'linux'
+        if: (matrix.os == 'mac' && matrix.arch == 'arm64') || (matrix.os == 'linux' && matrix.arch == 'x64')
         run: |
           SLUG="${{ matrix.os }}-${{ matrix.arch }}-${PROFILE}"
           export REACTOR_WEBRTC_LIB_DIR="$PWD/webrtc-build/out/$SLUG/dist"

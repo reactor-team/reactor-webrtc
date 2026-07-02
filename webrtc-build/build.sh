@@ -95,31 +95,22 @@ gn_args() {
       args+=("symbol_level=1" "rtc_use_h264=false" "use_custom_libcxx=false")
       ;;
     linux)
-      # Use the *host* clang + host libstdc++, NOT the bundled toolchain:
-      #   • the bundled clang is x86_64-only → can't run on arm64 hosts;
-      #   • the pinned debian sysroot's libstdc++ is too old for WebRTC's C++20
-      #     (e.g. std::make_unique_for_overwrite).
-      # This matches our C-ABI glue, which the sys crate compiles with the same
-      # host toolchain. Requires host dev libraries (see the CI "Linux build
-      # deps" step / your distro's -dev packages).
-      # Point gn at the host LLVM. gn derives the clang resource dir (compiler-rt
-      # builtins etc.) as <clang_base_path>/lib/clang/<clang_version>/; on Ubuntu
-      # that tree lives under /usr/lib/llvm-<ver>, not /usr. Pin both so the
-      # builtins archive (from libclang-rt-dev) is found for the target triple.
-      local cver cbp
-      cver="$(clang --version 2>/dev/null | sed -nE 's/.*clang version ([0-9]+).*/\1/p' | head -1)"
-      cbp="/usr"
-      [ -n "$cver" ] && [ -x "/usr/lib/llvm-$cver/bin/clang" ] && cbp="/usr/lib/llvm-$cver"
-      args+=(
-        "rtc_use_pipewire=false"
-        "is_clang=true"
-        "clang_base_path=\"$cbp\""
-        "clang_use_chrome_plugins=false"
-        "use_sysroot=false"
-        "use_custom_libcxx=false"
-        "symbol_level=1"
-      )
-      [ -n "$cver" ] && args+=("clang_version=\"$cver\"")
+      # Always use WebRTC's *bundled* clang: it's a Chromium fork with flags no
+      # stock clang has (-fno-lifetime-dse, -fdiagnostics-show-inlining-chain,
+      # --crel, …), so a host clang can't compile this tree. The bundled clang is
+      # published for x86_64 hosts only, which drives the per-arch split below.
+      args+=("rtc_use_pipewire=false" "is_clang=true" "symbol_level=1")
+      if [ "$CPU" = arm64 ]; then
+        # No linux-arm64 host clang exists → cross-compile from x86_64 against the
+        # arm64 sysroot. That sysroot's libstdc++ is too old for WebRTC's C++20,
+        # so use the bundled (modern) libc++.
+        args+=("use_sysroot=true" "use_custom_libcxx=true")
+      else
+        # Native x86_64: bundled clang + host libstdc++ (use_sysroot=false pulls
+        # the runner's modern libstdc++, which has std::make_unique_for_overwrite)
+        # and use_custom_libcxx=false so the lib and our C-ABI glue share it.
+        args+=("use_sysroot=false" "use_custom_libcxx=false")
+      fi
       ;;
     win)
       args+=("use_custom_libcxx=false" "symbol_level=1")
@@ -174,6 +165,14 @@ for p in "$HERE"/patches/*.patch; do
   git apply --3way "$p"
 done
 shopt -u nullglob
+
+# Cross-compiling linux/arm64 from an x86_64 host needs the arm64 sysroot, which
+# the default sync (host arch only) does not fetch.
+if [ "$GN_OS" = linux ] && [ "$CPU" != "$(uname -m | sed 's/x86_64/x64/;s/aarch64/arm64/')" ]; then
+  echo "==> installing linux sysroot for $CPU (cross)"
+  python3 build/linux/sysroot_scripts/install-sysroot.py --arch="$CPU" \
+    || python3 build/linux/sysroot_scripts/install_sysroot.py --arch="$CPU"
+fi
 
 # ── 4. gn gen ─────────────────────────────────────────────────────────────────
 ARGS="$(gn_args)"
