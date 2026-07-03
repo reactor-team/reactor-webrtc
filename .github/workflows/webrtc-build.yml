@@ -119,23 +119,6 @@ jobs:
           xcodebuild -version
           echo "SDK: $(xcrun --sdk macosx --show-sdk-version) at $(xcrun --show-sdk-path)"
 
-      # Native x86_64 uses the *host* libstdc++ (use_sysroot=false), so the host
-      # must supply the dev libraries the checkout's debian sysroot otherwise
-      # would. The bundled clang brings its own compiler-rt, so no clang/llvm
-      # host packages are needed. arm64 is cross-built against the sysroot and
-      # needs none of this.
-      - name: Linux build deps (native x64)
-        if: matrix.os == 'linux' && matrix.arch == 'x64'
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            nasm pkg-config \
-            libglib2.0-dev libasound2-dev libpulse-dev libudev-dev \
-            libx11-dev libxext-dev libxdamage-dev libxfixes-dev \
-            libxrandr-dev libxcomposite-dev libxtst-dev libxrender-dev \
-            libdrm-dev libgbm-dev
-
       - name: Build libwebrtc
         run: ./webrtc-build/build.sh ${{ matrix.os }} ${{ matrix.arch }} "$PROFILE"
 
@@ -145,9 +128,11 @@ jobs:
           ./webrtc-build/package.sh ${{ matrix.os }} ${{ matrix.arch }} "$PROFILE"
 
       # Run the lib-linked FFI/integration tests where the target runs natively
-      # (skip linux/arm64 — it is cross-built on an x86_64 runner).
+      # AND the glue links cleanly today. linux uses the bundled libc++, so its
+      # glue must be compiled with libc++ before the linux lib-link test can run
+      # (follow-up); arm64 is cross-built. So: macOS arm64 only for now.
       - name: Test (native targets)
-        if: (matrix.os == 'mac' && matrix.arch == 'arm64') || (matrix.os == 'linux' && matrix.arch == 'x64')
+        if: matrix.os == 'mac' && matrix.arch == 'arm64'
         run: |
           SLUG="${{ matrix.os }}-${{ matrix.arch }}-${PROFILE}"
           export REACTOR_WEBRTC_LIB_DIR="$PWD/webrtc-build/out/$SLUG/dist"

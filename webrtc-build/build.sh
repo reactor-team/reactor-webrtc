@@ -95,22 +95,23 @@ gn_args() {
       args+=("symbol_level=1" "rtc_use_h264=false" "use_custom_libcxx=false")
       ;;
     linux)
-      # Always use WebRTC's *bundled* clang: it's a Chromium fork with flags no
-      # stock clang has (-fno-lifetime-dse, -fdiagnostics-show-inlining-chain,
-      # --crel, …), so a host clang can't compile this tree. The bundled clang is
-      # published for x86_64 hosts only, which drives the per-arch split below.
-      args+=("rtc_use_pipewire=false" "is_clang=true" "symbol_level=1")
-      if [ "$CPU" = arm64 ]; then
-        # No linux-arm64 host clang exists → cross-compile from x86_64 against the
-        # arm64 sysroot. That sysroot's libstdc++ is too old for WebRTC's C++20,
-        # so use the bundled (modern) libc++.
-        args+=("use_sysroot=true" "use_custom_libcxx=true")
-      else
-        # Native x86_64: bundled clang + host libstdc++ (use_sysroot=false pulls
-        # the runner's modern libstdc++, which has std::make_unique_for_overwrite)
-        # and use_custom_libcxx=false so the lib and our C-ABI glue share it.
-        args+=("use_sysroot=false" "use_custom_libcxx=false")
-      fi
+      # Always use WebRTC's *bundled* clang + bundled libc++:
+      #   • the bundled clang is a Chromium fork with flags no stock clang has
+      #     (-fno-lifetime-dse, --crel, …), so a host clang can't compile this;
+      #   • the pinned debian sysroot's libstdc++ is too old for WebRTC's C++20
+      #     (std::make_unique_for_overwrite; ssl_stream_adapter.h's nullptr_t),
+      #     so use the bundled (modern) libc++.
+      # Self-contained via the sysroot. The bundled clang is published for x86_64
+      # hosts only, so arm64 is cross-compiled from x86_64 (see the sysroot fetch
+      # above + the CI runner mapping). NOTE: linking a consumer's glue against
+      # this lib requires compiling that glue with libc++ too (follow-up).
+      args+=(
+        "rtc_use_pipewire=false"
+        "is_clang=true"
+        "use_sysroot=true"
+        "use_custom_libcxx=true"
+        "symbol_level=1"
+      )
       ;;
     win)
       args+=("use_custom_libcxx=false" "symbol_level=1")
