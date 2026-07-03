@@ -91,8 +91,10 @@ gn_args() {
       )
       ;;
     android)
-      # NDK libc++ is the platform stdlib (matches the glue's NDK toolchain).
-      args+=("symbol_level=1" "rtc_use_h264=false" "use_custom_libcxx=false")
+      # Bundled libc++: it ships the libunwind that Chromium's link flags
+      # (--unwindlib=none) otherwise leave out, so the NDK link resolves
+      # _Unwind_* (undefined with use_custom_libcxx=false).
+      args+=("symbol_level=1" "rtc_use_h264=false" "use_custom_libcxx=true")
       ;;
     linux)
       # Always use WebRTC's *bundled* clang + bundled libc++:
