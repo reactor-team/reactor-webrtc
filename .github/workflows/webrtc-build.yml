@@ -23,7 +23,7 @@ on:
         description: "Which targets to build"
         type: choice
         default: mac
-        options: [mac, apple, linux, android, full]
+        options: [mac, apple, linux, android, win, full]
       profile:
         description: "Build profile"
         type: choice
@@ -72,6 +72,7 @@ jobs:
             apple)   inc="$mac_arm,$mac_x64,$ios_dev,$ios_sim" ;;
             linux)   inc="$linux_x64,$linux_arm" ;;
             android) inc="$android" ;;
+            win)     inc="$win" ;;
             full)    inc="$mac_arm,$mac_x64,$ios_dev,$ios_sim,$linux_x64,$linux_arm,$android,$win" ;;
             *)       inc="$mac_arm" ;;
           esac
@@ -119,13 +120,25 @@ jobs:
           xcodebuild -version
           echo "SDK: $(xcrun --sdk macosx --show-sdk-version) at $(xcrun --show-sdk-path)"
 
+      # POSIX targets: bash build.sh + package.sh.
       - name: Build libwebrtc
+        if: matrix.os != 'win'
         run: ./webrtc-build/build.sh ${{ matrix.os }} ${{ matrix.arch }} "$PROFILE"
 
       - name: Package + SBOM
+        if: matrix.os != 'win'
         run: |
           command -v zstd >/dev/null || (sudo apt-get update && sudo apt-get install -y zstd) || brew install zstd || true
           ./webrtc-build/package.sh ${{ matrix.os }} ${{ matrix.arch }} "$PROFILE"
+
+      # Windows: depot_tools is a native toolchain (Git Bash breaks its CIPD
+      # bootstrap), so build + package run in PowerShell via build.ps1.
+      - name: Build + package libwebrtc (Windows)
+        if: matrix.os == 'win'
+        shell: pwsh
+        run: |
+          choco install zstd -y --no-progress | Out-Null
+          ./webrtc-build/build.ps1 -Arch ${{ matrix.arch }} -Profile $env:PROFILE
 
       # Run the lib-linked FFI/integration tests where the target runs natively
       # AND the glue links cleanly today. linux uses the bundled libc++, so its
