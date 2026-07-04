@@ -94,7 +94,15 @@ gn_args() {
       # Bundled libc++: it ships the libunwind that Chromium's link flags
       # (--unwindlib=none) otherwise leave out, so the NDK link resolves
       # _Unwind_* (undefined with use_custom_libcxx=false).
-      args+=("symbol_level=1" "rtc_use_h264=false" "use_custom_libcxx=true")
+      # android_static_analysis=off: the default "build_server" needs autoninja
+      # (AUTONINJA_BUILD_ID) for the Java validate-deps step; we build with plain
+      # ninja and don't need Java lint/errorprone.
+      args+=(
+        "symbol_level=1"
+        "rtc_use_h264=false"
+        "use_custom_libcxx=true"
+        "android_static_analysis=\"off\""
+      )
       ;;
     linux)
       # Always use WebRTC's *bundled* clang + bundled libc++:
