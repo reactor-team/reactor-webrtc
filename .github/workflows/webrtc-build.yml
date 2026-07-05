@@ -138,6 +138,8 @@ jobs:
         shell: pwsh
         run: |
           choco install zstd -y --no-progress | Out-Null
+          git config --global user.email "ci@reactor.inc"
+          git config --global user.name  "reactor ci"
           ./webrtc-build/build.ps1 -Arch ${{ matrix.arch }} -Profile $env:PROFILE
 
       # Run the lib-linked FFI/integration tests where the target runs natively

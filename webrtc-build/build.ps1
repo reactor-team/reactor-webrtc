@@ -61,11 +61,11 @@ if (-not (Test-Path $DEPOT)) {
 $env:PATH = "$DEPOT;$env:PATH"
 $env:DEPOT_TOOLS_WIN_TOOLCHAIN = '0'   # use the runner's installed Visual Studio
 $env:DEPOT_TOOLS_UPDATE = '1'
-$env:GYP_GENERATORS = 'ninja'
-$env:vpython_BYPASS = 'manually managed python not supported by chrome operations'
+# NB: do NOT set vpython_BYPASS — depot_tools must use its *managed* Python,
+# which vendors httplib2 etc.; bypassing it to system Python breaks gclient.
 
-# Prime depot_tools (fetches cipd client, python, etc.) so the first real
-# command doesn't race the bootstrap.
+# Prime depot_tools: this first run bootstraps its bundled Python/cipd client,
+# so the real fetch/sync don't race the bootstrap.
 Run 'gclient.bat' @('--version')
 
 # ── 2. fetch + sync at the pinned ref ────────────────────────────────────────
