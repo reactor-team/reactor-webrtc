@@ -97,7 +97,18 @@ try {
   & git reset --hard $RESOLVED | Out-Null
   Get-ChildItem (Join-Path $HERE 'patches\*.patch') -ErrorAction SilentlyContinue | Sort-Object Name | ForEach-Object {
     Write-Host "==> applying patch $($_.Name)"
-    & git apply --3way $_.FullName
+    # WebRTC's .gitattributes can force CRLF in the Windows working tree (which
+    # overrides core.autocrlf), so our LF patch context won't match. Normalize
+    # the files this patch touches to LF, then apply to the working tree.
+    $patchFile = $_.FullName
+    Select-String -Path $patchFile -Pattern '^\+\+\+ b/(.+)$' | ForEach-Object {
+      $rel = $_.Matches[0].Groups[1].Value.Trim()
+      $abs = Join-Path $CHECKOUT $rel
+      if (Test-Path $abs) {
+        [IO.File]::WriteAllText($abs, ([IO.File]::ReadAllText($abs) -replace "`r`n", "`n"))
+      }
+    }
+    & git apply --ignore-whitespace --whitespace=nowarn $patchFile
     if ($LASTEXITCODE -ne 0) { throw "patch $($_.Name) failed" }
   }
 
