@@ -140,6 +140,9 @@ jobs:
           choco install zstd -y --no-progress | Out-Null
           git config --global user.email "ci@reactor.inc"
           git config --global user.name  "reactor ci"
+          # Git for Windows defaults to autocrlf=true → the checkout gets CRLF and
+          # our LF patch series won't apply. Force LF for the webrtc checkout.
+          git config --global core.autocrlf false
           ./webrtc-build/build.ps1 -Arch ${{ matrix.arch }} -Profile $env:PROFILE
 
       # Run the lib-linked FFI/integration tests where the target runs natively
