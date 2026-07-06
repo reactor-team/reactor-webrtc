@@ -113,28 +113,33 @@ try {
   }
 
   # ── 4. gn gen ──────────────────────────────────────────────────────────────
-  $gnArgs = @(
-    "is_debug=$([string]($Profile -eq 'debug').ToString().ToLower())"
-    'is_component_build=false'
-    'rtc_include_tests=false'
-    'rtc_build_examples=false'
-    'rtc_build_tools=false'
-    'rtc_enable_protobuf=true'
-    'treat_warnings_as_errors=false'
-    'use_rtti=true'
-    'rtc_libvpx_build_vp9=true'
-    'target_os="win"'
-    "target_cpu=`"$CPU`""
-    'is_clang=true'
-    # MSVC STL is the platform C++ lib on Windows; match it so the lib interops
-    # with a consumer's cc-built glue (which uses MSVC).
-    'use_custom_libcxx=false'
-    'symbol_level=1'
-  )
-  $argStr = $gnArgs -join ' '
+  # Write args.gn directly (proper gn syntax) instead of passing --args through
+  # cmd — embedded quotes in --args="target_os=\"win\"" get mangled by nested
+  # cmd/PowerShell quoting. `gn gen <out>` then reads this file.
+  $isDebug = if ($Profile -eq 'debug') { 'true' } else { 'false' }
+  $argsGn = @"
+is_debug = $isDebug
+is_component_build = false
+rtc_include_tests = false
+rtc_build_examples = false
+rtc_build_tools = false
+rtc_enable_protobuf = true
+treat_warnings_as_errors = false
+use_rtti = true
+rtc_libvpx_build_vp9 = true
+target_os = "win"
+target_cpu = "$CPU"
+is_clang = true
+# MSVC STL is the platform C++ lib on Windows; match it so the lib interops
+# with a consumer's cc-built glue (which uses MSVC).
+use_custom_libcxx = false
+symbol_level = 1
+"@
+  New-Item -ItemType Directory -Force -Path $OUT | Out-Null
+  Set-Content -Path (Join-Path $OUT 'args.gn') -Value $argsGn -Encoding ascii
   Write-Host "==> gn gen $OUT"
-  Write-Host "    args: $argStr"
-  Run 'gn.bat' @('gen', "`"$OUT`"", "--args=`"$argStr`"")
+  Write-Host $argsGn
+  Run 'gn.bat' @('gen', "`"$OUT`"")
 
   # ── 5. build the monolithic static lib ───────────────────────────────────────
   $ninjaTarget = if ($env:NINJA_TARGET) { $env:NINJA_TARGET } else { 'webrtc' }
