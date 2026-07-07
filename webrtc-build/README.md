@@ -88,32 +88,44 @@ factories — VP8/VP9/AV1; H.264 is off via `rtc_use_h264=false`). Notes:
 
 ## Target matrix
 
-`linux x64/arm64` · `macos arm64/x64` · `ios device+sim` ·
-`android arm64/armv7/x86_64` · `windows x64` · `visionos device+sim`
-(as the toolchain allows).
+Green today: `macos arm64/x64` · `ios device+sim` · `linux x64/arm64` ·
+`android arm64` · `windows x64`. (`visionos` has no upstream gn `target_os`;
+more android ABIs are a matrix add.)
 
 **CI split**: the fast public checks (fmt / check / clippy, dev-mode) run on
 GitHub Actions (`.github/workflows/ci.yml`). The heavy per-target libwebrtc
-builds + lib-linked tests also run on **GitHub Actions**
-(`.github/workflows/webrtc-build.yml`): a `targets`-driven matrix over
-`macos-14` (mac + iOS device/sim), `ubuntu-latest` (linux x64 + android),
-`ubuntu-24.04-arm` (linux arm64, native) and `windows-latest`. The ~30GB+
-checkout fits after the workflow's disk-cleanup step (and via larger/self-hosted
-runners where needed). `workflow_dispatch` with `publish=true` cuts a Release.
+builds also run on **GitHub Actions** (`.github/workflows/webrtc-build.yml`): a
+`targets`-driven matrix over `macos-15` (mac + iOS device/sim; Xcode 16),
+`ubuntu-latest` (linux x64 + android + linux/arm64 cross) and `windows-latest`.
+The ~30GB+ checkout fits after the workflow's disk-cleanup step. Windows uses a
+dedicated PowerShell path (`build.ps1`) — depot_tools' CIPD bootstrap breaks
+under Git Bash. `workflow_dispatch` with `publish=true` cuts a Release.
+
+Per-target toolchain notes (why each differs) live at the top of `build.sh`
+(POSIX) and `build.ps1` (Windows).
 
 ## Status
 
 - ✅ `gn args` + `build.sh` (fetch→patch→gn→ninja→assemble) and `package.sh`
   (headers + archive + checksum + manifest) implemented.
-- ✅ CI: fast checks + heavy per-target builds + lib-linked tests on GitHub
-  Actions (`.github/workflows/ci.yml`, `.github/workflows/webrtc-build.yml`).
-- ✅ First green macOS arm64 build (`branch-heads/7907`, commit locked in
-  `WEBRTC_VERSION`); 100 MB `libwebrtc.a`, 62 MB packaged archive.
-- ✅ Real-link proof: `reactor-webrtc-sys` glue links + runs against the lib
-  (see "Verify the build actually links" above).
-- ⏳ TODO: implement the prebuilt download+checksum (`build.rs` mode 2); publish
-  via GitHub Releases (`publish.sh`, wired into the workflow's publish job); the
-  patch series (namespace, ADM, Android Java); SBOM.
+- ✅ CI: fast checks + heavy per-target builds on GitHub Actions
+  (`.github/workflows/ci.yml`, `.github/workflows/webrtc-build.yml`). All matrix
+  targets build + package + upload green (`branch-heads/7907`, commit locked in
+  `WEBRTC_VERSION`).
+- ✅ Real-link proof: `reactor-webrtc-sys` glue links + runs against the lib on
+  macOS arm64 (the workflow's native lib-link test).
+- ⏳ TODO: prebuilt download+checksum (`build.rs` mode 2); publish via GitHub
+  Releases (`publish.sh`, wired into the workflow's publish job); patch series
+  (namespace, ADM, Android Java).
+- ⏳ Follow-ups from the build bring-up:
+  - **Linux/Android/Windows lib-link test** — those libs use the bundled libc++
+    (linux/android) / MSVC STL (windows); the native lib-link test runs on macOS
+    arm64 only for now. To test linux, the sys crate's glue must be compiled with
+    libc++ and the link's system-lib list completed.
+  - **SBOM on Windows** — `sbom.sh` is bash+python (POSIX targets only); port to
+    PowerShell/python for `build.ps1`.
+  - **linux/arm64 is cross-built** (no linux-arm64 bundled clang); consuming its
+    prebuilt needs the libc++ glue work above.
 
 > Upstream WebRTC build docs (and LiveKit's open build scripts as *reference
 > only*, not a dependency) inform this recipe.
