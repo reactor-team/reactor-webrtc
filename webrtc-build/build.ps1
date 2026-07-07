@@ -170,10 +170,15 @@ if ($LASTEXITCODE -ge 8) { throw "robocopy failed ($LASTEXITCODE)" }
 $global:LASTEXITCODE = 0
 
 $archive = Join-Path $DIST "$NAME.tar.zst"
+$tarPath = Join-Path $DIST "$NAME.tar"
 Write-Host "==> archiving $archive"
-# Windows 10+ ships bsdtar as `tar`; zstd.exe is installed by the CI step.
-& tar --use-compress-program "zstd -19" -cf $archive -C $STAGE lib include
+# Windows 10+ ships bsdtar as `tar`; zstd.exe comes from the CI choco step.
+# Tar and compress in two steps — bsdtar's --use-compress-program pipes to an
+# external zstd, which deadlocks on Windows (this hung ~4.5h until job timeout).
+& tar -cf $tarPath -C $STAGE lib include
 if ($LASTEXITCODE -ne 0) { throw "tar failed ($LASTEXITCODE)" }
+& zstd -19 -T0 -f -q --rm $tarPath -o $archive
+if ($LASTEXITCODE -ne 0) { throw "zstd failed ($LASTEXITCODE)" }
 
 $sha = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLower()
 "$sha  $NAME.tar.zst" | Out-File -Encoding ascii "$archive.sha256"
