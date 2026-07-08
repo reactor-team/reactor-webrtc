@@ -16,6 +16,10 @@ on:
         default: prebuilt-linux-x64
         options: [prebuilt-linux-x64, prebuilt-linux-arm64]
 
+permissions:
+  contents: read
+  actions: read   # gh run download from another run's artifacts
+
 jobs:
   test:
     runs-on: ubuntu-latest
