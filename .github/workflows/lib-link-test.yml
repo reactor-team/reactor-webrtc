@@ -1,0 +1,42 @@
+# Fast lib-link test: download a prebuilt libwebrtc artifact from a webrtc-build
+# run and compile + link + run the reactor-webrtc lib-link test against it —
+# WITHOUT rebuilding libwebrtc (~minutes, vs ~1h for a full build). Used to
+# iterate the sys crate's glue/link config (esp. the linux bundled-libc++ path).
+name: lib-link-test
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "webrtc-build run id that produced the prebuilt artifact"
+        required: true
+      artifact:
+        description: "artifact name to test"
+        type: choice
+        default: prebuilt-linux-x64
+        options: [prebuilt-linux-x64, prebuilt-linux-arm64]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deps (clang for the libc++ glue)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang zstd
+      - name: Fetch + extract prebuilt
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh run download "${{ inputs.run_id }}" -R "${{ github.repository }}" \
+            -n "${{ inputs.artifact }}" -D dl
+          mkdir -p prebuilt
+          zstd -dc dl/*.tar.zst | tar -x -C prebuilt
+          echo "extracted: $(ls prebuilt) ; lib: $(ls prebuilt/lib)"
+          test -d prebuilt/include/third_party/libc++/src/include \
+            && echo "bundled libc++ headers: present" \
+            || echo "bundled libc++ headers: MISSING (rebuild prebuilt with updated package.sh)"
+      - name: cargo test (lib-linked)
+        run: |
+          export REACTOR_WEBRTC_LIB_DIR="$PWD/prebuilt"
+          cargo test -p reactor-webrtc --verbose

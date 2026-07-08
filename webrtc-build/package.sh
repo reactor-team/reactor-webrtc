@@ -40,6 +40,38 @@ rsync -am \
   --exclude='out/**' --exclude='.git/**' --exclude='test/**' \
   "$SRC/" "$STAGE/include/"
 
+# ── Bundled libc++ headers (linux/android) ────────────────────────────────────
+# Those targets link WebRTC's bundled libc++, whose ABI namespace is __Cr (not
+# the platform libc++'s __1). A consumer's C++ glue must therefore compile
+# against THESE headers, so ship them in full (they are extensionless — <vector>,
+# __config — and skipped by the *.h filter above) plus the generated
+# __config_site that pins the ABI namespace.
+case "$OS" in
+  linux|android)
+    echo "==> staging bundled libc++ headers (ABI namespace __Cr)"
+    for d in \
+      third_party/libc++/src/include \
+      third_party/libc++abi/src/include \
+      buildtools/third_party/libc++ \
+      buildtools/third_party/libc++abi; do
+      if [ -d "$SRC/$d" ]; then
+        mkdir -p "$STAGE/include/$d"
+        rsync -am --exclude='test/**' "$SRC/$d/" "$STAGE/include/$d/"
+      fi
+    done
+    # __config_site is generated (into buildtools/… or the out dir); libc++'s
+    # <__config> includes it, so it must sit on the include path.
+    CS="$(find "$SRC/buildtools/third_party/libc++" "$OUT" -name '__config_site' 2>/dev/null | head -1)"
+    if [ -n "$CS" ]; then
+      mkdir -p "$STAGE/include/buildtools/third_party/libc++"
+      cp "$CS" "$STAGE/include/buildtools/third_party/libc++/__config_site"
+      echo "   __config_site: $CS"
+    else
+      echo "   WARNING: __config_site not found — libc++ glue ABI may mismatch" >&2
+    fi
+    ;;
+esac
+
 # ── Archive + checksum ────────────────────────────────────────────────────────
 mkdir -p "$DIST"
 ARCHIVE="$DIST/$NAME.tar.zst"

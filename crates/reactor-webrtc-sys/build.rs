@@ -127,6 +127,40 @@ fn compile_glue(include_dir: &Path) {
         }
         _ => {}
     }
+
+    // linux/android link WebRTC's *bundled* libc++, whose ABI namespace is __Cr
+    // (not the platform libc++'s __1). Compile the glue against those exact
+    // headers (shipped by package.sh) so std:: types match the archive; without
+    // this the glue's std::__1::* symbols won't resolve against libwebrtc.a's
+    // std::__Cr::*. mac/ios use the platform libc++ (clang default) and windows
+    // uses the MSVC STL — both already match their glue toolchain.
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if matches!(target_os.as_str(), "linux" | "android") {
+        let libcxx = include_dir.join("third_party/libc++/src/include");
+        let cfg_site = include_dir.join("buildtools/third_party/libc++");
+        if libcxx.is_dir() {
+            // libc++ requires clang (the default linux cc is gcc). Respect an
+            // explicit CXX (e.g. the NDK clang for android).
+            if target_os == "linux" && env::var_os("CXX").is_none() {
+                build.compiler("clang++");
+            }
+            build.flag("-nostdinc++");
+            build.flag("-isystem").flag(cfg_site.to_str().unwrap());
+            build.flag("-isystem").flag(libcxx.to_str().unwrap());
+            let libcxxabi = include_dir.join("third_party/libc++abi/src/include");
+            if libcxxabi.is_dir() {
+                build.flag("-isystem").flag(libcxxabi.to_str().unwrap());
+            }
+        } else {
+            println!(
+                "cargo:warning=reactor-webrtc-sys: bundled libc++ headers absent under {} — \
+                 glue will use the platform stdlib and likely fail to link against the \
+                 __Cr-namespaced lib. Rebuild the prebuilt with the updated package.sh.",
+                include_dir.display()
+            );
+        }
+    }
+
     build.compile("reactor_webrtc_glue");
 }
 
@@ -180,7 +214,10 @@ fn link_system_deps() {
             // -lc++_static -lc++abi -lEGL -lGLESv2 -lOpenSLES + JNI companion.
         }
         "linux" => {
-            println!("cargo:rustc-link-lib=dylib=stdc++");
+            // libwebrtc bundles libc++/libc++abi (ABI namespace __Cr) via
+            // complete_static_lib and the glue is compiled against those headers,
+            // so do NOT link the system stdc++/c++. The unwinder comes from the
+            // toolchain driver (libgcc_s).
             for l in ["dl", "pthread", "m"] {
                 println!("cargo:rustc-link-lib=dylib={l}");
             }
