@@ -25,8 +25,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Deps (clang for the libc++ glue)
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang zstd
+      - name: Deps (recent clang for the bundled libc++ glue)
+        run: |
+          set -euo pipefail
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends zstd wget lsb-release software-properties-common gnupg
+          # The bundled libc++ headers (Chromium's llvm-23 clang) use builtins
+          # (__builtin_popcountg, __is_convertible, …) absent from stock clang-18,
+          # so install the newest clang from apt.llvm.org and use it for the glue.
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh 21 || sudo /tmp/llvm.sh 20 || sudo /tmp/llvm.sh
+          ver=21; command -v clang++-21 >/dev/null || ver=20; command -v clang++-$ver >/dev/null || ver=$(ls /usr/bin/clang++-* | grep -oE '[0-9]+' | sort -n | tail -1)
+          echo "CXX=clang++-$ver" >> "$GITHUB_ENV"
+          echo "CC=clang-$ver" >> "$GITHUB_ENV"
+          clang++-$ver --version | head -1
       - name: Fetch + extract prebuilt
         env:
           GH_TOKEN: ${{ github.token }}

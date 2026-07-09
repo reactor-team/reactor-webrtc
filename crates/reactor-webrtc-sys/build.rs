@@ -145,6 +145,9 @@ fn compile_glue(include_dir: &Path) {
                 build.compiler("clang++");
             }
             build.flag("-nostdinc++");
+            // WebRTC sets the hardening mode via -D (its __config_site leaves
+            // _LIBCPP_HARDENING_MODE_DEFAULT unset); match it or <__config> errors.
+            build.define("_LIBCPP_HARDENING_MODE", "_LIBCPP_HARDENING_MODE_NONE");
             build.flag("-isystem").flag(cfg_site.to_str().unwrap());
             build.flag("-isystem").flag(libcxx.to_str().unwrap());
             let libcxxabi = include_dir.join("third_party/libc++abi/src/include");
