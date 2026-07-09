@@ -69,6 +69,15 @@ case "$OS" in
     else
       echo "   WARNING: __config_site not found — libc++ glue ABI may mismatch" >&2
     fi
+    # The bundled libc++/libc++abi are *separate* static libs (not folded into
+    # libwebrtc.a's complete_static_lib), so libwebrtc.a only *references* the
+    # std::__Cr::* symbols. Ship the archives so the consumer can resolve them.
+    FOUND=""
+    for name in libc++.a libc++abi.a libunwind.a; do
+      f="$(find "$OUT/obj" -name "$name" 2>/dev/null | head -1)"
+      [ -n "$f" ] && { cp "$f" "$STAGE/lib/"; FOUND="$FOUND $name"; }
+    done
+    echo "   bundled libc++ static libs:${FOUND:- <none found>}"
     ;;
 esac
 

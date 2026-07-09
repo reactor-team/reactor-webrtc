@@ -76,7 +76,7 @@ fn link(root: &Path) {
     // because the linker won't revisit earlier members; +whole-archive loads
     // every member, and the final `-dead_strip` drops what the FFI doesn't use.
     println!("cargo:rustc-link-lib=static:+whole-archive=webrtc");
-    link_system_deps();
+    link_system_deps(&lib_dir);
 
     // A real lib is present: enable link-dependent tests/examples.
     println!("cargo:rustc-cfg=have_libwebrtc");
@@ -168,7 +168,7 @@ fn compile_glue(include_dir: &Path) {
 }
 
 /// Per-target system libraries/frameworks libwebrtc needs at final link.
-fn link_system_deps() {
+fn link_system_deps(lib_dir: &Path) {
     match env::var("CARGO_CFG_TARGET_OS").unwrap_or_default().as_str() {
         "macos" => {
             println!("cargo:rustc-link-lib=c++");
@@ -217,10 +217,22 @@ fn link_system_deps() {
             // -lc++_static -lc++abi -lEGL -lGLESv2 -lOpenSLES + JNI companion.
         }
         "linux" => {
-            // libwebrtc bundles libc++/libc++abi (ABI namespace __Cr) via
-            // complete_static_lib and the glue is compiled against those headers,
-            // so do NOT link the system stdc++/c++. The unwinder comes from the
-            // toolchain driver (libgcc_s).
+            // libwebrtc.a only *references* the bundled libc++ (ABI namespace
+            // __Cr); its definitions live in separate libc++.a/libc++abi.a
+            // (shipped by package.sh). Link them after webrtc so its symbols
+            // resolve, and do NOT link the system stdc++. Fall back to the system
+            // stdc++ only for an older/bare layout without the bundled archives.
+            if lib_dir.join("libc++.a").is_file() {
+                println!("cargo:rustc-link-lib=static=c++");
+                if lib_dir.join("libc++abi.a").is_file() {
+                    println!("cargo:rustc-link-lib=static=c++abi");
+                }
+                if lib_dir.join("libunwind.a").is_file() {
+                    println!("cargo:rustc-link-lib=static=unwind");
+                }
+            } else {
+                println!("cargo:rustc-link-lib=dylib=stdc++");
+            }
             for l in ["dl", "pthread", "m"] {
                 println!("cargo:rustc-link-lib=dylib={l}");
             }
