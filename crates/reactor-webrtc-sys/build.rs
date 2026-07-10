@@ -145,6 +145,9 @@ fn compile_glue(include_dir: &Path) {
                 build.compiler("clang++");
             }
             build.flag("-nostdinc++");
+            // Don't let cc auto-link the system C++ stdlib (stdc++); we link the
+            // bundled libc++.a/libc++abi.a ourselves in link_system_deps.
+            build.cpp_link_stdlib(None);
             // WebRTC sets the hardening mode via -D (its __config_site leaves
             // _LIBCPP_HARDENING_MODE_DEFAULT unset); match it or <__config> errors.
             build.define("_LIBCPP_HARDENING_MODE", "_LIBCPP_HARDENING_MODE_NONE");

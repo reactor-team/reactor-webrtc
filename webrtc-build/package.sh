@@ -72,12 +72,18 @@ case "$OS" in
     # The bundled libc++/libc++abi are *separate* static libs (not folded into
     # libwebrtc.a's complete_static_lib), so libwebrtc.a only *references* the
     # std::__Cr::* symbols. Ship the archives so the consumer can resolve them.
+    # ninja emits these as THIN archives (members are .o *paths* relative to the
+    # out dir, not embedded); a bare copy is unusable off-host. Repack fat so the
+    # shipped .a is self-contained. (libwebrtc.a is complete_static_lib = already
+    # fat, hence it worked.)
     FOUND=""
     for name in libc++.a libc++abi.a libunwind.a; do
       f="$(find "$OUT/obj" -name "$name" 2>/dev/null | head -1)"
-      [ -n "$f" ] && { cp "$f" "$STAGE/lib/"; FOUND="$FOUND $name"; }
+      [ -n "$f" ] || continue
+      ( cd "$OUT" && ar qcs "$STAGE/lib/$name" $(ar t "$f") )
+      FOUND="$FOUND $name($(du -h "$STAGE/lib/$name" | cut -f1))"
     done
-    echo "   bundled libc++ static libs:${FOUND:- <none found>}"
+    echo "   bundled libc++ static libs (repacked fat):${FOUND:- <none found>}"
     ;;
 esac
 
