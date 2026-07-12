@@ -148,6 +148,10 @@ fn compile_glue(include_dir: &Path) {
             // Don't let cc auto-link the system C++ stdlib (stdc++); we link the
             // bundled libc++.a/libc++abi.a ourselves in link_system_deps.
             build.cpp_link_stdlib(None);
+            // Match the RELEASE lib's DCHECK config: without NDEBUG the glue
+            // enables RTC_DCHECK_IS_ON and references debug-only symbols the
+            // release archive omits (e.g. SequenceCheckerImpl::ExpectationToString).
+            build.define("NDEBUG", None);
             // WebRTC sets the hardening mode via -D (its __config_site leaves
             // _LIBCPP_HARDENING_MODE_DEFAULT unset); match it or <__config> errors.
             build.define("_LIBCPP_HARDENING_MODE", "_LIBCPP_HARDENING_MODE_NONE");
@@ -236,7 +240,8 @@ fn link_system_deps(lib_dir: &Path) {
             } else {
                 println!("cargo:rustc-link-lib=dylib=stdc++");
             }
-            for l in ["dl", "pthread", "m"] {
+            // webrtc's desktop_capture references libX11 (XOpenDisplay, …).
+            for l in ["dl", "pthread", "m", "X11"] {
                 println!("cargo:rustc-link-lib=dylib={l}");
             }
         }
