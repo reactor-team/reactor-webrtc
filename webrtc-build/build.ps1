@@ -200,5 +200,10 @@ Write-Host "   sha256: $sha"
 "@ | Out-File -Encoding ascii "$DIST\$NAME.manifest.json"
 Write-Host "   manifest: $DIST\$NAME.manifest.json"
 
-# NOTE: SBOM (sbom.sh) is a bash+python generator run on the POSIX targets;
-# Windows packaging skips it for now (follow-up: port to PowerShell/python).
+# SBOM (CycloneDX) via the cross-platform sbom.py (shared with sbom.sh).
+$objDir = Join-Path $OUT "obj\third_party"
+try {
+  & python "$HERE\sbom.py" --src $CHECKOUT --obj-dir $objDir `
+    --out "$DIST\$NAME.sbom.json" --name $NAME `
+    --milestone $MILESTONE --commit $RESOLVED
+} catch { Write-Host "SBOM step skipped: $_" }
