@@ -19,20 +19,13 @@ fn synthetic_adm() {
     smoke(AdmMode::Synthetic);
 }
 
+// The platform ADM opens the OS audio stack; WebRTC's adm_helpers.cc RTC_CHECKs
+// that adm->Init() succeeds and *aborts* (SIGABRT) if it can't — which it can't
+// on a headless host (no audio device). That abort is uncatchable from Rust, so
+// this is #[ignore]d by default; run `cargo test -- --ignored` on a machine with
+// audio. The synthetic path (above) already covers the factory/pc/dc wiring.
 #[test]
+#[ignore = "platform ADM aborts without an OS audio device; run with --ignored where audio exists"]
 fn platform_adm() {
-    // The platform ADM opens the OS audio stack; a headless CI host has no audio
-    // device, so factory creation fails there. Treat that as skipped — the
-    // synthetic path already covers the factory/peer-connection/data-channel
-    // wiring; where audio exists (dev machines) this exercises the real ADM.
-    match PeerConnectionFactory::with_adm(AdmMode::Platform) {
-        Ok(factory) => {
-            let pc = factory
-                .create_peer_connection(&RtcConfiguration::default(), PeerConnectionObserver::new())
-                .expect("peer connection");
-            let _dc = pc.create_data_channel("probe").expect("data channel");
-            println!("AdmMode::Platform → factory + peer connection OK");
-        }
-        Err(e) => eprintln!("platform_adm skipped (no audio device? {e})"),
-    }
+    smoke(AdmMode::Platform);
 }
