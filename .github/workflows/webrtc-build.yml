@@ -145,12 +145,24 @@ jobs:
           git config --global core.autocrlf false
           ./webrtc-build/build.ps1 -Arch ${{ matrix.arch }} -Profile $env:PROFILE
 
-      # Run the lib-linked FFI/integration tests where the target runs natively
-      # AND the glue links cleanly today. linux uses the bundled libc++, so its
-      # glue must be compiled with libc++ before the linux lib-link test can run
-      # (follow-up); arm64 is cross-built. So: macOS arm64 only for now.
+      # linux glue compiles against the bundled libc++ (ABI namespace __Cr) whose
+      # headers need a recent clang (stock clang-18 is too old); install it + the
+      # X11 dev lib webrtc's desktop_capture links.
+      - name: Test deps (linux)
+        if: matrix.os == 'linux' && matrix.arch == 'x64'
+        run: |
+          set -euo pipefail
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends wget lsb-release software-properties-common gnupg libx11-dev
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh && chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh 21 || sudo /tmp/llvm.sh 20 || sudo /tmp/llvm.sh
+          ver=21; command -v clang++-21 >/dev/null || ver=20; command -v clang++-$ver >/dev/null || ver=$(ls /usr/bin/clang++-* | grep -oE '[0-9]+' | sort -n | tail -1)
+          echo "CXX=clang++-$ver" >> "$GITHUB_ENV"; echo "CC=clang-$ver" >> "$GITHUB_ENV"
+
+      # Run the lib-linked FFI/integration tests where the target runs natively:
+      # macOS arm64 and linux x64. (iOS/android/windows are cross or non-native;
+      # linux/arm64 is cross-built on x86_64.)
       - name: Test (native targets)
-        if: matrix.os == 'mac' && matrix.arch == 'arm64'
+        if: (matrix.os == 'mac' && matrix.arch == 'arm64') || (matrix.os == 'linux' && matrix.arch == 'x64')
         run: |
           SLUG="${{ matrix.os }}-${{ matrix.arch }}-${PROFILE}"
           export REACTOR_WEBRTC_LIB_DIR="$PWD/webrtc-build/out/$SLUG/dist"

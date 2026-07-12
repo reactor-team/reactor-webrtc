@@ -113,19 +113,24 @@ Per-target toolchain notes (why each differs) live at the top of `build.sh`
   targets build + package + upload green (`branch-heads/7907`, commit locked in
   `WEBRTC_VERSION`).
 - ✅ Real-link proof: `reactor-webrtc-sys` glue links + runs against the lib on
-  macOS arm64 (the workflow's native lib-link test).
+  **macOS arm64 and linux x64** (the workflow's native lib-link test; the
+  `lib-link-test.yml` workflow iterates it against a prebuilt without rebuilding).
+- ✅ **linux libc++ glue interop**: the linux/android libs use WebRTC's bundled
+  libc++ (ABI namespace **`__Cr`**), so `package.sh` ships the bundled libc++/
+  libc++abi headers + `__config_site` + the (repacked-fat) `libc++.a`/`libc++abi.a`,
+  and the sys crate compiles the glue against them. **Consumer requirements on
+  linux**: a recent **clang (≥ 21)** — the bundled libc++ headers use builtins
+  absent from older clang — plus `libX11` (webrtc desktop_capture) at link.
 - ⏳ TODO: prebuilt download+checksum (`build.rs` mode 2); publish via GitHub
   Releases (`publish.sh`, wired into the workflow's publish job); patch series
   (namespace, ADM, Android Java).
 - ⏳ Follow-ups from the build bring-up:
-  - **Linux/Android/Windows lib-link test** — those libs use the bundled libc++
-    (linux/android) / MSVC STL (windows); the native lib-link test runs on macOS
-    arm64 only for now. To test linux, the sys crate's glue must be compiled with
-    libc++ and the link's system-lib list completed.
+  - **Android/Windows lib-link test** — android uses the bundled libc++ (same as
+    linux, via the NDK clang) and windows the MSVC STL; neither is run in CI yet.
   - **SBOM on Windows** — `sbom.sh` is bash+python (POSIX targets only); port to
     PowerShell/python for `build.ps1`.
-  - **linux/arm64 is cross-built** (no linux-arm64 bundled clang); consuming its
-    prebuilt needs the libc++ glue work above.
+  - **linux/arm64 is cross-built** (no linux-arm64 bundled clang), so it isn't
+    lib-link tested in CI; its glue interop mirrors linux x64.
 
 > Upstream WebRTC build docs (and LiveKit's open build scripts as *reference
 > only*, not a dependency) inform this recipe.
