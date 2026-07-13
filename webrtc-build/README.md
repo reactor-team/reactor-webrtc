@@ -118,9 +118,10 @@ Per-target toolchain notes (why each differs) live at the top of `build.sh`
 - ✅ **linux libc++ glue interop**: the linux/android libs use WebRTC's bundled
   libc++ (ABI namespace **`__Cr`**), so `package.sh` ships the bundled libc++/
   libc++abi headers + `__config_site` + the (repacked-fat) `libc++.a`/`libc++abi.a`,
-  and the sys crate compiles the glue against them. **Consumer requirements on
+  and the sys crate compiles the glue against them. **Consumer requirement on
   linux**: a recent **clang (≥ 21)** — the bundled libc++ headers use builtins
-  absent from older clang — plus `libX11` (webrtc desktop_capture) at link.
+  absent from older clang. (Desktop capture is disabled — `rtc_use_x11=false`,
+  `rtc_use_pipewire=false` — so there's no libX11/PipeWire link dependency.)
 - ⏳ TODO: prebuilt download+checksum (`build.rs` mode 2); publish via GitHub
   Releases (`publish.sh`, wired into the workflow's publish job); patch series
   (namespace, ADM, Android Java).

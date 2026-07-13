@@ -146,13 +146,12 @@ jobs:
           ./webrtc-build/build.ps1 -Arch ${{ matrix.arch }} -Profile $env:PROFILE
 
       # linux glue compiles against the bundled libc++ (ABI namespace __Cr) whose
-      # headers need a recent clang (stock clang-18 is too old); install it + the
-      # X11 dev lib webrtc's desktop_capture links.
+      # headers need a recent clang (stock clang-18 is too old); install it.
       - name: Test deps (linux)
         if: matrix.os == 'linux' && matrix.arch == 'x64'
         run: |
           set -euo pipefail
-          sudo apt-get update && sudo apt-get install -y --no-install-recommends wget lsb-release software-properties-common gnupg libx11-dev
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends wget lsb-release software-properties-common gnupg
           wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh && chmod +x /tmp/llvm.sh
           sudo /tmp/llvm.sh 21 || sudo /tmp/llvm.sh 20 || sudo /tmp/llvm.sh
           ver=21; command -v clang++-21 >/dev/null || ver=20; command -v clang++-$ver >/dev/null || ver=$(ls /usr/bin/clang++-* | grep -oE '[0-9]+' | sort -n | tail -1)

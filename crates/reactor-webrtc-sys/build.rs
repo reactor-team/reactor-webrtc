@@ -240,8 +240,9 @@ fn link_system_deps(lib_dir: &Path) {
             } else {
                 println!("cargo:rustc-link-lib=dylib=stdc++");
             }
-            // webrtc's desktop_capture references libX11 (XOpenDisplay, …).
-            for l in ["dl", "pthread", "m", "X11"] {
+            // Desktop capture (and its libX11 dep) is disabled in the build
+            // (rtc_use_x11=false), so only the base system libs are needed.
+            for l in ["dl", "pthread", "m"] {
                 println!("cargo:rustc-link-lib=dylib={l}");
             }
         }

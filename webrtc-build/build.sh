@@ -115,7 +115,10 @@ gn_args() {
       # hosts only, so arm64 is cross-compiled from x86_64 (see the sysroot fetch
       # above + the CI runner mapping). NOTE: linking a consumer's glue against
       # this lib requires compiling that glue with libc++ too (follow-up).
+      # No screen/desktop capture in a calling SDK: disable both linux backends
+      # (X11 + PipeWire) so the lib carries no libX11 dependency.
       args+=(
+        "rtc_use_x11=false"
         "rtc_use_pipewire=false"
         "is_clang=true"
         "use_sysroot=true"

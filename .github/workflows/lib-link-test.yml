@@ -28,7 +28,7 @@ jobs:
       - name: Deps (recent clang for the bundled libc++ glue)
         run: |
           set -euo pipefail
-          sudo apt-get update && sudo apt-get install -y --no-install-recommends zstd wget lsb-release software-properties-common gnupg libx11-dev
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends zstd wget lsb-release software-properties-common gnupg
           # The bundled libc++ headers (Chromium's llvm-23 clang) use builtins
           # (__builtin_popcountg, __is_convertible, …) absent from stock clang-18,
           # so install the newest clang from apt.llvm.org and use it for the glue.
