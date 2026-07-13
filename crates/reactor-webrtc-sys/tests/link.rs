@@ -216,10 +216,12 @@ fn links_and_runs_libwebrtc() {
 }
 
 #[test]
+#[ignore = "platform ADM aborts (RTC_CHECK) without an OS audio device; run with --ignored where audio exists"]
 fn platform_adm_factory_lifecycle() {
-    // SAFETY: the platform-ADM path lets the media engine create the real
-    // device ADM (CoreAudio on macOS). We only construct/destroy here — no
-    // capture starts, so no microphone is opened.
+    // The platform-ADM path lets the media engine create the real device ADM
+    // (CoreAudio/ALSA). WebRTC's adm_helpers.cc RTC_CHECKs adm->Init() and
+    // aborts (uncatchable SIGABRT) when there's no audio device — as on headless
+    // CI — so this is #[ignore]d there. Construct/destroy only; no capture.
     unsafe {
         let factory = reactor_webrtc_factory_create_with_adm(1);
         assert!(!factory.is_null(), "platform-ADM factory creation failed");

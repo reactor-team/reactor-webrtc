@@ -55,4 +55,4 @@ jobs:
       - name: cargo test (lib-linked)
         run: |
           export REACTOR_WEBRTC_LIB_DIR="$PWD/prebuilt"
-          cargo test -p reactor-webrtc --verbose
+          cargo test --workspace --verbose
