@@ -1023,6 +1023,10 @@ typedef void (*reactor_webrtc_userdata_free)(void* userdata);
 //
 // Raw I420 frame delivered to Rust for encoding. Planes are valid only for
 // the duration of the Encode() call — copy if encoding is asynchronous.
+//
+// `codec` mirrors webrtc::VideoCodecType: VP8=1, VP9=2, AV1=3, H264=4, H265=5.
+// It tells the callback which codec was negotiated for this session so the
+// application can produce the right bitstream.
 extern "C" {
 struct ReactorRawVideoFrame {
   const uint8_t* y;
@@ -1034,9 +1038,10 @@ struct ReactorRawVideoFrame {
   uint32_t       width;
   uint32_t       height;
   uint32_t       rtp_timestamp;
-  int            request_key_frame; // 1 = IDR requested by the media engine
+  int            request_key_frame; // 1 = IDR/keyframe requested
+  uint32_t       codec;             // VideoCodecType value (VP8=1 … H265=5)
 };
-// Filled by the Rust callback to deliver an encoded H.264 frame back.
+// Filled by the Rust callback to deliver an encoded frame back.
 // Set data=nullptr (or return non-zero) to drop the frame (nothing is sent).
 // `free_data` is called after the encoded bytes are copied; allows the caller
 // to free the buffer. May be null if the buffer has static/frame lifetime.
@@ -1071,9 +1076,10 @@ struct ReactorEncoderState {
 
 class ReactorVideoEncoder : public webrtc::VideoEncoder {
   std::shared_ptr<ReactorEncoderState> state_;
-  webrtc::EncodedImageCallback*        callback_ = nullptr;
-  uint32_t                             width_    = 0;
-  uint32_t                             height_   = 0;
+  webrtc::EncodedImageCallback*        callback_   = nullptr;
+  uint32_t                             width_      = 0;
+  uint32_t                             height_     = 0;
+  webrtc::VideoCodecType               codec_type_ = webrtc::kVideoCodecGeneric;
 
  public:
   explicit ReactorVideoEncoder(std::shared_ptr<ReactorEncoderState> state)
@@ -1082,8 +1088,9 @@ class ReactorVideoEncoder : public webrtc::VideoEncoder {
   int InitEncode(const webrtc::VideoCodec* settings,
                  const Settings&) override {
     if (settings) {
-      width_  = static_cast<uint32_t>(settings->width);
-      height_ = static_cast<uint32_t>(settings->height);
+      width_      = static_cast<uint32_t>(settings->width);
+      height_     = static_cast<uint32_t>(settings->height);
+      codec_type_ = settings->codecType;
     }
     return WEBRTC_VIDEO_CODEC_OK;
   }
@@ -1100,7 +1107,7 @@ class ReactorVideoEncoder : public webrtc::VideoEncoder {
   }
 
   int32_t Encode(
-      const webrtc::VideoFrame&                        frame,
+      const webrtc::VideoFrame&                  frame,
       const std::vector<webrtc::VideoFrameType>* frame_types) override {
     // Convert to I420 (handles any input format including NV12).
     webrtc::scoped_refptr<webrtc::I420BufferInterface> i420 =
@@ -1123,6 +1130,7 @@ class ReactorVideoEncoder : public webrtc::VideoEncoder {
     raw.height            = static_cast<uint32_t>(i420->height());
     raw.rtp_timestamp     = frame.rtp_timestamp();
     raw.request_key_frame = want_key ? 1 : 0;
+    raw.codec             = static_cast<uint32_t>(codec_type_);
 
     ReactorEncodedVideoOutput out{};
     int drop = state_->cb(state_->userdata, &raw, &out);
@@ -1138,13 +1146,36 @@ class ReactorVideoEncoder : public webrtc::VideoEncoder {
     img._encodedHeight = out.height ? out.height : raw.height;
     img.SetRtpTimestamp(out.rtp_timestamp ? out.rtp_timestamp : raw.rtp_timestamp);
 
+    // Build codec-specific metadata that the RTP packetizer needs.
     webrtc::CodecSpecificInfo info;
-    info.codecType = webrtc::kVideoCodecH264;
-    info.codecSpecific.H264.packetization_mode =
-        webrtc::H264PacketizationMode::NonInterleaved;
-    info.codecSpecific.H264.temporal_idx  = webrtc::kNoTemporalIdx;
-    info.codecSpecific.H264.idr_frame     = (out.is_key_frame != 0);
-    info.codecSpecific.H264.base_layer_sync = false;
+    info.codecType = codec_type_;
+    switch (codec_type_) {
+      case webrtc::kVideoCodecH264:
+        info.codecSpecific.H264.packetization_mode =
+            webrtc::H264PacketizationMode::NonInterleaved;
+        info.codecSpecific.H264.temporal_idx  = webrtc::kNoTemporalIdx;
+        info.codecSpecific.H264.idr_frame     = (out.is_key_frame != 0);
+        info.codecSpecific.H264.base_layer_sync = false;
+        break;
+      case webrtc::kVideoCodecVP8:
+        // keyIdx<0 means "don't include in RTP header"; temporalIdx=0 = base layer.
+        info.codecSpecific.VP8.keyIdx      = -1;
+        info.codecSpecific.VP8.temporalIdx = webrtc::kNoTemporalIdx;
+        info.codecSpecific.VP8.layerSync   = false;
+        info.codecSpecific.VP8.nonReference = false;
+        break;
+      case webrtc::kVideoCodecVP9:
+        info.codecSpecific.VP9.inter_pic_predicted   = !out.is_key_frame;
+        info.codecSpecific.VP9.first_frame_in_picture = true;
+        info.codecSpecific.VP9.num_spatial_layers     = 1;
+        info.codecSpecific.VP9.temporal_idx           = webrtc::kNoTemporalIdx;
+        info.codecSpecific.VP9.temporal_up_switch     = false;
+        info.codecSpecific.VP9.ss_data_available      = false;
+        break;
+      default:
+        // AV1, H265, Generic: codecType is sufficient; no union fields needed.
+        break;
+    }
 
     callback_->OnEncodedImage(img, &info);
     // Release the encoded buffer now that OnEncodedImage has copied it.
@@ -1170,11 +1201,15 @@ class ReactorVideoEncoderFactory : public webrtc::VideoEncoderFactory {
       : state_(std::move(s)) {}
 
   std::vector<webrtc::SdpVideoFormat> GetSupportedFormats() const override {
-    // H.264 Baseline Profile Level 3.1, packetization-mode 1 (non-interleaved).
-    return {webrtc::SdpVideoFormat(
-        "H264", {{"level-asymmetry-allowed", "1"},
-                 {"packetization-mode", "1"},
-                 {"profile-level-id", "42e01f"}})};
+    return {
+        webrtc::SdpVideoFormat::VP8(),
+        webrtc::SdpVideoFormat::VP9Profile0(),
+        webrtc::SdpVideoFormat("H264", {{"level-asymmetry-allowed", "1"},
+                                         {"packetization-mode", "1"},
+                                         {"profile-level-id", "42e01f"}}),
+        webrtc::SdpVideoFormat::AV1Profile0(),
+        webrtc::SdpVideoFormat::H265(),
+    };
   }
 
   std::unique_ptr<webrtc::VideoEncoder> Create(
@@ -1184,14 +1219,14 @@ class ReactorVideoEncoderFactory : public webrtc::VideoEncoderFactory {
   }
 };
 
-// A no-op H264 decoder: claims H264 support so that codec negotiation with
-// an H264-only sender succeeds, but discards every received frame. This build
-// of libwebrtc was compiled without WEBRTC_USE_H264, so the builtin decoder
-// factory has no H264 entry. Without this shim, a remote peer that only
-// advertises H264 (e.g. a ReactorVideoEncoderFactory sender) causes pc2 to
-// answer with m=video 0 (rejected), blocking ICE and encoder initialisation.
-class ReactorNullH264Decoder : public webrtc::VideoDecoder {
+// A no-op decoder for codecs not present in the builtin factory (H264, H265 in
+// this build which was compiled without WEBRTC_USE_H264). It claims support so
+// that SDP negotiation succeeds with peers that only advertise those codecs, but
+// discards every received frame. Right for send-only sessions or media servers.
+class ReactorNullVideoDecoder : public webrtc::VideoDecoder {
+  std::string name_;
  public:
+  explicit ReactorNullVideoDecoder(std::string name) : name_(std::move(name)) {}
   bool Configure(const Settings&) override { return true; }
   int32_t Decode(const webrtc::EncodedImage&, int64_t) override { return 0; }
   int32_t RegisterDecodeCompleteCallback(webrtc::DecodedImageCallback*) override {
@@ -1199,17 +1234,22 @@ class ReactorNullH264Decoder : public webrtc::VideoDecoder {
   }
   int32_t Release() override { return 0; }
   DecoderInfo GetDecoderInfo() const override {
-    return {"ReactorNullH264", /*is_hardware_accelerated=*/false};
+    return {name_, /*is_hardware_accelerated=*/false};
   }
 };
 
-// Wraps the builtin video decoder factory and adds H264 via the null decoder
-// above, enabling negotiation with H264-only senders.
-class ReactorH264CapableDecoderFactory : public webrtc::VideoDecoderFactory {
+// Wraps the builtin video decoder factory and adds null decoders for H264 and
+// H265, which this libwebrtc build (compiled without WEBRTC_USE_H264) does not
+// include. VP8, VP9, and AV1 are handled by the builtin factory as usual.
+class ReactorCustomDecoderFactory : public webrtc::VideoDecoderFactory {
   std::unique_ptr<webrtc::VideoDecoderFactory> builtin_;
 
+  static bool IsBuiltinCodec(const webrtc::SdpVideoFormat& f) {
+    return f.name == "VP8" || f.name == "VP9" || f.name == "AV1";
+  }
+
  public:
-  ReactorH264CapableDecoderFactory()
+  ReactorCustomDecoderFactory()
       : builtin_(webrtc::CreateBuiltinVideoDecoderFactory()) {}
 
   std::vector<webrtc::SdpVideoFormat> GetSupportedFormats() const override {
@@ -1218,16 +1258,15 @@ class ReactorH264CapableDecoderFactory : public webrtc::VideoDecoderFactory {
         "H264", {{"level-asymmetry-allowed", "1"},
                  {"packetization-mode", "1"},
                  {"profile-level-id", "42e01f"}}));
+    formats.push_back(webrtc::SdpVideoFormat::H265());
     return formats;
   }
 
   std::unique_ptr<webrtc::VideoDecoder> Create(
       const webrtc::Environment& env,
       const webrtc::SdpVideoFormat& format) override {
-    if (format.name == "H264") {
-      return std::make_unique<ReactorNullH264Decoder>();
-    }
-    return builtin_->Create(env, format);
+    if (IsBuiltinCodec(format)) return builtin_->Create(env, format);
+    return std::make_unique<ReactorNullVideoDecoder>("ReactorNull_" + format.name);
   }
 };
 
@@ -1275,7 +1314,7 @@ void* reactor_webrtc_factory_create_with_custom_video_encoder(
       webrtc::CreateBuiltinAudioEncoderFactory(),
       webrtc::CreateBuiltinAudioDecoderFactory(),
       std::make_unique<ReactorVideoEncoderFactory>(state),
-      std::make_unique<ReactorH264CapableDecoderFactory>(),
+      std::make_unique<ReactorCustomDecoderFactory>(),
       /*audio_mixer=*/nullptr, /*audio_processing=*/apm);
   if (!f->factory) return nullptr;
   return f.release();

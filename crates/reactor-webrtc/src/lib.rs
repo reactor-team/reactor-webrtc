@@ -30,7 +30,7 @@ use std::os::raw::c_int;
 pub use config::{ContinualGatheringPolicy, IceServer, IceTransportsType, RtcConfiguration};
 pub use encoded::{
     CustomVideoEncoder, EncodedFrame, EncodedVideoFrame, FrameAction, FrameDirection,
-    FrameTransform, RawVideoFrame,
+    FrameTransform, RawVideoFrame, VideoCodec,
 };
 pub use media::{AudioFrame, MediaKind, Track, VideoFrame};
 pub use observer::PeerConnectionObserver;

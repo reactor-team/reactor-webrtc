@@ -93,9 +93,12 @@ pub struct ReactorRawVideoFrame {
     pub rtp_timestamp: u32,
     /// 1 if the media engine requests a key frame (IDR), 0 otherwise.
     pub request_key_frame: c_int,
+    /// Negotiated codec — mirrors `webrtc::VideoCodecType`:
+    /// VP8=1, VP9=2, AV1=3, H264=4, H265=5.
+    pub codec: u32,
 }
 
-/// Filled by the custom encoder callback to deliver an encoded H.264 frame.
+/// Filled by the custom encoder callback to deliver an encoded frame.
 /// Set `data` to null (or return non-zero) to drop the frame.
 /// Layout must match `ReactorEncodedVideoOutput` in the C++ glue.
 #[repr(C)]

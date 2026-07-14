@@ -192,11 +192,39 @@ impl Drop for FrameTransform {
 
 // ── Custom video encoder ─────────────────────────────────────────────────────
 
+/// Which video codec was negotiated for the session.
+///
+/// The value mirrors `webrtc::VideoCodecType` so it round-trips through the
+/// FFI as a plain `u32`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoCodec {
+    Vp8  = 1,
+    Vp9  = 2,
+    Av1  = 3,
+    H264 = 4,
+    H265 = 5,
+}
+
+impl VideoCodec {
+    fn from_u32(v: u32) -> Option<Self> {
+        match v {
+            1 => Some(Self::Vp8),
+            2 => Some(Self::Vp9),
+            3 => Some(Self::Av1),
+            4 => Some(Self::H264),
+            5 => Some(Self::H265),
+            _ => None,
+        }
+    }
+}
+
 /// Raw I420 video frame delivered to a [`CustomVideoEncoder`] callback.
 ///
 /// Planes are slices into the native frame buffer and are **only valid for the
 /// duration of the callback**. Copy the data if your encoder is asynchronous.
 pub struct RawVideoFrame<'a> {
+    /// Which codec was negotiated — produce a matching bitstream.
+    pub codec: VideoCodec,
     /// Luma (Y) plane.
     pub y: &'a [u8],
     pub y_stride: u32,
@@ -209,7 +237,7 @@ pub struct RawVideoFrame<'a> {
     pub width: u32,
     pub height: u32,
     pub rtp_timestamp: u32,
-    /// `true` if the media engine is requesting an IDR (key frame).
+    /// `true` if the media engine is requesting a key frame (IDR / intra).
     pub request_key_frame: bool,
 }
 
@@ -248,6 +276,7 @@ extern "C" fn encode_tramp(
     let uv_len = (r.u_stride.max(0) as usize) * ((r.height as usize + 1) / 2);
 
     let frame = RawVideoFrame {
+        codec: VideoCodec::from_u32(r.codec).unwrap_or(VideoCodec::H264),
         y: if r.y.is_null() { &[] } else { unsafe { std::slice::from_raw_parts(r.y, y_len) } },
         y_stride: r.y_stride as u32,
         u: if r.u.is_null() { &[] } else { unsafe { std::slice::from_raw_parts(r.u, uv_len) } },
