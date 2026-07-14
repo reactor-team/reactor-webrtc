@@ -96,6 +96,10 @@ pub struct ReactorRawVideoFrame {
     /// Negotiated codec — mirrors `webrtc::VideoCodecType`:
     /// VP8=1, VP9=2, AV1=3, H264=4, H265=5.
     pub codec: u32,
+    /// Unique ID assigned by the factory per encoder instance (monotonically
+    /// increasing). Used to route frames to the correct per-track queue when
+    /// one factory serves multiple encoded video tracks.
+    pub encoder_id: u64,
 }
 
 /// Filled by the custom encoder callback to deliver an encoded frame.
@@ -180,6 +184,10 @@ extern "C" {
         ) -> c_int,
         userdata: *mut c_void,
         free_ud: Option<extern "C" fn(userdata: *mut c_void)>,
+        // Optional: called before creating each VideoEncoder instance.
+        // Return non-zero to use the builtin encoder for that slot; zero for custom.
+        // Pass None to always use the custom encoder (single-encoder-type factory).
+        use_builtin: Option<extern "C" fn(userdata: *mut c_void, encoder_id: u64) -> c_int>,
     ) -> *mut PeerConnectionFactory;
 
     /// Create a peer connection. `config_json` carries ICE servers / policies

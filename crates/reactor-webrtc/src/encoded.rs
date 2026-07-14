@@ -17,7 +17,7 @@
 //!
 //! The closure runs on a WebRTC thread and must not block it.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::CStr;
 use std::ffi::c_void;
 use std::os::raw::c_int;
@@ -296,29 +296,8 @@ extern "C" fn encode_tramp(
     };
 
     match result {
-        None => 1, // drop
-        Some(encoded) => {
-            // Leak the Vec into a raw allocation; C++ copies it via
-            // EncodedImageBuffer::Create(), then calls free_data (below) to
-            // release it. This avoids any lifetime issue across the FFI call.
-            let mut v = encoded.data;
-            v.shrink_to_fit();
-            let ptr = v.as_ptr();
-            let len = v.len();
-            std::mem::forget(v);
-
-            unsafe {
-                let o = &mut *out;
-                o.data          = ptr;
-                o.len           = len;
-                o.is_key_frame  = encoded.is_key_frame as c_int;
-                o.width         = encoded.width;
-                o.height        = encoded.height;
-                o.rtp_timestamp = encoded.rtp_timestamp;
-                o.free_data     = Some(free_encoded_data);
-            }
-            0 // forward
-        }
+        None => 1,
+        Some(encoded) => fill_output(encoded, out),
     }
 }
 
@@ -332,6 +311,146 @@ extern "C" fn free_encoded_data(data: *const u8, len: usize) {
 
 extern "C" fn free_encoder_state_tramp(ud: *mut c_void) {
     drop(unsafe { Box::from_raw(ud as *mut CustomEncoderState) });
+}
+
+// ── Multi-track encoder registry ─────────────────────────────────────────────
+
+/// A pending slot for one video transceiver in an [`EncoderRegistry`].
+///
+/// - `Custom` — the custom Rust encoder handles this slot; frames are read from
+///   the associated queue (push via [`EncodedVideoTrack`]).
+/// - `Builtin` — the factory delegates to libwebrtc's builtin VP8/VP9/AV1
+///   encoder; push raw BGRA frames via the returned [`Track`](crate::media::Track).
+#[derive(Clone)]
+pub(crate) enum RegistrySlot {
+    Custom(Arc<Mutex<VecDeque<EncodedVideoFrame>>>),
+    Builtin,
+}
+
+/// Routes encoder instances to per-track slots using the per-encoder-instance ID
+/// stamped by the C++ factory.
+///
+/// Slots are assigned lazily: when a given `encoder_id` appears for the first
+/// time (either in `use_builtin_for` or `pop_for`), the next pending slot is
+/// consumed and bound to that ID. The assignment order matches the order
+/// libwebrtc calls `VideoEncoderFactory::Create()` — one call per video
+/// transceiver, in negotiation order — which in turn matches the order
+/// [`add_encoded_slot`] / [`add_raw_slot`] were called on the builder.
+pub(crate) struct EncoderRegistry {
+    pending:  Mutex<VecDeque<RegistrySlot>>,
+    assigned: Mutex<HashMap<u64, RegistrySlot>>,
+}
+
+impl EncoderRegistry {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            pending:  Mutex::new(VecDeque::new()),
+            assigned: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Reserve a custom (pre-encoded) slot. Returns the queue the
+    /// [`EncodedVideoTrack`] will push frames into.
+    pub(crate) fn add_encoded_slot(&self) -> Arc<Mutex<VecDeque<EncodedVideoFrame>>> {
+        let q = Arc::new(Mutex::new(VecDeque::new()));
+        self.pending.lock().unwrap().push_back(RegistrySlot::Custom(q.clone()));
+        q
+    }
+
+    /// Reserve a builtin (raw BGRA) slot. The C++ factory will delegate to
+    /// the builtin VP8/VP9/AV1 encoder for this transceiver.
+    pub(crate) fn add_raw_slot(&self) {
+        self.pending.lock().unwrap().push_back(RegistrySlot::Builtin);
+    }
+
+    /// Called by `registry_use_builtin_tramp`. Assigns the next pending slot to
+    /// `encoder_id` if it has not been seen before, then returns whether the
+    /// C++ factory should delegate to the builtin encoder.
+    pub(crate) fn use_builtin_for(&self, encoder_id: u64) -> bool {
+        let mut assigned = self.assigned.lock().unwrap();
+        if let Some(slot) = assigned.get(&encoder_id) {
+            return matches!(slot, RegistrySlot::Builtin);
+        }
+        let slot = self.pending.lock().unwrap().pop_front()
+            .unwrap_or(RegistrySlot::Builtin);
+        let is_builtin = matches!(slot, RegistrySlot::Builtin);
+        assigned.insert(encoder_id, slot);
+        is_builtin
+    }
+
+    /// Called by `registry_encode_tramp`. Pops the next pre-encoded frame for
+    /// this encoder instance, assigning its slot on first call if needed.
+    fn pop_for(&self, encoder_id: u64) -> Option<EncodedVideoFrame> {
+        let mut assigned = self.assigned.lock().unwrap();
+        // Assign slot on first call (if use_builtin_for wasn't called first).
+        if !assigned.contains_key(&encoder_id) {
+            let slot = self.pending.lock().unwrap().pop_front()
+                .unwrap_or(RegistrySlot::Builtin);
+            assigned.insert(encoder_id, slot);
+        }
+        match assigned.get(&encoder_id) {
+            Some(RegistrySlot::Custom(q)) => {
+                let q = q.clone();
+                drop(assigned);
+                let result = q.lock().unwrap().pop_front();
+                result
+            }
+            _ => None,
+        }
+    }
+}
+
+struct RegistryState {
+    registry: Arc<EncoderRegistry>,
+}
+
+/// Fills `out` from an `EncodedVideoFrame`. Returns 0 (forward) on success.
+///
+/// Extracted so both trampolines share the same output-filling logic.
+fn fill_output(
+    encoded: EncodedVideoFrame,
+    out: *mut reactor_webrtc_sys::ReactorEncodedVideoOutput,
+) -> c_int {
+    let mut v = encoded.data;
+    v.shrink_to_fit();
+    let ptr = v.as_ptr();
+    let len = v.len();
+    std::mem::forget(v);
+    unsafe {
+        let o = &mut *out;
+        o.data          = ptr;
+        o.len           = len;
+        o.is_key_frame  = encoded.is_key_frame as c_int;
+        o.width         = encoded.width;
+        o.height        = encoded.height;
+        o.rtp_timestamp = encoded.rtp_timestamp;
+        o.free_data     = Some(free_encoded_data);
+    }
+    0
+}
+
+extern "C" fn registry_encode_tramp(
+    ud: *mut c_void,
+    raw: *const reactor_webrtc_sys::ReactorRawVideoFrame,
+    out: *mut reactor_webrtc_sys::ReactorEncodedVideoOutput,
+) -> c_int {
+    let Some(r) = (unsafe { raw.as_ref() }) else { return 1; };
+    let st = unsafe { &*(ud as *const RegistryState) };
+    match st.registry.pop_for(r.encoder_id) {
+        None => 1,
+        Some(encoded) => fill_output(encoded, out),
+    }
+}
+
+/// Called by C++ before creating each encoder instance. Returns 1 if the
+/// builtin VP8/VP9/AV1 encoder should be used for this slot, 0 for custom.
+extern "C" fn registry_use_builtin_tramp(ud: *mut c_void, encoder_id: u64) -> c_int {
+    let st = unsafe { &*(ud as *const RegistryState) };
+    st.registry.use_builtin_for(encoder_id) as c_int
+}
+
+extern "C" fn free_registry_state_tramp(ud: *mut c_void) {
+    drop(unsafe { Box::from_raw(ud as *mut RegistryState) });
 }
 
 /// A factory-level custom video encoder. Pass to
@@ -352,6 +471,9 @@ pub struct CustomVideoEncoder {
     ) -> c_int,
     pub(crate) userdata: *mut c_void,
     pub(crate) free_ud: Option<extern "C" fn(*mut c_void)>,
+    /// Optional: called by the C++ factory before creating each encoder instance.
+    /// Non-null only when the registry contains a mix of custom and builtin slots.
+    pub(crate) use_builtin: Option<extern "C" fn(*mut c_void, u64) -> c_int>,
 }
 
 // SAFETY: the callback is Mutex-guarded; userdata is a heap-pinned Box that
@@ -369,9 +491,10 @@ impl CustomVideoEncoder {
             cb: Mutex::new(Box::new(cb)),
         }));
         Self {
-            encode_fn: encode_tramp,
-            userdata: state as *mut c_void,
-            free_ud: Some(free_encoder_state_tramp),
+            encode_fn:   encode_tramp,
+            userdata:    state as *mut c_void,
+            free_ud:     Some(free_encoder_state_tramp),
+            use_builtin: None,
         }
     }
 
@@ -380,6 +503,22 @@ impl CustomVideoEncoder {
     /// Internal — called by [`PeerConnectionFactory::with_encoded_video_track`].
     pub(crate) fn from_queue(queue: Arc<Mutex<VecDeque<EncodedVideoFrame>>>) -> Self {
         Self::new(move |_raw| queue.lock().unwrap().pop_front())
+    }
+
+    /// Create a custom encoder backed by a shared [`EncoderRegistry`].
+    ///
+    /// Internal — used by [`EncodedVideoBuilder`](crate::EncodedVideoBuilder)
+    /// to route frames across multiple encoded and/or raw video tracks.
+    /// The `use_builtin` trampoline is passed to the C++ factory so it can
+    /// delegate individual encoder instances to the builtin VP8/VP9/AV1 pipeline.
+    pub(crate) fn from_registry(registry: Arc<EncoderRegistry>) -> Self {
+        let state = Box::into_raw(Box::new(RegistryState { registry }));
+        Self {
+            encode_fn:   registry_encode_tramp,
+            userdata:    state as *mut c_void,
+            free_ud:     Some(free_registry_state_tramp),
+            use_builtin: Some(registry_use_builtin_tramp),
+        }
     }
 }
 

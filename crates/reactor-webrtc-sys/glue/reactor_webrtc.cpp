@@ -1040,6 +1040,7 @@ struct ReactorRawVideoFrame {
   uint32_t       rtp_timestamp;
   int            request_key_frame; // 1 = IDR/keyframe requested
   uint32_t       codec;             // VideoCodecType value (VP8=1 … H265=5)
+  uint64_t       encoder_id;       // unique per ReactorVideoEncoder instance
 };
 // Filled by the Rust callback to deliver an encoded frame back.
 // Set data=nullptr (or return non-zero) to drop the frame (nothing is sent).
@@ -1058,15 +1059,22 @@ struct ReactorEncodedVideoOutput {
 typedef int (*reactor_video_encode_cb)(void*                      userdata,
                                        const ReactorRawVideoFrame* raw,
                                        ReactorEncodedVideoOutput*  out);
+// Optional: called by the factory before creating each VideoEncoder instance.
+// Return non-zero to delegate to the builtin VP8/VP9/AV1 encoder instead of
+// the custom one. May be null (always use custom). `encoder_id` matches the
+// value stamped on every subsequent ReactorRawVideoFrame from that encoder.
+typedef int (*reactor_use_builtin_cb)(void* userdata, uint64_t encoder_id);
 }
 
 struct ReactorEncoderState {
   reactor_video_encode_cb       cb;
   void*                          userdata;
   reactor_webrtc_userdata_free   free_ud;
+  reactor_use_builtin_cb         use_builtin; // null = always use custom
 
-  ReactorEncoderState(reactor_video_encode_cb c, void* u, reactor_webrtc_userdata_free f)
-      : cb(c), userdata(u), free_ud(f) {}
+  ReactorEncoderState(reactor_video_encode_cb c, void* u, reactor_webrtc_userdata_free f,
+                      reactor_use_builtin_cb ub = nullptr)
+      : cb(c), userdata(u), free_ud(f), use_builtin(ub) {}
   ~ReactorEncoderState() { if (free_ud) free_ud(userdata); }
   // Disable copy+move: free_ud would fire twice (once on the copy, once on
   // the original) which would double-free `userdata`.
@@ -1080,10 +1088,12 @@ class ReactorVideoEncoder : public webrtc::VideoEncoder {
   uint32_t                             width_      = 0;
   uint32_t                             height_     = 0;
   webrtc::VideoCodecType               codec_type_ = webrtc::kVideoCodecGeneric;
+  uint64_t                             id_         = 0;
 
  public:
-  explicit ReactorVideoEncoder(std::shared_ptr<ReactorEncoderState> state)
-      : state_(std::move(state)) {}
+  explicit ReactorVideoEncoder(std::shared_ptr<ReactorEncoderState> state,
+                               uint64_t id = 0)
+      : state_(std::move(state)), id_(id) {}
 
   int InitEncode(const webrtc::VideoCodec* settings,
                  const Settings&) override {
@@ -1131,6 +1141,7 @@ class ReactorVideoEncoder : public webrtc::VideoEncoder {
     raw.rtp_timestamp     = frame.rtp_timestamp();
     raw.request_key_frame = want_key ? 1 : 0;
     raw.codec             = static_cast<uint32_t>(codec_type_);
+    raw.encoder_id        = id_;
 
     ReactorEncodedVideoOutput out{};
     int drop = state_->cb(state_->userdata, &raw, &out);
@@ -1194,11 +1205,14 @@ class ReactorVideoEncoder : public webrtc::VideoEncoder {
 };
 
 class ReactorVideoEncoderFactory : public webrtc::VideoEncoderFactory {
-  std::shared_ptr<ReactorEncoderState> state_;
+  std::shared_ptr<ReactorEncoderState>        state_;
+  std::atomic<uint64_t>                       next_id_{0};
+  std::unique_ptr<webrtc::VideoEncoderFactory> builtin_;
 
  public:
   explicit ReactorVideoEncoderFactory(std::shared_ptr<ReactorEncoderState> s)
-      : state_(std::move(s)) {}
+      : state_(std::move(s)),
+        builtin_(webrtc::CreateBuiltinVideoEncoderFactory()) {}
 
   std::vector<webrtc::SdpVideoFormat> GetSupportedFormats() const override {
     return {
@@ -1213,9 +1227,13 @@ class ReactorVideoEncoderFactory : public webrtc::VideoEncoderFactory {
   }
 
   std::unique_ptr<webrtc::VideoEncoder> Create(
-      const webrtc::Environment&,
-      const webrtc::SdpVideoFormat&) override {
-    return std::make_unique<ReactorVideoEncoder>(state_);
+      const webrtc::Environment& env,
+      const webrtc::SdpVideoFormat& format) override {
+    uint64_t id = next_id_.fetch_add(1, std::memory_order_relaxed);
+    if (state_->use_builtin && state_->use_builtin(state_->userdata, id)) {
+      return builtin_->Create(env, format);
+    }
+    return std::make_unique<ReactorVideoEncoder>(state_, id);
   }
 };
 
@@ -1277,10 +1295,10 @@ class ReactorCustomDecoderFactory : public webrtc::VideoDecoderFactory {
 // gone (follows the same lifetime contract as frame_transformer_create).
 void* reactor_webrtc_factory_create_with_custom_video_encoder(
     int use_platform_adm, reactor_video_encode_cb cb, void* userdata,
-    reactor_webrtc_userdata_free free_ud) {
+    reactor_webrtc_userdata_free free_ud, reactor_use_builtin_cb use_builtin) {
   // make_shared constructs in-place via the explicit ctor — no temporary,
   // no copy, no premature destructor call.
-  auto state = std::make_shared<ReactorEncoderState>(cb, userdata, free_ud);
+  auto state = std::make_shared<ReactorEncoderState>(cb, userdata, free_ud, use_builtin);
 
   auto f = std::make_unique<ReactorFactory>();
   f->network_thread   = webrtc::Thread::CreateWithSocketServer();
