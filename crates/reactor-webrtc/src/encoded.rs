@@ -18,8 +18,8 @@
 //! The closure runs on a WebRTC thread and must not block it.
 
 use std::ffi::CStr;
-use std::os::raw::c_int;
 use std::ffi::c_void;
+use std::os::raw::c_int;
 use std::sync::Mutex;
 
 use crate::media::MediaKind;
@@ -186,6 +186,162 @@ impl Drop for FrameTransform {
     fn drop(&mut self) {
         if !self.raw.is_null() {
             unsafe { reactor_webrtc_sys::reactor_webrtc_frame_transformer_destroy(self.raw) }
+        }
+    }
+}
+
+// ── Custom video encoder ─────────────────────────────────────────────────────
+
+/// Raw I420 video frame delivered to a [`CustomVideoEncoder`] callback.
+///
+/// Planes are slices into the native frame buffer and are **only valid for the
+/// duration of the callback**. Copy the data if your encoder is asynchronous.
+pub struct RawVideoFrame<'a> {
+    /// Luma (Y) plane.
+    pub y: &'a [u8],
+    pub y_stride: u32,
+    /// Chroma (U / Cb) plane.
+    pub u: &'a [u8],
+    pub u_stride: u32,
+    /// Chroma (V / Cr) plane.
+    pub v: &'a [u8],
+    pub v_stride: u32,
+    pub width: u32,
+    pub height: u32,
+    pub rtp_timestamp: u32,
+    /// `true` if the media engine is requesting an IDR (key frame).
+    pub request_key_frame: bool,
+}
+
+/// An encoded H.264 frame produced by a [`CustomVideoEncoder`] callback.
+pub struct EncodedVideoFrame {
+    /// Raw H.264 Annex-B or AVCC bitstream bytes.
+    pub data: Vec<u8>,
+    /// `true` for IDR (key) frames.
+    pub is_key_frame: bool,
+    /// Width in pixels (0 = inherit from the raw frame).
+    pub width: u32,
+    /// Height in pixels (0 = inherit from the raw frame).
+    pub height: u32,
+    /// RTP timestamp (0 = inherit from the raw frame).
+    pub rtp_timestamp: u32,
+}
+
+type EncodeCallbackBox =
+    Box<dyn FnMut(&RawVideoFrame<'_>) -> Option<EncodedVideoFrame> + Send>;
+
+struct CustomEncoderState {
+    cb: Mutex<EncodeCallbackBox>,
+}
+
+extern "C" fn encode_tramp(
+    ud: *mut c_void,
+    raw: *const reactor_webrtc_sys::ReactorRawVideoFrame,
+    out: *mut reactor_webrtc_sys::ReactorEncodedVideoOutput,
+) -> c_int {
+    let Some(r) = (unsafe { raw.as_ref() }) else {
+        return 1;
+    };
+    let st = unsafe { &*(ud as *const CustomEncoderState) };
+
+    let y_len = (r.y_stride.max(0) as usize) * r.height as usize;
+    let uv_len = (r.u_stride.max(0) as usize) * ((r.height as usize + 1) / 2);
+
+    let frame = RawVideoFrame {
+        y: if r.y.is_null() { &[] } else { unsafe { std::slice::from_raw_parts(r.y, y_len) } },
+        y_stride: r.y_stride as u32,
+        u: if r.u.is_null() { &[] } else { unsafe { std::slice::from_raw_parts(r.u, uv_len) } },
+        u_stride: r.u_stride as u32,
+        v: if r.v.is_null() { &[] } else { unsafe { std::slice::from_raw_parts(r.v, uv_len) } },
+        v_stride: r.v_stride as u32,
+        width: r.width,
+        height: r.height,
+        rtp_timestamp: r.rtp_timestamp,
+        request_key_frame: r.request_key_frame != 0,
+    };
+
+    let result = match st.cb.lock() {
+        Ok(mut cb) => cb(&frame),
+        Err(_) => return 1,
+    };
+
+    match result {
+        None => 1, // drop
+        Some(encoded) => {
+            // Leak the Vec into a raw allocation; C++ copies it via
+            // EncodedImageBuffer::Create(), then calls free_data (below) to
+            // release it. This avoids any lifetime issue across the FFI call.
+            let mut v = encoded.data;
+            v.shrink_to_fit();
+            let ptr = v.as_ptr();
+            let len = v.len();
+            std::mem::forget(v);
+
+            unsafe {
+                let o = &mut *out;
+                o.data          = ptr;
+                o.len           = len;
+                o.is_key_frame  = encoded.is_key_frame as c_int;
+                o.width         = encoded.width;
+                o.height        = encoded.height;
+                o.rtp_timestamp = encoded.rtp_timestamp;
+                o.free_data     = Some(free_encoded_data);
+            }
+            0 // forward
+        }
+    }
+}
+
+/// Called by C++ after `EncodedImageBuffer::Create` has copied the bytes.
+extern "C" fn free_encoded_data(data: *const u8, len: usize) {
+    // Reconstruct the Vec we leaked in encode_tramp and drop it.
+    // SAFETY: this pointer+len was produced by a Vec with capacity==len
+    // (we called shrink_to_fit before forgetting it).
+    unsafe { drop(Vec::from_raw_parts(data as *mut u8, len, len)) };
+}
+
+extern "C" fn free_encoder_state_tramp(ud: *mut c_void) {
+    drop(unsafe { Box::from_raw(ud as *mut CustomEncoderState) });
+}
+
+/// A factory-level custom video encoder. Pass to
+/// [`PeerConnectionFactory::with_custom_video_encoder`](crate::PeerConnectionFactory::with_custom_video_encoder).
+///
+/// The closure is called **synchronously** on the WebRTC encoder thread for every
+/// raw I420 frame. Return `Some(encoded)` to inject H.264 bytes into the RTP
+/// stack, or `None` to drop the frame.
+///
+/// For asynchronous hardware encoders (VideoToolbox, GStreamer, etc.), copy the
+/// I420 planes into your pipeline and block until output is ready. The closure
+/// must be `Send` because it is called from a WebRTC-internal thread.
+pub struct CustomVideoEncoder {
+    pub(crate) encode_fn: extern "C" fn(
+        *mut c_void,
+        *const reactor_webrtc_sys::ReactorRawVideoFrame,
+        *mut reactor_webrtc_sys::ReactorEncodedVideoOutput,
+    ) -> c_int,
+    pub(crate) userdata: *mut c_void,
+    pub(crate) free_ud: Option<extern "C" fn(*mut c_void)>,
+}
+
+// SAFETY: the callback is Mutex-guarded; userdata is a heap-pinned Box that
+// lives until the native factory calls free_ud.
+unsafe impl Send for CustomVideoEncoder {}
+unsafe impl Sync for CustomVideoEncoder {}
+
+impl CustomVideoEncoder {
+    /// Create a custom encoder that calls `cb` for every frame to be encoded.
+    pub fn new(
+        cb: impl FnMut(&RawVideoFrame<'_>) -> Option<EncodedVideoFrame> + Send + 'static,
+    ) -> Self {
+        // Leak the state: the factory holds it and frees via free_encoder_state_tramp.
+        let state = Box::into_raw(Box::new(CustomEncoderState {
+            cb: Mutex::new(Box::new(cb)),
+        }));
+        Self {
+            encode_fn: encode_tramp,
+            userdata: state as *mut c_void,
+            free_ud: Some(free_encoder_state_tramp),
         }
     }
 }

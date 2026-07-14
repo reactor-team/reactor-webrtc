@@ -64,6 +64,9 @@
 #include "api/video_codecs/video_encoder_factory.h"
 #include "media/base/video_broadcaster.h"
 #include "modules/audio_device/include/audio_device_default.h"
+#include "modules/video_coding/codecs/interface/common_constants.h"
+#include "modules/video_coding/include/video_codec_interface.h"
+#include "modules/video_coding/include/video_error_codes.h"
 #include "pc/video_track_source.h"
 #include "rtc_base/copy_on_write_buffer.h"
 #include "rtc_base/thread.h"
@@ -1014,6 +1017,268 @@ typedef int (*reactor_webrtc_encoded_frame_cb)(void* userdata,
 // Called once when the transformer is finally destroyed (all refs dropped) so
 // the binding can free `userdata`. May be null.
 typedef void (*reactor_webrtc_userdata_free)(void* userdata);
+}
+
+// ── Custom video encoder (encoder bypass) ────────────────────────────────────
+//
+// Raw I420 frame delivered to Rust for encoding. Planes are valid only for
+// the duration of the Encode() call — copy if encoding is asynchronous.
+extern "C" {
+struct ReactorRawVideoFrame {
+  const uint8_t* y;
+  int            y_stride;
+  const uint8_t* u;
+  int            u_stride;
+  const uint8_t* v;
+  int            v_stride;
+  uint32_t       width;
+  uint32_t       height;
+  uint32_t       rtp_timestamp;
+  int            request_key_frame; // 1 = IDR requested by the media engine
+};
+// Filled by the Rust callback to deliver an encoded H.264 frame back.
+// Set data=nullptr (or return non-zero) to drop the frame (nothing is sent).
+// `free_data` is called after the encoded bytes are copied; allows the caller
+// to free the buffer. May be null if the buffer has static/frame lifetime.
+struct ReactorEncodedVideoOutput {
+  const uint8_t* data;
+  size_t         len;
+  int            is_key_frame;
+  uint32_t       width;         // 0 = inherit from raw frame
+  uint32_t       height;        // 0 = inherit from raw frame
+  uint32_t       rtp_timestamp; // 0 = inherit from raw frame
+  void           (*free_data)(const uint8_t* data, size_t len); // may be null
+};
+// Return 0 to forward the encoded frame, non-zero to drop it.
+typedef int (*reactor_video_encode_cb)(void*                      userdata,
+                                       const ReactorRawVideoFrame* raw,
+                                       ReactorEncodedVideoOutput*  out);
+}
+
+struct ReactorEncoderState {
+  reactor_video_encode_cb       cb;
+  void*                          userdata;
+  reactor_webrtc_userdata_free   free_ud;
+
+  ReactorEncoderState(reactor_video_encode_cb c, void* u, reactor_webrtc_userdata_free f)
+      : cb(c), userdata(u), free_ud(f) {}
+  ~ReactorEncoderState() { if (free_ud) free_ud(userdata); }
+  // Disable copy+move: free_ud would fire twice (once on the copy, once on
+  // the original) which would double-free `userdata`.
+  ReactorEncoderState(const ReactorEncoderState&) = delete;
+  ReactorEncoderState(ReactorEncoderState&&)      = delete;
+};
+
+class ReactorVideoEncoder : public webrtc::VideoEncoder {
+  std::shared_ptr<ReactorEncoderState> state_;
+  webrtc::EncodedImageCallback*        callback_ = nullptr;
+  uint32_t                             width_    = 0;
+  uint32_t                             height_   = 0;
+
+ public:
+  explicit ReactorVideoEncoder(std::shared_ptr<ReactorEncoderState> state)
+      : state_(std::move(state)) {}
+
+  int InitEncode(const webrtc::VideoCodec* settings,
+                 const Settings&) override {
+    if (settings) {
+      width_  = static_cast<uint32_t>(settings->width);
+      height_ = static_cast<uint32_t>(settings->height);
+    }
+    return WEBRTC_VIDEO_CODEC_OK;
+  }
+
+  int32_t RegisterEncodeCompleteCallback(
+      webrtc::EncodedImageCallback* cb) override {
+    callback_ = cb;
+    return WEBRTC_VIDEO_CODEC_OK;
+  }
+
+  int32_t Release() override {
+    callback_ = nullptr;
+    return WEBRTC_VIDEO_CODEC_OK;
+  }
+
+  int32_t Encode(
+      const webrtc::VideoFrame&                        frame,
+      const std::vector<webrtc::VideoFrameType>* frame_types) override {
+    // Convert to I420 (handles any input format including NV12).
+    webrtc::scoped_refptr<webrtc::I420BufferInterface> i420 =
+        frame.video_frame_buffer()->ToI420();
+
+    bool want_key = false;
+    if (frame_types) {
+      for (auto ft : *frame_types)
+        if (ft == webrtc::VideoFrameType::kVideoFrameKey) want_key = true;
+    }
+
+    ReactorRawVideoFrame raw{};
+    raw.y                 = i420->DataY();
+    raw.y_stride          = i420->StrideY();
+    raw.u                 = i420->DataU();
+    raw.u_stride          = i420->StrideU();
+    raw.v                 = i420->DataV();
+    raw.v_stride          = i420->StrideV();
+    raw.width             = static_cast<uint32_t>(i420->width());
+    raw.height            = static_cast<uint32_t>(i420->height());
+    raw.rtp_timestamp     = frame.rtp_timestamp();
+    raw.request_key_frame = want_key ? 1 : 0;
+
+    ReactorEncodedVideoOutput out{};
+    int drop = state_->cb(state_->userdata, &raw, &out);
+    if (drop || !out.data || out.len == 0 || !callback_) {
+      return WEBRTC_VIDEO_CODEC_OK;
+    }
+
+    webrtc::EncodedImage img;
+    img.SetEncodedData(webrtc::EncodedImageBuffer::Create(out.data, out.len));
+    img.SetFrameType(out.is_key_frame ? webrtc::VideoFrameType::kVideoFrameKey
+                                       : webrtc::VideoFrameType::kVideoFrameDelta);
+    img._encodedWidth  = out.width  ? out.width  : raw.width;
+    img._encodedHeight = out.height ? out.height : raw.height;
+    img.SetRtpTimestamp(out.rtp_timestamp ? out.rtp_timestamp : raw.rtp_timestamp);
+
+    webrtc::CodecSpecificInfo info;
+    info.codecType = webrtc::kVideoCodecH264;
+    info.codecSpecific.H264.packetization_mode =
+        webrtc::H264PacketizationMode::NonInterleaved;
+    info.codecSpecific.H264.temporal_idx  = webrtc::kNoTemporalIdx;
+    info.codecSpecific.H264.idr_frame     = (out.is_key_frame != 0);
+    info.codecSpecific.H264.base_layer_sync = false;
+
+    callback_->OnEncodedImage(img, &info);
+    // Release the encoded buffer now that OnEncodedImage has copied it.
+    if (out.free_data) out.free_data(out.data, out.len);
+    return WEBRTC_VIDEO_CODEC_OK;
+  }
+
+  void SetRates(const RateControlParameters&) override {}
+
+  EncoderInfo GetEncoderInfo() const override {
+    EncoderInfo info;
+    info.implementation_name     = "ReactorCustom";
+    info.is_hardware_accelerated = true;
+    return info;
+  }
+};
+
+class ReactorVideoEncoderFactory : public webrtc::VideoEncoderFactory {
+  std::shared_ptr<ReactorEncoderState> state_;
+
+ public:
+  explicit ReactorVideoEncoderFactory(std::shared_ptr<ReactorEncoderState> s)
+      : state_(std::move(s)) {}
+
+  std::vector<webrtc::SdpVideoFormat> GetSupportedFormats() const override {
+    // H.264 Baseline Profile Level 3.1, packetization-mode 1 (non-interleaved).
+    return {webrtc::SdpVideoFormat(
+        "H264", {{"level-asymmetry-allowed", "1"},
+                 {"packetization-mode", "1"},
+                 {"profile-level-id", "42e01f"}})};
+  }
+
+  std::unique_ptr<webrtc::VideoEncoder> Create(
+      const webrtc::Environment&,
+      const webrtc::SdpVideoFormat&) override {
+    return std::make_unique<ReactorVideoEncoder>(state_);
+  }
+};
+
+// A no-op H264 decoder: claims H264 support so that codec negotiation with
+// an H264-only sender succeeds, but discards every received frame. This build
+// of libwebrtc was compiled without WEBRTC_USE_H264, so the builtin decoder
+// factory has no H264 entry. Without this shim, a remote peer that only
+// advertises H264 (e.g. a ReactorVideoEncoderFactory sender) causes pc2 to
+// answer with m=video 0 (rejected), blocking ICE and encoder initialisation.
+class ReactorNullH264Decoder : public webrtc::VideoDecoder {
+ public:
+  bool Configure(const Settings&) override { return true; }
+  int32_t Decode(const webrtc::EncodedImage&, int64_t) override { return 0; }
+  int32_t RegisterDecodeCompleteCallback(webrtc::DecodedImageCallback*) override {
+    return 0;
+  }
+  int32_t Release() override { return 0; }
+  DecoderInfo GetDecoderInfo() const override {
+    return {"ReactorNullH264", /*is_hardware_accelerated=*/false};
+  }
+};
+
+// Wraps the builtin video decoder factory and adds H264 via the null decoder
+// above, enabling negotiation with H264-only senders.
+class ReactorH264CapableDecoderFactory : public webrtc::VideoDecoderFactory {
+  std::unique_ptr<webrtc::VideoDecoderFactory> builtin_;
+
+ public:
+  ReactorH264CapableDecoderFactory()
+      : builtin_(webrtc::CreateBuiltinVideoDecoderFactory()) {}
+
+  std::vector<webrtc::SdpVideoFormat> GetSupportedFormats() const override {
+    auto formats = builtin_->GetSupportedFormats();
+    formats.push_back(webrtc::SdpVideoFormat(
+        "H264", {{"level-asymmetry-allowed", "1"},
+                 {"packetization-mode", "1"},
+                 {"profile-level-id", "42e01f"}}));
+    return formats;
+  }
+
+  std::unique_ptr<webrtc::VideoDecoder> Create(
+      const webrtc::Environment& env,
+      const webrtc::SdpVideoFormat& format) override {
+    if (format.name == "H264") {
+      return std::make_unique<ReactorNullH264Decoder>();
+    }
+    return builtin_->Create(env, format);
+  }
+};
+
+// Create a PeerConnectionFactory that routes all video encoding through `cb`.
+// `cb` is called synchronously inside VideoEncoder::Encode() with the raw I420
+// frame; fill `*out` and return 0 to inject bytes into the RTP stack, or
+// return non-zero to drop. `free_ud` is called when all encoder instances are
+// gone (follows the same lifetime contract as frame_transformer_create).
+void* reactor_webrtc_factory_create_with_custom_video_encoder(
+    int use_platform_adm, reactor_video_encode_cb cb, void* userdata,
+    reactor_webrtc_userdata_free free_ud) {
+  // make_shared constructs in-place via the explicit ctor — no temporary,
+  // no copy, no premature destructor call.
+  auto state = std::make_shared<ReactorEncoderState>(cb, userdata, free_ud);
+
+  auto f = std::make_unique<ReactorFactory>();
+  f->network_thread   = webrtc::Thread::CreateWithSocketServer();
+  f->worker_thread    = webrtc::Thread::Create();
+  f->signaling_thread = webrtc::Thread::Create();
+  if (!f->network_thread->Start() || !f->worker_thread->Start() ||
+      !f->signaling_thread->Start()) {
+    return nullptr;
+  }
+
+  webrtc::scoped_refptr<webrtc::AudioDeviceModule> adm;
+  webrtc::scoped_refptr<webrtc::AudioProcessing>   apm;
+  if (use_platform_adm) {
+    webrtc::AudioProcessing::Config apm_config;
+    apm_config.echo_canceller.enabled    = true;
+    apm_config.noise_suppression.enabled = true;
+    apm_config.noise_suppression.level   =
+        webrtc::AudioProcessing::Config::NoiseSuppression::kHigh;
+    apm_config.gain_controller1.enabled  = true;
+    apm_config.high_pass_filter.enabled  = true;
+    apm = webrtc::BuiltinAudioProcessingBuilder(apm_config)
+              .Build(webrtc::CreateEnvironment());
+  } else {
+    f->adm = webrtc::make_ref_counted<FrameAdm>();
+    adm    = f->adm;
+  }
+
+  f->factory = webrtc::CreatePeerConnectionFactory(
+      f->network_thread.get(), f->worker_thread.get(),
+      f->signaling_thread.get(), adm,
+      webrtc::CreateBuiltinAudioEncoderFactory(),
+      webrtc::CreateBuiltinAudioDecoderFactory(),
+      std::make_unique<ReactorVideoEncoderFactory>(state),
+      std::make_unique<ReactorH264CapableDecoderFactory>(),
+      /*audio_mixer=*/nullptr, /*audio_processing=*/apm);
+  if (!f->factory) return nullptr;
+  return f.release();
 }
 
 // Replace the encoded payload of the frame currently in the callback. Copies.

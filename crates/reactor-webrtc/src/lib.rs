@@ -28,7 +28,10 @@ use std::ffi::CString;
 use std::os::raw::c_int;
 
 pub use config::{ContinualGatheringPolicy, IceServer, IceTransportsType, RtcConfiguration};
-pub use encoded::{EncodedFrame, FrameAction, FrameDirection, FrameTransform};
+pub use encoded::{
+    CustomVideoEncoder, EncodedFrame, EncodedVideoFrame, FrameAction, FrameDirection,
+    FrameTransform, RawVideoFrame,
+};
 pub use media::{AudioFrame, MediaKind, Track, VideoFrame};
 pub use observer::PeerConnectionObserver;
 pub use peer_connection::{
@@ -118,6 +121,43 @@ impl PeerConnectionFactory {
         };
         if raw.is_null() {
             return Err(Error::Webrtc("factory creation returned null".into()));
+        }
+        Ok(Self { raw })
+    }
+
+    /// Create a factory that replaces the builtin H.264 encoder with `encoder`.
+    ///
+    /// The encoder callback is invoked synchronously on the WebRTC encoder
+    /// thread for every raw I420 frame ready to be sent. Return
+    /// `Some(EncodedVideoFrame)` to push H.264 bytes into the RTP packetizer,
+    /// or `None` to drop the frame silently.
+    ///
+    /// Audio encoding is unaffected; the builtin audio codecs (Opus, G.711,
+    /// etc.) remain active.
+    pub fn with_custom_video_encoder(encoder: crate::CustomVideoEncoder) -> Result<Self> {
+        let encode_fn = encoder.encode_fn;
+        let userdata  = encoder.userdata;
+        let free_ud   = encoder.free_ud;
+        // Transfer ownership of `userdata` to the factory before the call so
+        // we don't double-free on success. On failure, free it manually.
+        std::mem::forget(encoder);
+
+        let raw = unsafe {
+            reactor_webrtc_sys::reactor_webrtc_factory_create_with_custom_video_encoder(
+                0, // synthetic ADM
+                encode_fn,
+                userdata,
+                free_ud,
+            )
+        };
+        if raw.is_null() {
+            // Factory did not take ownership — free the state ourselves.
+            if let Some(f) = free_ud {
+                f(userdata);
+            }
+            return Err(Error::Webrtc(
+                "factory with custom encoder returned null".into(),
+            ));
         }
         Ok(Self { raw })
     }

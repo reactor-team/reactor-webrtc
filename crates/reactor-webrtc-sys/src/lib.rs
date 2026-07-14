@@ -77,6 +77,41 @@ pub struct ReactorEncodedFrame {
     pub frame: *mut c_void,
 }
 
+/// Raw I420 video frame delivered to a custom encoder callback. Planes are
+/// valid only for the duration of the call — copy if encoding asynchronously.
+/// Layout must match `ReactorRawVideoFrame` in the C++ glue.
+#[repr(C)]
+pub struct ReactorRawVideoFrame {
+    pub y: *const u8,
+    pub y_stride: c_int,
+    pub u: *const u8,
+    pub u_stride: c_int,
+    pub v: *const u8,
+    pub v_stride: c_int,
+    pub width: u32,
+    pub height: u32,
+    pub rtp_timestamp: u32,
+    /// 1 if the media engine requests a key frame (IDR), 0 otherwise.
+    pub request_key_frame: c_int,
+}
+
+/// Filled by the custom encoder callback to deliver an encoded H.264 frame.
+/// Set `data` to null (or return non-zero) to drop the frame.
+/// Layout must match `ReactorEncodedVideoOutput` in the C++ glue.
+#[repr(C)]
+pub struct ReactorEncodedVideoOutput {
+    pub data: *const u8,
+    pub len: usize,
+    pub is_key_frame: c_int,
+    /// 0 = inherit width/height/rtp_timestamp from the raw frame.
+    pub width: u32,
+    pub height: u32,
+    pub rtp_timestamp: u32,
+    /// Called by C++ after the encoded bytes are copied; frees the buffer.
+    /// May be null for static/frame-lifetime buffers.
+    pub free_data: Option<extern "C" fn(data: *const u8, len: usize)>,
+}
+
 /// PeerConnectionObserver callbacks, forwarded from the C++ glue. Every field
 /// is optional (`None` = a null function pointer on the C side). `userdata` is
 /// passed back verbatim to each callback. State arguments are the integer value
@@ -127,6 +162,22 @@ extern "C" {
         use_platform_adm: c_int,
     ) -> *mut PeerConnectionFactory;
     pub fn reactor_webrtc_factory_destroy(factory: *mut PeerConnectionFactory);
+
+    /// Create a factory that routes all video encoding through `on_encode`.
+    /// `on_encode` is called synchronously within `VideoEncoder::Encode()` with
+    /// the raw I420 frame; fill `*out` and return 0 to inject encoded bytes into
+    /// the RTP stack, or return non-zero to drop the frame. `userdata` lifetime
+    /// follows the same contract as `reactor_webrtc_frame_transformer_create`.
+    pub fn reactor_webrtc_factory_create_with_custom_video_encoder(
+        use_platform_adm: c_int,
+        on_encode: extern "C" fn(
+            userdata: *mut c_void,
+            raw: *const ReactorRawVideoFrame,
+            out: *mut ReactorEncodedVideoOutput,
+        ) -> c_int,
+        userdata: *mut c_void,
+        free_ud: Option<extern "C" fn(userdata: *mut c_void)>,
+    ) -> *mut PeerConnectionFactory;
 
     /// Create a peer connection. `config_json` carries ICE servers / policies
     /// (may be null). `callbacks` may be null. Returns null on failure.
