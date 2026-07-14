@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -40,6 +41,7 @@
 #include "api/data_channel_interface.h"
 #include "api/environment/environment.h"
 #include "api/environment/environment_factory.h"
+#include "api/frame_transformer_interface.h"
 #include "api/jsep.h"
 #include "api/make_ref_counted.h"
 #include "api/media_stream_interface.h"
@@ -918,6 +920,38 @@ void* reactor_webrtc_peer_connection_add_transceiver(void* pc, int media_kind,
   return new ReactorTransceiver{result.MoveValue()};
 }
 
+// Number of transceivers on the peer connection (post-negotiation this
+// includes ones auto-created from the remote description).
+int reactor_webrtc_peer_connection_transceiver_count(void* pc) {
+  auto* rpc = reinterpret_cast<ReactorPeerConnection*>(pc);
+  if (!rpc || !rpc->pc) return 0;
+  return static_cast<int>(rpc->pc->GetTransceivers().size());
+}
+
+// Return a new owned handle to the transceiver at `index`
+// (free with reactor_webrtc_rtp_transceiver_destroy), or null if out of range.
+void* reactor_webrtc_peer_connection_get_transceiver(void* pc, int index) {
+  auto* rpc = reinterpret_cast<ReactorPeerConnection*>(pc);
+  if (!rpc || !rpc->pc || index < 0) return nullptr;
+  auto tcs = rpc->pc->GetTransceivers();
+  if (static_cast<size_t>(index) >= tcs.size()) return nullptr;
+  return new ReactorTransceiver{tcs[static_cast<size_t>(index)]};
+}
+
+// Media kind of a transceiver: 0 = audio, 1 = video, -1 = unknown.
+int reactor_webrtc_rtp_transceiver_media_kind(void* transceiver) {
+  auto* h = reinterpret_cast<ReactorTransceiver*>(transceiver);
+  if (!h || !h->tc) return -1;
+  switch (h->tc->media_type()) {
+    case webrtc::MediaType::AUDIO:
+      return 0;
+    case webrtc::MediaType::VIDEO:
+      return 1;
+    default:
+      return -1;
+  }
+}
+
 // Write the transceiver's mid into `out` (NUL-terminated, capped at `cap`).
 // Returns the mid length, or -1 if there is no mid yet (before SLD).
 int reactor_webrtc_rtp_transceiver_mid(void* transceiver, char* out, int cap) {
@@ -945,6 +979,189 @@ int reactor_webrtc_rtp_transceiver_set_track(void* transceiver, void* track) {
 // Destroy a transceiver handle (releases our reference).
 void reactor_webrtc_rtp_transceiver_destroy(void* transceiver) {
   delete reinterpret_cast<ReactorTransceiver*>(transceiver);
+}
+
+// ── Encoded-frame transform (codec bypass / forward) ─────────────────────────
+//
+// WebRTC's Insertable Streams / Encoded Transform: a FrameTransformerInterface
+// attached to a sender (SetFrameTransformer via
+// SetEncoderToPacketizerFrameTransformer) sees each *encoded* frame after the
+// encoder and before packetization; on a receiver
+// (SetDepacketizerToDecoderFrameTransformer) it sees each encoded frame after
+// depacketization and before the decoder. The bindings can read the encoded
+// payload (to forward it elsewhere), optionally replace it, and choose whether
+// to emit it downstream — dropping it on the receive side bypasses the decoder.
+
+extern "C" {
+// Encoded frame handed to the callback. `data`/`mime_type` are valid only for
+// the duration of the call. `frame` is an opaque handle for set_data.
+struct ReactorEncodedFrame {
+  int direction;        // 0 = send (egress), 1 = receive (ingress)
+  int is_audio;         // 1 = audio, 0 = video
+  int is_key_frame;     // video only (0 for audio)
+  uint8_t payload_type;
+  uint32_t ssrc;
+  uint32_t timestamp;
+  const uint8_t* data;  // encoded payload
+  size_t data_len;
+  const char* mime_type;  // e.g. "video/VP8", "audio/opus"
+  void* frame;          // opaque -> reactor_webrtc_encoded_frame_set_data
+};
+// Return 0 to emit the frame downstream (after any set_data), non-zero to drop
+// it (receive side: bypasses the decoder; send side: nothing is sent).
+typedef int (*reactor_webrtc_encoded_frame_cb)(void* userdata,
+                                               const ReactorEncodedFrame* frame);
+// Called once when the transformer is finally destroyed (all refs dropped) so
+// the binding can free `userdata`. May be null.
+typedef void (*reactor_webrtc_userdata_free)(void* userdata);
+}
+
+// Replace the encoded payload of the frame currently in the callback. Copies.
+void reactor_webrtc_encoded_frame_set_data(void* frame, const uint8_t* data,
+                                           size_t len) {
+  if (!frame || !data) return;
+  auto* f = reinterpret_cast<webrtc::TransformableFrameInterface*>(frame);
+  f->SetData(std::span<const uint8_t>(data, len));
+}
+
+class ReactorFrameTransformer : public webrtc::FrameTransformerInterface {
+ public:
+  ReactorFrameTransformer(reactor_webrtc_encoded_frame_cb cb, void* userdata,
+                          reactor_webrtc_userdata_free free_ud)
+      : cb_(cb), userdata_(userdata), free_ud_(free_ud) {}
+  // Runs when the last ref drops (senders/receivers hold their own), so the
+  // binding's userdata outlives every possible callback.
+  ~ReactorFrameTransformer() override {
+    if (free_ud_) free_ud_(userdata_);
+  }
+
+  // Single callback: used by senders (one transform per sender).
+  void RegisterTransformedFrameCallback(
+      webrtc::scoped_refptr<webrtc::TransformedFrameCallback> cb) override {
+    std::lock_guard<std::mutex> lock(mu_);
+    send_sink_ = std::move(cb);
+  }
+  void UnregisterTransformedFrameCallback() override {
+    std::lock_guard<std::mutex> lock(mu_);
+    send_sink_ = nullptr;
+  }
+  // Per-ssrc callback: used by receivers (one transform can serve many ssrcs).
+  void RegisterTransformedFrameSinkCallback(
+      webrtc::scoped_refptr<webrtc::TransformedFrameCallback> cb,
+      uint32_t ssrc) override {
+    std::lock_guard<std::mutex> lock(mu_);
+    recv_sinks_[ssrc] = std::move(cb);
+  }
+  void UnregisterTransformedFrameSinkCallback(uint32_t ssrc) override {
+    std::lock_guard<std::mutex> lock(mu_);
+    recv_sinks_.erase(ssrc);
+  }
+
+  void Transform(
+      std::unique_ptr<webrtc::TransformableFrameInterface> frame) override {
+    if (!frame) return;
+    // Pick the sink for this frame: receive frames route by ssrc, send frames
+    // use the single sender sink.
+    webrtc::scoped_refptr<webrtc::TransformedFrameCallback> sink;
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      auto it = recv_sinks_.find(frame->GetSsrc());
+      if (it != recv_sinks_.end())
+        sink = it->second;
+      else
+        sink = send_sink_;
+    }
+
+    int emit = 0;
+    if (cb_) {
+      // RTTI is on (use_rtti=true), so dynamic_cast distinguishes video/audio
+      // and exposes IsKeyFrame.
+      int is_audio = 0, is_key = 0;
+      if (auto* v = dynamic_cast<webrtc::TransformableVideoFrameInterface*>(
+              frame.get())) {
+        is_key = v->IsKeyFrame() ? 1 : 0;
+      } else if (dynamic_cast<webrtc::TransformableAudioFrameInterface*>(
+                     frame.get())) {
+        is_audio = 1;
+      }
+      const std::span<const uint8_t> data = frame->GetData();
+      const std::string mime = frame->GetMimeType();
+      const int direction =
+          frame->GetDirection() ==
+                  webrtc::TransformableFrameInterface::Direction::kReceiver
+              ? 1
+              : 0;
+      ReactorEncodedFrame ef{
+          direction,
+          is_audio,
+          is_key,
+          frame->GetPayloadType(),
+          frame->GetSsrc(),
+          frame->GetTimestamp(),
+          data.data(),
+          data.size(),
+          mime.c_str(),
+          frame.get(),
+      };
+      emit = cb_(userdata_, &ef);
+    }
+
+    if (emit == 0 && sink) sink->OnTransformedFrame(std::move(frame));
+    // else: dropped (decoder bypassed on receive; nothing sent on egress).
+  }
+
+ private:
+  reactor_webrtc_encoded_frame_cb cb_;
+  void* userdata_;
+  reactor_webrtc_userdata_free free_ud_;
+  std::mutex mu_;
+  webrtc::scoped_refptr<webrtc::TransformedFrameCallback> send_sink_;
+  std::map<uint32_t, webrtc::scoped_refptr<webrtc::TransformedFrameCallback>>
+      recv_sinks_;
+};
+
+// Owns one reference to the transformer (the sender/receiver keep their own).
+struct ReactorTransformerHandle {
+  webrtc::scoped_refptr<ReactorFrameTransformer> t;
+};
+
+// Create an encoded-frame transformer. `cb` fires per encoded frame (see
+// ReactorEncodedFrame); `free_ud` (nullable) frees `userdata` when the
+// transformer is finally destroyed. Returns an owned handle
+// (free with reactor_webrtc_frame_transformer_destroy) or null.
+void* reactor_webrtc_frame_transformer_create(
+    reactor_webrtc_encoded_frame_cb cb, void* userdata,
+    reactor_webrtc_userdata_free free_ud) {
+  auto t = webrtc::make_ref_counted<ReactorFrameTransformer>(cb, userdata,
+                                                             free_ud);
+  return new ReactorTransformerHandle{std::move(t)};
+}
+
+// Attach the transformer to the transceiver's sender (encoder -> packetizer).
+// Returns 1 on success, 0 on failure.
+int reactor_webrtc_rtp_transceiver_set_sender_transform(void* transceiver,
+                                                        void* transformer) {
+  auto* h = reinterpret_cast<ReactorTransceiver*>(transceiver);
+  auto* th = reinterpret_cast<ReactorTransformerHandle*>(transformer);
+  if (!h || !h->tc || !th || !h->tc->sender()) return 0;
+  h->tc->sender()->SetFrameTransformer(th->t);
+  return 1;
+}
+
+// Attach the transformer to the transceiver's receiver (depacketizer ->
+// decoder). Returns 1 on success, 0 on failure.
+int reactor_webrtc_rtp_transceiver_set_receiver_transform(void* transceiver,
+                                                          void* transformer) {
+  auto* h = reinterpret_cast<ReactorTransceiver*>(transceiver);
+  auto* th = reinterpret_cast<ReactorTransformerHandle*>(transformer);
+  if (!h || !h->tc || !th || !h->tc->receiver()) return 0;
+  h->tc->receiver()->SetFrameTransformer(th->t);
+  return 1;
+}
+
+// Release a transformer handle (our reference; sender/receiver keep theirs).
+void reactor_webrtc_frame_transformer_destroy(void* transformer) {
+  delete reinterpret_cast<ReactorTransformerHandle*>(transformer);
 }
 
 // Destroy a track handle (detaches any sink and releases the track + source).

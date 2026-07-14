@@ -38,6 +38,10 @@ pub struct MediaStreamTrack {
     _private: [u8; 0],
 }
 #[repr(C)]
+pub struct FrameTransformer {
+    _private: [u8; 0],
+}
+#[repr(C)]
 pub struct VideoSource {
     _private: [u8; 0],
 }
@@ -48,6 +52,29 @@ pub struct AudioSource {
 #[repr(C)]
 pub struct AudioDeviceModule {
     _private: [u8; 0],
+}
+
+/// An encoded media frame handed to a frame-transform callback (Insertable
+/// Streams / Encoded Transform). `data` and `mime_type` are valid only for the
+/// duration of the callback; copy them to retain. `frame` is an opaque handle
+/// for [`reactor_webrtc_encoded_frame_set_data`]. Layout must match the C
+/// `ReactorEncodedFrame` in the glue.
+#[repr(C)]
+pub struct ReactorEncodedFrame {
+    /// 0 = send (egress, encoder→packetizer), 1 = receive (ingress).
+    pub direction: c_int,
+    /// 1 = audio, 0 = video.
+    pub is_audio: c_int,
+    /// Video only (0 for audio): 1 if this is a key frame.
+    pub is_key_frame: c_int,
+    pub payload_type: u8,
+    pub ssrc: u32,
+    pub timestamp: u32,
+    pub data: *const u8,
+    pub data_len: usize,
+    pub mime_type: *const c_char,
+    /// Opaque frame handle for [`reactor_webrtc_encoded_frame_set_data`].
+    pub frame: *mut c_void,
 }
 
 /// PeerConnectionObserver callbacks, forwarded from the C++ glue. Every field
@@ -235,6 +262,17 @@ extern "C" {
         media_kind: c_int,
         direction: c_int,
     ) -> *mut RtpTransceiver;
+    /// Number of transceivers on the peer connection (post-negotiation this
+    /// includes ones auto-created from the remote description).
+    pub fn reactor_webrtc_peer_connection_transceiver_count(pc: *mut PeerConnection) -> c_int;
+    /// Owned handle to the transceiver at `index` (free with
+    /// [`reactor_webrtc_rtp_transceiver_destroy`]), or null if out of range.
+    pub fn reactor_webrtc_peer_connection_get_transceiver(
+        pc: *mut PeerConnection,
+        index: c_int,
+    ) -> *mut RtpTransceiver;
+    /// Media kind of a transceiver: 0 = audio, 1 = video, -1 = unknown.
+    pub fn reactor_webrtc_rtp_transceiver_media_kind(transceiver: *mut RtpTransceiver) -> c_int;
     /// Write the transceiver's mid into `out` (capped at `cap`); returns the mid
     /// length, or -1 if there is no mid yet (before set_local_description).
     pub fn reactor_webrtc_rtp_transceiver_mid(
@@ -250,6 +288,35 @@ extern "C" {
     ) -> c_int;
     /// Release a transceiver handle.
     pub fn reactor_webrtc_rtp_transceiver_destroy(transceiver: *mut RtpTransceiver);
+
+    // ── Encoded-frame transform (codec bypass / forward) ─────────────────────
+    /// Create an encoded-frame transformer. `on_frame(userdata, frame)` fires
+    /// per encoded frame; it returns 0 to emit the frame downstream (after any
+    /// [`reactor_webrtc_encoded_frame_set_data`]) or non-zero to drop it
+    /// (receive: bypasses the decoder; send: nothing is sent). Returns an owned
+    /// handle (free with [`reactor_webrtc_frame_transformer_destroy`]) or null.
+    pub fn reactor_webrtc_frame_transformer_create(
+        on_frame: extern "C" fn(userdata: *mut c_void, frame: *const ReactorEncodedFrame) -> c_int,
+        userdata: *mut c_void,
+        free_userdata: extern "C" fn(userdata: *mut c_void),
+    ) -> *mut FrameTransformer;
+    /// Replace the encoded payload of the frame currently in the callback
+    /// (copies). `frame` is [`ReactorEncodedFrame::frame`].
+    pub fn reactor_webrtc_encoded_frame_set_data(frame: *mut c_void, data: *const u8, len: usize);
+    /// Attach the transformer to the transceiver's **sender** (encoder →
+    /// packetizer). Returns 1 on success, 0 on failure.
+    pub fn reactor_webrtc_rtp_transceiver_set_sender_transform(
+        transceiver: *mut RtpTransceiver,
+        transformer: *mut FrameTransformer,
+    ) -> c_int;
+    /// Attach the transformer to the transceiver's **receiver** (depacketizer →
+    /// decoder). Returns 1 on success, 0 on failure.
+    pub fn reactor_webrtc_rtp_transceiver_set_receiver_transform(
+        transceiver: *mut RtpTransceiver,
+        transformer: *mut FrameTransformer,
+    ) -> c_int;
+    /// Release a transformer handle (the sender/receiver keep their own ref).
+    pub fn reactor_webrtc_frame_transformer_destroy(transformer: *mut FrameTransformer);
     /// Destroy a track handle (detaches any sink, releases the track + source).
     pub fn reactor_webrtc_media_stream_track_destroy(track: *mut MediaStreamTrack);
 

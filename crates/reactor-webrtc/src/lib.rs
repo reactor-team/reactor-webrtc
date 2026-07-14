@@ -18,6 +18,7 @@
 //! works without one.
 
 mod config;
+mod encoded;
 mod media;
 mod observer;
 mod peer_connection;
@@ -27,6 +28,7 @@ use std::ffi::CString;
 use std::os::raw::c_int;
 
 pub use config::{ContinualGatheringPolicy, IceServer, IceTransportsType, RtcConfiguration};
+pub use encoded::{EncodedFrame, FrameAction, FrameDirection, FrameTransform};
 pub use media::{AudioFrame, MediaKind, Track, VideoFrame};
 pub use observer::PeerConnectionObserver;
 pub use peer_connection::{
