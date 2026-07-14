@@ -24,13 +24,15 @@ mod observer;
 mod peer_connection;
 pub mod platform;
 
+use std::collections::VecDeque;
 use std::ffi::CString;
 use std::os::raw::c_int;
+use std::sync::{Arc, Mutex};
 
 pub use config::{ContinualGatheringPolicy, IceServer, IceTransportsType, RtcConfiguration};
 pub use encoded::{
-    CustomVideoEncoder, EncodedFrame, EncodedVideoFrame, FrameAction, FrameDirection,
-    FrameTransform, RawVideoFrame, VideoCodec,
+    CustomVideoEncoder, EncodedFrame, EncodedVideoFrame, EncodedVideoTrack, FrameAction,
+    FrameDirection, FrameTransform, RawVideoFrame, VideoCodec,
 };
 pub use media::{AudioFrame, MediaKind, Track, VideoFrame};
 pub use observer::PeerConnectionObserver;
@@ -160,6 +162,45 @@ impl PeerConnectionFactory {
             ));
         }
         Ok(Self { raw })
+    }
+
+    /// Create a factory pre-wired for push-based encoded video.
+    ///
+    /// Returns both the factory and an [`EncodedVideoTrack`] handle. Call
+    /// [`EncodedVideoTrack::push_encoded_frame`] whenever your encoder produces
+    /// a frame — no raw pixel pumping required.
+    ///
+    /// ```rust,ignore
+    /// let (factory, video) =
+    ///     PeerConnectionFactory::with_encoded_video_track("cam", 1280, 720)?;
+    ///
+    /// let pc  = factory.create_peer_connection(&config, observer)?;
+    /// let tx  = pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendOnly)?;
+    /// tx.set_track(video.track())?;
+    ///
+    /// // … later, on your encoder thread:
+    /// video.push_encoded_frame(EncodedVideoFrame {
+    ///     data: h264_annex_b_bytes,
+    ///     is_key_frame: true,
+    ///     width: 1280, height: 720, rtp_timestamp: 0,
+    /// });
+    /// ```
+    ///
+    /// `width` and `height` set the resolution advertised to libwebrtc's
+    /// encoder pipeline. They must match the resolution you intend to encode.
+    /// Pass `0` in [`EncodedVideoFrame`] fields to inherit them automatically.
+    pub fn with_encoded_video_track(
+        track_id: &str,
+        width: u32,
+        height: u32,
+    ) -> Result<(Self, crate::EncodedVideoTrack)> {
+        let queue: Arc<Mutex<VecDeque<EncodedVideoFrame>>> =
+            Arc::new(Mutex::new(VecDeque::new()));
+        let encoder = crate::CustomVideoEncoder::from_queue(queue.clone());
+        let factory = Self::with_custom_video_encoder(encoder)?;
+        let track   = factory.create_video_track(track_id)?;
+        let encoded = crate::EncodedVideoTrack::new(track, queue, width, height);
+        Ok((factory, encoded))
     }
 
     /// Create a peer connection with the given configuration and observer.

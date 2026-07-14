@@ -17,10 +17,11 @@
 //!
 //! The closure runs on a WebRTC thread and must not block it.
 
+use std::collections::VecDeque;
 use std::ffi::CStr;
 use std::ffi::c_void;
 use std::os::raw::c_int;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::media::MediaKind;
 
@@ -372,5 +373,85 @@ impl CustomVideoEncoder {
             userdata: state as *mut c_void,
             free_ud: Some(free_encoder_state_tramp),
         }
+    }
+
+    /// Create a custom encoder driven by an [`EncodedVideoTrack`] queue.
+    ///
+    /// Internal — called by [`PeerConnectionFactory::with_encoded_video_track`].
+    pub(crate) fn from_queue(queue: Arc<Mutex<VecDeque<EncodedVideoFrame>>>) -> Self {
+        Self::new(move |_raw| queue.lock().unwrap().pop_front())
+    }
+}
+
+// ── Push-based encoded video track ───────────────────────────────────────────
+
+/// A video track that accepts **pre-encoded** frames directly, bypassing the
+/// libwebrtc software encoder pipeline entirely.
+///
+/// Obtain one via [`PeerConnectionFactory::with_encoded_video_track`], then:
+///
+/// 1. Attach `EncodedVideoTrack::track()` to a send-only transceiver.
+/// 2. Call `push_encoded_frame` whenever your encoder (VideoToolbox, NVENC,
+///    GStreamer, libvpx, …) produces a frame — at your rate, on any thread.
+///
+/// # Timing
+///
+/// The WebRTC encoder thread is triggered internally each time you call
+/// `push_encoded_frame`, so you do **not** need to call
+/// `push_video_frame` separately. The dummy raw frame used to trigger it
+/// is cheap (pre-allocated; the I420 data is discarded by the encoder
+/// callback before it ever touches your encoded bytes).
+pub struct EncodedVideoTrack {
+    pub(crate) track: crate::media::Track,
+    pub(crate) queue: Arc<Mutex<VecDeque<EncodedVideoFrame>>>,
+    // Pre-allocated BGRA buffer used to trigger the WebRTC encoder thread.
+    // The dimensions are kept in sync with the track's configured resolution
+    // so the pipeline doesn't reject the frame due to a size mismatch.
+    dummy: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+
+// SAFETY: the queue is Mutex-guarded and the dummy buffer is owned; both are
+// safe to move across threads.
+unsafe impl Send for EncodedVideoTrack {}
+unsafe impl Sync for EncodedVideoTrack {}
+
+impl EncodedVideoTrack {
+    pub(crate) fn new(
+        track: crate::media::Track,
+        queue: Arc<Mutex<VecDeque<EncodedVideoFrame>>>,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        let dummy = vec![0u8; (width * height * 4) as usize];
+        Self { track, queue, dummy, width, height }
+    }
+
+    /// The underlying video [`Track`](crate::Track). Pass this to
+    /// [`Transceiver::set_track`](crate::Transceiver::set_track) after creating
+    /// the send-only transceiver.
+    pub fn track(&self) -> &crate::media::Track {
+        &self.track
+    }
+
+    /// Inject a pre-encoded frame into the WebRTC RTP stack.
+    ///
+    /// The call returns immediately; the frame is queued and forwarded to the
+    /// RTP packetizer on the WebRTC encoder thread. Thread-safe — call from
+    /// any thread, including a hardware encoder callback.
+    ///
+    /// Set `frame.width` / `frame.height` to 0 to inherit from the track's
+    /// configured resolution (the value passed to
+    /// [`with_encoded_video_track`](crate::PeerConnectionFactory::with_encoded_video_track)).
+    pub fn push_encoded_frame(&self, frame: EncodedVideoFrame) {
+        // Queue first so the frame is always present when the encoder thread
+        // dequeues it (the two operations are not atomic, but the encoder
+        // thread is asynchronous, so the queue push always wins the race).
+        self.queue.lock().unwrap().push_back(frame);
+        // Push a dummy raw frame to wake the WebRTC encoder thread.
+        // The I420 data is thrown away in the encoder callback — the actual
+        // encoded bytes come from the queue above.
+        self.track.push_video_frame(&self.dummy, self.width, self.height);
     }
 }
