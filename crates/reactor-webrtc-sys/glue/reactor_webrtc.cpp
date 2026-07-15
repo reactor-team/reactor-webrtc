@@ -285,12 +285,16 @@ class ReactorDcObserver : public webrtc::DataChannelObserver {
   ReactorDcObserver(webrtc::DataChannelInterface* channel, void* userdata,
                     void (*on_message)(void*, const uint8_t*, size_t, int),
                     void (*on_state_change)(void*, int),
-                    void (*on_buffered_amount_low)(void*))
+                    void (*on_buffered_amount_low)(void*),
+                    uint64_t low_threshold)
       : channel_(channel),
         userdata_(userdata),
         on_message_(on_message),
         on_state_change_(on_state_change),
-        on_buffered_amount_low_(on_buffered_amount_low) {}
+        on_buffered_amount_low_(on_buffered_amount_low),
+        low_threshold_(low_threshold) {}
+
+  void SetLowThreshold(uint64_t t) { low_threshold_ = t; }
 
   void OnStateChange() override {
     if (!on_state_change_) return;
@@ -308,10 +312,11 @@ class ReactorDcObserver : public webrtc::DataChannelObserver {
       on_message_(userdata_, buffer.data.cdata(), buffer.data.size(),
                   buffer.binary ? 1 : 0);
   }
+  // M7907 removed buffered_amount_low_threshold() from the public API;
+  // we track the threshold ourselves and fire on crossing it.
   void OnBufferedAmountChange(uint64_t /*previous_amount*/) override {
     if (on_buffered_amount_low_ &&
-        channel_->buffered_amount() <=
-            channel_->buffered_amount_low_threshold())
+        channel_->buffered_amount() <= low_threshold_)
       on_buffered_amount_low_(userdata_);
   }
 
@@ -321,6 +326,7 @@ class ReactorDcObserver : public webrtc::DataChannelObserver {
   void (*on_message_)(void*, const uint8_t*, size_t, int);
   void (*on_state_change_)(void*, int);
   void (*on_buffered_amount_low_)(void*);
+  uint64_t low_threshold_;
 };
 
 // A data-channel handle (the `DataChannel` in the Rust API): the channel plus
@@ -328,6 +334,7 @@ class ReactorDcObserver : public webrtc::DataChannelObserver {
 struct ReactorDataChannel {
   webrtc::scoped_refptr<webrtc::DataChannelInterface> channel;
   std::unique_ptr<ReactorDcObserver> observer;
+  uint64_t low_threshold = 0;  // persisted across observer re-registrations
 };
 
 // A transceiver handle (the `RtpTransceiver` in the Rust API).
@@ -786,7 +793,7 @@ void reactor_webrtc_data_channel_register_observer(
   if (h->observer) h->channel->UnregisterObserver();
   h->observer = std::make_unique<ReactorDcObserver>(
       h->channel.get(), userdata, on_message, on_state_change,
-      on_buffered_amount_low);
+      on_buffered_amount_low, h->low_threshold);
   h->channel->RegisterObserver(h->observer.get());
 }
 
@@ -824,10 +831,14 @@ int reactor_webrtc_data_channel_state(void* data_channel) {
 
 // Sets the buffered-amount-low threshold. on_buffered_amount_low fires when
 // the buffered amount drops to this value or below after a send.
+// M7907 removed SetBufferedAmountLowThreshold from the public API; the
+// threshold is tracked in ReactorDataChannel/ReactorDcObserver instead.
 void reactor_webrtc_data_channel_set_low_threshold(void* data_channel,
                                                     uint64_t threshold) {
   auto* h = reinterpret_cast<ReactorDataChannel*>(data_channel);
-  if (h && h->channel) h->channel->SetBufferedAmountLowThreshold(threshold);
+  if (!h) return;
+  h->low_threshold = threshold;
+  if (h->observer) h->observer->SetLowThreshold(threshold);
 }
 
 // Destroy a DataChannel handle (unregisters its observer, releases the channel).
