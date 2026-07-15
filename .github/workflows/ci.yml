@@ -19,13 +19,16 @@ jobs:
       - run: cargo clippy --workspace -- -D warnings
 
   test:
-    name: test (linux-x64, libwebrtc prebuilt)
-    runs-on: ubuntu-latest
+    name: test (mac-arm64, libwebrtc prebuilt)
+    # macOS: build.rs uses the system libc++ instead of the bundled one, so
+    # there is no compiler-version requirement from the prebuilt's libc++ headers.
+    # The linux prebuilt requires clang-20 (Chromium toolchain) which is not
+    # easily available on ubuntu-22.04 runners.
+    runs-on: macos-14
     env:
-      # Release: webrtc-7907-a5ddff60-p1 — reactor-webrtc-linux-x64-release.tar.zst
-      # Use the GitHub API asset endpoint so Bearer auth works for this private repo.
-      REACTOR_WEBRTC_PREBUILT_URL: https://api.github.com/repos/reactor-team/reactor-webrtc/releases/assets/475845307
-      REACTOR_WEBRTC_PREBUILT_SHA256: 4b8b99f45859ab78c3b236c90e8907830a418cb2f2729a56eccaaccda6d3c832
+      # Release: webrtc-7907-a5ddff60-p1 — reactor-webrtc-mac-arm64-release.tar.zst
+      REACTOR_WEBRTC_PREBUILT_URL: https://api.github.com/repos/reactor-team/reactor-webrtc/releases/assets/475845466
+      REACTOR_WEBRTC_PREBUILT_SHA256: 20c2a158223a943a1cf6d939f67cb1abc7450bb2dc43bdb608544628892785e3
       REACTOR_WEBRTC_PREBUILT_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
@@ -39,9 +42,4 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-test-
-      # The bundled libc++ headers require clang-18 (needs __builtin_popcountg
-      # and C++23 attributes absent in the default clang-14 on ubuntu-22.04).
-      - run: sudo apt-get install -y --no-install-recommends clang-18
       - run: cargo test --workspace
-        env:
-          CXX: clang++-18
