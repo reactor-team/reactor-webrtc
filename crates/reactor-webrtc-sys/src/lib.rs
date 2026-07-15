@@ -259,9 +259,12 @@ extern "C" {
         len: usize,
         binary: c_int,
     ) -> c_int;
-    /// Register data-channel callbacks. `on_message(userdata, data, len,
-    /// binary)` fires per message (`data` valid only during the call);
-    /// `on_open`/`on_close` on state transitions. Replaces any prior observer.
+    /// Register data-channel callbacks. `on_message` fires per received message
+    /// (`data` valid only during the call). `on_state_change(userdata, state)`
+    /// fires on all transitions: 0=Connecting 1=Open 2=Closing 3=Closed.
+    /// `on_buffered_amount_low` fires when buffered_amount drops at or below the
+    /// threshold set by `reactor_webrtc_data_channel_set_low_threshold`. Any
+    /// pointer may be null. Replaces any previously registered observer.
     pub fn reactor_webrtc_data_channel_register_observer(
         data_channel: *mut DataChannel,
         userdata: *mut c_void,
@@ -271,8 +274,26 @@ extern "C" {
             len: usize,
             binary: c_int,
         ),
-        on_open: extern "C" fn(userdata: *mut c_void),
-        on_close: extern "C" fn(userdata: *mut c_void),
+        on_state_change: extern "C" fn(userdata: *mut c_void, state: c_int),
+        on_buffered_amount_low: extern "C" fn(userdata: *mut c_void),
+    );
+    /// Number of bytes currently queued for sending on the data channel.
+    pub fn reactor_webrtc_data_channel_buffered_amount(data_channel: *mut DataChannel) -> u64;
+    /// Copy the channel's label into `out` (NUL-terminated, capped at `cap`).
+    /// Returns the label length or -1 on error.
+    pub fn reactor_webrtc_data_channel_label(
+        data_channel: *mut DataChannel,
+        out: *mut c_char,
+        cap: c_int,
+    ) -> c_int;
+    /// Current channel state: 0=Connecting 1=Open 2=Closing 3=Closed.
+    pub fn reactor_webrtc_data_channel_state(data_channel: *mut DataChannel) -> c_int;
+    /// Set the buffered-amount-low threshold (bytes). The
+    /// `on_buffered_amount_low` callback fires when `buffered_amount` drops to
+    /// this value or below after a send.
+    pub fn reactor_webrtc_data_channel_set_low_threshold(
+        data_channel: *mut DataChannel,
+        threshold: u64,
     );
     /// Release a data channel handle.
     pub fn reactor_webrtc_data_channel_destroy(data_channel: *mut DataChannel);

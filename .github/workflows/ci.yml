@@ -6,18 +6,43 @@ on:
   pull_request:
 
 jobs:
-  rust:
-    name: check + fmt + clippy
+  lint:
+    name: fmt + check + clippy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      # API/dev mode: no native libwebrtc configured, so `check`/`clippy` build
-      # the Rust API surface without linking. A full build+test against a real
-      # prebuilt runs in a separate job once prebuilts are published (set
-      # REACTOR_WEBRTC_PREBUILT_URL / _SHA256).
       - run: cargo fmt --all -- --check
       - run: cargo check --workspace
       - run: cargo clippy --workspace -- -D warnings
+
+  test:
+    name: test (linux-x64, libwebrtc prebuilt)
+    runs-on: ubuntu-latest
+    env:
+      # Release: webrtc-7907-a5ddff60-p1 — reactor-webrtc-linux-x64-release.tar.zst
+      REACTOR_WEBRTC_PREBUILT_URL: https://api.github.com/repos/reactor-team/reactor-webrtc/releases/assets/475845307
+      REACTOR_WEBRTC_PREBUILT_SHA256: 4b8b99f45859ab78c3b236c90e8907830a418cb2f2729a56eccaaccda6d3c832
+      REACTOR_WEBRTC_PREBUILT_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      CXX: clang++-19
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install clang-19
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/llvm.asc
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-19 main" | sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang-19
+      - name: Cache cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-test-
+      - run: cargo test --workspace
