@@ -6,20 +6,40 @@ on:
   pull_request:
 
 jobs:
-  rust:
-    name: check + fmt + clippy
+  lint:
+    name: fmt + check + clippy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      # Without REACTOR_WEBRTC_LIB_DIR the build script skips native linking and
-      # does not emit cfg(have_libwebrtc), so check/clippy/test all build the Rust
-      # API surface only. Tests gated on have_libwebrtc compile to empty modules
-      # and pass with 0 tests. A full linked test run requires a prebuilt artifact
-      # (set REACTOR_WEBRTC_PREBUILT_URL/_SHA256 or REACTOR_WEBRTC_LIB_DIR).
       - run: cargo fmt --all -- --check
       - run: cargo check --workspace
       - run: cargo clippy --workspace -- -D warnings
+
+  test:
+    name: test (linux-x64, libwebrtc prebuilt)
+    runs-on: ubuntu-latest
+    env:
+      # Release: webrtc-7907-a5ddff60-p1 — reactor-webrtc-linux-x64-release.tar.zst
+      # Use the GitHub API asset endpoint so Bearer auth works for this private repo.
+      REACTOR_WEBRTC_PREBUILT_URL: https://api.github.com/repos/reactor-team/reactor-webrtc/releases/assets/475845307
+      REACTOR_WEBRTC_PREBUILT_SHA256: 4b8b99f45859ab78c3b236c90e8907830a418cb2f2729a56eccaaccda6d3c832
+      REACTOR_WEBRTC_PREBUILT_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-test-
+      # build.rs sets compiler("clang++") for Linux; clang is pre-installed on
+      # ubuntu-latest but ensure it is symlinked as clang++.
+      - run: sudo apt-get install -y --no-install-recommends clang
       - run: cargo test --workspace
