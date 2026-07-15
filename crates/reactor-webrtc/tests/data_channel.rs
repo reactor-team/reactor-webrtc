@@ -117,17 +117,25 @@ mod tests {
         let recv_count = Arc::new(AtomicU32::new(0));
         let last_msg: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
 
-        // pc2 receives the channel via on_data_channel.
-        // We need to set the handler after pc2's channel appears.
+        // Register dc1's on_open *before* negotiate so we don't miss the
+        // transition — in a loopback test the channel can open before the
+        // callback is wired if we wait until after negotiation completes.
+        let dc1_open = Arc::new(AtomicBool::new(false));
+        let dc1_open2 = dc1_open.clone();
+        dc1.on_open(move || {
+            dc1_open2.store(true, Ordering::SeqCst);
+        });
+
         negotiate(&pc1, &pc2);
 
-        // Wait for connection and pc2's on_data_channel to fire.
+        // Wait for connection, pc2's on_data_channel, and dc1 to open.
         let ok = wait_for(&s1, &s2, &pc1, &pc2, || {
             s1.connected.load(Ordering::SeqCst)
                 && s2.connected.load(Ordering::SeqCst)
                 && !s2.data_channels.lock().unwrap().is_empty()
+                && dc1_open.load(Ordering::SeqCst)
         });
-        assert!(ok, "timed out waiting for connection + on_data_channel");
+        assert!(ok, "timed out waiting for connection + dc1 open");
 
         // Wire up the receiver on pc2's side.
         let mut dc2 = s2.data_channels.lock().unwrap().pop().unwrap();
@@ -137,16 +145,6 @@ mod tests {
             *last_msg2.lock().unwrap() = data.to_vec();
             recv_count2.fetch_add(1, Ordering::SeqCst);
         });
-
-        // Wait for dc1 to open, then send.
-        let dc1_open = Arc::new(AtomicBool::new(false));
-        let dc1_open2 = dc1_open.clone();
-        dc1.on_open(move || {
-            dc1_open2.store(true, Ordering::SeqCst);
-        });
-
-        let ok = wait_for(&s1, &s2, &pc1, &pc2, || dc1_open.load(Ordering::SeqCst));
-        assert!(ok, "timed out waiting for dc1 to open");
 
         dc1.send(b"hello reactor", true).expect("send");
         dc1.send(b"second message", false).expect("send");
