@@ -176,15 +176,36 @@ impl PeerConnectionState {
     }
 }
 
+/// Data channel readiness state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataChannelState {
+    Connecting,
+    Open,
+    Closing,
+    Closed,
+}
+
+impl DataChannelState {
+    fn from_raw(v: c_int) -> Self {
+        match v {
+            0 => DataChannelState::Connecting,
+            1 => DataChannelState::Open,
+            2 => DataChannelState::Closing,
+            _ => DataChannelState::Closed,
+        }
+    }
+}
+
 type MessageCb = Box<dyn for<'a> FnMut(&'a [u8], bool) + Send>;
 type EventCb = Box<dyn FnMut() + Send>;
+type StateCb = Box<dyn FnMut(DataChannelState) + Send>;
 
 // Heap-pinned data-channel callback state addressed by the sys `userdata`.
 #[derive(Default)]
 struct DcObserverState {
     on_message: Option<Mutex<MessageCb>>,
-    on_open: Option<Mutex<EventCb>>,
-    on_close: Option<Mutex<EventCb>>,
+    on_state_change: Option<Mutex<StateCb>>,
+    on_buffered_amount_low: Option<Mutex<EventCb>>,
 }
 
 extern "C" fn dc_on_message(ud: *mut c_void, data: *const u8, len: usize, binary: c_int) {
@@ -196,24 +217,25 @@ extern "C" fn dc_on_message(ud: *mut c_void, data: *const u8, len: usize, binary
         }
     }
 }
-extern "C" fn dc_on_open(ud: *mut c_void) {
+extern "C" fn dc_on_state_change(ud: *mut c_void, state: c_int) {
     let st = unsafe { &*(ud as *const DcObserverState) };
-    if let Some(m) = &st.on_open {
+    if let Some(m) = &st.on_state_change {
         if let Ok(mut cb) = m.lock() {
-            cb();
+            cb(DataChannelState::from_raw(state));
         }
     }
 }
-extern "C" fn dc_on_close(ud: *mut c_void) {
+extern "C" fn dc_on_buffered_amount_low(ud: *mut c_void) {
     let st = unsafe { &*(ud as *const DcObserverState) };
-    if let Some(m) = &st.on_close {
+    if let Some(m) = &st.on_buffered_amount_low {
         if let Ok(mut cb) = m.lock() {
             cb();
         }
     }
 }
 
-/// A negotiated data channel. Dropping it releases the native handle.
+/// A data channel — either locally created or handed to `on_data_channel` by
+/// the remote peer. Dropping releases the native handle.
 pub struct DataChannel {
     raw: *mut reactor_webrtc_sys::DataChannel,
     // Keeps the callback closures alive while the native observer is registered.
@@ -221,7 +243,8 @@ pub struct DataChannel {
 }
 
 // SAFETY: the native data channel is internally thread-safe; callbacks are
-// serialized on the signaling thread and guarded by mutexes.
+// serialized on the network/signaling thread and guarded by mutexes on the
+// Rust side.
 unsafe impl Send for DataChannel {}
 unsafe impl Sync for DataChannel {}
 
@@ -233,7 +256,45 @@ impl DataChannel {
         }
     }
 
-    /// Send bytes over the channel (`binary` selects the message type).
+    /// The label this channel was created with.
+    pub fn label(&self) -> String {
+        let mut buf = [0u8; 256];
+        let n = unsafe {
+            reactor_webrtc_sys::reactor_webrtc_data_channel_label(
+                self.raw,
+                buf.as_mut_ptr() as *mut c_char,
+                buf.len() as c_int,
+            )
+        };
+        if n < 0 {
+            String::new()
+        } else {
+            unsafe { CStr::from_ptr(buf.as_ptr() as *const c_char) }
+                .to_string_lossy()
+                .into_owned()
+        }
+    }
+
+    /// Current readiness state.
+    pub fn state(&self) -> DataChannelState {
+        DataChannelState::from_raw(unsafe {
+            reactor_webrtc_sys::reactor_webrtc_data_channel_state(self.raw)
+        })
+    }
+
+    /// Bytes currently queued for sending (backpressure signal).
+    pub fn buffered_amount(&self) -> u64 {
+        unsafe { reactor_webrtc_sys::reactor_webrtc_data_channel_buffered_amount(self.raw) }
+    }
+
+    /// Set the threshold below which `on_buffered_amount_low` fires.
+    pub fn set_buffered_amount_low_threshold(&self, threshold: u64) {
+        unsafe {
+            reactor_webrtc_sys::reactor_webrtc_data_channel_set_low_threshold(self.raw, threshold)
+        }
+    }
+
+    /// Send bytes over the channel. `binary` selects the SCTP message type.
     pub fn send(&self, data: &[u8], binary: bool) -> Result<()> {
         let ok = unsafe {
             reactor_webrtc_sys::reactor_webrtc_data_channel_send(
@@ -250,22 +311,50 @@ impl DataChannel {
         }
     }
 
-    /// Set the message handler. The closure runs on a WebRTC thread.
+    /// Receive handler — fires on every incoming message. The closure runs on
+    /// a WebRTC network thread; return quickly or offload heavy work.
     pub fn on_message(&mut self, cb: impl for<'a> FnMut(&'a [u8], bool) + Send + 'static) {
         self.observer
             .get_or_insert_with(Default::default)
             .on_message = Some(Mutex::new(Box::new(cb)));
         self.reregister();
     }
-    /// Set the open handler (fires when the channel becomes open).
-    pub fn on_open(&mut self, cb: impl FnMut() + Send + 'static) {
-        self.observer.get_or_insert_with(Default::default).on_open = Some(Mutex::new(Box::new(cb)));
+
+    /// State-change handler — fires for every transition including
+    /// Connecting → Open → Closing → Closed.
+    pub fn on_state_change(&mut self, cb: impl FnMut(DataChannelState) + Send + 'static) {
+        self.observer
+            .get_or_insert_with(Default::default)
+            .on_state_change = Some(Mutex::new(Box::new(cb)));
         self.reregister();
     }
-    /// Set the close handler.
+
+    /// Convenience: fires once when the channel becomes `Open`.
+    pub fn on_open(&mut self, cb: impl FnMut() + Send + 'static) {
+        let mut cb = cb;
+        self.on_state_change(move |s| {
+            if s == DataChannelState::Open {
+                cb();
+            }
+        });
+    }
+
+    /// Convenience: fires once when the channel reaches `Closed`.
     pub fn on_close(&mut self, cb: impl FnMut() + Send + 'static) {
-        self.observer.get_or_insert_with(Default::default).on_close =
-            Some(Mutex::new(Box::new(cb)));
+        let mut cb = cb;
+        self.on_state_change(move |s| {
+            if s == DataChannelState::Closed {
+                cb();
+            }
+        });
+    }
+
+    /// Flow-control handler — fires when `buffered_amount` drops at or below
+    /// the threshold set by [`set_buffered_amount_low_threshold`](Self::set_buffered_amount_low_threshold).
+    pub fn on_buffered_amount_low(&mut self, cb: impl FnMut() + Send + 'static) {
+        self.observer
+            .get_or_insert_with(Default::default)
+            .on_buffered_amount_low = Some(Mutex::new(Box::new(cb)));
         self.reregister();
     }
 
@@ -277,8 +366,8 @@ impl DataChannel {
                     self.raw,
                     ud,
                     dc_on_message,
-                    dc_on_open,
-                    dc_on_close,
+                    dc_on_state_change,
+                    dc_on_buffered_amount_low,
                 );
             }
         }

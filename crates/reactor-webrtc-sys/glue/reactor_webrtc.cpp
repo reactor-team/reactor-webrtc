@@ -279,41 +279,48 @@ struct ReactorMediaStreamTrack {
 };
 
 // Bridges data-channel events to C callbacks.
+// State int values: 0=Connecting 1=Open 2=Closing 3=Closed.
 class ReactorDcObserver : public webrtc::DataChannelObserver {
  public:
   ReactorDcObserver(webrtc::DataChannelInterface* channel, void* userdata,
                     void (*on_message)(void*, const uint8_t*, size_t, int),
-                    void (*on_open)(void*), void (*on_close)(void*))
+                    void (*on_state_change)(void*, int),
+                    void (*on_buffered_amount_low)(void*))
       : channel_(channel),
         userdata_(userdata),
         on_message_(on_message),
-        on_open_(on_open),
-        on_close_(on_close) {}
+        on_state_change_(on_state_change),
+        on_buffered_amount_low_(on_buffered_amount_low) {}
 
   void OnStateChange() override {
+    if (!on_state_change_) return;
+    int s;
     switch (channel_->state()) {
-      case webrtc::DataChannelInterface::kOpen:
-        if (on_open_) on_open_(userdata_);
-        break;
-      case webrtc::DataChannelInterface::kClosed:
-        if (on_close_) on_close_(userdata_);
-        break;
-      default:
-        break;
+      case webrtc::DataChannelInterface::kConnecting: s = 0; break;
+      case webrtc::DataChannelInterface::kOpen:       s = 1; break;
+      case webrtc::DataChannelInterface::kClosing:    s = 2; break;
+      default:                                        s = 3; break;
     }
+    on_state_change_(userdata_, s);
   }
   void OnMessage(const webrtc::DataBuffer& buffer) override {
     if (on_message_)
       on_message_(userdata_, buffer.data.cdata(), buffer.data.size(),
                   buffer.binary ? 1 : 0);
   }
+  void OnBufferedAmountChange(uint64_t /*previous_amount*/) override {
+    if (on_buffered_amount_low_ &&
+        channel_->buffered_amount() <=
+            channel_->buffered_amount_low_threshold())
+      on_buffered_amount_low_(userdata_);
+  }
 
  private:
   webrtc::DataChannelInterface* channel_;  // not owned
   void* userdata_;
   void (*on_message_)(void*, const uint8_t*, size_t, int);
-  void (*on_open_)(void*);
-  void (*on_close_)(void*);
+  void (*on_state_change_)(void*, int);
+  void (*on_buffered_amount_low_)(void*);
 };
 
 // A data-channel handle (the `DataChannel` in the Rust API): the channel plus
@@ -762,19 +769,65 @@ int reactor_webrtc_data_channel_send(void* data_channel, const uint8_t* data,
   return h->channel->Send(webrtc::DataBuffer(buffer, binary != 0)) ? 1 : 0;
 }
 
-// Register callbacks for a data channel. `on_message(userdata, data, len,
-// binary)` fires per message; `on_open`/`on_close` on state transitions. Any
-// pointer may be null. Replaces a previously registered observer.
+// Register callbacks for a data channel.
+// `on_message(userdata, data, len, binary)` fires per message.
+// `on_state_change(userdata, state)` fires on all state transitions;
+//   state: 0=Connecting 1=Open 2=Closing 3=Closed.
+// `on_buffered_amount_low(userdata)` fires when buffered_amount drops at or
+//   below the threshold set by reactor_webrtc_data_channel_set_low_threshold.
+// Any pointer may be null. Replaces any previously registered observer.
 void reactor_webrtc_data_channel_register_observer(
     void* data_channel, void* userdata,
     void (*on_message)(void*, const uint8_t*, size_t, int),
-    void (*on_open)(void*), void (*on_close)(void*)) {
+    void (*on_state_change)(void*, int),
+    void (*on_buffered_amount_low)(void*)) {
   auto* h = reinterpret_cast<ReactorDataChannel*>(data_channel);
   if (!h || !h->channel) return;
   if (h->observer) h->channel->UnregisterObserver();
   h->observer = std::make_unique<ReactorDcObserver>(
-      h->channel.get(), userdata, on_message, on_open, on_close);
+      h->channel.get(), userdata, on_message, on_state_change,
+      on_buffered_amount_low);
   h->channel->RegisterObserver(h->observer.get());
+}
+
+// Returns the number of bytes currently queued for sending.
+uint64_t reactor_webrtc_data_channel_buffered_amount(void* data_channel) {
+  auto* h = reinterpret_cast<ReactorDataChannel*>(data_channel);
+  if (!h || !h->channel) return 0;
+  return h->channel->buffered_amount();
+}
+
+// Copies the channel label into `out` (NUL-terminated, capped at `cap`).
+// Returns the label length (may exceed cap if truncated), or -1 on error.
+int reactor_webrtc_data_channel_label(void* data_channel, char* out, int cap) {
+  auto* h = reinterpret_cast<ReactorDataChannel*>(data_channel);
+  if (!h || !h->channel || !out || cap <= 0) return -1;
+  const std::string& label = h->channel->label();
+  int n = static_cast<int>(label.size());
+  int copy = std::min(n, cap - 1);
+  std::memcpy(out, label.data(), copy);
+  out[copy] = '\0';
+  return n;
+}
+
+// Returns the current channel state: 0=Connecting 1=Open 2=Closing 3=Closed.
+int reactor_webrtc_data_channel_state(void* data_channel) {
+  auto* h = reinterpret_cast<ReactorDataChannel*>(data_channel);
+  if (!h || !h->channel) return 3;
+  switch (h->channel->state()) {
+    case webrtc::DataChannelInterface::kConnecting: return 0;
+    case webrtc::DataChannelInterface::kOpen:       return 1;
+    case webrtc::DataChannelInterface::kClosing:    return 2;
+    default:                                        return 3;
+  }
+}
+
+// Sets the buffered-amount-low threshold. on_buffered_amount_low fires when
+// the buffered amount drops to this value or below after a send.
+void reactor_webrtc_data_channel_set_low_threshold(void* data_channel,
+                                                    uint64_t threshold) {
+  auto* h = reinterpret_cast<ReactorDataChannel*>(data_channel);
+  if (h && h->channel) h->channel->SetBufferedAmountLowThreshold(threshold);
 }
 
 // Destroy a DataChannel handle (unregisters its observer, releases the channel).
