@@ -224,7 +224,3 @@ mod tests {
     }
 }
 
-#[cfg(not(have_libwebrtc))]
-fn main() {
-    eprintln!("Set REACTOR_WEBRTC_LIB_DIR=<path/to/dist> to run data_channel tests.");
-}
