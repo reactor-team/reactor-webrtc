@@ -35,10 +35,7 @@
 fn main() {
     #[cfg(not(have_libwebrtc))]
     {
-        eprintln!(
-            "Set REACTOR_WEBRTC_LIB_DIR=<path/to/dist> to link a native libwebrtc build."
-        );
-        return;
+        eprintln!("Set REACTOR_WEBRTC_LIB_DIR=<path/to/dist> to link a native libwebrtc build.");
     }
     #[cfg(have_libwebrtc)]
     run();
@@ -53,23 +50,23 @@ fn run() {
     use std::time::{Duration, Instant};
 
     use reactor_webrtc::{
-        EncodedVideoFrame, FrameAction, FrameTransform, IceCandidate, MediaKind,
-        PeerConnection, PeerConnectionFactory, PeerConnectionObserver, PeerConnectionState,
-        RtcConfiguration, Track, TransceiverDirection,
+        EncodedVideoFrame, FrameAction, FrameTransform, IceCandidate, MediaKind, PeerConnection,
+        PeerConnectionFactory, PeerConnectionObserver, PeerConnectionState, RtcConfiguration,
+        Track, TransceiverDirection,
     };
 
     // ── peer boilerplate ──────────────────────────────────────────────────────
 
     #[derive(Default)]
     struct Peer {
-        ice:       Mutex<VecDeque<IceCandidate>>,
+        ice: Mutex<VecDeque<IceCandidate>>,
         connected: AtomicBool,
-        tracks:    Mutex<Vec<Track>>,
+        tracks: Mutex<Vec<Track>>,
     }
 
     fn make_peer(
         factory: &PeerConnectionFactory,
-        config:  &RtcConfiguration,
+        config: &RtcConfiguration,
     ) -> (PeerConnection, Arc<Peer>) {
         let shared = Arc::new(Peer::default());
         let obs = PeerConnectionObserver::new()
@@ -112,10 +109,9 @@ fn run() {
 
     let (w, h) = (640u32, 480u32);
     let (factory, video) =
-        PeerConnectionFactory::with_encoded_video_track("cam", w, h)
-            .expect("factory");
+        PeerConnectionFactory::with_encoded_video_track("cam", w, h).expect("factory");
 
-    let config    = RtcConfiguration::default();
+    let config = RtcConfiguration::default();
     let (pc1, s1) = make_peer(&factory, &config);
     let (pc2, s2) = make_peer(&factory, &config);
 
@@ -147,7 +143,12 @@ fn run() {
     let negotiated_codec = answer
         .sdp
         .lines()
-        .find(|l| l.starts_with("a=rtpmap") && !l.contains("rtx") && !l.contains("red") && !l.contains("ulpfec"))
+        .find(|l| {
+            l.starts_with("a=rtpmap")
+                && !l.contains("rtx")
+                && !l.contains("red")
+                && !l.contains("ulpfec")
+        })
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|s| s.split('/').next())
         .unwrap_or("(unknown)")
@@ -160,17 +161,22 @@ fn run() {
     // ── receiver: FrameTransform to capture encoded bytes ────────────────────
 
     let received_count = Arc::new(AtomicU32::new(0));
-    let received_key   = Arc::new(AtomicU32::new(0));
+    let received_key = Arc::new(AtomicU32::new(0));
 
     let recv_tf = FrameTransform::new({
         let received_count = received_count.clone();
-        let received_key   = received_key.clone();
+        let received_key = received_key.clone();
         move |f| {
-            if f.data.is_empty() { return FrameAction::Drop; }
+            if f.data.is_empty() {
+                return FrameAction::Drop;
+            }
 
             println!(
                 "  [recv] codec={} key={} size={}B ts={}",
-                f.mime_type, f.is_key_frame, f.data.len(), f.timestamp,
+                f.mime_type,
+                f.is_key_frame,
+                f.data.len(),
+                f.timestamp,
             );
 
             // Here you would:
@@ -183,7 +189,9 @@ fn run() {
             // that comes with with_encoded_video_track).
 
             received_count.fetch_add(1, Ordering::SeqCst);
-            if f.is_key_frame { received_key.fetch_add(1, Ordering::SeqCst); }
+            if f.is_key_frame {
+                received_key.fetch_add(1, Ordering::SeqCst);
+            }
             FrameAction::Drop
         }
     });
@@ -193,7 +201,8 @@ fn run() {
         .into_iter()
         .find(|t| t.kind() == MediaKind::Video)
         .expect("pc2 video transceiver");
-    rx2.set_receiver_transform(&recv_tf).expect("receiver transform");
+    rx2.set_receiver_transform(&recv_tf)
+        .expect("receiver transform");
 
     // ── push pre-encoded frames ───────────────────────────────────────────────
     //
@@ -205,7 +214,7 @@ fn run() {
     // No raw pixel pumping. No closure. Any thread. Any rate.
 
     let encoded_count = Arc::new(AtomicU32::new(0));
-    let stop          = AtomicBool::new(false);
+    let stop = AtomicBool::new(false);
 
     thread::scope(|scope| {
         scope.spawn(|| {
@@ -259,8 +268,7 @@ fn run() {
     let enc = encoded_count.load(Ordering::SeqCst);
     let rec = received_count.load(Ordering::SeqCst);
     let key = received_key.load(Ordering::SeqCst);
-    let connected =
-        s1.connected.load(Ordering::SeqCst) && s2.connected.load(Ordering::SeqCst);
+    let connected = s1.connected.load(Ordering::SeqCst) && s2.connected.load(Ordering::SeqCst);
 
     drop(recv_tf);
 
@@ -270,9 +278,7 @@ fn run() {
              received {rec} ({key} key)"
         );
     } else {
-        eprintln!(
-            "\npre_encoded ❌ — connected={connected} pushed={enc} received={rec}"
-        );
+        eprintln!("\npre_encoded ❌ — connected={connected} pushed={enc} received={rec}");
         std::process::exit(1);
     }
 }

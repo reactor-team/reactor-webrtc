@@ -31,7 +31,10 @@ struct Ice {
     recv: Mutex<Vec<Track>>,
 }
 
-fn make_peer(factory: &PeerConnectionFactory, config: &RtcConfiguration) -> (PeerConnection, Arc<Ice>) {
+fn make_peer(
+    factory: &PeerConnectionFactory,
+    config: &RtcConfiguration,
+) -> (PeerConnection, Arc<Ice>) {
     let ice = Arc::new(Ice::default());
     let observer = PeerConnectionObserver::new()
         .on_ice_candidate({
@@ -104,7 +107,8 @@ fn encoded_frames_flow_both_directions() {
             FrameAction::Forward
         }
     });
-    tx1.set_sender_transform(&send_tf).expect("sender transform");
+    tx1.set_sender_transform(&send_tf)
+        .expect("sender transform");
 
     // Receiver transform: observe ingress encoded frames; forward to the decoder.
     let recvd = Arc::new(AtomicU32::new(0));
@@ -123,10 +127,13 @@ fn encoded_frames_flow_both_directions() {
     // Offer/answer.
     let offer = pc1.create_offer().expect("create offer");
     pc1.set_local_description(&offer).expect("pc1 local offer");
-    pc2.set_remote_description(&offer).expect("pc2 remote offer");
+    pc2.set_remote_description(&offer)
+        .expect("pc2 remote offer");
     let answer = pc2.create_answer().expect("create answer");
-    pc2.set_local_description(&answer).expect("pc2 local answer");
-    pc1.set_remote_description(&answer).expect("pc1 remote answer");
+    pc2.set_local_description(&answer)
+        .expect("pc2 local answer");
+    pc1.set_remote_description(&answer)
+        .expect("pc1 remote answer");
 
     // Attach the receiver transform *after* negotiation to the transceiver that
     // actually receives (auto-created from the offer on pc2). This is the SFU

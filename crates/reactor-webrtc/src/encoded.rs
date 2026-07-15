@@ -18,8 +18,8 @@
 //! The closure runs on a WebRTC thread and must not block it.
 
 use std::collections::{HashMap, VecDeque};
-use std::ffi::CStr;
 use std::ffi::c_void;
+use std::ffi::CStr;
 use std::os::raw::c_int;
 use std::sync::{Arc, Mutex};
 
@@ -106,7 +106,9 @@ extern "C" fn encoded_tramp(
     let mime = if f.mime_type.is_null() {
         ""
     } else {
-        unsafe { CStr::from_ptr(f.mime_type) }.to_str().unwrap_or("")
+        unsafe { CStr::from_ptr(f.mime_type) }
+            .to_str()
+            .unwrap_or("")
     };
     let ef = EncodedFrame {
         direction: if f.direction == 1 {
@@ -199,9 +201,9 @@ impl Drop for FrameTransform {
 /// FFI as a plain `u32`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoCodec {
-    Vp8  = 1,
-    Vp9  = 2,
-    Av1  = 3,
+    Vp8 = 1,
+    Vp9 = 2,
+    Av1 = 3,
     H264 = 4,
     H265 = 5,
 }
@@ -256,8 +258,7 @@ pub struct EncodedVideoFrame {
     pub rtp_timestamp: u32,
 }
 
-type EncodeCallbackBox =
-    Box<dyn FnMut(&RawVideoFrame<'_>) -> Option<EncodedVideoFrame> + Send>;
+type EncodeCallbackBox = Box<dyn FnMut(&RawVideoFrame<'_>) -> Option<EncodedVideoFrame> + Send>;
 
 struct CustomEncoderState {
     cb: Mutex<EncodeCallbackBox>,
@@ -274,15 +275,27 @@ extern "C" fn encode_tramp(
     let st = unsafe { &*(ud as *const CustomEncoderState) };
 
     let y_len = (r.y_stride.max(0) as usize) * r.height as usize;
-    let uv_len = (r.u_stride.max(0) as usize) * ((r.height as usize + 1) / 2);
+    let uv_len = (r.u_stride.max(0) as usize) * (r.height as usize).div_ceil(2);
 
     let frame = RawVideoFrame {
         codec: VideoCodec::from_u32(r.codec).unwrap_or(VideoCodec::H264),
-        y: if r.y.is_null() { &[] } else { unsafe { std::slice::from_raw_parts(r.y, y_len) } },
+        y: if r.y.is_null() {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(r.y, y_len) }
+        },
         y_stride: r.y_stride as u32,
-        u: if r.u.is_null() { &[] } else { unsafe { std::slice::from_raw_parts(r.u, uv_len) } },
+        u: if r.u.is_null() {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(r.u, uv_len) }
+        },
         u_stride: r.u_stride as u32,
-        v: if r.v.is_null() { &[] } else { unsafe { std::slice::from_raw_parts(r.v, uv_len) } },
+        v: if r.v.is_null() {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(r.v, uv_len) }
+        },
         v_stride: r.v_stride as u32,
         width: r.width,
         height: r.height,
@@ -337,14 +350,14 @@ pub(crate) enum RegistrySlot {
 /// transceiver, in negotiation order — which in turn matches the order
 /// [`add_encoded_slot`] / [`add_raw_slot`] were called on the builder.
 pub(crate) struct EncoderRegistry {
-    pending:  Mutex<VecDeque<RegistrySlot>>,
+    pending: Mutex<VecDeque<RegistrySlot>>,
     assigned: Mutex<HashMap<u64, RegistrySlot>>,
 }
 
 impl EncoderRegistry {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
-            pending:  Mutex::new(VecDeque::new()),
+            pending: Mutex::new(VecDeque::new()),
             assigned: Mutex::new(HashMap::new()),
         })
     }
@@ -353,14 +366,20 @@ impl EncoderRegistry {
     /// [`EncodedVideoTrack`] will push frames into.
     pub(crate) fn add_encoded_slot(&self) -> Arc<Mutex<VecDeque<EncodedVideoFrame>>> {
         let q = Arc::new(Mutex::new(VecDeque::new()));
-        self.pending.lock().unwrap().push_back(RegistrySlot::Custom(q.clone()));
+        self.pending
+            .lock()
+            .unwrap()
+            .push_back(RegistrySlot::Custom(q.clone()));
         q
     }
 
     /// Reserve a builtin (raw BGRA) slot. The C++ factory will delegate to
     /// the builtin VP8/VP9/AV1 encoder for this transceiver.
     pub(crate) fn add_raw_slot(&self) {
-        self.pending.lock().unwrap().push_back(RegistrySlot::Builtin);
+        self.pending
+            .lock()
+            .unwrap()
+            .push_back(RegistrySlot::Builtin);
     }
 
     /// Called by `registry_use_builtin_tramp`. Assigns the next pending slot to
@@ -371,7 +390,11 @@ impl EncoderRegistry {
         if let Some(slot) = assigned.get(&encoder_id) {
             return matches!(slot, RegistrySlot::Builtin);
         }
-        let slot = self.pending.lock().unwrap().pop_front()
+        let slot = self
+            .pending
+            .lock()
+            .unwrap()
+            .pop_front()
             .unwrap_or(RegistrySlot::Builtin);
         let is_builtin = matches!(slot, RegistrySlot::Builtin);
         assigned.insert(encoder_id, slot);
@@ -382,18 +405,19 @@ impl EncoderRegistry {
     /// this encoder instance, assigning its slot on first call if needed.
     fn pop_for(&self, encoder_id: u64) -> Option<EncodedVideoFrame> {
         let mut assigned = self.assigned.lock().unwrap();
-        // Assign slot on first call (if use_builtin_for wasn't called first).
-        if !assigned.contains_key(&encoder_id) {
-            let slot = self.pending.lock().unwrap().pop_front()
-                .unwrap_or(RegistrySlot::Builtin);
-            assigned.insert(encoder_id, slot);
-        }
-        match assigned.get(&encoder_id) {
-            Some(RegistrySlot::Custom(q)) => {
+        let slot = assigned.entry(encoder_id).or_insert_with(|| {
+            self.pending
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(RegistrySlot::Builtin)
+        });
+        match slot {
+            RegistrySlot::Custom(q) => {
                 let q = q.clone();
                 drop(assigned);
-                let result = q.lock().unwrap().pop_front();
-                result
+                let frame = q.lock().unwrap().pop_front();
+                frame
             }
             _ => None,
         }
@@ -418,13 +442,13 @@ fn fill_output(
     std::mem::forget(v);
     unsafe {
         let o = &mut *out;
-        o.data          = ptr;
-        o.len           = len;
-        o.is_key_frame  = encoded.is_key_frame as c_int;
-        o.width         = encoded.width;
-        o.height        = encoded.height;
+        o.data = ptr;
+        o.len = len;
+        o.is_key_frame = encoded.is_key_frame as c_int;
+        o.width = encoded.width;
+        o.height = encoded.height;
         o.rtp_timestamp = encoded.rtp_timestamp;
-        o.free_data     = Some(free_encoded_data);
+        o.free_data = Some(free_encoded_data);
     }
     0
 }
@@ -434,7 +458,9 @@ extern "C" fn registry_encode_tramp(
     raw: *const reactor_webrtc_sys::ReactorRawVideoFrame,
     out: *mut reactor_webrtc_sys::ReactorEncodedVideoOutput,
 ) -> c_int {
-    let Some(r) = (unsafe { raw.as_ref() }) else { return 1; };
+    let Some(r) = (unsafe { raw.as_ref() }) else {
+        return 1;
+    };
     let st = unsafe { &*(ud as *const RegistryState) };
     match st.registry.pop_for(r.encoder_id) {
         None => 1,
@@ -491,9 +517,9 @@ impl CustomVideoEncoder {
             cb: Mutex::new(Box::new(cb)),
         }));
         Self {
-            encode_fn:   encode_tramp,
-            userdata:    state as *mut c_void,
-            free_ud:     Some(free_encoder_state_tramp),
+            encode_fn: encode_tramp,
+            userdata: state as *mut c_void,
+            free_ud: Some(free_encoder_state_tramp),
             use_builtin: None,
         }
     }
@@ -514,9 +540,9 @@ impl CustomVideoEncoder {
     pub(crate) fn from_registry(registry: Arc<EncoderRegistry>) -> Self {
         let state = Box::into_raw(Box::new(RegistryState { registry }));
         Self {
-            encode_fn:   registry_encode_tramp,
-            userdata:    state as *mut c_void,
-            free_ud:     Some(free_registry_state_tramp),
+            encode_fn: registry_encode_tramp,
+            userdata: state as *mut c_void,
+            free_ud: Some(free_registry_state_tramp),
             use_builtin: Some(registry_use_builtin_tramp),
         }
     }
@@ -564,7 +590,13 @@ impl EncodedVideoTrack {
         height: u32,
     ) -> Self {
         let dummy = vec![0u8; (width * height * 4) as usize];
-        Self { track, queue, dummy, width, height }
+        Self {
+            track,
+            queue,
+            dummy,
+            width,
+            height,
+        }
     }
 
     /// The underlying video [`Track`](crate::Track). Pass this to
@@ -591,6 +623,7 @@ impl EncodedVideoTrack {
         // Push a dummy raw frame to wake the WebRTC encoder thread.
         // The I420 data is thrown away in the encoder callback — the actual
         // encoded bytes come from the queue above.
-        self.track.push_video_frame(&self.dummy, self.width, self.height);
+        self.track
+            .push_video_frame(&self.dummy, self.width, self.height);
     }
 }

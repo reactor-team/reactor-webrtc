@@ -28,7 +28,10 @@ struct Ice {
     recv: Mutex<Vec<Track>>,
 }
 
-fn make_peer(factory: &PeerConnectionFactory, config: &RtcConfiguration) -> (PeerConnection, Arc<Ice>) {
+fn make_peer(
+    factory: &PeerConnectionFactory,
+    config: &RtcConfiguration,
+) -> (PeerConnection, Arc<Ice>) {
     let ice = Arc::new(Ice::default());
     let observer = PeerConnectionObserver::new()
         .on_ice_candidate({
@@ -129,9 +132,7 @@ fn custom_encoder_receives_raw_frames() {
         loop {
             forward_ice(&s1, &pc2);
             forward_ice(&s2, &pc1);
-            if raw_count.load(Ordering::SeqCst) > 0
-                || start.elapsed() > Duration::from_secs(15)
-            {
+            if raw_count.load(Ordering::SeqCst) > 0 || start.elapsed() > Duration::from_secs(15) {
                 break;
             }
             thread::sleep(Duration::from_millis(50));

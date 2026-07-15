@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use crate::encoded::{EncoderRegistry, EncodedVideoFrame, EncodedVideoTrack};
+use crate::encoded::{EncodedVideoFrame, EncodedVideoTrack, EncoderRegistry};
 use crate::media::Track;
 use crate::{CustomVideoEncoder, PeerConnectionFactory, Result};
 
@@ -46,8 +46,15 @@ impl MixedVideoTrack {
 }
 
 enum SlotConfig {
-    Raw     { id: String },
-    Encoded { id: String, width: u32, height: u32, queue: Arc<Mutex<VecDeque<EncodedVideoFrame>>> },
+    Raw {
+        id: String,
+    },
+    Encoded {
+        id: String,
+        width: u32,
+        height: u32,
+        queue: Arc<Mutex<VecDeque<EncodedVideoFrame>>>,
+    },
 }
 
 /// Builds a [`PeerConnectionFactory`] wired for **multiple** video tracks that
@@ -76,14 +83,14 @@ enum SlotConfig {
 /// [`PeerConnectionFactory::with_encoded_video_track`] is simpler.
 pub struct EncodedVideoBuilder {
     registry: Arc<EncoderRegistry>,
-    slots:    Vec<SlotConfig>,
+    slots: Vec<SlotConfig>,
 }
 
 impl EncodedVideoBuilder {
     pub(crate) fn new() -> Self {
         Self {
             registry: EncoderRegistry::new(),
-            slots:    Vec::new(),
+            slots: Vec::new(),
         }
     }
 
@@ -105,8 +112,13 @@ impl EncodedVideoBuilder {
     /// Returns the index into the `Vec<MixedVideoTrack>` that [`build`] produces.
     pub fn add_encoded_track(&mut self, id: &str, width: u32, height: u32) -> usize {
         let queue = self.registry.add_encoded_slot();
-        let idx   = self.slots.len();
-        self.slots.push(SlotConfig::Encoded { id: id.to_owned(), width, height, queue });
+        let idx = self.slots.len();
+        self.slots.push(SlotConfig::Encoded {
+            id: id.to_owned(),
+            width,
+            height,
+            queue,
+        });
         idx
     }
 
@@ -129,11 +141,16 @@ impl EncodedVideoBuilder {
                     let track = factory.create_video_track(&id)?;
                     out.push(MixedVideoTrack::Raw(track));
                 }
-                SlotConfig::Encoded { id, width, height, queue } => {
+                SlotConfig::Encoded {
+                    id,
+                    width,
+                    height,
+                    queue,
+                } => {
                     let track = factory.create_video_track(&id)?;
-                    out.push(MixedVideoTrack::Encoded(
-                        EncodedVideoTrack::new(track, queue, width, height),
-                    ));
+                    out.push(MixedVideoTrack::Encoded(EncodedVideoTrack::new(
+                        track, queue, width, height,
+                    )));
                 }
             }
         }

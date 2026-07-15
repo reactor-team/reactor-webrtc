@@ -115,8 +115,7 @@ impl Transceiver {
 
     /// The transceiver's media kind (audio/video).
     pub fn kind(&self) -> MediaKind {
-        let k =
-            unsafe { reactor_webrtc_sys::reactor_webrtc_rtp_transceiver_media_kind(self.raw) };
+        let k = unsafe { reactor_webrtc_sys::reactor_webrtc_rtp_transceiver_media_kind(self.raw) };
         MediaKind::from_raw(k)
     }
 
@@ -167,7 +166,9 @@ impl Transceiver {
         if ok == 1 {
             Ok(())
         } else {
-            Err(Error::Webrtc("transceiver set_sender_transform failed".into()))
+            Err(Error::Webrtc(
+                "transceiver set_sender_transform failed".into(),
+            ))
         }
     }
 

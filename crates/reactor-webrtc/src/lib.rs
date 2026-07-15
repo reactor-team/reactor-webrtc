@@ -30,12 +30,12 @@ use std::ffi::CString;
 use std::os::raw::c_int;
 use std::sync::{Arc, Mutex};
 
+pub use builder::{EncodedVideoBuilder, MixedVideoTrack};
 pub use config::{ContinualGatheringPolicy, IceServer, IceTransportsType, RtcConfiguration};
 pub use encoded::{
     CustomVideoEncoder, EncodedFrame, EncodedVideoFrame, EncodedVideoTrack, FrameAction,
     FrameDirection, FrameTransform, RawVideoFrame, VideoCodec,
 };
-pub use builder::{EncodedVideoBuilder, MixedVideoTrack};
 pub use media::{AudioFrame, MediaKind, Track, VideoFrame};
 pub use observer::PeerConnectionObserver;
 pub use peer_connection::{
@@ -139,13 +139,10 @@ impl PeerConnectionFactory {
     /// Audio encoding is unaffected; the builtin audio codecs (Opus, G.711,
     /// etc.) remain active.
     pub fn with_custom_video_encoder(encoder: crate::CustomVideoEncoder) -> Result<Self> {
-        let encode_fn   = encoder.encode_fn;
-        let userdata    = encoder.userdata;
-        let free_ud     = encoder.free_ud;
+        let encode_fn = encoder.encode_fn;
+        let userdata = encoder.userdata;
+        let free_ud = encoder.free_ud;
         let use_builtin = encoder.use_builtin;
-        // Transfer ownership of `userdata` to the factory before the call so
-        // we don't double-free on success. On failure, free it manually.
-        std::mem::forget(encoder);
 
         let raw = unsafe {
             reactor_webrtc_sys::reactor_webrtc_factory_create_with_custom_video_encoder(
@@ -215,11 +212,10 @@ impl PeerConnectionFactory {
         width: u32,
         height: u32,
     ) -> Result<(Self, crate::EncodedVideoTrack)> {
-        let queue: Arc<Mutex<VecDeque<EncodedVideoFrame>>> =
-            Arc::new(Mutex::new(VecDeque::new()));
+        let queue: Arc<Mutex<VecDeque<EncodedVideoFrame>>> = Arc::new(Mutex::new(VecDeque::new()));
         let encoder = crate::CustomVideoEncoder::from_queue(queue.clone());
         let factory = Self::with_custom_video_encoder(encoder)?;
-        let track   = factory.create_video_track(track_id)?;
+        let track = factory.create_video_track(track_id)?;
         let encoded = crate::EncodedVideoTrack::new(track, queue, width, height);
         Ok((factory, encoded))
     }

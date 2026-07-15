@@ -21,7 +21,6 @@ fn main() {
             "Set REACTOR_WEBRTC_LIB_DIR=<path/to/dist> to link a native libwebrtc build.\n\
              See the README for download instructions."
         );
-        return;
     }
     #[cfg(have_libwebrtc)]
     run();
@@ -46,8 +45,8 @@ fn run() {
 
     #[derive(Default)]
     struct Peer {
-        ice:          Mutex<VecDeque<IceCandidate>>,
-        connected:    AtomicBool,
+        ice: Mutex<VecDeque<IceCandidate>>,
+        connected: AtomicBool,
         video_frames: AtomicU32,
         audio_frames: AtomicU32,
         // Keep received track handles alive so their sinks don't drop.
@@ -56,7 +55,7 @@ fn run() {
 
     fn make_peer(
         factory: &PeerConnectionFactory,
-        config:  &RtcConfiguration,
+        config: &RtcConfiguration,
     ) -> (PeerConnection, Arc<Peer>) {
         let shared = Arc::new(Peer::default());
         let obs = PeerConnectionObserver::new()
@@ -85,7 +84,9 @@ fn run() {
                                 // Feed it to your renderer (Metal, wgpu, SDL2, …).
                                 println!(
                                     "  [pc2 video] {}×{} frame — {} bytes BGRA",
-                                    f.width, f.height, f.bgra.len()
+                                    f.width,
+                                    f.height,
+                                    f.bgra.len()
                                 );
                                 s.video_frames.fetch_add(1, Ordering::SeqCst);
                             });
@@ -128,7 +129,7 @@ fn run() {
     // Switch to PeerConnectionFactory::with_platform_adm() to capture from
     // the real microphone and play decoded audio through the speaker.
     let factory = PeerConnectionFactory::new().expect("factory");
-    let config  = RtcConfiguration::default();
+    let config = RtcConfiguration::default();
 
     let (pc1, s1) = make_peer(&factory, &config);
     let (pc2, s2) = make_peer(&factory, &config);
@@ -159,7 +160,8 @@ fn run() {
     }
 
     pc1.set_local_description(&offer).expect("pc1 local offer");
-    pc2.set_remote_description(&offer).expect("pc2 remote offer");
+    pc2.set_remote_description(&offer)
+        .expect("pc2 remote offer");
 
     let answer = pc2.create_answer().expect("create answer");
     println!("Answer m= lines:");
@@ -167,8 +169,10 @@ fn run() {
         println!("  {line}");
     }
 
-    pc2.set_local_description(&answer).expect("pc2 local answer");
-    pc1.set_remote_description(&answer).expect("pc1 remote answer");
+    pc2.set_local_description(&answer)
+        .expect("pc2 local answer");
+    pc1.set_remote_description(&answer)
+        .expect("pc1 remote answer");
 
     // ── media pump + ICE trickle loop ─────────────────────────────────────────
 
@@ -228,8 +232,7 @@ fn run() {
 
     let v = s2.video_frames.load(Ordering::SeqCst);
     let a = s2.audio_frames.load(Ordering::SeqCst);
-    let connected =
-        s1.connected.load(Ordering::SeqCst) && s2.connected.load(Ordering::SeqCst);
+    let connected = s1.connected.load(Ordering::SeqCst) && s2.connected.load(Ordering::SeqCst);
 
     if connected && v > 0 && a > 0 {
         println!("\nbuiltin_codec ✅ — pc2 received {v} video + {a} audio frame(s)");
