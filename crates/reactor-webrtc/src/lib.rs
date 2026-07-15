@@ -17,16 +17,25 @@
 //! `REACTOR_WEBRTC_LIB_DIR` / `REACTOR_WEBRTC_PREBUILT_URL`); `cargo check`
 //! works without one.
 
+mod builder;
 mod config;
+mod encoded;
 mod media;
 mod observer;
 mod peer_connection;
 pub mod platform;
 
+use std::collections::VecDeque;
 use std::ffi::CString;
 use std::os::raw::c_int;
+use std::sync::{Arc, Mutex};
 
+pub use builder::{EncodedVideoBuilder, MixedVideoTrack};
 pub use config::{ContinualGatheringPolicy, IceServer, IceTransportsType, RtcConfiguration};
+pub use encoded::{
+    CustomVideoEncoder, EncodedFrame, EncodedVideoFrame, EncodedVideoTrack, FrameAction,
+    FrameDirection, FrameTransform, RawVideoFrame, VideoCodec,
+};
 pub use media::{AudioFrame, MediaKind, Track, VideoFrame};
 pub use observer::PeerConnectionObserver;
 pub use peer_connection::{
@@ -118,6 +127,97 @@ impl PeerConnectionFactory {
             return Err(Error::Webrtc("factory creation returned null".into()));
         }
         Ok(Self { raw })
+    }
+
+    /// Create a factory that replaces the builtin H.264 encoder with `encoder`.
+    ///
+    /// The encoder callback is invoked synchronously on the WebRTC encoder
+    /// thread for every raw I420 frame ready to be sent. Return
+    /// `Some(EncodedVideoFrame)` to push H.264 bytes into the RTP packetizer,
+    /// or `None` to drop the frame silently.
+    ///
+    /// Audio encoding is unaffected; the builtin audio codecs (Opus, G.711,
+    /// etc.) remain active.
+    pub fn with_custom_video_encoder(encoder: crate::CustomVideoEncoder) -> Result<Self> {
+        let encode_fn = encoder.encode_fn;
+        let userdata = encoder.userdata;
+        let free_ud = encoder.free_ud;
+        let use_builtin = encoder.use_builtin;
+
+        let raw = unsafe {
+            reactor_webrtc_sys::reactor_webrtc_factory_create_with_custom_video_encoder(
+                0, // synthetic ADM
+                encode_fn,
+                userdata,
+                free_ud,
+                use_builtin,
+            )
+        };
+        if raw.is_null() {
+            // Factory did not take ownership — free the state ourselves.
+            if let Some(f) = free_ud {
+                f(userdata);
+            }
+            return Err(Error::Webrtc(
+                "factory with custom encoder returned null".into(),
+            ));
+        }
+        Ok(Self { raw })
+    }
+
+    /// Create a builder for a factory that supports **multiple** pre-encoded
+    /// video tracks.
+    ///
+    /// ```rust,ignore
+    /// let mut b = PeerConnectionFactory::encoded_video_builder();
+    /// let camera = b.add_track("camera", 1280, 720);
+    /// let screen  = b.add_track("screen",  1920, 1080);
+    /// let (factory, tracks) = b.build()?;
+    ///
+    /// // tracks[0] == camera stream, tracks[1] == screen stream
+    /// tracks[0].push_encoded_frame(camera_frame);
+    /// tracks[1].push_encoded_frame(screen_frame);
+    /// ```
+    pub fn encoded_video_builder() -> EncodedVideoBuilder {
+        EncodedVideoBuilder::new()
+    }
+
+    /// Create a factory pre-wired for push-based encoded video.
+    ///
+    /// Returns both the factory and an [`EncodedVideoTrack`] handle. Call
+    /// [`EncodedVideoTrack::push_encoded_frame`] whenever your encoder produces
+    /// a frame — no raw pixel pumping required.
+    ///
+    /// ```rust,ignore
+    /// let (factory, video) =
+    ///     PeerConnectionFactory::with_encoded_video_track("cam", 1280, 720)?;
+    ///
+    /// let pc  = factory.create_peer_connection(&config, observer)?;
+    /// let tx  = pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendOnly)?;
+    /// tx.set_track(video.track())?;
+    ///
+    /// // … later, on your encoder thread:
+    /// video.push_encoded_frame(EncodedVideoFrame {
+    ///     data: h264_annex_b_bytes,
+    ///     is_key_frame: true,
+    ///     width: 1280, height: 720, rtp_timestamp: 0,
+    /// });
+    /// ```
+    ///
+    /// `width` and `height` set the resolution advertised to libwebrtc's
+    /// encoder pipeline. They must match the resolution you intend to encode.
+    /// Pass `0` in [`EncodedVideoFrame`] fields to inherit them automatically.
+    pub fn with_encoded_video_track(
+        track_id: &str,
+        width: u32,
+        height: u32,
+    ) -> Result<(Self, crate::EncodedVideoTrack)> {
+        let queue: Arc<Mutex<VecDeque<EncodedVideoFrame>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let encoder = crate::CustomVideoEncoder::from_queue(queue.clone());
+        let factory = Self::with_custom_video_encoder(encoder)?;
+        let track = factory.create_video_track(track_id)?;
+        let encoded = crate::EncodedVideoTrack::new(track, queue, width, height);
+        Ok((factory, encoded))
     }
 
     /// Create a peer connection with the given configuration and observer.

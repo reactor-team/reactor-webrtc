@@ -6,6 +6,7 @@ use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use crate::encoded::FrameTransform;
 use crate::media::{MediaKind, Track};
 use crate::observer::ObserverState;
 use crate::{Error, Result};
@@ -112,6 +113,12 @@ impl Transceiver {
         Self { raw }
     }
 
+    /// The transceiver's media kind (audio/video).
+    pub fn kind(&self) -> MediaKind {
+        let k = unsafe { reactor_webrtc_sys::reactor_webrtc_rtp_transceiver_media_kind(self.raw) };
+        MediaKind::from_raw(k)
+    }
+
     /// The transceiver's mid, once assigned (after `set_local_description`).
     pub fn mid(&self) -> Option<String> {
         let mut buf = [0u8; 256];
@@ -142,6 +149,47 @@ impl Transceiver {
             Ok(())
         } else {
             Err(Error::Webrtc("transceiver set_track failed".into()))
+        }
+    }
+
+    /// Attach an encoded-frame transform to this transceiver's **sender**
+    /// (encoder → packetizer): observe/replace/drop each encoded frame before
+    /// it is sent. See [`crate::FrameTransform`]. The transform must outlive
+    /// this transceiver's use of it.
+    pub fn set_sender_transform(&self, transform: &FrameTransform) -> Result<()> {
+        let ok = unsafe {
+            reactor_webrtc_sys::reactor_webrtc_rtp_transceiver_set_sender_transform(
+                self.raw,
+                transform.raw(),
+            )
+        };
+        if ok == 1 {
+            Ok(())
+        } else {
+            Err(Error::Webrtc(
+                "transceiver set_sender_transform failed".into(),
+            ))
+        }
+    }
+
+    /// Attach an encoded-frame transform to this transceiver's **receiver**
+    /// (depacketizer → decoder): observe each encoded frame before decode, and
+    /// [`FrameAction::Drop`](crate::FrameAction) to bypass the decoder. See
+    /// [`crate::FrameTransform`]. The transform must outlive this transceiver's
+    /// use of it.
+    pub fn set_receiver_transform(&self, transform: &FrameTransform) -> Result<()> {
+        let ok = unsafe {
+            reactor_webrtc_sys::reactor_webrtc_rtp_transceiver_set_receiver_transform(
+                self.raw,
+                transform.raw(),
+            )
+        };
+        if ok == 1 {
+            Ok(())
+        } else {
+            Err(Error::Webrtc(
+                "transceiver set_receiver_transform failed".into(),
+            ))
         }
     }
 }
@@ -473,6 +521,25 @@ impl PeerConnection {
         } else {
             Ok(Transceiver::from_raw(raw))
         }
+    }
+
+    /// All transceivers on this peer connection. After negotiation this includes
+    /// transceivers auto-created from the remote description — use this to reach
+    /// a receiving transceiver (e.g. to attach an encoded-frame transform to its
+    /// receiver: match on [`Transceiver::kind`] and call
+    /// [`Transceiver::set_receiver_transform`]).
+    pub fn transceivers(&self) -> Vec<Transceiver> {
+        let n = unsafe {
+            reactor_webrtc_sys::reactor_webrtc_peer_connection_transceiver_count(self.raw)
+        };
+        (0..n)
+            .filter_map(|i| {
+                let raw = unsafe {
+                    reactor_webrtc_sys::reactor_webrtc_peer_connection_get_transceiver(self.raw, i)
+                };
+                (!raw.is_null()).then(|| Transceiver::from_raw(raw))
+            })
+            .collect()
     }
 
     /// Create an SDP-negotiated data channel.
