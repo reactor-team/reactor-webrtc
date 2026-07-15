@@ -39,7 +39,9 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-test-
-      # build.rs sets compiler("clang++") for Linux; clang is pre-installed on
-      # ubuntu-latest but ensure it is symlinked as clang++.
-      - run: sudo apt-get install -y --no-install-recommends clang
+      # The bundled libc++ headers require clang-18 (needs __builtin_popcountg
+      # and C++23 attributes absent in the default clang-14 on ubuntu-22.04).
+      - run: sudo apt-get install -y --no-install-recommends clang-18
       - run: cargo test --workspace
+        env:
+          CXX: clang++-18
