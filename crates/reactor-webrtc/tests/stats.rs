@@ -103,6 +103,11 @@ mod tests {
         let (pc1, s1) = make_peer(&factory, &cfg);
         let (pc2, s2) = make_peer(&factory, &cfg);
 
+        // A data channel forces SCTP negotiation, which gives the DTLS transport
+        // something to connect over — without it PeerConnectionState::Connected
+        // is never reached and the test times out.
+        let _dc = pc1.create_data_channel("stats-probe").expect("dc");
+
         negotiate(&pc1, &pc2);
 
         let ok = wait_for(&s1, &s2, &pc1, &pc2, || {
