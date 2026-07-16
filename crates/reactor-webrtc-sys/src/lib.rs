@@ -119,6 +119,44 @@ pub struct ReactorEncodedVideoOutput {
     pub free_data: Option<extern "C" fn(data: *const u8, len: usize)>,
 }
 
+/// A single entry in the stats snapshot delivered by
+/// [`reactor_webrtc_peer_connection_get_stats`]. The `kind` field selects
+/// which subset of fields is populated; all others are zero-initialised.
+///
+/// | `kind` | stat type |
+/// |--------|-----------|
+/// | `0`    | `RTCInboundRtpStreamStats` |
+/// | `1`    | `RTCOutboundRtpStreamStats` |
+/// | `2`    | `RTCIceCandidatePairStats` |
+///
+/// Field layout is explicit and padding-free — it must match the C++ struct in
+/// `glue/reactor_webrtc.cpp`.
+#[repr(C)]
+pub struct ReactorStatEntry {
+    pub kind: i32,
+    pub ssrc: u32,
+    pub packets_received: u32,
+    pub packets_lost: i32,
+    pub nack_count: u32,
+    pub packets_sent: u32,
+    /// ICE pair state: 0=waiting 1=in_progress 2=failed 3=succeeded 4=cancelled
+    pub pair_state: i32,
+    pub retransmitted_packets_sent: u32,
+    pub bytes_received: u64,
+    pub bytes_sent: u64,
+    pub priority: u64,
+    /// jitter in seconds (inbound RTP)
+    pub jitter: f64,
+    /// total decode time in seconds (inbound RTP)
+    pub total_decode_time: f64,
+    /// target bitrate in bps (outbound RTP)
+    pub target_bitrate: f64,
+    /// round-trip time in seconds (outbound RTP), 0 if not measured
+    pub round_trip_time: f64,
+    /// current round-trip time in seconds (candidate pair), 0 if not measured
+    pub current_round_trip_time: f64,
+}
+
 /// PeerConnectionObserver callbacks, forwarded from the C++ glue. Every field
 /// is optional (`None` = a null function pointer on the C side). `userdata` is
 /// passed back verbatim to each callback. State arguments are the integer value
@@ -443,6 +481,23 @@ extern "C" {
     pub fn reactor_webrtc_factory_set_adm_playout_enabled(
         factory: *mut PeerConnectionFactory,
         enabled: c_int,
+    );
+
+    // ── Stats ────────────────────────────────────────────────────────────────
+    /// Request a stats snapshot from the peer connection. `callback` fires
+    /// exactly once on the WebRTC signaling thread with a pointer to a
+    /// temporary `ReactorStatEntry` array (valid only for the duration of
+    /// the call) and its element count. `count` is 0 when the PC is
+    /// unavailable. The native call is non-blocking; the safe crate drives
+    /// the blocking wait via a one-shot channel.
+    pub fn reactor_webrtc_peer_connection_get_stats(
+        pc: *mut PeerConnection,
+        userdata: *mut c_void,
+        callback: extern "C" fn(
+            userdata: *mut c_void,
+            entries: *const ReactorStatEntry,
+            count: c_int,
+        ),
     );
 
     // ── Platform bootstrap ───────────────────────────────────────────────────
