@@ -19,7 +19,8 @@ reactor-webrtc/
 ├── WEBRTC_VERSION              pinned upstream milestone + our patch level
 ├── crates/
 │   ├── reactor-webrtc-sys/     unsafe FFI + C++ glue (glue/) + build.rs
-│   └── reactor-webrtc/         safe, idiomatic Rust API
+│   ├── reactor-webrtc/         safe, idiomatic Rust API
+│   └── reactor-webrtc-py/      PyO3/Maturin Python bindings (reactor-webrtc wheel)
 ├── webrtc-build/               our build pipeline (depot_tools + gn/ninja)
 │   ├── build.sh                POSIX build: fetch + patch + gn + ninja + assemble
 │   ├── build.ps1               Windows build+package (PowerShell; native depot_tools)
@@ -32,6 +33,62 @@ reactor-webrtc/
 ├── .github/workflows/webrtc-build.yml   heavy per-target libwebrtc builds + publish
 └── .github/workflows/lib-link-test.yml  fast lib-link test against a prebuilt
 ```
+
+## Python bindings (`reactor-webrtc-py`)
+
+`crates/reactor-webrtc-py` exposes the Rust API to Python via
+[PyO3](https://pyo3.rs) + [Maturin](https://maturin.rs). The wheel embeds
+`libwebrtc` statically — no separate native dependency at runtime.
+
+```python
+import reactor_webrtc as rw
+
+factory = rw.PeerConnectionFactory()
+
+obs = rw.PeerConnectionObserver()
+obs.on_ice_candidate     = lambda c: ...
+obs.on_connection_state_change = lambda s: ...
+
+pc = factory.create_peer_connection(rw.RtcConfiguration(), obs)
+offer = pc.create_offer()
+pc.set_local_description(offer)
+
+# Stats (RTCStatsReport)
+report = pc.get_stats()
+for pair in report.candidate_pairs:
+    print(pair.state, pair.current_round_trip_time_s)
+```
+
+**Building locally** (requires a prebuilt `libwebrtc`):
+
+```bash
+# Point at an extracted prebuilt or a local build output
+export REACTOR_WEBRTC_LIB_DIR=/path/to/libwebrtc
+
+uv venv .venv --python 3.12
+uv pip install maturin pytest
+
+maturin build --manifest-path crates/reactor-webrtc-py/Cargo.toml
+pip install target/wheels/reactor_webrtc-*.whl
+
+pytest crates/reactor-webrtc-py/tests/ -v
+```
+
+**Exposed types** (see `crates/reactor-webrtc-py/reactor_webrtc.pyi` for the
+full typed surface):
+
+| Type | Description |
+|------|-------------|
+| `PeerConnectionFactory` | Thread pool + media engine factory |
+| `PeerConnection` | Offer/answer, ICE, tracks, data channels, stats |
+| `PeerConnectionObserver` | Callbacks: state change, ICE candidate, track, data channel |
+| `DataChannel` | Reliable/unreliable messaging over SCTP |
+| `Track` / `EncodedVideoTrack` | Local media sources |
+| `Transceiver` | RTP send/recv direction + MID |
+| `StatsReport` | `inbound_rtp`, `outbound_rtp`, `candidate_pairs` |
+| `SessionDescription`, `IceCandidate`, `RtcConfiguration` | Signaling types |
+
+Requires **Python ≥ 3.10** (stable ABI `abi3-py310`).
 
 ## How the native library is resolved
 
@@ -90,6 +147,9 @@ Per-target toolchain rationale lives at the top of `build.sh` (POSIX) and
   published as a GitHub Release.
 - ✅ FFI glue links + runs against the lib (lib-link tests on macOS arm64 and
   Linux x64 in CI).
+- ✅ Python bindings (`reactor-webrtc-py`): PyO3/Maturin wheel with full
+  signaling API, data channels, media tracks, stats, and a loopback test suite;
+  built and tested in CI.
 - ⏳ **TODO:** flesh out the remaining safe API; the symbol-isolation and
   Android Java-namespace patches (see `webrtc-build/patches/README.md`); wire
   `reactor-sdk-core` to link this behind a flag, then make it the default and
