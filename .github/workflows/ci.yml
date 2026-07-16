@@ -51,7 +51,9 @@ jobs:
           python-version: "3.12"
       - name: Install maturin + pytest
         run: pip install maturin pytest
-      - name: Build reactor-webrtc-py (maturin develop)
-        run: maturin develop --manifest-path crates/reactor-webrtc-py/Cargo.toml
+      - name: Build reactor-webrtc-py wheel
+        run: maturin build --manifest-path crates/reactor-webrtc-py/Cargo.toml
+      - name: Install reactor-webrtc-py wheel
+        run: pip install target/wheels/reactor_webrtc-*.whl
       - name: Run Python tests
         run: pytest crates/reactor-webrtc-py/tests/ -v
