@@ -158,8 +158,9 @@ class TestPeerConnection:
     def test_ice_gathering_change_fires(self, factory):
         p = make_peer(factory)
         p.pc.create_data_channel("probe")
-        # create_offer triggers ICE gathering; Gathering and Complete states follow
-        p.pc.create_offer()
+        # ICE gathering starts after set_local_description, not create_offer
+        offer = p.pc.create_offer()
+        p.pc.set_local_description(offer)
         ok = wait_for(lambda: rw.IceGatheringState.Gathering in p.gathering_states)
         assert ok, "on_ice_gathering_change(Gathering) never fired"
 

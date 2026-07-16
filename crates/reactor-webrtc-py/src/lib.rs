@@ -635,7 +635,13 @@ impl PeerConnectionObserver {
             let cb = cb.clone_ref(py);
             obs = obs.on_data_channel(move |dc| {
                 Python::with_gil(|py| {
-                    let py_dc = Py::new(py, DataChannel { inner: ManuallyDrop::new(dc) }).unwrap();
+                    let py_dc = Py::new(
+                        py,
+                        DataChannel {
+                            inner: ManuallyDrop::new(dc),
+                        },
+                    )
+                    .unwrap();
                     let _ = cb.call1(py, (py_dc,));
                 });
             });
@@ -715,7 +721,9 @@ impl PeerConnection {
     fn create_data_channel(&self, label: &str) -> PyResult<DataChannel> {
         self.inner
             .create_data_channel(label)
-            .map(|inner| DataChannel { inner: ManuallyDrop::new(inner) })
+            .map(|inner| DataChannel {
+                inner: ManuallyDrop::new(inner),
+            })
             .map_err(err)
     }
 }
@@ -757,7 +765,9 @@ impl PeerConnectionFactory {
         let rust_obs = observer.build_rust_observer(py);
         self.inner
             .create_peer_connection(&rust_config, rust_obs)
-            .map(|inner| PeerConnection { inner: ManuallyDrop::new(inner) })
+            .map(|inner| PeerConnection {
+                inner: ManuallyDrop::new(inner),
+            })
             .map_err(err)
     }
 
