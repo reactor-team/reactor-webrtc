@@ -46,3 +46,12 @@ jobs:
           key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-test-
       - run: cargo test --workspace
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install maturin + pytest
+        run: pip install maturin pytest
+      - name: Build reactor-webrtc-py (maturin develop)
+        run: maturin develop --manifest-path crates/reactor-webrtc-py/Cargo.toml
+      - name: Run Python tests
+        run: pytest crates/reactor-webrtc-py/tests/ -v
