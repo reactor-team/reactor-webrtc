@@ -10,9 +10,9 @@
 
 #[cfg(have_libwebrtc)]
 mod tests {
+    use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::collections::VecDeque;
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -53,7 +53,9 @@ mod tests {
                     }
                 }
             });
-        let pc = factory.create_peer_connection(cfg, obs).expect("peer connection");
+        let pc = factory
+            .create_peer_connection(cfg, obs)
+            .expect("peer connection");
         (pc, shared)
     }
 

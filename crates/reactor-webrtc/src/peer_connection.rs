@@ -784,9 +784,7 @@ impl PeerConnection {
     /// - [`StatsReport::candidate_pairs`] — ICE candidate pair state and RTT.
     pub fn get_stats(&self) -> Result<StatsReport> {
         run_stats(|ud| unsafe {
-            reactor_webrtc_sys::reactor_webrtc_peer_connection_get_stats(
-                self.raw, ud, stats_cb,
-            )
+            reactor_webrtc_sys::reactor_webrtc_peer_connection_get_stats(self.raw, ud, stats_cb)
         })
     }
 }

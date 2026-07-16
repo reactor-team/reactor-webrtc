@@ -539,16 +539,21 @@ void parse_ice_servers(const char* config_json,
   }
 }
 
-// Safely dereference an RTCStatsMember<T> (zero-value if not defined).
-template <typename T>
-static T stat_val(const webrtc::RTCStatsMember<T>& m) {
-  return m.is_defined() ? *m : T{};
+// Safely dereference any optional-like field (absl::optional<T>, std::optional<T>,
+// or any bool-convertible + dereferenceable type). Returns a zero-constructed T
+// when the field has no value. Avoids naming the concrete optional type, which
+// changed from RTCStatsMember<T> to absl::optional<T> in M7907.
+template <typename M>
+static auto stat_val(const M& m) -> std::decay_t<decltype(*m)> {
+  using T = std::decay_t<decltype(*m)>;
+  return m ? static_cast<T>(*m) : T{};
 }
 
 // Parse the string ICE-pair state to the integer encoding used in
 // ReactorStatEntry::pair_state.
-static int parse_pair_state(const webrtc::RTCStatsMember<std::string>& m) {
-  if (!m.is_defined()) return 0;
+template <typename S>
+static int parse_pair_state(const S& m) {
+  if (!m) return 0;
   const std::string& s = *m;
   if (s == "in-progress") return 1;
   if (s == "failed")      return 2;
@@ -591,7 +596,8 @@ class StatsCallback : public webrtc::RTCStatsCollectorCallback {
           e.packets_sent               = stat_val(s.packets_sent);
           e.bytes_sent                 = stat_val(s.bytes_sent);
           e.target_bitrate             = stat_val(s.target_bitrate);
-          e.round_trip_time            = stat_val(s.round_trip_time);
+          // round_trip_time was removed from RTCOutboundRtpStreamStats in M7907;
+          // RTT for the send path is now in RTCRemoteInboundRtpStreamStats.
           e.retransmitted_packets_sent = stat_val(s.retransmitted_packets_sent);
           entries.push_back(e);
         } else if (stats.type() == webrtc::RTCIceCandidatePairStats::kType) {

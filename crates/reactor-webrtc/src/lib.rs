@@ -39,7 +39,7 @@ pub use encoded::{
 pub use media::{AudioFrame, MediaKind, Track, VideoFrame};
 pub use observer::PeerConnectionObserver;
 pub use peer_connection::{
-    DataChannel, DataChannelState, IceCandidatePairState, IceCandidatePairStats, IceCandidate,
+    DataChannel, DataChannelState, IceCandidate, IceCandidatePairState, IceCandidatePairStats,
     IceGatheringState, InboundRtpStats, OutboundRtpStats, PeerConnection, PeerConnectionState,
     SdpType, SessionDescription, StatsReport, Transceiver, TransceiverDirection,
 };
