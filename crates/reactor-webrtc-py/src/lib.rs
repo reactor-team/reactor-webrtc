@@ -399,25 +399,29 @@ impl EncodedVideoTrack {
 
     /// Add this track to a peer connection via `add_track` (creates a sendrecv
     /// transceiver automatically).
-    fn add_to_peer_connection(&self, pc: &PeerConnection) -> PyResult<()> {
-        pc.inner.add_track(self.inner.track()).map_err(err)
+    fn add_to_peer_connection(&self, py: Python, pc: &PeerConnection) -> PyResult<()> {
+        let track = self.inner.track();
+        py.allow_threads(|| pc.inner.add_track(track)).map_err(err)
     }
 
     /// Add a transceiver of the given `direction` for this track. Returns the
     /// `Transceiver` (its `mid` is set after SDP exchange).
     fn add_transceiver(
         &self,
+        py: Python,
         pc: &PeerConnection,
         direction: TransceiverDirection,
     ) -> PyResult<Transceiver> {
-        let t = pc
-            .inner
-            .add_transceiver(
-                rw::MediaKind::Video,
-                rw::TransceiverDirection::from(direction),
-            )
+        let track = self.inner.track();
+        let t = py
+            .allow_threads(|| {
+                pc.inner.add_transceiver(
+                    rw::MediaKind::Video,
+                    rw::TransceiverDirection::from(direction),
+                )
+            })
             .map_err(err)?;
-        t.set_track(self.inner.track()).map_err(err)?;
+        py.allow_threads(|| t.set_track(track)).map_err(err)?;
         Ok(Transceiver { inner: t })
     }
 }
@@ -433,13 +437,14 @@ pub struct Transceiver {
 #[pymethods]
 impl Transceiver {
     /// The `mid`, set after `set_local_description`.
-    fn mid(&self) -> Option<String> {
-        self.inner.mid()
+    fn mid(&self, py: Python) -> Option<String> {
+        py.allow_threads(|| self.inner.mid())
     }
 
     /// Attach a local track to the sender slot.
-    fn set_track(&self, track: &Track) -> PyResult<()> {
-        self.inner.set_track(&track.inner).map_err(err)
+    fn set_track(&self, py: Python, track: &Track) -> PyResult<()> {
+        py.allow_threads(|| self.inner.set_track(&track.inner))
+            .map_err(err)
     }
 }
 
@@ -462,19 +467,20 @@ impl Drop for DataChannel {
 
 #[pymethods]
 impl DataChannel {
-    fn label(&self) -> String {
-        self.inner.label()
+    fn label(&self, py: Python) -> String {
+        py.allow_threads(|| self.inner.label())
     }
-    fn state(&self) -> DataChannelState {
-        DataChannelState::from(self.inner.state())
+    fn state(&self, py: Python) -> DataChannelState {
+        DataChannelState::from(py.allow_threads(|| self.inner.state()))
     }
-    fn buffered_amount(&self) -> u64 {
-        self.inner.buffered_amount()
+    fn buffered_amount(&self, py: Python) -> u64 {
+        py.allow_threads(|| self.inner.buffered_amount())
     }
 
     /// Send bytes. `binary=True` for binary SCTP messages, `False` for text.
-    fn send(&self, data: &[u8], binary: bool) -> PyResult<()> {
-        self.inner.send(data, binary).map_err(err)
+    fn send(&self, py: Python, data: &[u8], binary: bool) -> PyResult<()> {
+        py.allow_threads(|| self.inner.send(data, binary))
+            .map_err(err)
     }
 
     /// Register `callback(data: bytes, binary: bool)` for incoming messages.
@@ -700,11 +706,13 @@ impl PeerConnection {
         py.allow_threads(|| self.inner.add_ice_candidate(&rust))
             .map_err(err)
     }
-    fn add_track(&self, track: &Track) -> PyResult<()> {
-        self.inner.add_track(&track.inner).map_err(err)
+    fn add_track(&self, py: Python, track: &Track) -> PyResult<()> {
+        py.allow_threads(|| self.inner.add_track(&track.inner))
+            .map_err(err)
     }
     fn add_transceiver(
         &self,
+        py: Python,
         kind: MediaKind,
         direction: TransceiverDirection,
     ) -> PyResult<Transceiver> {
@@ -713,14 +721,15 @@ impl PeerConnection {
             MediaKind::Video => rw::MediaKind::Video,
             MediaKind::Unknown => return Err(PyRuntimeError::new_err("need Audio or Video")),
         };
-        self.inner
-            .add_transceiver(rust_kind, rw::TransceiverDirection::from(direction))
-            .map(|t| Transceiver { inner: t })
-            .map_err(err)
+        py.allow_threads(|| {
+            self.inner
+                .add_transceiver(rust_kind, rw::TransceiverDirection::from(direction))
+        })
+        .map(|t| Transceiver { inner: t })
+        .map_err(err)
     }
-    fn create_data_channel(&self, label: &str) -> PyResult<DataChannel> {
-        self.inner
-            .create_data_channel(label)
+    fn create_data_channel(&self, py: Python, label: &str) -> PyResult<DataChannel> {
+        py.allow_threads(|| self.inner.create_data_channel(label))
             .map(|inner| DataChannel {
                 inner: ManuallyDrop::new(inner),
             })

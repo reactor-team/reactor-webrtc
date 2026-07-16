@@ -44,11 +44,19 @@ def make_peer(
 ) -> Peer:
     peer = Peer(pc=None)  # type: ignore[arg-type]
     obs = rw.PeerConnectionObserver()
-    obs.on_ice_candidate = lambda c: peer.ice.append(c)
+    # Capture the individual collections rather than `peer` itself to avoid a
+    # reference cycle: peer.pc -> observer closures -> lambda -> peer -> peer.pc.
+    # A cycle prevents CPython's refcount from reaching zero when the test frame
+    # exits, keeping the old PeerConnection (and its active ICE threads) alive
+    # into subsequent tests where they can deadlock signaling-thread operations.
+    _ice = peer.ice
+    _connected = peer.connected
+    _gathering = peer.gathering_states
+    obs.on_ice_candidate = lambda c: _ice.append(c)
     obs.on_connection_state_change = (
-        lambda s: peer.connected.set() if s == rw.PeerConnectionState.Connected else None
+        lambda s: _connected.set() if s == rw.PeerConnectionState.Connected else None
     )
-    obs.on_ice_gathering_change = lambda s: peer.gathering_states.append(s)
+    obs.on_ice_gathering_change = lambda s: _gathering.append(s)
     if on_data_channel is not None:
         obs.on_data_channel = on_data_channel
     if on_track is not None:
