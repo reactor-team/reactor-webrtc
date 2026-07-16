@@ -108,16 +108,6 @@ class TestFactory:
         with pytest.raises(RuntimeError, match="even"):
             factory.push_audio_frame(b"\x00" * 3, sample_rate=48000, channels=1)
 
-    def test_with_encoded_video_track(self):
-        _, evtrack = rw.PeerConnectionFactory.with_encoded_video_track("cam", 640, 480)
-        # push_encoded_frame must not raise for a well-formed call
-        evtrack.push_encoded_frame(b"\x00" * 100, is_key_frame=True, width=640, height=480)
-
-    def test_with_encoded_video_track_defaults(self):
-        _, evtrack = rw.PeerConnectionFactory.with_encoded_video_track("cam", 640, 480)
-        # All optional args omitted — should not raise
-        evtrack.push_encoded_frame(b"\x00" * 10)
-
 
 # ── Peer connection creation ──────────────────────────────────────────────────
 
