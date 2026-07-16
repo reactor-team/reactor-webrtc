@@ -39,8 +39,9 @@ pub use encoded::{
 pub use media::{AudioFrame, MediaKind, Track, VideoFrame};
 pub use observer::PeerConnectionObserver;
 pub use peer_connection::{
-    DataChannel, DataChannelState, IceCandidate, IceGatheringState, PeerConnection,
-    PeerConnectionState, SdpType, SessionDescription, Transceiver, TransceiverDirection,
+    DataChannel, DataChannelState, IceCandidatePairState, IceCandidatePairStats, IceCandidate,
+    IceGatheringState, InboundRtpStats, OutboundRtpStats, PeerConnection, PeerConnectionState,
+    SdpType, SessionDescription, StatsReport, Transceiver, TransceiverDirection,
 };
 
 /// The ABI version of the linked native build. Used to assert that the safe

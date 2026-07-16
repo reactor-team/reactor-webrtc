@@ -6,6 +6,8 @@ use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use reactor_webrtc_sys::ReactorStatEntry;
+
 use crate::encoded::FrameTransform;
 use crate::media::{MediaKind, Track};
 use crate::observer::ObserverState;
@@ -244,6 +246,76 @@ impl DataChannelState {
     }
 }
 
+// ── Stats types ──────────────────────────────────────────────────────────────
+
+/// State of an ICE candidate pair (`RTCIceCandidatePairStats::state`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IceCandidatePairState {
+    Waiting,
+    InProgress,
+    Failed,
+    Succeeded,
+    Cancelled,
+}
+
+impl IceCandidatePairState {
+    fn from_raw(v: c_int) -> Self {
+        match v {
+            1 => IceCandidatePairState::InProgress,
+            2 => IceCandidatePairState::Failed,
+            3 => IceCandidatePairState::Succeeded,
+            4 => IceCandidatePairState::Cancelled,
+            _ => IceCandidatePairState::Waiting,
+        }
+    }
+}
+
+/// `RTCInboundRtpStreamStats` subset.
+#[derive(Debug, Clone)]
+pub struct InboundRtpStats {
+    pub ssrc: u32,
+    pub packets_received: u32,
+    pub bytes_received: u64,
+    /// Jitter in seconds.
+    pub jitter_s: f64,
+    pub packets_lost: i32,
+    pub nack_count: u32,
+    /// Cumulative decode time in seconds.
+    pub total_decode_time_s: f64,
+}
+
+/// `RTCOutboundRtpStreamStats` subset.
+#[derive(Debug, Clone)]
+pub struct OutboundRtpStats {
+    pub ssrc: u32,
+    pub packets_sent: u32,
+    pub bytes_sent: u64,
+    /// Target encoder bitrate in bps.
+    pub target_bitrate_bps: f64,
+    /// Round-trip time in seconds; `0.0` if not yet measured.
+    pub round_trip_time_s: f64,
+    pub retransmitted_packets_sent: u32,
+}
+
+/// `RTCIceCandidatePairStats` subset.
+#[derive(Debug, Clone)]
+pub struct IceCandidatePairStats {
+    /// Current RTT in seconds; `0.0` if not yet measured.
+    pub current_round_trip_time_s: f64,
+    pub priority: u64,
+    pub state: IceCandidatePairState,
+}
+
+/// A snapshot of the stats delivered by [`PeerConnection::get_stats`].
+#[derive(Debug, Clone, Default)]
+pub struct StatsReport {
+    pub inbound_rtp: Vec<InboundRtpStats>,
+    pub outbound_rtp: Vec<OutboundRtpStats>,
+    pub candidate_pairs: Vec<IceCandidatePairStats>,
+}
+
+// ── Data channel callbacks ────────────────────────────────────────────────────
+
 type MessageCb = Box<dyn for<'a> FnMut(&'a [u8], bool) + Send>;
 type EventCb = Box<dyn FnMut() + Send>;
 type StateCb = Box<dyn FnMut(DataChannelState) + Send>;
@@ -467,6 +539,55 @@ extern "C" fn complete_cb(ud: *mut c_void, error: *const c_char) {
     let _ = tx.try_send(r);
 }
 
+type StatsTx = SyncSender<StatsReport>;
+
+extern "C" fn stats_cb(ud: *mut c_void, entries: *const ReactorStatEntry, count: c_int) {
+    let tx = unsafe { &*(ud as *const StatsTx) };
+    let slice = if entries.is_null() || count <= 0 {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(entries, count as usize) }
+    };
+    let mut report = StatsReport::default();
+    for e in slice {
+        match e.kind {
+            0 => report.inbound_rtp.push(InboundRtpStats {
+                ssrc: e.ssrc,
+                packets_received: e.packets_received,
+                bytes_received: e.bytes_received,
+                jitter_s: e.jitter,
+                packets_lost: e.packets_lost,
+                nack_count: e.nack_count,
+                total_decode_time_s: e.total_decode_time,
+            }),
+            1 => report.outbound_rtp.push(OutboundRtpStats {
+                ssrc: e.ssrc,
+                packets_sent: e.packets_sent,
+                bytes_sent: e.bytes_sent,
+                target_bitrate_bps: e.target_bitrate,
+                round_trip_time_s: e.round_trip_time,
+                retransmitted_packets_sent: e.retransmitted_packets_sent,
+            }),
+            2 => report.candidate_pairs.push(IceCandidatePairStats {
+                current_round_trip_time_s: e.current_round_trip_time,
+                priority: e.priority,
+                state: IceCandidatePairState::from_raw(e.pair_state),
+            }),
+            _ => {}
+        }
+    }
+    let _ = tx.try_send(report);
+}
+
+fn run_stats(call: impl FnOnce(*mut c_void)) -> Result<StatsReport> {
+    let (tx, rx) = sync_channel::<StatsReport>(1);
+    let p = Box::into_raw(Box::new(tx));
+    call(p as *mut c_void);
+    let r = rx.recv_timeout(OP_TIMEOUT);
+    drop(unsafe { Box::from_raw(p) });
+    r.map_err(|_| Error::Webrtc("get_stats timed out".into()))
+}
+
 fn run_sdp(call: impl FnOnce(*mut c_void)) -> Result<SessionDescription> {
     let (tx, rx) = sync_channel::<Result<SessionDescription>>(1);
     let p = Box::into_raw(Box::new(tx));
@@ -646,6 +767,27 @@ impl PeerConnection {
         } else {
             Ok(DataChannel::from_raw(raw))
         }
+    }
+
+    // ── Stats ────────────────────────────────────────────────────────────────
+
+    /// Collect a stats snapshot from this peer connection.
+    ///
+    /// Blocks the current thread (up to [`OP_TIMEOUT`]) until the WebRTC
+    /// engine delivers the report. The returned [`StatsReport`] contains only
+    /// the three stat types surfaced through the C ABI:
+    ///
+    /// - [`StatsReport::inbound_rtp`] — per-SSRC receive statistics
+    ///   (packets, jitter, NACK count, decode time).
+    /// - [`StatsReport::outbound_rtp`] — per-SSRC send statistics
+    ///   (bytes sent, target bitrate, RTT).
+    /// - [`StatsReport::candidate_pairs`] — ICE candidate pair state and RTT.
+    pub fn get_stats(&self) -> Result<StatsReport> {
+        run_stats(|ud| unsafe {
+            reactor_webrtc_sys::reactor_webrtc_peer_connection_get_stats(
+                self.raw, ud, stats_cb,
+            )
+        })
     }
 }
 

@@ -29,6 +29,11 @@
 #include <utility>
 #include <vector>
 
+#include <limits>
+
+#include "api/stats/rtc_stats_collector_callback.h"
+#include "api/stats/rtc_stats_report.h"
+#include "api/stats/rtcstats_objects.h"
 #include "api/audio/audio_device.h"
 #include "api/audio/audio_device_defines.h"
 #include "api/audio/audio_processing.h"
@@ -77,6 +82,35 @@
 // ── C ABI types (must match crates/reactor-webrtc-sys/src/lib.rs) ─────────────
 
 extern "C" {
+// A single entry in the stats snapshot delivered to
+// reactor_webrtc_peer_connection_get_stats. `kind` discriminates which set of
+// fields is populated; unused fields are zero-initialised.
+//   kind 0 = inbound_rtp   (RTCInboundRtpStreamStats)
+//   kind 1 = outbound_rtp  (RTCOutboundRtpStreamStats)
+//   kind 2 = candidate_pair (RTCIceCandidatePairStats)
+// Fields are ordered to avoid padding; the layout must match the repr(C)
+// struct in reactor-webrtc-sys/src/lib.rs.
+struct ReactorStatEntry {
+  int32_t  kind;
+  uint32_t ssrc;
+  // 4-byte integer fields
+  uint32_t packets_received;
+  int32_t  packets_lost;
+  uint32_t nack_count;
+  uint32_t packets_sent;
+  int32_t  pair_state;  // 0=waiting 1=in_progress 2=failed 3=succeeded 4=cancelled
+  uint32_t retransmitted_packets_sent;
+  // 8-byte fields (natural alignment)
+  uint64_t bytes_received;
+  uint64_t bytes_sent;
+  uint64_t priority;
+  double   jitter;                  // seconds
+  double   total_decode_time;       // seconds
+  double   target_bitrate;          // bps
+  double   round_trip_time;         // seconds, 0 if not measured
+  double   current_round_trip_time; // seconds, 0 if not measured
+};
+
 // PeerConnectionObserver events, forwarded to the safe crate. Any pointer may
 // be null (the field is `Option<extern "C" fn>` on the Rust side).
 struct ReactorPcCallbacks {
@@ -504,6 +538,80 @@ void parse_ice_servers(const char* config_json,
     start = end + 1;
   }
 }
+
+// Safely dereference an RTCStatsMember<T> (zero-value if not defined).
+template <typename T>
+static T stat_val(const webrtc::RTCStatsMember<T>& m) {
+  return m.is_defined() ? *m : T{};
+}
+
+// Parse the string ICE-pair state to the integer encoding used in
+// ReactorStatEntry::pair_state.
+static int parse_pair_state(const webrtc::RTCStatsMember<std::string>& m) {
+  if (!m.is_defined()) return 0;
+  const std::string& s = *m;
+  if (s == "in-progress") return 1;
+  if (s == "failed")      return 2;
+  if (s == "succeeded")   return 3;
+  if (s == "cancelled")   return 4;
+  return 0;  // "waiting" or unknown
+}
+
+// Collects a WebRTC stats report and serialises the RTCInboundRtpStreamStats,
+// RTCOutboundRtpStreamStats, and RTCIceCandidatePairStats entries into the
+// flat C ABI array expected by the safe crate.
+class StatsCallback : public webrtc::RTCStatsCollectorCallback {
+ public:
+  StatsCallback(void* userdata,
+                void (*callback)(void*, const ReactorStatEntry*, int))
+      : userdata_(userdata), callback_(callback) {}
+
+  void OnStatsDelivered(
+      const webrtc::scoped_refptr<const webrtc::RTCStatsReport>& report)
+      override {
+    std::vector<ReactorStatEntry> entries;
+    if (report) {
+      for (const webrtc::RTCStats& stats : *report) {
+        ReactorStatEntry e{};
+        if (stats.type() == webrtc::RTCInboundRtpStreamStats::kType) {
+          const auto& s = stats.cast_to<webrtc::RTCInboundRtpStreamStats>();
+          e.kind              = 0;
+          e.ssrc              = stat_val(s.ssrc);
+          e.packets_received  = stat_val(s.packets_received);
+          e.bytes_received    = stat_val(s.bytes_received);
+          e.jitter            = stat_val(s.jitter);
+          e.packets_lost      = stat_val(s.packets_lost);
+          e.nack_count        = stat_val(s.nack_count);
+          e.total_decode_time = stat_val(s.total_decode_time);
+          entries.push_back(e);
+        } else if (stats.type() == webrtc::RTCOutboundRtpStreamStats::kType) {
+          const auto& s = stats.cast_to<webrtc::RTCOutboundRtpStreamStats>();
+          e.kind                       = 1;
+          e.ssrc                       = stat_val(s.ssrc);
+          e.packets_sent               = stat_val(s.packets_sent);
+          e.bytes_sent                 = stat_val(s.bytes_sent);
+          e.target_bitrate             = stat_val(s.target_bitrate);
+          e.round_trip_time            = stat_val(s.round_trip_time);
+          e.retransmitted_packets_sent = stat_val(s.retransmitted_packets_sent);
+          entries.push_back(e);
+        } else if (stats.type() == webrtc::RTCIceCandidatePairStats::kType) {
+          const auto& s = stats.cast_to<webrtc::RTCIceCandidatePairStats>();
+          e.kind                    = 2;
+          e.current_round_trip_time = stat_val(s.current_round_trip_time);
+          e.priority                = stat_val(s.priority);
+          e.pair_state              = parse_pair_state(s.state);
+          entries.push_back(e);
+        }
+      }
+    }
+    if (callback_)
+      callback_(userdata_, entries.data(), static_cast<int>(entries.size()));
+  }
+
+ private:
+  void* userdata_;
+  void (*callback_)(void*, const ReactorStatEntry*, int);
+};
 
 }  // namespace
 
@@ -1564,6 +1672,24 @@ void reactor_webrtc_media_stream_track_destroy(void* track) {
     }
   }
   delete h;
+}
+
+// ── Stats ─────────────────────────────────────────────────────────────────────
+
+// Request a stats snapshot from the peer connection. `callback(userdata,
+// entries, count)` fires once on the WebRTC signaling thread — `entries` is a
+// pointer to a temporary array valid only for the duration of the call. If
+// the peer connection is closed or not set, `callback` is called with count=0.
+void reactor_webrtc_peer_connection_get_stats(
+    void* pc, void* userdata,
+    void (*callback)(void* userdata, const ReactorStatEntry* entries, int count)) {
+  auto* rpc = reinterpret_cast<ReactorPeerConnection*>(pc);
+  if (!rpc || !rpc->pc) {
+    if (callback) callback(userdata, nullptr, 0);
+    return;
+  }
+  rpc->pc->GetStats(
+      webrtc::make_ref_counted<StatsCallback>(userdata, callback).get());
 }
 
 }  // extern "C"
