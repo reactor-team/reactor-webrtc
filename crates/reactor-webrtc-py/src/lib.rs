@@ -22,6 +22,7 @@ use ::reactor_webrtc as rw;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
+use std::mem::ManuallyDrop;
 
 fn err(e: rw::Error) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
@@ -447,7 +448,16 @@ impl Transceiver {
 /// An SCTP data channel for binary or text messaging.
 #[pyclass]
 pub struct DataChannel {
-    inner: rw::DataChannel,
+    inner: ManuallyDrop<rw::DataChannel>,
+}
+
+impl Drop for DataChannel {
+    fn drop(&mut self) {
+        // DataChannel callbacks (on_close, on_state_change) call Python::with_gil.
+        // Release the GIL before dropping so those callbacks can fire without deadlocking.
+        let inner = unsafe { ManuallyDrop::take(&mut self.inner) };
+        Python::with_gil(|py| py.allow_threads(|| drop(inner)));
+    }
 }
 
 #[pymethods]
@@ -625,7 +635,7 @@ impl PeerConnectionObserver {
             let cb = cb.clone_ref(py);
             obs = obs.on_data_channel(move |dc| {
                 Python::with_gil(|py| {
-                    let py_dc = Py::new(py, DataChannel { inner: dc }).unwrap();
+                    let py_dc = Py::new(py, DataChannel { inner: ManuallyDrop::new(dc) }).unwrap();
                     let _ = cb.call1(py, (py_dc,));
                 });
             });
@@ -643,7 +653,18 @@ impl PeerConnectionObserver {
 /// calling from an async context.
 #[pyclass]
 pub struct PeerConnection {
-    inner: rw::PeerConnection,
+    inner: ManuallyDrop<rw::PeerConnection>,
+}
+
+impl Drop for PeerConnection {
+    fn drop(&mut self) {
+        // pc->Close() dispatches synchronously to the signaling thread, which fires
+        // on_connection_state_change(Closed) and tries Python::with_gil. If the GIL
+        // is held by the Python GC thread that invoked this drop, both threads deadlock.
+        // Release the GIL first so those callbacks can complete.
+        let inner = unsafe { ManuallyDrop::take(&mut self.inner) };
+        Python::with_gil(|py| py.allow_threads(|| drop(inner)));
+    }
 }
 
 #[pymethods]
@@ -694,7 +715,7 @@ impl PeerConnection {
     fn create_data_channel(&self, label: &str) -> PyResult<DataChannel> {
         self.inner
             .create_data_channel(label)
-            .map(|inner| DataChannel { inner })
+            .map(|inner| DataChannel { inner: ManuallyDrop::new(inner) })
             .map_err(err)
     }
 }
@@ -736,7 +757,7 @@ impl PeerConnectionFactory {
         let rust_obs = observer.build_rust_observer(py);
         self.inner
             .create_peer_connection(&rust_config, rust_obs)
-            .map(|inner| PeerConnection { inner })
+            .map(|inner| PeerConnection { inner: ManuallyDrop::new(inner) })
             .map_err(err)
     }
 
