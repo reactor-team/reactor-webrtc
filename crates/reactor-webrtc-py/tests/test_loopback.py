@@ -314,3 +314,99 @@ class TestDataChannel:
         assert wait_for(lambda: received_a and received_b), "messages not received on both channels"
         assert received_a == [b"from-a"]
         assert received_b == [b"from-b"]
+
+
+# ── Stats ─────────────────────────────────────────────────────────────────────
+
+
+class TestStats:
+    def test_get_stats_returns_report(self, factory):
+        """get_stats() always returns a StatsReport, even before connection."""
+        p = make_peer(factory)
+        report = p.pc.get_stats()
+        assert isinstance(report, rw.StatsReport)
+
+    def test_stats_empty_before_negotiation(self, factory):
+        """No RTP streams without an offer/answer exchange."""
+        p = make_peer(factory)
+        report = p.pc.get_stats()
+        assert report.inbound_rtp == []
+        assert report.outbound_rtp == []
+
+    def test_stats_candidate_pairs_after_connection(self, factory):
+        """At least one candidate pair exists once peers are connected."""
+        p1 = make_peer(factory)
+        p2 = make_peer(factory)
+        p1.pc.create_data_channel("probe")
+
+        ok = connect(p1, p2)
+        assert ok, "peers did not connect within timeout"
+
+        report1 = p1.pc.get_stats()
+        assert isinstance(report1, rw.StatsReport)
+        assert len(report1.candidate_pairs) > 0, "expected at least one candidate pair"
+
+    def test_candidate_pair_stats_fields(self, factory):
+        """IceCandidatePairStats fields have sane types and values."""
+        p1 = make_peer(factory)
+        p2 = make_peer(factory)
+        p1.pc.create_data_channel("probe")
+
+        ok = connect(p1, p2)
+        assert ok, "peers did not connect within timeout"
+
+        report = p1.pc.get_stats()
+        pair = next(
+            (cp for cp in report.candidate_pairs if cp.state == rw.IceCandidatePairState.Succeeded),
+            None,
+        )
+        assert pair is not None, "expected a Succeeded candidate pair"
+        assert pair.priority > 0
+        assert pair.current_round_trip_time_s >= 0.0
+
+    def test_ice_candidate_pair_state_variants_distinct(self):
+        variants = [
+            rw.IceCandidatePairState.Waiting,
+            rw.IceCandidatePairState.InProgress,
+            rw.IceCandidatePairState.Failed,
+            rw.IceCandidatePairState.Succeeded,
+            rw.IceCandidatePairState.Cancelled,
+        ]
+        for i, a in enumerate(variants):
+            for j, b in enumerate(variants):
+                assert (a == b) == (i == j)
+
+    def test_stats_report_repr(self, factory):
+        p = make_peer(factory)
+        r = p.pc.get_stats()
+        assert "StatsReport" in repr(r)
+
+    def test_inbound_rtp_stats_fields_after_receive(self, factory):
+        """After receiving RTP audio, inbound stats are populated."""
+        received_audio = threading.Event()
+        p1 = make_peer(factory)
+        p2 = make_peer(factory, on_track=lambda kind, t: (
+            t.on_audio_frame(lambda *_: received_audio.set())
+        ))
+
+        audio = factory.create_audio_track("mic")
+        p1.pc.add_track(audio)
+
+        ok = connect(p1, p2)
+        assert ok, "peers did not connect within timeout"
+
+        # Push enough PCM so at least one RTP packet crosses the loopback
+        pcm = b"\x00" * 960  # 10 ms at 48 kHz mono
+        for _ in range(20):
+            factory.push_audio_frame(pcm, sample_rate=48000, channels=1)
+            time.sleep(0.01)
+
+        wait_for(lambda: received_audio.is_set(), timeout=10.0)
+
+        report = p2.pc.get_stats()
+        assert len(report.inbound_rtp) > 0, "expected inbound RTP stats after receiving audio"
+        s = report.inbound_rtp[0]
+        assert s.ssrc > 0
+        assert s.packets_received >= 0
+        assert s.bytes_received >= 0
+        assert s.jitter_s >= 0.0

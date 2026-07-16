@@ -71,6 +71,42 @@ class TransceiverDirection:
     RecvOnly: TransceiverDirection
     Inactive: TransceiverDirection
 
+# ── Stats ─────────────────────────────────────────────────────────────────────
+
+class IceCandidatePairState:
+    Waiting: IceCandidatePairState
+    InProgress: IceCandidatePairState
+    Failed: IceCandidatePairState
+    Succeeded: IceCandidatePairState
+    Cancelled: IceCandidatePairState
+
+class InboundRtpStats:
+    ssrc: int
+    packets_received: int
+    bytes_received: int
+    jitter_s: float
+    packets_lost: int
+    nack_count: int
+    total_decode_time_s: float
+
+class OutboundRtpStats:
+    ssrc: int
+    packets_sent: int
+    bytes_sent: int
+    target_bitrate_bps: float
+    round_trip_time_s: float
+    retransmitted_packets_sent: int
+
+class IceCandidatePairStats:
+    current_round_trip_time_s: float
+    priority: int
+    state: IceCandidatePairState
+
+class StatsReport:
+    inbound_rtp: list[InboundRtpStats]
+    outbound_rtp: list[OutboundRtpStats]
+    candidate_pairs: list[IceCandidatePairStats]
+
 # ── Media ─────────────────────────────────────────────────────────────────────
 
 class Track:
@@ -142,6 +178,7 @@ class PeerConnection:
         self, kind: MediaKind, direction: TransceiverDirection
     ) -> Transceiver: ...
     def create_data_channel(self, label: str) -> DataChannel: ...
+    def get_stats(self) -> StatsReport: ...
 
 # ── Factory ───────────────────────────────────────────────────────────────────
 

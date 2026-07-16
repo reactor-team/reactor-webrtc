@@ -307,6 +307,159 @@ impl From<TransceiverDirection> for rw::TransceiverDirection {
     }
 }
 
+// ── Stats types ───────────────────────────────────────────────────────────────
+
+/// ICE candidate-pair state (`RTCIceCandidatePairStats::state`).
+#[pyclass(eq, eq_int)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum IceCandidatePairState {
+    Waiting,
+    InProgress,
+    Failed,
+    Succeeded,
+    Cancelled,
+}
+
+impl From<rw::IceCandidatePairState> for IceCandidatePairState {
+    fn from(s: rw::IceCandidatePairState) -> Self {
+        match s {
+            rw::IceCandidatePairState::Waiting => Self::Waiting,
+            rw::IceCandidatePairState::InProgress => Self::InProgress,
+            rw::IceCandidatePairState::Failed => Self::Failed,
+            rw::IceCandidatePairState::Succeeded => Self::Succeeded,
+            rw::IceCandidatePairState::Cancelled => Self::Cancelled,
+        }
+    }
+}
+
+/// Subset of `RTCInboundRtpStreamStats`.
+#[pyclass(get_all)]
+#[derive(Clone)]
+pub struct InboundRtpStats {
+    pub ssrc: u32,
+    pub packets_received: u32,
+    pub bytes_received: u64,
+    /// Jitter in seconds.
+    pub jitter_s: f64,
+    pub packets_lost: i32,
+    pub nack_count: u32,
+    /// Cumulative decode time in seconds.
+    pub total_decode_time_s: f64,
+}
+
+#[pymethods]
+impl InboundRtpStats {
+    fn __repr__(&self) -> String {
+        format!("InboundRtpStats(ssrc={})", self.ssrc)
+    }
+}
+
+impl From<rw::InboundRtpStats> for InboundRtpStats {
+    fn from(s: rw::InboundRtpStats) -> Self {
+        Self {
+            ssrc: s.ssrc,
+            packets_received: s.packets_received,
+            bytes_received: s.bytes_received,
+            jitter_s: s.jitter_s,
+            packets_lost: s.packets_lost,
+            nack_count: s.nack_count,
+            total_decode_time_s: s.total_decode_time_s,
+        }
+    }
+}
+
+/// Subset of `RTCOutboundRtpStreamStats`.
+#[pyclass(get_all)]
+#[derive(Clone)]
+pub struct OutboundRtpStats {
+    pub ssrc: u32,
+    pub packets_sent: u32,
+    pub bytes_sent: u64,
+    /// Target encoder bitrate in bps.
+    pub target_bitrate_bps: f64,
+    /// Round-trip time in seconds; `0.0` if not yet measured.
+    pub round_trip_time_s: f64,
+    pub retransmitted_packets_sent: u32,
+}
+
+#[pymethods]
+impl OutboundRtpStats {
+    fn __repr__(&self) -> String {
+        format!("OutboundRtpStats(ssrc={})", self.ssrc)
+    }
+}
+
+impl From<rw::OutboundRtpStats> for OutboundRtpStats {
+    fn from(s: rw::OutboundRtpStats) -> Self {
+        Self {
+            ssrc: s.ssrc,
+            packets_sent: s.packets_sent,
+            bytes_sent: s.bytes_sent,
+            target_bitrate_bps: s.target_bitrate_bps,
+            round_trip_time_s: s.round_trip_time_s,
+            retransmitted_packets_sent: s.retransmitted_packets_sent,
+        }
+    }
+}
+
+/// Subset of `RTCIceCandidatePairStats`.
+#[pyclass(get_all)]
+#[derive(Clone)]
+pub struct IceCandidatePairStats {
+    /// Current RTT in seconds; `0.0` if not yet measured.
+    pub current_round_trip_time_s: f64,
+    pub priority: u64,
+    pub state: IceCandidatePairState,
+}
+
+#[pymethods]
+impl IceCandidatePairStats {
+    fn __repr__(&self) -> String {
+        format!("IceCandidatePairStats(state={:?})", self.state as i32)
+    }
+}
+
+impl From<rw::IceCandidatePairStats> for IceCandidatePairStats {
+    fn from(s: rw::IceCandidatePairStats) -> Self {
+        Self {
+            current_round_trip_time_s: s.current_round_trip_time_s,
+            priority: s.priority,
+            state: IceCandidatePairState::from(s.state),
+        }
+    }
+}
+
+/// Snapshot delivered by `PeerConnection.get_stats()`.
+#[pyclass(get_all)]
+#[derive(Clone)]
+pub struct StatsReport {
+    pub inbound_rtp: Vec<InboundRtpStats>,
+    pub outbound_rtp: Vec<OutboundRtpStats>,
+    pub candidate_pairs: Vec<IceCandidatePairStats>,
+}
+
+#[pymethods]
+impl StatsReport {
+    fn __repr__(&self) -> String {
+        format!(
+            "StatsReport(inbound={}, outbound={}, pairs={})",
+            self.inbound_rtp.len(),
+            self.outbound_rtp.len(),
+            self.candidate_pairs.len()
+        )
+    }
+}
+
+impl From<rw::StatsReport> for StatsReport {
+    fn from(r: rw::StatsReport) -> Self {
+        Self {
+            inbound_rtp: r.inbound_rtp.into_iter().map(Into::into).collect(),
+            outbound_rtp: r.outbound_rtp.into_iter().map(Into::into).collect(),
+            candidate_pairs: r.candidate_pairs.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
 // ── Track ─────────────────────────────────────────────────────────────────────
 
 /// A media track — local (push frames) or remote (attach a sink).
@@ -735,6 +888,15 @@ impl PeerConnection {
             })
             .map_err(err)
     }
+
+    /// Collect a stats snapshot from the WebRTC engine. Blocks until the report
+    /// arrives (typically <5 ms). Returns a `StatsReport` with inbound/outbound
+    /// RTP streams and ICE candidate-pair metrics.
+    fn get_stats(&self, py: Python) -> PyResult<StatsReport> {
+        py.allow_threads(|| self.inner.get_stats())
+            .map(StatsReport::from)
+            .map_err(err)
+    }
 }
 
 // ── PeerConnectionFactory ─────────────────────────────────────────────────────
@@ -844,6 +1006,11 @@ fn reactor_webrtc(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<DataChannelState>()?;
     m.add_class::<MediaKind>()?;
     m.add_class::<TransceiverDirection>()?;
+    m.add_class::<IceCandidatePairState>()?;
+    m.add_class::<InboundRtpStats>()?;
+    m.add_class::<OutboundRtpStats>()?;
+    m.add_class::<IceCandidatePairStats>()?;
+    m.add_class::<StatsReport>()?;
     m.add_class::<Track>()?;
     m.add_class::<EncodedVideoTrack>()?;
     m.add_class::<Transceiver>()?;
