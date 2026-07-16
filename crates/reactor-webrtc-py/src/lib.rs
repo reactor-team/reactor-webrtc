@@ -193,7 +193,10 @@ impl From<rw::SessionDescription> for SessionDescription {
 fn to_rust_sdp(s: &SessionDescription) -> PyResult<rw::SessionDescription> {
     let kind = parse_sdp_type(&s.kind)
         .ok_or_else(|| PyRuntimeError::new_err(format!("unknown SDP kind: {}", s.kind)))?;
-    Ok(rw::SessionDescription { kind, sdp: s.sdp.clone() })
+    Ok(rw::SessionDescription {
+        kind,
+        sdp: s.sdp.clone(),
+    })
 }
 
 // ── Enums ─────────────────────────────────────────────────────────────────────
