@@ -478,8 +478,9 @@ impl Track {
     }
 
     /// Push a raw BGRA video frame into a local video track.
-    fn push_video_frame(&self, bgra: &[u8], width: u32, height: u32) {
-        self.inner.push_video_frame(bgra, width, height);
+    fn push_video_frame(&self, py: Python, bgra: &[u8], width: u32, height: u32) {
+        let owned = bgra.to_vec();
+        py.allow_threads(|| self.inner.push_video_frame(&owned, width, height));
     }
 
     /// Register `callback(bgra: bytes, width: int, height: int)` for decoded
@@ -594,9 +595,22 @@ impl Transceiver {
         py.allow_threads(|| self.inner.mid())
     }
 
+    /// Media kind (Audio or Video).
+    fn kind(&self, py: Python) -> MediaKind {
+        MediaKind::from(py.allow_threads(|| self.inner.kind()))
+    }
+
     /// Attach a local track to the sender slot.
     fn set_track(&self, py: Python, track: &Track) -> PyResult<()> {
         py.allow_threads(|| self.inner.set_track(&track.inner))
+            .map_err(err)
+    }
+
+    /// Set the transceiver direction (SendOnly, RecvOnly, SendRecv, Inactive).
+    /// Must be called before `create_answer()`/`create_offer()` for the change
+    /// to appear in the SDP.
+    fn set_direction(&self, py: Python, direction: TransceiverDirection) -> PyResult<()> {
+        py.allow_threads(|| self.inner.set_direction(rw::TransceiverDirection::from(direction)))
             .map_err(err)
     }
 }
@@ -889,6 +903,17 @@ impl PeerConnection {
             .map_err(err)
     }
 
+    /// All transceivers on this peer connection, in offer m-section order after
+    /// `set_remote_description`. Use this (together with `Transceiver.set_track`)
+    /// to attach local tracks to the transceivers auto-created from the remote
+    /// offer's recvonly m-sections.
+    fn transceivers(&self, py: Python) -> Vec<Transceiver> {
+        py.allow_threads(|| self.inner.transceivers())
+            .into_iter()
+            .map(|t| Transceiver { inner: t })
+            .collect()
+    }
+
     /// Collect a stats snapshot from the WebRTC engine. Blocks until the report
     /// arrives (typically <5 ms). Returns a `StatsReport` with inbound/outbound
     /// RTP streams and ICE candidate-pair metrics.
@@ -913,14 +938,27 @@ pub struct PeerConnectionFactory {
 #[pymethods]
 impl PeerConnectionFactory {
     #[new]
-    #[pyo3(signature = (platform_adm=false))]
-    fn new(platform_adm: bool) -> PyResult<Self> {
+    #[pyo3(signature = (
+        platform_adm=false,
+        echo_canceller=false,
+        noise_suppression=false,
+        agc=false,
+        high_pass_filter=false,
+    ))]
+    fn new(
+        platform_adm: bool,
+        echo_canceller: bool,
+        noise_suppression: bool,
+        agc: bool,
+        high_pass_filter: bool,
+    ) -> PyResult<Self> {
         let adm = if platform_adm {
             rw::AdmMode::Platform
         } else {
             rw::AdmMode::Synthetic
         };
-        rw::PeerConnectionFactory::with_adm(adm)
+        let apm = rw::ApmConfig { echo_canceller, noise_suppression, agc, high_pass_filter };
+        rw::PeerConnectionFactory::with_adm_apm(adm, apm)
             .map(|inner| Self { inner })
             .map_err(err)
     }
@@ -960,7 +998,7 @@ impl PeerConnectionFactory {
 
     /// Push interleaved signed 16-bit little-endian PCM to the synthetic ADM.
     /// `pcm` must have even length (2 bytes per i16 sample).
-    fn push_audio_frame(&self, pcm: &[u8], sample_rate: u32, channels: u32) -> PyResult<()> {
+    fn push_audio_frame(&self, py: Python, pcm: &[u8], sample_rate: u32, channels: u32) -> PyResult<()> {
         if !pcm.len().is_multiple_of(2) {
             return Err(PyRuntimeError::new_err("pcm byte length must be even"));
         }
@@ -968,7 +1006,7 @@ impl PeerConnectionFactory {
             .chunks_exact(2)
             .map(|c| i16::from_le_bytes([c[0], c[1]]))
             .collect();
-        self.inner.push_audio_frame(&samples, sample_rate, channels);
+        py.allow_threads(|| self.inner.push_audio_frame(&samples, sample_rate, channels));
         Ok(())
     }
 

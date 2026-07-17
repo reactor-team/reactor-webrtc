@@ -657,14 +657,34 @@ int reactor_webrtc_selftest(char* out, int cap) {
   return count;
 }
 
+// APM flags bitmask (OR together to enable processing stages):
+//   0x01  echo_canceller (AEC3)
+//   0x02  noise_suppression (kHigh when enabled)
+//   0x04  gain_controller1 (AGC)
+//   0x08  high_pass_filter
+static webrtc::scoped_refptr<webrtc::AudioProcessing> build_apm(int apm_flags) {
+  webrtc::AudioProcessing::Config cfg;
+  cfg.echo_canceller.enabled    = (apm_flags & 0x01) != 0;
+  cfg.noise_suppression.enabled = (apm_flags & 0x02) != 0;
+  if (cfg.noise_suppression.enabled)
+    cfg.noise_suppression.level =
+        webrtc::AudioProcessing::Config::NoiseSuppression::kHigh;
+  cfg.gain_controller1.enabled = (apm_flags & 0x04) != 0;
+  cfg.high_pass_filter.enabled = (apm_flags & 0x08) != 0;
+  return webrtc::BuiltinAudioProcessingBuilder(cfg)
+      .Build(webrtc::CreateEnvironment());
+}
+
 // Create a PeerConnectionFactory: start the network/worker/signaling threads
 // and wire the builtin audio+video codec factories.
 //
 // `use_platform_adm`: 0 → our synthetic FrameAdm (push PCM, no hardware);
 // nonzero → pass a null ADM so the media engine creates the platform default
-// ADM (real mic/speaker, e.g. CoreAudio on macOS). Returns an opaque
-// ReactorFactory* (the `PeerConnectionFactory` handle), or nullptr.
-void* reactor_webrtc_factory_create_with_adm(int use_platform_adm) {
+// ADM (real mic/speaker, e.g. CoreAudio on macOS).
+// `apm_flags`: bitmask of REACTOR_APM_* flags (0 = all processing disabled).
+// Returns an opaque ReactorFactory* or nullptr.
+void* reactor_webrtc_factory_create_with_adm_apm(int use_platform_adm,
+                                                  int apm_flags) {
   auto f = std::make_unique<ReactorFactory>();
 
   f->network_thread = webrtc::Thread::CreateWithSocketServer();
@@ -675,28 +695,13 @@ void* reactor_webrtc_factory_create_with_adm(int use_platform_adm) {
     return nullptr;
   }
 
-  // Synthetic ADM unless the platform default is requested (null → engine
-  // creates the real device ADM internally).
   webrtc::scoped_refptr<webrtc::AudioDeviceModule> adm;
-  webrtc::scoped_refptr<webrtc::AudioProcessing> apm;
-  if (use_platform_adm) {
-    // Real mic capture → enable the standard capture-processing chain:
-    // AEC3 + noise suppression + AGC + high-pass filter. (Bandwidth estimation
-    // / GoogCC is always compiled in and active for media.) The synthetic ADM
-    // path stays passthrough (bit-exact PCM push, e.g. server forwarding).
-    webrtc::AudioProcessing::Config apm_config;
-    apm_config.echo_canceller.enabled = true;
-    apm_config.noise_suppression.enabled = true;
-    apm_config.noise_suppression.level =
-        webrtc::AudioProcessing::Config::NoiseSuppression::kHigh;
-    apm_config.gain_controller1.enabled = true;
-    apm_config.high_pass_filter.enabled = true;
-    apm = webrtc::BuiltinAudioProcessingBuilder(apm_config)
-              .Build(webrtc::CreateEnvironment());
-  } else {
+  if (!use_platform_adm) {
     f->adm = webrtc::make_ref_counted<FrameAdm>();
     adm = f->adm;
   }
+
+  auto apm = build_apm(apm_flags);
 
   f->factory = webrtc::CreatePeerConnectionFactory(
       f->network_thread.get(), f->worker_thread.get(),
@@ -707,14 +712,18 @@ void* reactor_webrtc_factory_create_with_adm(int use_platform_adm) {
       webrtc::CreateBuiltinVideoDecoderFactory(),
       /*audio_mixer=*/nullptr, /*audio_processing=*/apm);
   if (!f->factory) {
-    return nullptr;  // threads stopped by ReactorFactory's destructor
+    return nullptr;
   }
   return f.release();
 }
 
-// Create a factory with the synthetic (push-able) ADM.
+void* reactor_webrtc_factory_create_with_adm(int use_platform_adm) {
+  return reactor_webrtc_factory_create_with_adm_apm(use_platform_adm, 0);
+}
+
+// Create a factory with the synthetic (push-able) ADM and no APM processing.
 void* reactor_webrtc_factory_create() {
-  return reactor_webrtc_factory_create_with_adm(0);
+  return reactor_webrtc_factory_create_with_adm_apm(0, 0);
 }
 
 // Enable/disable the synthetic ADM's playout pump (no-op for the platform ADM).
@@ -1157,6 +1166,16 @@ int reactor_webrtc_rtp_transceiver_set_track(void* transceiver, void* track) {
   return h->tc->sender()->SetTrack(raw) ? 1 : 0;
 }
 
+// Set the transceiver's direction. direction: 0=sendrecv, 1=sendonly,
+// 2=recvonly, 3=inactive. Returns 1 on success, 0 on failure.
+int reactor_webrtc_rtp_transceiver_set_direction(void* transceiver, int direction) {
+  auto* h = reinterpret_cast<ReactorTransceiver*>(transceiver);
+  if (!h || !h->tc) return 0;
+  auto dir = static_cast<webrtc::RtpTransceiverDirection>(direction);
+  auto err = h->tc->SetDirectionWithError(dir);
+  return err.ok() ? 1 : 0;
+}
+
 // Destroy a transceiver handle (releases our reference).
 void reactor_webrtc_rtp_transceiver_destroy(void* transceiver) {
   delete reinterpret_cast<ReactorTransceiver*>(transceiver);
@@ -1473,9 +1492,8 @@ class ReactorCustomDecoderFactory : public webrtc::VideoDecoderFactory {
 // gone (follows the same lifetime contract as frame_transformer_create).
 void* reactor_webrtc_factory_create_with_custom_video_encoder(
     int use_platform_adm, reactor_video_encode_cb cb, void* userdata,
-    reactor_webrtc_userdata_free free_ud, reactor_use_builtin_cb use_builtin) {
-  // make_shared constructs in-place via the explicit ctor — no temporary,
-  // no copy, no premature destructor call.
+    reactor_webrtc_userdata_free free_ud, reactor_use_builtin_cb use_builtin,
+    int apm_flags) {
   auto state = std::make_shared<ReactorEncoderState>(cb, userdata, free_ud, use_builtin);
 
   auto f = std::make_unique<ReactorFactory>();
@@ -1488,21 +1506,12 @@ void* reactor_webrtc_factory_create_with_custom_video_encoder(
   }
 
   webrtc::scoped_refptr<webrtc::AudioDeviceModule> adm;
-  webrtc::scoped_refptr<webrtc::AudioProcessing>   apm;
-  if (use_platform_adm) {
-    webrtc::AudioProcessing::Config apm_config;
-    apm_config.echo_canceller.enabled    = true;
-    apm_config.noise_suppression.enabled = true;
-    apm_config.noise_suppression.level   =
-        webrtc::AudioProcessing::Config::NoiseSuppression::kHigh;
-    apm_config.gain_controller1.enabled  = true;
-    apm_config.high_pass_filter.enabled  = true;
-    apm = webrtc::BuiltinAudioProcessingBuilder(apm_config)
-              .Build(webrtc::CreateEnvironment());
-  } else {
+  if (!use_platform_adm) {
     f->adm = webrtc::make_ref_counted<FrameAdm>();
     adm    = f->adm;
   }
+
+  auto apm = build_apm(apm_flags);
 
   f->factory = webrtc::CreatePeerConnectionFactory(
       f->network_thread.get(), f->worker_thread.get(),

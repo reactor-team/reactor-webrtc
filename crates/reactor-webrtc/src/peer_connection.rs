@@ -154,6 +154,22 @@ impl Transceiver {
         }
     }
 
+    /// Set the transceiver's direction — controls what appears in the next
+    /// `create_answer()` / `create_offer()` for this m-section.
+    pub fn set_direction(&self, direction: TransceiverDirection) -> Result<()> {
+        let ok = unsafe {
+            reactor_webrtc_sys::reactor_webrtc_rtp_transceiver_set_direction(
+                self.raw,
+                direction.to_raw() as c_int,
+            )
+        };
+        if ok == 1 {
+            Ok(())
+        } else {
+            Err(Error::Webrtc("transceiver set_direction failed".into()))
+        }
+    }
+
     /// Attach an encoded-frame transform to this transceiver's **sender**
     /// (encoder → packetizer): observe/replace/drop each encoded frame before
     /// it is sent. See [`crate::FrameTransform`]. The transform must outlive
