@@ -215,6 +215,47 @@ class TestTransceiverDirection:
                 assert (a == b) == (i == j)
 
 
+class TestPeerConnectionFactory:
+    def test_duplicate_factory_raises(self, factory):
+        # The session-scoped factory fixture keeps one factory alive; a second
+        # must be rejected with a clear error rather than a segfault.
+        with pytest.raises(RuntimeError, match="already"):
+            rw.PeerConnectionFactory()
+
+    def test_apm_kwargs_accepted(self, factory):
+        # Verify that keyword arguments exist and have the correct defaults.
+        # We cannot create a second factory here, so we check the signature
+        # via introspection instead.
+        import inspect
+        sig = inspect.signature(rw.PeerConnectionFactory.__init__)
+        params = sig.parameters
+        assert "echo_canceller" in params
+        assert "noise_suppression" in params
+        assert "agc" in params
+        assert "high_pass_filter" in params
+        for name in ("echo_canceller", "noise_suppression", "agc", "high_pass_filter"):
+            assert params[name].default is False, f"{name} default should be False"
+
+
+class TestTrack:
+    def test_push_video_frame_buffer_too_short(self, factory):
+        track = factory.create_video_track("v")
+        # 640×480 BGRA needs 640*480*4 = 1 228 800 bytes; pass far fewer.
+        with pytest.raises(RuntimeError, match="too short"):
+            track.push_video_frame(b"\x00" * 16, 640, 480)
+
+    def test_push_video_frame_dimension_overflow(self, factory):
+        track = factory.create_video_track("v")
+        # width * height * 4 overflows usize on any platform.
+        with pytest.raises(RuntimeError, match="overflow"):
+            track.push_video_frame(b"\x00" * 4, 2**31, 2**31)
+
+    def test_push_video_frame_exact_size_ok(self, factory):
+        track = factory.create_video_track("v")
+        # 2×2 BGRA = 16 bytes — exactly the minimum.
+        track.push_video_frame(b"\x00" * 16, 2, 2)
+
+
 class TestPeerConnectionObserver:
     def test_all_callbacks_default_none(self):
         obs = rw.PeerConnectionObserver()

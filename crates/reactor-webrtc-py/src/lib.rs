@@ -23,6 +23,26 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::mem::ManuallyDrop;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+// Process-wide guard: libwebrtc starts global threads on factory creation and
+// joins them on destruction.  Creating a second factory before the first is
+// fully destroyed races those threads and reliably segfaults.  One factory at
+// a time is the safe contract; enforce it here so callers get a clear error
+// instead of a crash.
+static FACTORY_LIVE: AtomicBool = AtomicBool::new(false);
+
+fn claim_factory() -> PyResult<()> {
+    FACTORY_LIVE
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .map(|_| ())
+        .map_err(|_| {
+            PyRuntimeError::new_err(
+                "a PeerConnectionFactory is already alive in this process; \
+                 drop it before creating another",
+            )
+        })
+}
 
 fn err(e: rw::Error) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
@@ -478,9 +498,24 @@ impl Track {
     }
 
     /// Push a raw BGRA video frame into a local video track.
-    fn push_video_frame(&self, py: Python, bgra: &[u8], width: u32, height: u32) {
+    fn push_video_frame(&self, py: Python, bgra: &[u8], width: u32, height: u32) -> PyResult<()> {
+        let expected = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|n| n.checked_mul(4))
+            .ok_or_else(|| {
+                PyRuntimeError::new_err(format!(
+                    "frame dimensions overflow: {width}×{height}×4 exceeds usize"
+                ))
+            })?;
+        if bgra.len() < expected {
+            return Err(PyRuntimeError::new_err(format!(
+                "bgra buffer too short: need {expected} bytes for {width}×{height}, got {}",
+                bgra.len()
+            )));
+        }
         let owned = bgra.to_vec();
         py.allow_threads(|| self.inner.push_video_frame(&owned, width, height));
+        Ok(())
     }
 
     /// Register `callback(bgra: bytes, width: int, height: int)` for decoded
@@ -645,6 +680,7 @@ impl DataChannel {
     }
 
     /// Send bytes. `binary=True` for binary SCTP messages, `False` for text.
+    #[pyo3(signature = (data, binary = true))]
     fn send(&self, py: Python, data: &[u8], binary: bool) -> PyResult<()> {
         py.allow_threads(|| self.inner.send(data, binary))
             .map_err(err)
@@ -790,8 +826,10 @@ impl PeerConnectionObserver {
             let cb = cb.clone_ref(py);
             obs = obs.on_ice_candidate(move |cand| {
                 Python::with_gil(|py| {
-                    let py_cand = Py::new(py, IceCandidate::from(cand)).unwrap();
-                    let _ = cb.call1(py, (py_cand,));
+                    match Py::new(py, IceCandidate::from(cand)) {
+                        Ok(py_cand) => { let _ = cb.call1(py, (py_cand,)); }
+                        Err(e) => e.restore(py),
+                    }
                 });
             });
         }
@@ -799,8 +837,10 @@ impl PeerConnectionObserver {
             let cb = cb.clone_ref(py);
             obs = obs.on_track(move |kind, track| {
                 Python::with_gil(|py| {
-                    let py_track = Py::new(py, Track::from_rust(track)).unwrap();
-                    let _ = cb.call1(py, (MediaKind::from(kind), py_track));
+                    match Py::new(py, Track::from_rust(track)) {
+                        Ok(py_track) => { let _ = cb.call1(py, (MediaKind::from(kind), py_track)); }
+                        Err(e) => e.restore(py),
+                    }
                 });
             });
         }
@@ -808,14 +848,10 @@ impl PeerConnectionObserver {
             let cb = cb.clone_ref(py);
             obs = obs.on_data_channel(move |dc| {
                 Python::with_gil(|py| {
-                    let py_dc = Py::new(
-                        py,
-                        DataChannel {
-                            inner: ManuallyDrop::new(dc),
-                        },
-                    )
-                    .unwrap();
-                    let _ = cb.call1(py, (py_dc,));
+                    match Py::new(py, DataChannel { inner: ManuallyDrop::new(dc) }) {
+                        Ok(py_dc) => { let _ = cb.call1(py, (py_dc,)); }
+                        Err(e) => e.restore(py),
+                    }
                 });
             });
         }
@@ -930,9 +966,18 @@ impl PeerConnection {
 ///
 /// Uses the **synthetic** (push-based) ADM by default (no audio hardware).
 /// Pass `platform_adm=True` for real mic/speaker on desktop.
+///
+/// Only one `PeerConnectionFactory` may exist per process at a time.
+/// Creating a second one while the first is alive raises `RuntimeError`.
 #[pyclass]
 pub struct PeerConnectionFactory {
     inner: rw::PeerConnectionFactory,
+}
+
+impl Drop for PeerConnectionFactory {
+    fn drop(&mut self) {
+        FACTORY_LIVE.store(false, Ordering::SeqCst);
+    }
 }
 
 #[pymethods]
@@ -952,6 +997,7 @@ impl PeerConnectionFactory {
         agc: bool,
         high_pass_filter: bool,
     ) -> PyResult<Self> {
+        claim_factory()?;
         let adm = if platform_adm {
             rw::AdmMode::Platform
         } else {
@@ -960,7 +1006,10 @@ impl PeerConnectionFactory {
         let apm = rw::ApmConfig { echo_canceller, noise_suppression, agc, high_pass_filter };
         rw::PeerConnectionFactory::with_adm_apm(adm, apm)
             .map(|inner| Self { inner })
-            .map_err(err)
+            .map_err(|e| {
+                FACTORY_LIVE.store(false, Ordering::SeqCst);
+                err(e)
+            })
     }
 
     /// Create a `PeerConnection` with `config` and `observer`.
@@ -1021,9 +1070,13 @@ impl PeerConnectionFactory {
         width: u32,
         height: u32,
     ) -> PyResult<(Self, EncodedVideoTrack)> {
+        claim_factory()?;
         rw::PeerConnectionFactory::with_encoded_video_track(track_id, width, height)
             .map(|(f, t)| (Self { inner: f }, EncodedVideoTrack { inner: t }))
-            .map_err(err)
+            .map_err(|e| {
+                FACTORY_LIVE.store(false, Ordering::SeqCst);
+                err(e)
+            })
     }
 
     fn set_adm_playout_enabled(&self, enabled: bool) {
