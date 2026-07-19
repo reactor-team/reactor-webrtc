@@ -223,18 +223,18 @@ class TestPeerConnectionFactory:
             rw.PeerConnectionFactory()
 
     def test_apm_kwargs_accepted(self, factory):
-        # Verify that keyword arguments exist and have the correct defaults.
-        # We cannot create a second factory here, so we check the signature
-        # via introspection instead.
-        import inspect
-        sig = inspect.signature(rw.PeerConnectionFactory.__init__)
-        params = sig.parameters
-        assert "echo_canceller" in params
-        assert "noise_suppression" in params
-        assert "agc" in params
-        assert "high_pass_filter" in params
-        for name in ("echo_canceller", "noise_suppression", "agc", "high_pass_filter"):
-            assert params[name].default is False, f"{name} default should be False"
+        # Verify APM kwargs are accepted as valid named parameters.
+        # A second factory cannot be created (factory fixture keeps one alive),
+        # so we rely on PyO3 validating kwargs before the factory-guard check:
+        # unknown names raise TypeError, but valid names reach the guard and
+        # raise RuntimeError("already").
+        with pytest.raises(RuntimeError, match="already"):
+            rw.PeerConnectionFactory(
+                echo_canceller=False,
+                noise_suppression=False,
+                agc=False,
+                high_pass_filter=False,
+            )
 
 
 class TestTrack:

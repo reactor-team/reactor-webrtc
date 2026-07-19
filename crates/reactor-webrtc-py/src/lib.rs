@@ -1047,7 +1047,13 @@ impl PeerConnectionFactory {
 
     /// Push interleaved signed 16-bit little-endian PCM to the synthetic ADM.
     /// `pcm` must have even length (2 bytes per i16 sample).
-    fn push_audio_frame(&self, py: Python, pcm: &[u8], sample_rate: u32, channels: u32) -> PyResult<()> {
+    fn push_audio_frame(
+        &self,
+        py: Python,
+        pcm: &[u8],
+        sample_rate: u32,
+        channels: u32,
+    ) -> PyResult<()> {
         if !pcm.len().is_multiple_of(2) {
             return Err(PyRuntimeError::new_err("pcm byte length must be even"));
         }
