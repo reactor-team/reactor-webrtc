@@ -108,10 +108,18 @@ pub struct ApmConfig {
 impl ApmConfig {
     fn to_flags(self) -> c_int {
         let mut f: c_int = 0;
-        if self.echo_canceller   { f |= 0x01; }
-        if self.noise_suppression { f |= 0x02; }
-        if self.agc              { f |= 0x04; }
-        if self.high_pass_filter  { f |= 0x08; }
+        if self.echo_canceller {
+            f |= 0x01;
+        }
+        if self.noise_suppression {
+            f |= 0x02;
+        }
+        if self.agc {
+            f |= 0x04;
+        }
+        if self.high_pass_filter {
+            f |= 0x08;
+        }
         f
     }
 }

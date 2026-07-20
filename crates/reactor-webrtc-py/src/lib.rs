@@ -645,8 +645,11 @@ impl Transceiver {
     /// Must be called before `create_answer()`/`create_offer()` for the change
     /// to appear in the SDP.
     fn set_direction(&self, py: Python, direction: TransceiverDirection) -> PyResult<()> {
-        py.allow_threads(|| self.inner.set_direction(rw::TransceiverDirection::from(direction)))
-            .map_err(err)
+        py.allow_threads(|| {
+            self.inner
+                .set_direction(rw::TransceiverDirection::from(direction))
+        })
+        .map_err(err)
     }
 }
 
@@ -825,22 +828,22 @@ impl PeerConnectionObserver {
         if let Some(cb) = &self.on_ice_candidate {
             let cb = cb.clone_ref(py);
             obs = obs.on_ice_candidate(move |cand| {
-                Python::with_gil(|py| {
-                    match Py::new(py, IceCandidate::from(cand)) {
-                        Ok(py_cand) => { let _ = cb.call1(py, (py_cand,)); }
-                        Err(e) => e.restore(py),
+                Python::with_gil(|py| match Py::new(py, IceCandidate::from(cand)) {
+                    Ok(py_cand) => {
+                        let _ = cb.call1(py, (py_cand,));
                     }
+                    Err(e) => e.restore(py),
                 });
             });
         }
         if let Some(cb) = &self.on_track {
             let cb = cb.clone_ref(py);
             obs = obs.on_track(move |kind, track| {
-                Python::with_gil(|py| {
-                    match Py::new(py, Track::from_rust(track)) {
-                        Ok(py_track) => { let _ = cb.call1(py, (MediaKind::from(kind), py_track)); }
-                        Err(e) => e.restore(py),
+                Python::with_gil(|py| match Py::new(py, Track::from_rust(track)) {
+                    Ok(py_track) => {
+                        let _ = cb.call1(py, (MediaKind::from(kind), py_track));
                     }
+                    Err(e) => e.restore(py),
                 });
             });
         }
@@ -848,8 +851,15 @@ impl PeerConnectionObserver {
             let cb = cb.clone_ref(py);
             obs = obs.on_data_channel(move |dc| {
                 Python::with_gil(|py| {
-                    match Py::new(py, DataChannel { inner: ManuallyDrop::new(dc) }) {
-                        Ok(py_dc) => { let _ = cb.call1(py, (py_dc,)); }
+                    match Py::new(
+                        py,
+                        DataChannel {
+                            inner: ManuallyDrop::new(dc),
+                        },
+                    ) {
+                        Ok(py_dc) => {
+                            let _ = cb.call1(py, (py_dc,));
+                        }
                         Err(e) => e.restore(py),
                     }
                 });
@@ -1003,7 +1013,12 @@ impl PeerConnectionFactory {
         } else {
             rw::AdmMode::Synthetic
         };
-        let apm = rw::ApmConfig { echo_canceller, noise_suppression, agc, high_pass_filter };
+        let apm = rw::ApmConfig {
+            echo_canceller,
+            noise_suppression,
+            agc,
+            high_pass_filter,
+        };
         rw::PeerConnectionFactory::with_adm_apm(adm, apm)
             .map(|inner| Self { inner })
             .map_err(|e| {
