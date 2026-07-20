@@ -59,6 +59,39 @@ list, e.g. `opus, G722, PCMU, PCMA, VP8, AV1, VP9`. (H.264 is intentionally off 
 
 ---
 
+### 0002 — Android JNI package prefix
+
+`0002-android-jni-package-prefix.patch` · touches `third_party/jni_zero/jni_zero.gni` (+28 lines)
+
+**What.** Adds a `declare_args() { android_jni_package_prefix = "" }` GN variable
+to `jni_zero.gni` and wires it as `--package-prefix <value>` into both the
+`generate_jni_registration` and `generate_jni_impl` templates (the two paths
+that invoke `jni_zero.py`). When the arg is non-empty, every JNI-generated Java
+class gets the prefix prepended to its package name.
+
+**Why.** WebRTC's Android SDK ships Java classes under `org.webrtc.*`. The
+previous PoC depended on LiveKit's repackaged `livekit.org.webrtc.*` JAR which
+we must not ship. Setting `android_jni_package_prefix = "inc.reactor"` in
+`build.sh` produces `inc.reactor.org.webrtc.*` Java classes in `libwebrtc.jar`
+and the matching `Java_inc_reactor_org_webrtc_*` JNI symbols in `libwebrtc.a`.
+
+**How it works.** `jni_zero.py` already supports `--package-prefix` natively
+(it is used by Cronet for `"internal"`). The missing piece was a GN-level arg
+to activate it project-wide. This patch adds that arg; `build.sh` sets it to
+`"inc.reactor"` for the Android target. The same mechanism Cronet uses
+(`_cronet_renaming_extra_args`) is the model.
+
+**Note.** This patch targets `third_party/jni_zero/jni_zero.gni`, which lives
+in a separate gclient sub-repo. `build.sh` applies it with `patch -p1` (fallback
+from `git apply`) from `src/` after `gclient sync` resets jni_zero to its
+pinned state.
+
+**Verify.** After an Android build, `jar tf out/android-*/lib.java/sdk/android/libwebrtc.jar`
+should list `inc/reactor/org/webrtc/PeerConnection.class` (and equivalents).
+`nm libwebrtc.a | grep Java_` should show `Java_inc_reactor_org_webrtc_*` symbols.
+
+---
+
 ## Planned (not yet authored — need their target builds to validate)
 
 - **Symbol isolation** — keep WebRTC's C++ symbols from clashing when a consumer
@@ -66,11 +99,6 @@ list, e.g. `opus, G722, PCMU, PCMA, VP8, AV1, VP9`. (H.264 is intentionally off 
   (`reactor-sdk-core`) already exports only `reactor_webrtc_*`; for static-lib
   consumers the plan is hidden visibility + a localize pass over `libwebrtc.a`.
   To author + validate on the Linux/Windows builds.
-- **Android Java namespace** — repackage WebRTC's `org.webrtc` Java classes and
-  the `JNI_OnLoad`/registration into our own namespace. This is a tree-wide
-  rename applied during the Android build (the earlier PoC leaned on LiveKit's
-  `livekit.org.webrtc`, which we must not ship). To author + validate once the
-  Android Java companion is wired.
 
 ---
 

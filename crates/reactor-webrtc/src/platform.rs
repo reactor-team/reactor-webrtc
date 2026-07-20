@@ -2,8 +2,8 @@
 //! platform ADM, the application `Context`) before a peer connection is built.
 //!
 //! These mirror the PoC's `initialize_android` / `initialize_android_context`,
-//! but against our own WebRTC build and **our own Java namespace** (not
-//! `livekit.org.webrtc`).
+//! but against our own WebRTC build and our own Java namespace
+//! (`inc.reactor.org.webrtc.*` — set via android_jni_package_prefix in the build).
 
 /// Hand libwebrtc the `JavaVM`. Call once, typically from `JNI_OnLoad`.
 ///

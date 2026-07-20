@@ -97,11 +97,15 @@ gn_args() {
       # android_static_analysis=off: the default "build_server" needs autoninja
       # (AUTONINJA_BUILD_ID) for the Java validate-deps step; we build with plain
       # ninja and don't need Java lint/errorprone.
+      # android_jni_package_prefix: repackages all org.webrtc.* Java classes into
+      # inc.reactor.org.webrtc.* so the JAR is namespaced to Reactor, not LiveKit.
+      # Patch 0002 wires this arg into jni_zero.gni's generate_jni templates.
       args+=(
         "symbol_level=1"
         "rtc_use_h264=false"
         "use_custom_libcxx=true"
         "android_static_analysis=\"off\""
+        "android_jni_package_prefix=\"inc.reactor\""
       )
       ;;
     linux)
@@ -173,10 +177,15 @@ echo "==> resolved WebRTC commit: $RESOLVED  (lock this in WEBRTC_VERSION:WEBRTC
 # ── 3. apply our patch series ─────────────────────────────────────────────────
 cd "$SRC/src"
 git reset --hard "$RESOLVED" >/dev/null
+# Also reset third_party sub-repos that our patches touch (gclient sync already
+# pinned them; reset makes repeated builds idempotent).
+[ -d third_party/jni_zero/.git ] && git -C third_party/jni_zero reset --hard >/dev/null 2>&1 || true
 shopt -s nullglob
 for p in "$HERE"/patches/*.patch; do
   echo "==> applying patch $(basename "$p")"
-  git apply --3way "$p"
+  # Try git apply (works for files tracked by the main WebRTC repo); fall back
+  # to patch(1) for files in third_party sub-repos (e.g. jni_zero).
+  git apply --3way "$p" 2>/dev/null || patch -p1 < "$p"
 done
 shopt -u nullglob
 
