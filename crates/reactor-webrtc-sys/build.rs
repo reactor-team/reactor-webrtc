@@ -216,6 +216,7 @@ fn link_system_deps(lib_dir: &Path) {
                 "VideoToolbox",
                 "AVFoundation",
                 "Metal",
+                "UIKit",
             ] {
                 println!("cargo:rustc-link-lib=framework={fw}");
             }
