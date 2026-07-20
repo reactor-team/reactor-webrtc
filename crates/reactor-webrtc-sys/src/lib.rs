@@ -203,6 +203,11 @@ extern "C" {
     /// Create a factory choosing the audio device backend. `use_platform_adm`:
     /// 0 → synthetic ADM (push PCM via [`reactor_webrtc_factory_push_audio_frame`]);
     /// nonzero → the platform default ADM (real mic/speaker, e.g. CoreAudio).
+    /// `apm_flags` is an OR of REACTOR_APM_* bits (0 = all processing disabled).
+    pub fn reactor_webrtc_factory_create_with_adm_apm(
+        use_platform_adm: c_int,
+        apm_flags: c_int,
+    ) -> *mut PeerConnectionFactory;
     pub fn reactor_webrtc_factory_create_with_adm(
         use_platform_adm: c_int,
     ) -> *mut PeerConnectionFactory;
@@ -213,6 +218,7 @@ extern "C" {
     /// the raw I420 frame; fill `*out` and return 0 to inject encoded bytes into
     /// the RTP stack, or return non-zero to drop the frame. `userdata` lifetime
     /// follows the same contract as `reactor_webrtc_frame_transformer_create`.
+    /// `apm_flags` is an OR of REACTOR_APM_* bits (0 = all processing disabled).
     pub fn reactor_webrtc_factory_create_with_custom_video_encoder(
         use_platform_adm: c_int,
         on_encode: extern "C" fn(
@@ -222,10 +228,8 @@ extern "C" {
         ) -> c_int,
         userdata: *mut c_void,
         free_ud: Option<extern "C" fn(userdata: *mut c_void)>,
-        // Optional: called before creating each VideoEncoder instance.
-        // Return non-zero to use the builtin encoder for that slot; zero for custom.
-        // Pass None to always use the custom encoder (single-encoder-type factory).
         use_builtin: Option<extern "C" fn(userdata: *mut c_void, encoder_id: u64) -> c_int>,
+        apm_flags: c_int,
     ) -> *mut PeerConnectionFactory;
 
     /// Create a peer connection. `config_json` carries ICE servers / policies
@@ -406,6 +410,12 @@ extern "C" {
     pub fn reactor_webrtc_rtp_transceiver_set_track(
         transceiver: *mut RtpTransceiver,
         track: *mut MediaStreamTrack,
+    ) -> c_int;
+    /// Set the transceiver's direction (0=sendrecv, 1=sendonly, 2=recvonly, 3=inactive).
+    /// Returns 1 on success, 0 on failure.
+    pub fn reactor_webrtc_rtp_transceiver_set_direction(
+        transceiver: *mut RtpTransceiver,
+        direction: c_int,
     ) -> c_int;
     /// Release a transceiver handle.
     pub fn reactor_webrtc_rtp_transceiver_destroy(transceiver: *mut RtpTransceiver);

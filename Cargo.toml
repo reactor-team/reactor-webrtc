@@ -3,6 +3,13 @@ resolver = "2"
 members = [
     "crates/reactor-webrtc-sys",
     "crates/reactor-webrtc",
+    "crates/reactor-webrtc-py",
+]
+# reactor-webrtc-py is a cdylib (Maturin wheel) — excluded from the default
+# workspace build so `cargo check/test` targets the library crates only.
+default-members = [
+    "crates/reactor-webrtc-sys",
+    "crates/reactor-webrtc",
 ]
 
 [workspace.package]

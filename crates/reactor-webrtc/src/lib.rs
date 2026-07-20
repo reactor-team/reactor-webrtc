@@ -83,10 +83,45 @@ pub enum AdmMode {
     #[default]
     Synthetic,
     /// The platform audio device (CoreAudio / ALSA / WASAPI): real mic capture +
-    /// speaker playout, with the AEC/NS/AGC processing chain enabled. Right for
-    /// desktop client apps. (On Android the platform ADM needs the app Context;
-    /// fall back to `Synthetic` there.)
+    /// speaker playout. Right for desktop client apps.
     Platform,
+}
+
+/// Audio Processing Module configuration passed to [`PeerConnectionFactory`].
+///
+/// All fields default to `false` (no processing). Enable selectively:
+/// ```
+/// ApmConfig { echo_canceller: true, noise_suppression: true, ..Default::default() }
+/// ```
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ApmConfig {
+    /// AEC3 acoustic echo cancellation.
+    pub echo_canceller: bool,
+    /// Noise suppression (level = kHigh when enabled).
+    pub noise_suppression: bool,
+    /// Automatic gain control (gain_controller1).
+    pub agc: bool,
+    /// High-pass filter.
+    pub high_pass_filter: bool,
+}
+
+impl ApmConfig {
+    fn to_flags(self) -> c_int {
+        let mut f: c_int = 0;
+        if self.echo_canceller {
+            f |= 0x01;
+        }
+        if self.noise_suppression {
+            f |= 0x02;
+        }
+        if self.agc {
+            f |= 0x04;
+        }
+        if self.high_pass_filter {
+            f |= 0x08;
+        }
+        f
+    }
 }
 
 /// Entry point: creates peer connections and tracks, and owns the audio device
@@ -101,33 +136,35 @@ unsafe impl Send for PeerConnectionFactory {}
 unsafe impl Sync for PeerConnectionFactory {}
 
 impl PeerConnectionFactory {
-    /// Create a factory with the given [`AdmMode`].
+    /// Create a factory with the given [`AdmMode`] and no APM processing.
     pub fn with_adm(mode: AdmMode) -> Result<Self> {
-        Self::create(matches!(mode, AdmMode::Platform))
+        Self::with_adm_apm(mode, ApmConfig::default())
     }
 
-    /// Create a factory using the **synthetic** audio device module — no audio
-    /// hardware; feed audio with [`PeerConnectionFactory::push_audio_frame`].
-    /// (Shorthand for [`with_adm(AdmMode::Synthetic)`](PeerConnectionFactory::with_adm).)
-    pub fn new() -> Result<Self> {
-        Self::with_adm(AdmMode::Synthetic)
-    }
-
-    /// Create a factory using the **platform** audio device module (real
-    /// mic/speaker, e.g. CoreAudio on macOS). Shorthand for
-    /// [`with_adm(AdmMode::Platform)`](PeerConnectionFactory::with_adm).
-    pub fn with_platform_adm() -> Result<Self> {
-        Self::with_adm(AdmMode::Platform)
-    }
-
-    fn create(use_platform_adm: bool) -> Result<Self> {
+    /// Create a factory with full control over the audio device and APM chain.
+    pub fn with_adm_apm(mode: AdmMode, apm: ApmConfig) -> Result<Self> {
         let raw = unsafe {
-            reactor_webrtc_sys::reactor_webrtc_factory_create_with_adm(use_platform_adm as c_int)
+            reactor_webrtc_sys::reactor_webrtc_factory_create_with_adm_apm(
+                matches!(mode, AdmMode::Platform) as c_int,
+                apm.to_flags(),
+            )
         };
         if raw.is_null() {
             return Err(Error::Webrtc("factory creation returned null".into()));
         }
         Ok(Self { raw })
+    }
+
+    /// Create a factory using the **synthetic** audio device module — no audio
+    /// hardware; feed audio with [`PeerConnectionFactory::push_audio_frame`].
+    pub fn new() -> Result<Self> {
+        Self::with_adm(AdmMode::Synthetic)
+    }
+
+    /// Create a factory using the **platform** audio device module (real
+    /// mic/speaker, e.g. CoreAudio on macOS).
+    pub fn with_platform_adm() -> Result<Self> {
+        Self::with_adm(AdmMode::Platform)
     }
 
     /// Create a factory that replaces the builtin H.264 encoder with `encoder`.
@@ -152,6 +189,7 @@ impl PeerConnectionFactory {
                 userdata,
                 free_ud,
                 use_builtin,
+                0, // apm_flags: all disabled
             )
         };
         if raw.is_null() {

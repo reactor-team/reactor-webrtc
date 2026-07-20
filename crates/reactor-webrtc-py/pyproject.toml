@@ -1,0 +1,23 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "reactor-webrtc"
+dynamic = ["version"]
+description = "Python bindings for reactor-webrtc — WebRTC primitives via PyO3"
+license = { text = "LicenseRef-Reactor-Proprietary" }
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Communications",
+]
+
+[tool.maturin]
+# The cdylib is named reactor_webrtc, imported as `import reactor_webrtc`.
+module-name = "reactor_webrtc"
+# Embed libwebrtc statically — the prebuilt archive linked at build time.
+# maturin build --release produces a self-contained .so / .dylib wheel.
+features = []

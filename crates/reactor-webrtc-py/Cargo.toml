@@ -1,0 +1,16 @@
+[package]
+name = "reactor-webrtc-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "reactor_webrtc"
+crate-type = ["cdylib"]
+
+[dependencies]
+reactor-webrtc = { path = "../reactor-webrtc", version = "0.0.0" }
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py310"] }
+
+[features]
+default = []
