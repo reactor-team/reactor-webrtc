@@ -162,9 +162,19 @@ impl PeerConnectionFactory {
     }
 
     /// Create a factory using the **platform** audio device module (real
-    /// mic/speaker, e.g. CoreAudio on macOS).
+    /// mic/speaker, e.g. CoreAudio on macOS) with the full AEC3 + noise
+    /// suppression + AGC + high-pass chain enabled — the sensible default for
+    /// real hardware capture.
     pub fn with_platform_adm() -> Result<Self> {
-        Self::with_adm(AdmMode::Platform)
+        Self::with_adm_apm(
+            AdmMode::Platform,
+            ApmConfig {
+                echo_canceller: true,
+                noise_suppression: true,
+                agc: true,
+                high_pass_filter: true,
+            },
+        )
     }
 
     /// Create a factory that replaces the builtin H.264 encoder with `encoder`.

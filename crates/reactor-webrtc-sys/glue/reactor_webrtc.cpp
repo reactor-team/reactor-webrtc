@@ -666,6 +666,7 @@ int reactor_webrtc_selftest(char* out, int cap) {
 //   0x04  gain_controller1 (AGC)
 //   0x08  high_pass_filter
 static webrtc::scoped_refptr<webrtc::AudioProcessing> build_apm(int apm_flags) {
+  if (apm_flags == 0) return nullptr;  // no processing → true passthrough
   webrtc::AudioProcessing::Config cfg;
   cfg.echo_canceller.enabled    = (apm_flags & 0x01) != 0;
   cfg.noise_suppression.enabled = (apm_flags & 0x02) != 0;
