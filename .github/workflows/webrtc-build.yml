@@ -3,9 +3,10 @@
 #
 # A WebRTC checkout + build is large + slow (fetch is tens of GB; compile is
 # minutes-to-hours on a cold runner). Triggers:
-#   • push touching WEBRTC_VERSION / webrtc-build/** / this workflow → macOS arm64
-#     smoke build.
-#   • workflow_dispatch → pick `targets`; set `publish=true` to cut a Release.
+#   • push / pull_request touching WEBRTC_VERSION, webrtc-build/** (non-markdown),
+#     or this workflow file → full target matrix, debug profile.
+#   • workflow_dispatch → pick `targets` and `profile`; set `publish=true` to
+#     cut a GitHub Release (release prebuilts are always manual).
 #
 # Host coverage (cross-compile aware):
 #   • macos-15 (Apple Silicon + Xcode 16) → mac arm64, mac x64, iOS device + sim.
@@ -34,9 +35,17 @@ on:
         type: boolean
         default: false
   push:
+    branches: [main]
     paths:
       - "WEBRTC_VERSION"
       - "webrtc-build/**"
+      - "!webrtc-build/**.md"
+      - ".github/workflows/webrtc-build.yml"
+  pull_request:
+    paths:
+      - "WEBRTC_VERSION"
+      - "webrtc-build/**"
+      - "!webrtc-build/**.md"
       - ".github/workflows/webrtc-build.yml"
 
 concurrency:
@@ -64,8 +73,14 @@ jobs:
           linux_arm='{"os":"linux","arch":"arm64","runner":"ubuntu-latest"}'
           android='{"os":"android","arch":"arm64","runner":"ubuntu-latest"}'
           win='{"os":"win","arch":"x64","runner":"windows-latest"}'
+          # CI (push / pull_request) → full target matrix, debug profile.
+          # workflow_dispatch → use the selected inputs.
           t="${{ github.event.inputs.targets }}"
-          [ "${{ github.event_name }}" = "push" ] && t=mac
+          prof="${{ github.event.inputs.profile }}"
+          if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+            t=full
+            prof=debug
+          fi
           t="${t:-mac}"
           case "$t" in
             mac)     inc="$mac_arm" ;;
@@ -77,7 +92,6 @@ jobs:
             *)       inc="$mac_arm" ;;
           esac
           echo "matrix={\"include\":[$inc]}" >> "$GITHUB_OUTPUT"
-          prof="${{ github.event.inputs.profile }}"
           echo "profile=${prof:-release}" >> "$GITHUB_OUTPUT"
 
   build:
