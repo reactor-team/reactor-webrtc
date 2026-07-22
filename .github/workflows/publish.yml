@@ -63,12 +63,12 @@ jobs:
           - platform: linux-x64
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            manylinux: auto
+            manylinux: "2_28"  # AlmaLinux 8; clang installed via before-script
 
           - platform: linux-arm64
             os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            manylinux: auto
+            manylinux: "2_28"
 
           - platform: macos-arm64
             os: macos-latest
@@ -115,6 +115,10 @@ jobs:
             --out dist
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
+          # build.rs selects clang++ on Linux automatically; install it in the
+          # manylinux_2_28 (AlmaLinux 8) container before building.
+          before-script-linux: |
+            yum install -y clang
         env:
           REACTOR_WEBRTC_PREBUILT_URL: ${{ steps.prebuilt.outputs.url }}
           REACTOR_WEBRTC_PREBUILT_TOKEN: ${{ secrets.GITHUB_TOKEN }}
