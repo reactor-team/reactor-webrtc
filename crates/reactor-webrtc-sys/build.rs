@@ -216,12 +216,35 @@ fn link_system_deps(lib_dir: &Path) {
                 "VideoToolbox",
                 "AVFoundation",
                 "Metal",
+                "UIKit",
             ] {
                 println!("cargo:rustc-link-lib=framework={fw}");
             }
         }
         "android" => {
-            // -lc++_static -lc++abi -lEGL -lGLESv2 -lOpenSLES + JNI companion.
+            // WebRTC for Android links the bundled libc++ (ABI namespace __Cr)
+            // and the same NDK system libraries as a normal WebRTC Android build.
+            println!("cargo:rustc-link-lib=static=c++");
+            if lib_dir.join("libc++abi.a").is_file() {
+                println!("cargo:rustc-link-lib=static=c++abi");
+            }
+            if lib_dir.join("libunwind.a").is_file() {
+                println!("cargo:rustc-link-lib=static=unwind");
+            }
+            for l in ["EGL", "GLESv2", "OpenSLES", "log"] {
+                println!("cargo:rustc-link-lib=dylib={l}");
+            }
+            // JNI_OnLoad is defined inside libwebrtc.a (sdk/android/src/jni/
+            // jni_onload.cc). With --gc-sections / whole-archive the symbol may
+            // be stripped if nothing references it by name. Keep it alive so the
+            // Android runtime finds it when dlopen-ing libreactor_ffi.so.
+            println!("cargo:rustc-link-arg=-Wl,--undefined=JNI_OnLoad");
+            // Expose the JAR path so downstream tooling (build-android-libs.sh)
+            // can locate it without a fragile find(1) over the whole target tree.
+            let jar = lib_dir.join("libwebrtc.jar");
+            if jar.is_file() {
+                println!("cargo:rustc-env=REACTOR_WEBRTC_JAR={}", jar.display());
+            }
         }
         "linux" => {
             // libwebrtc.a only *references* the bundled libc++ (ABI namespace

@@ -1,0 +1,49 @@
+diff --git a/third_party/jni_zero/jni_zero.gni b/third_party/jni_zero/jni_zero.gni
+index 532b59115295..2713c942b6bf 100644
+--- a/third_party/jni_zero/jni_zero.gni
++++ b/third_party/jni_zero/jni_zero.gni
+@@ -27,6 +27,14 @@ declare_args() {
+       (!enable_jni_multiplexing && !is_java_debug) || is_cronet_build
+ }
+
++declare_args() {
++  # Reactor: package prefix for JNI-generated Java classes on Android.
++  # E.g. "inc.reactor" → org.webrtc.Foo becomes inc.reactor.org.webrtc.Foo.
++  # Maps to jni_zero.py's --package-prefix flag (same mechanism Cronet uses for
++  # "internal"). Empty string = no prefix (upstream default).
++  android_jni_package_prefix = ""
++}
++
+ assert(!use_hashed_jni_names || !enable_jni_multiplexing,
+        "Multiplexing requires that hashed names be disabled.")
+
+@@ -282,6 +290,14 @@ template("generate_jni_registration") {
+     if (defined(is_cronet_build) && is_cronet_build) {
+       args += _cronet_renaming_extra_args
+     }
++
++    # Reactor: apply our own Android package prefix when configured.
++    if (android_jni_package_prefix != "") {
++      args += [
++        "--package-prefix",
++        android_jni_package_prefix,
++      ]
++    }
+   }
+ }
+
+@@ -505,6 +521,14 @@ template("generate_jni_impl") {
+         if (defined(is_cronet_build) && is_cronet_build) {
+           args += _cronet_renaming_extra_args
+         }
++
++        # Reactor: apply our own Android package prefix when configured.
++        if (android_jni_package_prefix != "") {
++          args += [
++            "--package-prefix",
++            android_jni_package_prefix,
++          ]
++        }
+       } else {
+         if (is_robolectric) {
+           not_needed(invoker, [ "jar_file" ])

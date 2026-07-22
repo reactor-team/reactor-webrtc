@@ -40,6 +40,21 @@ rsync -am \
   --exclude='out/**' --exclude='.git/**' --exclude='test/**' \
   "$SRC/" "$STAGE/include/"
 
+# ── Android: bundle the generated Java JAR ────────────────────────────────────
+# The Android build produces a dist_jar("libwebrtc") target whose output is at
+# lib.java/sdk/android/libwebrtc.jar (path set in sdk/android/BUILD.gn).
+# With android_jni_package_prefix="inc.reactor" the Java classes are namespaced
+# as inc.reactor.org.webrtc.* so consumers don't depend on livekit.org.webrtc.*.
+if [ "$OS" = "android" ]; then
+  JAR_PATH="$(find "$OUT/lib.java" -name "libwebrtc.jar" 2>/dev/null | head -1)"
+  if [ -n "$JAR_PATH" ]; then
+    cp "$JAR_PATH" "$STAGE/lib/libwebrtc.jar"
+    echo "   JAR: $JAR_PATH → $STAGE/lib/libwebrtc.jar"
+  else
+    echo "   WARNING: libwebrtc.jar not found under $OUT/lib.java — Java classes missing from archive" >&2
+  fi
+fi
+
 # ── Bundled libc++ headers (linux/android) ────────────────────────────────────
 # Those targets link WebRTC's bundled libc++, whose ABI namespace is __Cr (not
 # the platform libc++'s __1). A consumer's C++ glue must therefore compile

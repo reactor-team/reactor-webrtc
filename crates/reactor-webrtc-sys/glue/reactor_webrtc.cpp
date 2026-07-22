@@ -12,6 +12,9 @@
 // The remaining surface in `src/lib.rs` (tracks, frame I/O, ADM, set-remote-
 // description / add-ice-candidate) lands next and will eventually be generated
 // rather than hand-written.
+//
+// Android bootstrap (reactor_webrtc_android_init / _init_context): located at
+// the bottom of this file, guarded by #ifdef WEBRTC_ANDROID.
 
 #include <atomic>
 #include <chrono>
@@ -663,6 +666,7 @@ int reactor_webrtc_selftest(char* out, int cap) {
 //   0x04  gain_controller1 (AGC)
 //   0x08  high_pass_filter
 static webrtc::scoped_refptr<webrtc::AudioProcessing> build_apm(int apm_flags) {
+  if (apm_flags == 0) return nullptr;  // no processing → true passthrough
   webrtc::AudioProcessing::Config cfg;
   cfg.echo_canceller.enabled    = (apm_flags & 0x01) != 0;
   cfg.noise_suppression.enabled = (apm_flags & 0x02) != 0;
@@ -1708,3 +1712,32 @@ void reactor_webrtc_peer_connection_get_stats(
 }
 
 }  // extern "C"
+
+// ── Android bootstrap ─────────────────────────────────────────────────────────
+// Called from JNI_OnLoad (reactor-ffi/src/lib.rs) to hand the JavaVM to
+// libwebrtc before any PeerConnectionFactory is created. The Java classes are
+// namespaced inc.reactor.org.webrtc.* via android_jni_package_prefix="inc.reactor"
+// (webrtc-build/patches/0002-*); JNI_OnLoad in libwebrtc's jni_onload.cc wires
+// them up through InitClassLoader.
+//
+// reactor_webrtc_android_init_context is provided for completeness (platform ADM
+// needs the Application Context), but the synthetic ADM used on Android does not
+// require it — so it simply re-initialises the JavaVM and returns 1 (success).
+
+#ifdef WEBRTC_ANDROID
+#include <jni.h>
+#include "sdk/android/native_api/base/init.h"
+
+extern "C" {
+
+void reactor_webrtc_android_init(void* vm) {
+  webrtc::InitAndroid(static_cast<JavaVM*>(vm));
+}
+
+int reactor_webrtc_android_init_context(void* vm, void* /*context*/) {
+  webrtc::InitAndroid(static_cast<JavaVM*>(vm));
+  return 1;
+}
+
+}  // extern "C"
+#endif  // WEBRTC_ANDROID
