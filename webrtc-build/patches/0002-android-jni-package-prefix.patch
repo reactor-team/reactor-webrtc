@@ -1,3 +1,30 @@
+diff --git a/third_party/jni_zero/codegen/header_common.py b/third_party/jni_zero/codegen/header_common.py
+--- a/third_party/jni_zero/codegen/header_common.py
++++ b/third_party/jni_zero/codegen/header_common.py
+@@ -32,7 +32,23 @@
+ #endif
+ 
+ """)
++    # When a package prefix is active the generated C++ identifier changes
++    # (e.g. org_webrtc_Foo_clazz → inc_reactor_org_webrtc_Foo_clazz), but
++    # static .cc files in sdk/android/src/jni/ reference the unprefixed name
++    # directly.  Emit a compat #define so those files compile without edits.
++    if java_class._prefix:
++      original_fqn = java_class._fqn[len(java_class._prefix) + 1:]
++      original_escaped = common.jni_mangle(original_fqn)
++      if original_escaped != escaped_name:
++        sb(f"""\
++#ifndef {original_escaped}_clazz_defined
++#define {original_escaped}_clazz_defined
++#define {original_escaped}_clazz {escaped_name}_clazz
++#endif
+ 
++""")
++
++
+ def class_accessor_expression(java_class):
+   if java_class == java_types.CLASS_LOADER_CLASS:
+     return 'jni_zero::g_class_loader_class'
 diff --git a/third_party/jni_zero/jni_zero.gni b/third_party/jni_zero/jni_zero.gni
 index 532b59115295..2713c942b6bf 100644
 --- a/third_party/jni_zero/jni_zero.gni
@@ -47,4 +74,3 @@ index 532b59115295..2713c942b6bf 100644
        } else {
          if (is_robolectric) {
            not_needed(invoker, [ "jar_file" ])
- 

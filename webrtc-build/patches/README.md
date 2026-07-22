@@ -59,15 +59,27 @@ list, e.g. `opus, G722, PCMU, PCMA, VP8, AV1, VP9`. (H.264 is intentionally off 
 
 ---
 
-### 0002 — Android JNI package prefix
+### 0002 — Android JNI package prefix + compat aliases
 
-`0002-android-jni-package-prefix.patch` · touches `third_party/jni_zero/jni_zero.gni` (+28 lines)
+`0002-android-jni-package-prefix.patch` · touches `third_party/jni_zero/jni_zero.gni` (+28 lines) and `third_party/jni_zero/codegen/header_common.py` (+16 lines)
 
-**What.** Adds a `declare_args() { android_jni_package_prefix = "" }` GN variable
-to `jni_zero.gni` and wires it as `--package-prefix <value>` into both the
-`generate_jni_registration` and `generate_jni_impl` templates (the two paths
-that invoke `jni_zero.py`). When the arg is non-empty, every JNI-generated Java
-class gets the prefix prepended to its package name.
+**What.** Two inseparable changes applied as one patch:
+
+1. Adds a `declare_args() { android_jni_package_prefix = "" }` GN variable to
+   `jni_zero.gni` and wires it as `--package-prefix <value>` into both the
+   `generate_jni_registration` and `generate_jni_impl` templates (the two paths
+   that invoke `jni_zero.py`). When the arg is non-empty, every JNI-generated
+   Java class gets the prefix prepended to its package name.
+
+2. Extends `class_accessors()` in jni_zero's C++ header codegen to emit a
+   backward-compat `#define` alias whenever a package prefix is active:
+
+   ```cpp
+   // generated (new):
+   inline jclass inc_reactor_org_webrtc_Foo_clazz(JNIEnv* env) { … }
+   // alias (new, from this patch):
+   #define org_webrtc_Foo_clazz inc_reactor_org_webrtc_Foo_clazz
+   ```
 
 **Why.** WebRTC's Android SDK ships Java classes under `org.webrtc.*`. The
 previous PoC depended on LiveKit's repackaged `livekit.org.webrtc.*` JAR which
@@ -75,13 +87,20 @@ we must not ship. Setting `android_jni_package_prefix = "inc.reactor"` in
 `build.sh` produces `inc.reactor.org.webrtc.*` Java classes in `libwebrtc.jar`
 and the matching `Java_inc_reactor_org_webrtc_*` JNI symbols in `libwebrtc.a`.
 
+The GN change alone is insufficient: it renames every generated `_clazz` C++
+identifier from `org_webrtc_*` to `inc_reactor_org_webrtc_*`, but four static
+`.cc` files in `sdk/android/src/jni/` (`encoded_image.cc`, `stats_observer.cc`,
+`ice_candidate.cc`, `media_stream.cc`) reference the old names directly and fail
+to compile. Patching all four is brittle; emitting the alias in the generator
+fixes the root cause once. The two halves only make sense together.
+
 **How it works.** `jni_zero.py` already supports `--package-prefix` natively
 (it is used by Cronet for `"internal"`). The missing piece was a GN-level arg
 to activate it project-wide. This patch adds that arg; `build.sh` sets it to
 `"inc.reactor"` for the Android target. The same mechanism Cronet uses
 (`_cronet_renaming_extra_args`) is the model.
 
-**Note.** This patch targets `third_party/jni_zero/jni_zero.gni`, which lives
+**Note.** This patch targets files inside `third_party/jni_zero/`, which lives
 in a separate gclient sub-repo. `build.sh` applies it with `patch -p1` (fallback
 from `git apply`) from `src/` after `gclient sync` resets jni_zero to its
 pinned state.
@@ -89,33 +108,7 @@ pinned state.
 **Verify.** After an Android build, `jar tf out/android-*/lib.java/sdk/android/libwebrtc.jar`
 should list `inc/reactor/org/webrtc/PeerConnection.class` (and equivalents).
 `nm libwebrtc.a | grep Java_` should show `Java_inc_reactor_org_webrtc_*` symbols.
-
----
-
-### 0003 — jni_zero compat aliases for prefixed `_clazz` identifiers
-
-`0003-jni-zero-compat-clazz-aliases.patch` · touches `third_party/jni_zero/codegen/header_common.py` (+16 lines)
-
-**What.** Extends `class_accessors()` in jni_zero's C++ header codegen to emit a
-backward-compat `#define` alias whenever a package prefix is active:
-
-```cpp
-// generated (new):
-inline jclass inc_reactor_org_webrtc_Foo_clazz(JNIEnv* env) { … }
-// alias (new, from this patch):
-#define org_webrtc_Foo_clazz inc_reactor_org_webrtc_Foo_clazz
-```
-
-**Why.** When `android_jni_package_prefix = "inc.reactor"` (patch 0002), the
-jni_zero codegen renames every generated `_clazz` C++ identifier from
-`org_webrtc_*` to `inc_reactor_org_webrtc_*`. Four static `.cc` files in
-`sdk/android/src/jni/` (`encoded_image.cc`, `stats_observer.cc`,
-`ice_candidate.cc`, `media_stream.cc`) call those identifiers directly by the old
-name and fail to compile. Patching all four is brittle; emitting the alias in the
-generator fixes the root cause once.
-
-**Verify.** Android build completes without `use of undeclared identifier
-'org_webrtc_*_clazz'` errors.
+Android build completes without `use of undeclared identifier 'org_webrtc_*_clazz'` errors.
 
 ---
 
