@@ -23,8 +23,8 @@ on:
       targets:
         description: "Which targets to build"
         type: choice
-        default: mac
-        options: [mac, apple, linux, android, win, full]
+        default: full
+        options: [full, mac, apple, linux, android, win]
       profile:
         description: "Build profile"
         type: choice
