@@ -1,6 +1,6 @@
 [package]
 name = "reactor-webrtc"
-version.workspace = true
+version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -13,4 +13,4 @@ build = "build.rs"
 doctest = false
 
 [dependencies]
-reactor-webrtc-sys = { path = "../reactor-webrtc-sys", version = "0.0.0" }
+reactor-webrtc-sys = { path = "../reactor-webrtc-sys", version = "0.1.0" }

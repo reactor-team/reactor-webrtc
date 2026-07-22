@@ -1,6 +1,9 @@
 name: Publish
 
 # Triggered by a semver tag (v0.1.0, v1.2.3, …) or manually for a dry run.
+# Each crate carries its own version in its Cargo.toml — bump only the crates
+# that changed before tagging. The publish steps skip crates whose current
+# version is already on crates.io, so unchanged crates are never re-published.
 on:
   push:
     tags:
@@ -26,31 +29,37 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
 
-      # On a tag push the workspace version is still 0.0.0 in source; patch it
-      # to match the tag so crates.io receives the correct version number.
-      - name: Set version from tag
-        if: github.event_name == 'push'
+      # Publish sys first (webrtc depends on it), then webrtc.
+      # Each step queries crates.io first and skips if the version is already
+      # published — safe to re-run and handles partial-release recovery.
+      - name: Publish crates
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          find . -name "Cargo.toml" | xargs sed -i "s/\"0\.0\.0\"/\"${VERSION}\"/g"
+          already_published() {
+            local crate="$1" version="$2"
+            curl -sf "https://crates.io/api/v1/crates/${crate}/${version}" \
+              -H "User-Agent: reactor-webrtc-ci" \
+              | jq -e '.version.num' > /dev/null 2>&1
+          }
 
-      # reactor-webrtc-sys must land first; reactor-webrtc depends on it.
-      # --no-verify skips `cargo package --verify` which tries to link a native
-      # lib.  crates.io itself never runs the build script, so skipping is safe.
-      - name: Publish reactor-webrtc-sys
-        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
-        run: cargo publish -p reactor-webrtc-sys --no-verify
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+          SYS_VER=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name=="reactor-webrtc-sys") | .version')
+          WRT_VER=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name=="reactor-webrtc") | .version')
 
-      # crates.io indexes asynchronously — wait before publishing the dependent.
-      - name: Wait for crates.io index
-        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
-        run: sleep 45
+          if already_published reactor-webrtc-sys "$SYS_VER"; then
+            echo "::notice::reactor-webrtc-sys@${SYS_VER} already on crates.io — skipping"
+          else
+            cargo publish -p reactor-webrtc-sys --no-verify
+            echo "Waiting 45 s for crates.io index…"
+            sleep 45
+          fi
 
-      - name: Publish reactor-webrtc
-        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
-        run: cargo publish -p reactor-webrtc --no-verify
+          if already_published reactor-webrtc "$WRT_VER"; then
+            echo "::notice::reactor-webrtc@${WRT_VER} already on crates.io — skipping"
+          else
+            cargo publish -p reactor-webrtc --no-verify
+          fi
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
 
@@ -62,6 +71,9 @@ jobs:
           cargo package -p reactor-webrtc      --no-verify --list
 
   # ── 2. Python wheels → PyPI ─────────────────────────────────────────────
+  # Dependency chain for the wheel build: reactor-webrtc-py → reactor-webrtc
+  # → reactor-webrtc-sys. Cargo resolves the local path deps automatically;
+  # no manual ordering needed within the build step.
   build-wheels:
     name: Build wheel · ${{ matrix.platform }}
     strategy:
@@ -91,13 +103,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set version from tag
-        if: github.event_name == 'push'
-        shell: bash
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          find . -name "Cargo.toml" | xargs sed -i "s/\"0\.0\.0\"/\"${VERSION}\"/g"
 
       # Derive the libwebrtc release tag from WEBRTC_VERSION and look up the
       # matching prebuilt asset URL via the GitHub API.
@@ -144,9 +149,11 @@ jobs:
           path: dist/*.whl
           if-no-files-found: error
 
+  # publish-python runs only after BOTH build-wheels AND publish-crates succeed,
+  # ensuring we never publish to PyPI if the crates release failed.
   publish-python:
     name: Publish Python package to PyPI
-    needs: build-wheels
+    needs: [build-wheels, publish-crates]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
