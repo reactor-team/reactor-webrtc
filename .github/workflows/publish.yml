@@ -32,7 +32,7 @@ jobs:
         if: github.event_name == 'push'
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          sed -i "s/^version = \"0\.0\.0\"/version = \"${VERSION}\"/" Cargo.toml
+          find . -name "Cargo.toml" | xargs sed -i "s/\"0\.0\.0\"/\"${VERSION}\"/g"
 
       # reactor-webrtc-sys must land first; reactor-webrtc depends on it.
       # --no-verify skips `cargo package --verify` which tries to link a native
@@ -97,7 +97,7 @@ jobs:
         shell: bash
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          sed -i "s/^version = \"0\.0\.0\"/version = \"${VERSION}\"/" Cargo.toml
+          find . -name "Cargo.toml" | xargs sed -i "s/\"0\.0\.0\"/\"${VERSION}\"/g"
 
       # Derive the libwebrtc release tag from WEBRTC_VERSION and look up the
       # matching prebuilt asset URL via the GitHub API.
