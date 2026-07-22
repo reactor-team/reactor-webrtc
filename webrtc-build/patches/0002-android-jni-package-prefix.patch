@@ -1,7 +1,7 @@
 diff --git a/third_party/jni_zero/codegen/header_common.py b/third_party/jni_zero/codegen/header_common.py
 --- a/third_party/jni_zero/codegen/header_common.py
 +++ b/third_party/jni_zero/codegen/header_common.py
-@@ -32,7 +32,23 @@
+@@ -32,7 +32,22 @@
  #endif
  
  """)
@@ -18,10 +18,10 @@ diff --git a/third_party/jni_zero/codegen/header_common.py b/third_party/jni_zer
 +#define {original_escaped}_clazz_defined
 +#define {original_escaped}_clazz {escaped_name}_clazz
 +#endif
- 
++
 +""")
-+
-+
+ 
+ 
  def class_accessor_expression(java_class):
    if java_class == java_types.CLASS_LOADER_CLASS:
      return 'jni_zero::g_class_loader_class'
