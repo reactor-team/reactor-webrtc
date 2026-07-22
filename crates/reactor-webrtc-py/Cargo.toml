@@ -3,6 +3,7 @@ name = "reactor-webrtc-py"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false  # distributed as a Python wheel (PyPI), not a crate
 
 [lib]
 name = "reactor_webrtc"

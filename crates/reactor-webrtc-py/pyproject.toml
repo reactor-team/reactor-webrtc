@@ -6,7 +6,7 @@ build-backend = "maturin"
 name = "reactor-webrtc"
 dynamic = ["version"]
 description = "Python bindings for reactor-webrtc — WebRTC primitives via PyO3"
-license = { text = "LicenseRef-Reactor-Proprietary" }
+license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
 classifiers = [
     "Programming Language :: Rust",

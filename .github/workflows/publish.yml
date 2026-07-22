@@ -1,0 +1,156 @@
+name: Publish
+
+# Triggered by a semver tag (v0.1.0, v1.2.3, …) or manually for a dry run.
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run — build everything but skip the actual publish steps"
+        type: boolean
+        default: true
+
+# Prevent two publish runs from racing on the same tag.
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ── 1. Rust crates → crates.io ──────────────────────────────────────────
+  publish-crates:
+    name: Publish crates to crates.io
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      # reactor-webrtc-sys must land first; reactor-webrtc depends on it.
+      # --no-verify skips `cargo package --verify` which tries to link a native
+      # lib.  crates.io itself never runs the build script, so skipping is safe.
+      - name: Publish reactor-webrtc-sys
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+        run: cargo publish -p reactor-webrtc-sys --no-verify
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+
+      # crates.io indexes asynchronously — wait before publishing the dependent.
+      - name: Wait for crates.io index
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+        run: sleep 45
+
+      - name: Publish reactor-webrtc
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+        run: cargo publish -p reactor-webrtc --no-verify
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+
+      - name: Dry-run summary (crates)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+        run: |
+          echo "DRY RUN — would publish:"
+          cargo package -p reactor-webrtc-sys --no-verify --list
+          cargo package -p reactor-webrtc      --no-verify --list
+
+  # ── 2. Python wheels → PyPI ─────────────────────────────────────────────
+  build-wheels:
+    name: Build wheel · ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            manylinux: auto
+
+          - platform: linux-arm64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            manylinux: auto
+
+          - platform: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            manylinux: "off"
+
+          - platform: win-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            manylinux: "off"
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Derive the libwebrtc release tag from WEBRTC_VERSION and look up the
+      # matching prebuilt asset URL via the GitHub API.
+      - name: Resolve libwebrtc prebuilt URL
+        id: prebuilt
+        shell: bash
+        run: |
+          source WEBRTC_VERSION
+          MILESTONE=${WEBRTC_BRANCH#branch-heads/}
+          COMMIT_SHORT=${WEBRTC_COMMIT:0:8}
+          TAG="webrtc-${MILESTONE}-${COMMIT_SHORT}-p${REACTOR_PATCH_LEVEL}"
+          ASSET="reactor-webrtc-${{ matrix.platform }}-release.tar.zst"
+          echo "Looking up asset '${ASSET}' in release '${TAG}'..."
+          URL=$(gh api "repos/${{ github.repository }}/releases/tags/${TAG}" \
+                --jq ".assets[] | select(.name == \"${ASSET}\") | .url")
+          if [ -z "$URL" ]; then
+            echo "::error::Asset '${ASSET}' not found in release '${TAG}'"
+            exit 1
+          fi
+          echo "url=${URL}" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: >-
+            --release
+            --manifest-path crates/reactor-webrtc-py/Cargo.toml
+            --out dist
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+        env:
+          REACTOR_WEBRTC_PREBUILT_URL: ${{ steps.prebuilt.outputs.url }}
+          REACTOR_WEBRTC_PREBUILT_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.platform }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  publish-python:
+    name: Publish Python package to PyPI
+    needs: build-wheels
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # OIDC trusted publishing — no API token required
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          merge-multiple: true
+          path: dist/
+
+      - name: List wheels
+        run: ls -lh dist/
+
+      - name: Publish to PyPI
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+        uses: pypa/gh-action-pypi-publish@release/v1
+        # No token needed — uses OIDC trusted publishing configured on PyPI.
+        # Set up at: https://pypi.org/manage/project/reactor-webrtc/settings/publishing/
+        # Publisher: reactor-team/reactor-webrtc, workflow: publish.yml, env: pypi
+
+      - name: Dry-run summary (Python)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+        run: |
+          echo "DRY RUN — wheels that would be published:"
+          ls -1 dist/
