@@ -115,7 +115,21 @@ mod tests {
         });
         assert!(ok, "timed out waiting for connection");
 
-        let report = pc1.get_stats().expect("get_stats");
+        // The stats snapshot may lag the connection event by a tick or two;
+        // poll until a Succeeded pair appears (or we time out).
+        let report = {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let r = pc1.get_stats().expect("get_stats");
+                if r.candidate_pairs.iter().any(|p| p.state == IceCandidatePairState::Succeeded) {
+                    break r;
+                }
+                if Instant::now() >= deadline {
+                    break r;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        };
 
         // A connected loopback peer must have at least one succeeded
         // candidate pair.
