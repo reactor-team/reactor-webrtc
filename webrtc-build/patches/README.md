@@ -92,6 +92,33 @@ should list `inc/reactor/org/webrtc/PeerConnection.class` (and equivalents).
 
 ---
 
+### 0003 — jni_zero compat aliases for prefixed `_clazz` identifiers
+
+`0003-jni-zero-compat-clazz-aliases.patch` · touches `third_party/jni_zero/codegen/header_common.py` (+16 lines)
+
+**What.** Extends `class_accessors()` in jni_zero's C++ header codegen to emit a
+backward-compat `#define` alias whenever a package prefix is active:
+
+```cpp
+// generated (new):
+inline jclass inc_reactor_org_webrtc_Foo_clazz(JNIEnv* env) { … }
+// alias (new, from this patch):
+#define org_webrtc_Foo_clazz inc_reactor_org_webrtc_Foo_clazz
+```
+
+**Why.** When `android_jni_package_prefix = "inc.reactor"` (patch 0002), the
+jni_zero codegen renames every generated `_clazz` C++ identifier from
+`org_webrtc_*` to `inc_reactor_org_webrtc_*`. Four static `.cc` files in
+`sdk/android/src/jni/` (`encoded_image.cc`, `stats_observer.cc`,
+`ice_candidate.cc`, `media_stream.cc`) call those identifiers directly by the old
+name and fail to compile. Patching all four is brittle; emitting the alias in the
+generator fixes the root cause once.
+
+**Verify.** Android build completes without `use of undeclared identifier
+'org_webrtc_*_clazz'` errors.
+
+---
+
 ## Planned (not yet authored — need their target builds to validate)
 
 - **Symbol isolation** — keep WebRTC's C++ symbols from clashing when a consumer

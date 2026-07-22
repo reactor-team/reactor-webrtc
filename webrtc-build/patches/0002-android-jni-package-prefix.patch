@@ -5,7 +5,7 @@ index 532b59115295..2713c942b6bf 100644
 @@ -27,6 +27,14 @@ declare_args() {
        (!enable_jni_multiplexing && !is_java_debug) || is_cronet_build
  }
-
+ 
 +declare_args() {
 +  # Reactor: package prefix for JNI-generated Java classes on Android.
 +  # E.g. "inc.reactor" → org.webrtc.Foo becomes inc.reactor.org.webrtc.Foo.
@@ -16,7 +16,7 @@ index 532b59115295..2713c942b6bf 100644
 +
  assert(!use_hashed_jni_names || !enable_jni_multiplexing,
         "Multiplexing requires that hashed names be disabled.")
-
+ 
 @@ -282,6 +290,14 @@ template("generate_jni_registration") {
      if (defined(is_cronet_build) && is_cronet_build) {
        args += _cronet_renaming_extra_args
@@ -31,7 +31,7 @@ index 532b59115295..2713c942b6bf 100644
 +    }
    }
  }
-
+ 
 @@ -505,6 +521,14 @@ template("generate_jni_impl") {
          if (defined(is_cronet_build) && is_cronet_build) {
            args += _cronet_renaming_extra_args
@@ -47,3 +47,4 @@ index 532b59115295..2713c942b6bf 100644
        } else {
          if (is_robolectric) {
            not_needed(invoker, [ "jar_file" ])
+ 
