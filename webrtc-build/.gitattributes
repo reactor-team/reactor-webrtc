@@ -1,0 +1,3 @@
+# Patch files must stay LF on all platforms — CRLF line endings corrupt the
+# unified-diff format and cause `git apply` to reject them on Windows.
+*.patch text eol=lf

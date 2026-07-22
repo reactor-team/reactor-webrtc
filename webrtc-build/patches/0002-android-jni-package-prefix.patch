@@ -1,3 +1,30 @@
+diff --git a/third_party/jni_zero/codegen/header_common.py b/third_party/jni_zero/codegen/header_common.py
+--- a/third_party/jni_zero/codegen/header_common.py
++++ b/third_party/jni_zero/codegen/header_common.py
+@@ -32,7 +32,22 @@
+ #endif
+ 
+ """)
++    # When a package prefix is active the generated C++ identifier changes
++    # (e.g. org_webrtc_Foo_clazz → inc_reactor_org_webrtc_Foo_clazz), but
++    # static .cc files in sdk/android/src/jni/ reference the unprefixed name
++    # directly.  Emit a compat #define so those files compile without edits.
++    if java_class._prefix:
++      original_fqn = java_class._fqn[len(java_class._prefix) + 1:]
++      original_escaped = common.jni_mangle(original_fqn)
++      if original_escaped != escaped_name:
++        sb(f"""\
++#ifndef {original_escaped}_clazz_defined
++#define {original_escaped}_clazz_defined
++#define {original_escaped}_clazz {escaped_name}_clazz
++#endif
++
++""")
+ 
+ 
+ def class_accessor_expression(java_class):
+   if java_class == java_types.CLASS_LOADER_CLASS:
+     return 'jni_zero::g_class_loader_class'
 diff --git a/third_party/jni_zero/jni_zero.gni b/third_party/jni_zero/jni_zero.gni
 index 532b59115295..2713c942b6bf 100644
 --- a/third_party/jni_zero/jni_zero.gni
@@ -5,7 +32,7 @@ index 532b59115295..2713c942b6bf 100644
 @@ -27,6 +27,14 @@ declare_args() {
        (!enable_jni_multiplexing && !is_java_debug) || is_cronet_build
  }
-
+ 
 +declare_args() {
 +  # Reactor: package prefix for JNI-generated Java classes on Android.
 +  # E.g. "inc.reactor" → org.webrtc.Foo becomes inc.reactor.org.webrtc.Foo.
@@ -16,7 +43,7 @@ index 532b59115295..2713c942b6bf 100644
 +
  assert(!use_hashed_jni_names || !enable_jni_multiplexing,
         "Multiplexing requires that hashed names be disabled.")
-
+ 
 @@ -282,6 +290,14 @@ template("generate_jni_registration") {
      if (defined(is_cronet_build) && is_cronet_build) {
        args += _cronet_renaming_extra_args
@@ -31,7 +58,7 @@ index 532b59115295..2713c942b6bf 100644
 +    }
    }
  }
-
+ 
 @@ -505,6 +521,14 @@ template("generate_jni_impl") {
          if (defined(is_cronet_build) && is_cronet_build) {
            args += _cronet_renaming_extra_args
