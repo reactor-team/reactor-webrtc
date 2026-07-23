@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+#MISE description="[Release] Publish built prebuilts as a GitHub Release"
+set -euo pipefail
+exec "$REPO_ROOT/webrtc-build/publish.sh" "$@"

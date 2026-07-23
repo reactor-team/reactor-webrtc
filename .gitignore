@@ -15,3 +15,8 @@ Cargo.lock
 # mise local state (mise.lock IS committed; these are per-machine overrides)
 /.mise.local.toml
 mise.local.toml
+
+# Python tooling caches (scripts/ lints run under uv)
+__pycache__/
+*.pyc
+.pytest_cache/

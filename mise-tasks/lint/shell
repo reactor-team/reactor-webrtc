@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+#MISE description="[Quality] Shellcheck tracked shell scripts and bash mise-tasks"
+set -euo pipefail
+cd "$REPO_ROOT"
+# Every tracked file that is a *.sh OR carries a bash/sh shebang (catches the
+# extensionless bash mise-tasks). Python tasks/scripts have a python3 shebang and
+# are skipped.
+mapfile -t files < <(
+  git ls-files | while read -r f; do
+    [ -f "$f" ] || continue
+    case "$f" in *.sh) echo "$f"; continue ;; esac
+    head -1 "$f" 2>/dev/null | grep -qE '^#!.*\b(bash|sh)\b' && echo "$f"
+  done
+)
+if [ "${#files[@]}" -eq 0 ]; then echo "no shell scripts to check"; exit 0; fi
+shellcheck "${files[@]}"
+echo "✓ shellcheck OK: ${#files[@]} file(s)"

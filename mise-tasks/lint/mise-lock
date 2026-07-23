@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+#MISE description="[Quality] Verify mise.lock is complete against mise.toml"
+set -euo pipefail
+uv run --quiet --no-project --python 3.12 --with 'tomli==2.2.1' -- \
+  python3 "$REPO_ROOT/scripts/check-mise-lock.py"

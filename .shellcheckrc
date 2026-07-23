@@ -1,0 +1,4 @@
+# SC1091: shellcheck can't follow files sourced at runtime (WEBRTC_VERSION,
+# depot_tools/gclient env, etc.) — they are not static-analysis inputs. This is
+# the standard "not following sourced file" note; disable it repo-wide.
+disable=SC1091
