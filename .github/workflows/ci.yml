@@ -5,37 +5,56 @@ on:
     branches: [main]
   pull_request:
 
+concurrency:
+  group: ci-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  MISE_VERSION: "2026.6.14"   # pinned; must be >= mise.toml min_version
+  # Workflow-level so every step (mise-action AND the `mise run` steps) sees it.
+  MISE_LOCKED: "1"            # install/run only mise.lock versions; never float
+  # CI installs the Rust toolchain via actions-rust-lang/setup-rust-toolchain
+  # (reads rust-toolchain.toml). Disable mise's rust/rustup so the action owns it.
+  # That action also exports RUSTFLAGS="-D warnings" — kept on purpose: warnings
+  # are errors in CI.
+  MISE_DISABLE_TOOLS: "rust,rustup,aqua:rust-lang/rustup"
+
 jobs:
   lint:
-    name: fmt + check + clippy
+    name: fmt + clippy + repo lints
     runs-on: ubuntu-latest
+    env:
+      # check/clippy compile the sys crate's C++ glue, which build.rs auto-detects
+      # + downloads the prebuilt headers for; needs a token + a recent clang.
+      REACTOR_WEBRTC_PREBUILT_TOKEN: ${{ secrets.REACTOR_WEBRTC_PREBUILT_TOKEN }}
+      CXX: clang++-21
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
-      # The bundled libc++ headers in the p2 prebuilt (Chromium llvm-23) require
-      # clang ≥ 20 (builtins like __builtin_clzg added in that toolchain era).
+          fetch-depth: 0   # mise.lock drift check diffs against the merge-base
+      - uses: actions-rust-lang/setup-rust-toolchain@v1   # reads rust-toolchain.toml
+      # The bundled libc++ headers in the prebuilt (Chromium llvm-23) require
+      # clang >= 20 (builtins like __builtin_clzg added in that toolchain era).
       - name: Install clang-21
         run: |
-          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
-            | sudo tee /etc/apt/trusted.gpg.d/llvm.asc
-          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" \
-            | sudo tee /etc/apt/sources.list.d/llvm.list
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/llvm.asc
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm.list
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends clang-21
-      - run: cargo fmt --all -- --check
-      - run: cargo check --workspace
+      - uses: jdx/mise-action@v2
+        with:
+          version: ${{ env.MISE_VERSION }}
+      - run: mise run fmt:check
+      - run: mise run clippy
+      - run: mise run lint:shell
+      - run: mise run lint:mise-tools-root
+      - name: mise.lock drift (vs committed)
+        run: mise run lint:mise-lock
         env:
-          REACTOR_WEBRTC_PREBUILT_TOKEN: ${{ secrets.REACTOR_WEBRTC_PREBUILT_TOKEN }}
-          CXX: clang++-21
-      - run: cargo clippy --workspace -- -D warnings
-        env:
-          REACTOR_WEBRTC_PREBUILT_TOKEN: ${{ secrets.REACTOR_WEBRTC_PREBUILT_TOKEN }}
-          CXX: clang++-21
+          MISE_LOCK_CHECK_FROM: head
 
   test:
-    name: test (linux-x64, libwebrtc prebuilt)
+    name: cargo test (linux-x64, libwebrtc prebuilt)
     runs-on: ubuntu-latest
     env:
       # Release: webrtc-7907-a5ddff60-p1 — reactor-webrtc-linux-x64-release.tar.zst
@@ -45,35 +64,77 @@ jobs:
       CXX: clang++-21
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
       - name: Install clang-21
         run: |
           wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/llvm.asc
           echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm.list
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends clang-21
-      - name: Cache cargo registry + build
-        uses: actions/cache@v4
+      - uses: jdx/mise-action@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-test-
-      - run: cargo test --workspace
-      - uses: actions/setup-python@v5
+          version: ${{ env.MISE_VERSION }}
+      - run: mise run test
+
+  build-wheel:
+    name: build reactor-webrtc wheel
+    runs-on: ubuntu-latest
+    env:
+      REACTOR_WEBRTC_PREBUILT_URL: https://api.github.com/repos/reactor-team/reactor-webrtc/releases/assets/475845307
+      REACTOR_WEBRTC_PREBUILT_SHA256: 4b8b99f45859ab78c3b236c90e8907830a418cb2f2729a56eccaaccda6d3c832
+      REACTOR_WEBRTC_PREBUILT_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      CXX: clang++-21
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Install clang-21
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/llvm.asc
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang-21
+      - uses: jdx/mise-action@v2
         with:
-          python-version: "3.12"
-      - name: Install maturin + pytest
-        run: pip install maturin pytest
-      - name: Build reactor-webrtc-py wheel
-        run: maturin build --manifest-path crates/reactor-webrtc-py/Cargo.toml
-      - name: Install reactor-webrtc-py wheel
-        run: pip install target/wheels/reactor_webrtc-*.whl
-      # Each invocation is a fresh process so the PeerConnectionFactory singleton
-      # constraint (one factory per process) is satisfied across test files.
-      - name: Run Python tests (standard factory)
-        run: pytest crates/reactor-webrtc-py/tests/test_loopback.py -v
-      - name: Run Python tests (encoded-video-track factory)
-        run: pytest crates/reactor-webrtc-py/tests/test_encoded_track.py -v
+          version: ${{ env.MISE_VERSION }}
+      - name: Build wheel
+        run: mise run //crates/reactor-webrtc-py:build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reactor-webrtc-wheel
+          path: target/wheels/reactor_webrtc-*.whl
+          if-no-files-found: error
+
+  test-py:
+    name: pytest (built wheel)
+    needs: build-wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: reactor-webrtc-wheel
+          path: target/wheels
+      - uses: jdx/mise-action@v2
+        with:
+          version: ${{ env.MISE_VERSION }}
+      - name: Run Python tests against the built wheel
+        run: mise run //crates/reactor-webrtc-py:test
+
+  ci-complete:
+    name: CI Complete
+    needs: [lint, test, build-wheel, test-py]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify no job failed
+        run: |
+          for r in \
+            "${{ needs.lint.result }}" \
+            "${{ needs.test.result }}" \
+            "${{ needs.build-wheel.result }}" \
+            "${{ needs.test-py.result }}"; do
+            if [ "$r" = "failure" ] || [ "$r" = "cancelled" ]; then
+              echo "::error::a required job failed ($r)"; exit 1
+            fi
+          done
+          echo "All CI checks passed."

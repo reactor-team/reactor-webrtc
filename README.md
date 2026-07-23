@@ -52,6 +52,22 @@ for pair in report.candidate_pairs:
 
 **Building locally** (requires a prebuilt `libwebrtc`):
 
+With [mise](https://mise.jdx.dev) (recommended — pins the whole toolchain):
+
+```bash
+mise install                 # rust (via rust-toolchain.toml) + uv/ruff/maturin/nextest/shellcheck
+make check                   # fmt-check + cargo check + clippy (no native lib needed)
+
+export REACTOR_WEBRTC_LIB_DIR=/path/to/libwebrtc   # a prebuilt is required to link/test
+make test                                          # cargo test --workspace
+mise run //crates/reactor-webrtc-py:build          # build the wheel
+mise run //crates/reactor-webrtc-py:test           # pytest the wheel
+```
+
+`make help` works at the repo root and in each module directory (`crates/reactor-webrtc-py/`, `webrtc-build/`).
+
+Or drive the tools directly:
+
 ```bash
 # Point at an extracted prebuilt or a local build output
 export REACTOR_WEBRTC_LIB_DIR=/path/to/libwebrtc
