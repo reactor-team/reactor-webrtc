@@ -32,7 +32,8 @@ const PREBUILT_BASE: &str =
     "https://github.com/reactor-team/reactor-webrtc/releases/download";
 
 // Fallback tag used when WEBRTC_VERSION is not accessible (e.g. builds from a
-// published crate on crates.io). Updated with every libwebrtc release.
+// published crate on crates.io). Patched automatically by publish.yml before
+// cargo publish — never edit this line manually.
 const PREBUILT_TAG_FALLBACK: &str = "webrtc-7907-a5ddff60-p2";
 
 fn main() {
