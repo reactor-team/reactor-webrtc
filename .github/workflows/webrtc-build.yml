@@ -78,18 +78,20 @@ jobs:
           t="${{ github.event.inputs.targets }}"
           prof="${{ github.event.inputs.profile }}"
           if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
-            t=full
+            # TODO: restore t=full once custom_encoder passes on linux-x64
+            t=linux-x64
             prof=debug
           fi
           t="${t:-mac}"
           case "$t" in
-            mac)     inc="$mac_arm" ;;
-            apple)   inc="$mac_arm,$mac_x64,$ios_dev,$ios_sim" ;;
-            linux)   inc="$linux_x64,$linux_arm" ;;
-            android) inc="$android" ;;
-            win)     inc="$win" ;;
-            full)    inc="$mac_arm,$mac_x64,$ios_dev,$ios_sim,$linux_x64,$linux_arm,$android,$win" ;;
-            *)       inc="$mac_arm" ;;
+            mac)      inc="$mac_arm" ;;
+            apple)    inc="$mac_arm,$mac_x64,$ios_dev,$ios_sim" ;;
+            linux)    inc="$linux_x64,$linux_arm" ;;
+            android)  inc="$android" ;;
+            win)      inc="$win" ;;
+            full)     inc="$mac_arm,$mac_x64,$ios_dev,$ios_sim,$linux_x64,$linux_arm,$android,$win" ;;
+            linux-x64) inc="$linux_x64" ;;
+            *)        inc="$mac_arm" ;;
           esac
           echo "matrix={\"include\":[$inc]}" >> "$GITHUB_OUTPUT"
           echo "profile=${prof:-release}" >> "$GITHUB_OUTPUT"

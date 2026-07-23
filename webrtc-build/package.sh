@@ -102,6 +102,13 @@ case "$OS" in
     ;;
 esac
 
+# ── Build profile marker (read by reactor-webrtc-sys/build.rs) ───────────────
+# Lets build.rs match NDEBUG to the prebuilt's own DCHECK config: debug archives
+# compile WebRTC without NDEBUG (RTC_DCHECK_IS_ON=1), which adds SequenceChecker
+# members to base classes. Mismatching causes silent heap corruption (glibc aborts
+# with "malloc(): invalid size (unsorted)"). Included in the archive below.
+echo "$PROFILE" > "$STAGE/lib/build_profile"
+
 # ── Archive + checksum ────────────────────────────────────────────────────────
 mkdir -p "$DIST"
 ARCHIVE="$DIST/$NAME.tar.zst"
