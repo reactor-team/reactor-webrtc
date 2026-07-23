@@ -28,8 +28,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 // ── Prebuilt location ─────────────────────────────────────────────────────────
-const PREBUILT_BASE: &str =
-    "https://github.com/reactor-team/reactor-webrtc/releases/download";
+const PREBUILT_BASE: &str = "https://github.com/reactor-team/reactor-webrtc/releases/download";
 
 // Fallback tag used when WEBRTC_VERSION is not accessible (e.g. builds from a
 // published crate on crates.io). Patched automatically by publish.yml before
@@ -367,7 +366,11 @@ fn prebuilt_platform() -> Option<&'static str> {
             // aarch64-apple-ios-sim       → simulator (abi = "sim")
             // x86_64-apple-ios            → simulator (x64 is always sim)
             let is_sim = abi == "sim" || arch == "x86_64";
-            Some(if is_sim { "ios-arm64-simulator" } else { "ios-arm64-device" })
+            Some(if is_sim {
+                "ios-arm64-simulator"
+            } else {
+                "ios-arm64-device"
+            })
         }
         "linux" => match arch.as_str() {
             "x86_64" => Some("linux-x64"),
@@ -391,10 +394,14 @@ fn prebuilt_platform() -> Option<&'static str> {
 fn fetch_sha256(sha_url: &str) -> Option<String> {
     let tmp = PathBuf::from(env::var("OUT_DIR").unwrap()).join("prebuilt.sha256");
     let mut cmd = std::process::Command::new("curl");
-    cmd.args(["-fsSL", "--retry", "3", "-o"]).arg(&tmp).arg(sha_url);
+    cmd.args(["-fsSL", "--retry", "3", "-o"])
+        .arg(&tmp)
+        .arg(sha_url);
     if let Ok(token) = env::var("REACTOR_WEBRTC_PREBUILT_TOKEN") {
-        cmd.arg("-H").arg(format!("Authorization: Bearer {token}"))
-           .arg("-H").arg("Accept: application/octet-stream");
+        cmd.arg("-H")
+            .arg(format!("Authorization: Bearer {token}"))
+            .arg("-H")
+            .arg("Accept: application/octet-stream");
     }
     let ok = cmd.status().map(|s| s.success()).unwrap_or(false);
     if !ok {
