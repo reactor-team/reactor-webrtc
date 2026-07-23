@@ -27,12 +27,13 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
-// ── Pinned prebuilt ──────────────────────────────────────────────────────────
-// Updated whenever a new libwebrtc release is published to GitHub Releases.
-// Keep in sync with WEBRTC_VERSION at the repository root.
-const PREBUILT_TAG: &str = "webrtc-7907-a5ddff60-p2";
+// ── Prebuilt location ─────────────────────────────────────────────────────────
 const PREBUILT_BASE: &str =
     "https://github.com/reactor-team/reactor-webrtc/releases/download";
+
+// Fallback tag used when WEBRTC_VERSION is not accessible (e.g. builds from a
+// published crate on crates.io). Updated with every libwebrtc release.
+const PREBUILT_TAG_FALLBACK: &str = "webrtc-7907-a5ddff60-p2";
 
 fn main() {
     println!("cargo:rerun-if-env-changed=REACTOR_WEBRTC_LIB_DIR");
@@ -54,12 +55,12 @@ fn main() {
         return;
     }
 
-    // Mode 3: auto-detect the correct prebuilt from the baked-in version tag
-    // and the current Cargo target triple. Covers all published targets; falls
-    // back to API/check-only for unsupported or cross-compile targets.
+    // Mode 3: auto-detect the correct prebuilt from WEBRTC_VERSION (or the
+    // baked-in fallback tag) and the current Cargo target triple.
     if let Some(platform) = prebuilt_platform() {
+        let tag = prebuilt_tag();
         let asset = format!("reactor-webrtc-{platform}-release.tar.zst");
-        let url = format!("{PREBUILT_BASE}/{PREBUILT_TAG}/{asset}");
+        let url = format!("{PREBUILT_BASE}/{tag}/{asset}");
         let sha_url = format!("{url}.sha256");
         let sha256 = fetch_sha256(&sha_url);
         let dir = download_prebuilt(&url, sha256.as_deref());
@@ -306,6 +307,43 @@ fn link_system_deps(lib_dir: &Path) {
         }
         _ => {}
     }
+}
+
+/// Resolve the release tag from `WEBRTC_VERSION` at the workspace root, or
+/// fall back to `PREBUILT_TAG_FALLBACK` for builds from a published crate
+/// (where the workspace root is absent).
+fn prebuilt_tag() -> String {
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
+    let path = Path::new(&manifest_dir).join("../../WEBRTC_VERSION");
+    if let Ok(src) = std::fs::read_to_string(&path) {
+        println!("cargo:rerun-if-changed={}", path.display());
+        return parse_webrtc_tag(&src);
+    }
+    PREBUILT_TAG_FALLBACK.to_string()
+}
+
+/// Parse `WEBRTC_VERSION` shell-variable format into a release tag string.
+/// Tag format: `webrtc-<milestone>-<commit8>-p<patch>` (mirrors publish.sh).
+fn parse_webrtc_tag(src: &str) -> String {
+    let mut branch = "";
+    let mut commit = "";
+    let mut patch = "0";
+    for line in src.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        if let Some(v) = line.strip_prefix("WEBRTC_BRANCH=") {
+            branch = v;
+        } else if let Some(v) = line.strip_prefix("WEBRTC_COMMIT=") {
+            commit = v;
+        } else if let Some(v) = line.strip_prefix("REACTOR_PATCH_LEVEL=") {
+            patch = v;
+        }
+    }
+    let milestone = branch.strip_prefix("branch-heads/").unwrap_or(branch);
+    let short = &commit[..commit.len().min(8)];
+    format!("webrtc-{milestone}-{short}-p{patch}")
 }
 
 /// Map the current Cargo target triple to its prebuilt platform token, or
