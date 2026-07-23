@@ -16,7 +16,11 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --all -- --check
       - run: cargo check --workspace
+        env:
+          REACTOR_WEBRTC_PREBUILT_TOKEN: ${{ secrets.REACTOR_WEBRTC_PREBUILT_TOKEN }}
       - run: cargo clippy --workspace -- -D warnings
+        env:
+          REACTOR_WEBRTC_PREBUILT_TOKEN: ${{ secrets.REACTOR_WEBRTC_PREBUILT_TOKEN }}
 
   test:
     name: test (linux-x64, libwebrtc prebuilt)
