@@ -50,21 +50,33 @@ fn main() {
 
     if let Ok(url) = env::var("REACTOR_WEBRTC_PREBUILT_URL") {
         let sha256 = env::var("REACTOR_WEBRTC_PREBUILT_SHA256").ok();
-        let dir = download_prebuilt(&url, sha256.as_deref());
+        let dir = download_prebuilt(&url, sha256.as_deref()).unwrap_or_else(|| {
+            panic!("reactor-webrtc-sys: failed to download REACTOR_WEBRTC_PREBUILT_URL={url}")
+        });
         link(&dir);
         return;
     }
 
     // Mode 3: auto-detect the correct prebuilt from WEBRTC_VERSION (or the
     // baked-in fallback tag) and the current Cargo target triple.
+    // download_prebuilt returns None on network/404 errors so that `cargo check`
+    // (which needs no native lib) keeps working even when no prebuilt is published
+    // yet for this tag.
     if let Some(platform) = prebuilt_platform() {
         let tag = prebuilt_tag();
         let asset = format!("reactor-webrtc-{platform}-release.tar.zst");
         let url = format!("{PREBUILT_BASE}/{tag}/{asset}");
         let sha_url = format!("{url}.sha256");
         let sha256 = fetch_sha256(&sha_url);
-        let dir = download_prebuilt(&url, sha256.as_deref());
-        link(&dir);
+        if let Some(dir) = download_prebuilt(&url, sha256.as_deref()) {
+            link(&dir);
+            return;
+        }
+        println!(
+            "cargo:warning=reactor-webrtc-sys: could not download prebuilt for \
+             {platform} (tag={tag}). Building API/check only — final linking will fail. \
+             Set REACTOR_WEBRTC_LIB_DIR to a local build to link a binary."
+        );
         return;
     }
 
@@ -419,14 +431,14 @@ fn fetch_sha256(sha_url: &str) -> Option<String> {
 /// `cargo check` stays fast). For a private-repo release asset, set
 /// `REACTOR_WEBRTC_PREBUILT_TOKEN` (a `repo`-scoped token) — `curl` follows the
 /// GitHub redirect and drops the auth header on the cross-host hop.
-fn download_prebuilt(url: &str, sha256: Option<&str>) -> PathBuf {
+fn download_prebuilt(url: &str, sha256: Option<&str>) -> Option<PathBuf> {
     let out_root = PathBuf::from(env::var("OUT_DIR").unwrap());
     let out = out_root.join("libwebrtc");
     let archive = out_root.join("prebuilt.tar.zst");
 
     // Cached from a previous build of this OUT_DIR.
     if out.join("lib/libwebrtc.a").is_file() {
-        return out;
+        return Some(out);
     }
 
     // ── download ──────────────────────────────────────────────────────────
@@ -444,7 +456,12 @@ fn download_prebuilt(url: &str, sha256: Option<&str>) -> PathBuf {
             .arg("-H")
             .arg("Accept: application/octet-stream");
     }
-    run(&mut curl, "download prebuilt (curl)");
+    // Return None on network/HTTP errors (e.g. 404 when no prebuilt is published
+    // yet). Callers decide whether to panic (mode 2) or warn+skip (mode 3).
+    let ok = curl.status().map(|s| s.success()).unwrap_or(false);
+    if !ok {
+        return None;
+    }
 
     // ── verify sha256 ─────────────────────────────────────────────────────
     if let Some(expected) = sha256 {
@@ -486,7 +503,7 @@ fn download_prebuilt(url: &str, sha256: Option<&str>) -> PathBuf {
             "reactor-webrtc-sys: extracted prebuilt has no lib/libwebrtc.a (bad archive layout?)"
         );
     }
-    out
+    Some(out)
 }
 
 /// Run a command, panicking with context on failure.
