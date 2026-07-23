@@ -1,18 +1,8 @@
 # reactor-webrtc
 
-Reactor's **owned** WebRTC stack: a safe Rust API (`reactor-webrtc`) over our
-own build of Google's WebRTC (`libwebrtc`), with the low-level FFI in
-`reactor-webrtc-sys`. **No dependency on LiveKit's `libwebrtc` / `webrtc-sys`
-crates.**
-
-It is the WebRTC engine shared across the platform:
-
-- **`reactor-sdk-core`** — the native client SDK core (C ABI) consumed by the
-  C++/Python/Swift/Kotlin/Go SDKs, and
-- **`reactor-runtime`** — the server, where it replaces GStreamer.
-
-This is **M1** of the SDK Architecture Plan — the foundation every other step
-builds on.
+Safe Rust API and Python bindings over an owned build of Google's WebRTC engine.
+The low-level FFI lives in `reactor-webrtc-sys`; `reactor-webrtc-py` exposes
+the API to Python as a self-contained wheel (no native runtime dependency).
 
 ```
 reactor-webrtc/
@@ -29,9 +19,10 @@ reactor-webrtc/
 │   ├── sbom.sh                 SBOM wrapper for the POSIX builds
 │   ├── publish.sh              cut a GitHub Release with the per-target assets
 │   └── patches/                deterministic patch series (see patches/README.md)
-├── .github/workflows/ci.yml             fast public checks (fmt / check / clippy)
-├── .github/workflows/webrtc-build.yml   heavy per-target libwebrtc builds + publish
-└── .github/workflows/lib-link-test.yml  fast lib-link test against a prebuilt
+├── .github/workflows/ci.yml             fast checks (fmt / check / clippy)
+├── .github/workflows/webrtc-build.yml   per-target libwebrtc builds (debug CI + manual release)
+├── .github/workflows/lib-link-test.yml  fast lib-link test against a prebuilt
+└── .github/workflows/publish.yml        crates.io + PyPI publish (triggered by semver tag)
 ```
 
 ## Python bindings (`reactor-webrtc-py`)
@@ -95,14 +86,15 @@ Requires **Python ≥ 3.10** (stable ABI `abi3-py310`).
 `reactor-webrtc-sys`'s build script links the native `libwebrtc` in one of three
 modes (priority order):
 
-1. `REACTOR_WEBRTC_LIB_DIR=/path` — link a locally built/extracted lib
+1. Nothing set — **auto-detect**: `build.rs` derives the correct prebuilt URL
+   from the baked-in version tag and the Cargo target triple, downloads +
+   verifies + links automatically. `cargo add reactor-webrtc && cargo build`
+   just works for all published targets.
+2. `REACTOR_WEBRTC_LIB_DIR=/path` — link a locally built/extracted lib
    (packaged layout `<dir>/lib` + `<dir>/include`, or a bare dir + optional
    `REACTOR_WEBRTC_INCLUDE_DIR`).
-2. `REACTOR_WEBRTC_PREBUILT_URL=…` (+ `…_SHA256`) — download + verify our
-   prebuilt for the target, extract, and link. **Default production path.**
-3. Nothing set — **API/dev mode**: no link directives, so `cargo check` and
-   rlib builds of the API succeed without a native library. A final binary that
-   actually calls WebRTC must use mode 1 or 2.
+3. `REACTOR_WEBRTC_PREBUILT_URL=…` (+ `…_SHA256`) — download a specific
+   prebuilt archive (overrides the auto-detected URL).
 
 ```bash
 cargo check        # ✅ builds the API surface (no native lib needed)
@@ -136,29 +128,21 @@ Per-target toolchain rationale lives at the top of `build.sh` (POSIX) and
 `build.ps1` (Windows); the full build recipe is in
 [`webrtc-build/README.md`](webrtc-build/README.md).
 
-## Status (M1)
+## Status
 
-- ✅ Workspace + two crates; safe API surface mirroring the shape
-  `reactor-sdk-core` used from LiveKit's crate (drop-in intent).
-- ✅ `build.rs` with the 3-mode native resolution.
-- ✅ `webrtc-build/` pipeline (fetch → patch → gn → ninja → package → publish),
+- ✅ Safe Rust API (`reactor-webrtc`) over the owned `libwebrtc` build.
+- ✅ `build.rs` with 3-mode native resolution (local dir, prebuilt URL, or API-only).
+- ✅ Full build pipeline (`webrtc-build/`): fetch → patch → gn → ninja → package → publish,
   pinned to `branch-heads/7907` in `WEBRTC_VERSION`.
-- ✅ All matrix targets build + package + upload green on GitHub Actions, and are
-  published as a GitHub Release.
-- ✅ FFI glue links + runs against the lib (lib-link tests on macOS arm64 and
-  Linux x64 in CI).
-- ✅ Python bindings (`reactor-webrtc-py`): PyO3/Maturin wheel with full
-  signaling API, data channels, media tracks, stats, and a loopback test suite;
-  built and tested in CI.
-- ⏳ **TODO:** flesh out the remaining safe API; the symbol-isolation and
-  Android Java-namespace patches (see `webrtc-build/patches/README.md`); wire
-  `reactor-sdk-core` to link this behind a flag, then make it the default and
-  drop LiveKit.
-
-See the SDK Architecture Plan for the full design and rollout.
+- ✅ All matrix targets build and are published as a GitHub Release.
+- ✅ FFI glue links and runs against the lib (lib-link tests on macOS arm64 and Linux x64 in CI).
+- ✅ Python wheel (`reactor-webrtc-py`): full signaling API, data channels, media tracks,
+  stats, and a loopback test suite — built and tested in CI.
+- ✅ crates.io + PyPI publish CI (`publish.yml`), triggered by semver tag.
 
 ## Licensing
 
+This repository is **Apache-2.0** licensed — see [`LICENSE`](LICENSE).
+
 Upstream WebRTC is **BSD-3-Clause + the WebRTC patent grant**; redistributing
 prebuilts is permitted with attribution (recorded in the SBOM + `NOTICE.md`).
-This crate's own license is TBD (`LicenseRef-Reactor-Proprietary` placeholder).

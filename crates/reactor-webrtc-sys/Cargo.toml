@@ -4,7 +4,8 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Low-level FFI bindings to Reactor's owned libwebrtc build. Not for direct use — see the safe `reactor-webrtc` crate."
+readme = "README.md"
+description = "Low-level FFI bindings to an owned libwebrtc build. Not for direct use — see the safe `reactor-webrtc` crate."
 keywords = ["webrtc", "ffi", "sys"]
 categories = ["multimedia", "external-ffi-bindings"]
 # `links` marks the native dependency and lets the build script publish metadata.

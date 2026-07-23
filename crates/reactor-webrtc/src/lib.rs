@@ -1,20 +1,15 @@
-//! `reactor-webrtc` — a safe, idiomatic Rust API over Reactor's **owned**
-//! `libwebrtc` build (see the `reactor-webrtc-sys` crate and `../../webrtc-build`).
-//!
-//! This is the WebRTC engine shared across the platform:
-//!
-//! - **`reactor-sdk-core`** — the native client SDK core (C ABI), and
-//! - **`reactor-runtime`** — the server (replacing GStreamer).
+//! `reactor-webrtc` — a safe, idiomatic Rust API over an owned build of Google's
+//! WebRTC engine (see the `reactor-webrtc-sys` crate and `../../webrtc-build`).
 //!
 //! ## Shape
 //!
 //! [`PeerConnectionFactory`] → [`PeerConnection`] (with a closure-based
 //! [`PeerConnectionObserver`]) → SDP offer/answer, ICE, [`Track`]s (audio +
 //! video send/receive) and [`DataChannel`]s. RAII throughout: dropping a handle
-//! releases the native object. We do **not** depend on any LiveKit crate.
+//! releases the native object.
 //!
-//! Building a real binary/test requires a native `libwebrtc` (set
-//! `REACTOR_WEBRTC_LIB_DIR` / `REACTOR_WEBRTC_PREBUILT_URL`); `cargo check`
+//! Building a real binary or test requires a native `libwebrtc`; set
+//! `REACTOR_WEBRTC_LIB_DIR` or `REACTOR_WEBRTC_PREBUILT_URL`. `cargo check`
 //! works without one.
 
 mod builder;

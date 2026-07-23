@@ -1,14 +1,8 @@
-//! `reactor-webrtc-sys` — low-level FFI to Reactor's owned `libwebrtc` build.
+//! `reactor-webrtc-sys` — low-level FFI to an owned `libwebrtc` build.
 //!
 //! This crate is the unsafe boundary: opaque handle types and `extern "C"`
-//! declarations that the C++ glue (built by `../../webrtc-build`) implements.
+//! declarations implemented by the C++ glue in `glue/reactor_webrtc.cpp`.
 //! Application code should use the safe [`reactor-webrtc`] crate instead.
-//!
-//! The surface below is the **initial M1 scaffold** — a representative subset
-//! of the WebRTC objects `reactor-sdk-core` needs (factory, peer connection,
-//! data channel, tracks, frame I/O, ADM, platform bootstrap). It will be
-//! generated from the C++ glue (via `cxx`/`bindgen`) rather than hand-written
-//! as the build pipeline matures; until then it documents the intended C ABI.
 //!
 //! [`reactor-webrtc`]: https://docs.rs/reactor-webrtc
 #![allow(non_camel_case_types)]
@@ -519,9 +513,3 @@ extern "C" {
         context: *mut std::ffi::c_void,
     ) -> c_int;
 }
-
-// TODO(M1): expand to the full surface used by reactor-sdk-core —
-//   create_answer / set_local/remote_description / add_ice_candidate,
-//   on_track, add_transceiver (+ direction), data_channel send / on_message,
-//   native video/audio sinks (NativeVideoStream/NativeAudioStream equivalents),
-//   I420/BGRA conversion helpers — and move to generated bindings (cxx/bindgen).

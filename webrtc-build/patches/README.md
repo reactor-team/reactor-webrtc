@@ -81,11 +81,11 @@ list, e.g. `opus, G722, PCMU, PCMA, VP8, AV1, VP9`. (H.264 is intentionally off 
    #define org_webrtc_Foo_clazz inc_reactor_org_webrtc_Foo_clazz
    ```
 
-**Why.** WebRTC's Android SDK ships Java classes under `org.webrtc.*`. The
-previous PoC depended on LiveKit's repackaged `livekit.org.webrtc.*` JAR which
-we must not ship. Setting `android_jni_package_prefix = "inc.reactor"` in
-`build.sh` produces `inc.reactor.org.webrtc.*` Java classes in `libwebrtc.jar`
-and the matching `Java_inc_reactor_org_webrtc_*` JNI symbols in `libwebrtc.a`.
+**Why.** WebRTC's Android SDK ships Java classes under `org.webrtc.*`. Setting
+`android_jni_package_prefix = "inc.reactor"` in `build.sh` produces
+`inc.reactor.org.webrtc.*` Java classes in `libwebrtc.jar` and the matching
+`Java_inc_reactor_org_webrtc_*` JNI symbols in `libwebrtc.a`, avoiding
+collisions with any other WebRTC consumer in the same process.
 
 The GN change alone is insufficient: it renames every generated `_clazz` C++
 identifier from `org_webrtc_*` to `inc_reactor_org_webrtc_*`, but four static

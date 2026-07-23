@@ -3,7 +3,7 @@
 Produces the per-target `libwebrtc` static library (+ public headers, and later
 the Android Java companion) that `reactor-webrtc-sys` links, from Google's
 upstream WebRTC pinned in `../WEBRTC_VERSION`. Output is published as versioned,
-checksummed prebuilt archives (+ SBOM) to our artifact host; nothing here is
+checksummed prebuilt archives (+ SBOM) as GitHub Releases; nothing here is
 committed (see `../.gitignore`).
 
 ## Pipeline
@@ -172,5 +172,4 @@ Per-target toolchain notes (why each differs) live at the top of `build.sh`
   - **Patch series** — symbol isolation + Android Java-namespace repackaging (see
     [`patches/README.md`](patches/README.md)).
 
-> Upstream WebRTC build docs (and LiveKit's open build scripts as *reference
-> only*, not a dependency) inform this recipe.
+> Upstream WebRTC build docs inform this recipe.
