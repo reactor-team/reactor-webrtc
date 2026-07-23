@@ -11,15 +11,11 @@ runtime dependency.
 reactor-webrtc = "0.1"
 ```
 
-A native `libwebrtc` must be available at link time — set one of:
+The build script automatically downloads the correct `libwebrtc` prebuilt for
+your target when you run `cargo build` — no extra setup needed. The prebuilt is
+cached in Cargo's build directory and not re-downloaded on subsequent builds.
 
-- `REACTOR_WEBRTC_LIB_DIR=/path/to/extracted-prebuilt` — local build or
-  extracted prebuilt archive.
-- `REACTOR_WEBRTC_PREBUILT_URL=https://…` (+ `REACTOR_WEBRTC_PREBUILT_SHA256`)
-  — download the prebuilt for the current target at build time.
-
-Without either variable set, `cargo check` and rlib builds of the API succeed;
-only the final link of a binary or test requires the native library.
+To use a local build instead, set `REACTOR_WEBRTC_LIB_DIR=/path/to/prebuilt`.
 
 ## Example
 

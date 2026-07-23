@@ -4,17 +4,18 @@
 //! in one of three modes, in priority order:
 //!
 //!   1. `REACTOR_WEBRTC_LIB_DIR=/path`  — link a locally-built/extracted lib
-//!      directory (used by contributors building WebRTC from source). The dir
-//!      is either a packaged layout (`<dir>/lib/libwebrtc.a` + `<dir>/include`)
-//!      or a bare dir containing `libwebrtc.a` (headers then come from
-//!      `REACTOR_WEBRTC_INCLUDE_DIR`).
+//!      directory (contributors building WebRTC from source). The dir is either
+//!      a packaged layout (`<dir>/lib/libwebrtc.a` + `<dir>/include`) or a bare
+//!      dir containing `libwebrtc.a` (headers from `REACTOR_WEBRTC_INCLUDE_DIR`).
 //!   2. `REACTOR_WEBRTC_PREBUILT_URL=...` (+ `REACTOR_WEBRTC_PREBUILT_SHA256`)
-//!      — download our prebuilt archive for this target, verify the checksum,
-//!      extract into `OUT_DIR`, and link it. This is the default production path.
-//!   3. Nothing configured — **API/dev mode**: emit no link directives so
-//!      `cargo check` and rlib builds of the API succeed without a native lib.
-//!      Any final binary/test that actually calls into WebRTC must set one of
-//!      the env vars above, or linking will fail.
+//!      — download a specific prebuilt archive, verify the checksum, extract
+//!      into `OUT_DIR`, and link it.
+//!   3. Nothing configured — **auto-detect**: derive the correct prebuilt URL
+//!      from the baked-in `PREBUILT_TAG` and the current Cargo target triple,
+//!      download + verify + link automatically. This is the default path for
+//!      end users: `cargo add reactor-webrtc` + `cargo build` just works for
+//!      all published targets (mac, ios, linux, android, windows).
+//!      Falls back to API/check-only for unsupported targets.
 //!
 //! When a native lib is resolved we also compile the C++ glue in `glue/` (the
 //! FFI implementation) and emit `cfg(have_libwebrtc)` so link-dependent tests
@@ -25,6 +26,13 @@
 
 use std::env;
 use std::path::{Path, PathBuf};
+
+// ── Pinned prebuilt ──────────────────────────────────────────────────────────
+// Updated whenever a new libwebrtc release is published to GitHub Releases.
+// Keep in sync with WEBRTC_VERSION at the repository root.
+const PREBUILT_TAG: &str = "webrtc-7907-a5ddff60-p2";
+const PREBUILT_BASE: &str =
+    "https://github.com/reactor-team/reactor-webrtc/releases/download";
 
 fn main() {
     println!("cargo:rerun-if-env-changed=REACTOR_WEBRTC_LIB_DIR");
@@ -46,10 +54,23 @@ fn main() {
         return;
     }
 
+    // Mode 3: auto-detect the correct prebuilt from the baked-in version tag
+    // and the current Cargo target triple. Covers all published targets; falls
+    // back to API/check-only for unsupported or cross-compile targets.
+    if let Some(platform) = prebuilt_platform() {
+        let asset = format!("reactor-webrtc-{platform}-release.tar.zst");
+        let url = format!("{PREBUILT_BASE}/{PREBUILT_TAG}/{asset}");
+        let sha_url = format!("{url}.sha256");
+        let sha256 = fetch_sha256(&sha_url);
+        let dir = download_prebuilt(&url, sha256.as_deref());
+        link(&dir);
+        return;
+    }
+
     println!(
-        "cargo:warning=reactor-webrtc-sys: no native libwebrtc configured \
-         (set REACTOR_WEBRTC_PREBUILT_URL[+_SHA256] or REACTOR_WEBRTC_LIB_DIR). \
-         Building API/check only — final linking will fail until a prebuilt is provided."
+        "cargo:warning=reactor-webrtc-sys: no prebuilt available for this target. \
+         Set REACTOR_WEBRTC_LIB_DIR (local build) or REACTOR_WEBRTC_PREBUILT_URL \
+         (custom archive). Building API/check only — final linking will fail."
     );
 }
 
@@ -285,6 +306,63 @@ fn link_system_deps(lib_dir: &Path) {
         }
         _ => {}
     }
+}
+
+/// Map the current Cargo target triple to its prebuilt platform token, or
+/// `None` if no prebuilt is available for this target.
+///
+/// Token format matches `package.sh`'s `$OS-$ARCH[-$VARIANT]` naming.
+fn prebuilt_platform() -> Option<&'static str> {
+    let os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let abi = env::var("CARGO_CFG_TARGET_ABI").unwrap_or_default();
+
+    match os.as_str() {
+        "macos" => match arch.as_str() {
+            "aarch64" => Some("mac-arm64"),
+            "x86_64" => Some("mac-x64"),
+            _ => None,
+        },
+        "ios" => {
+            // aarch64-apple-ios           → device (abi = "")
+            // aarch64-apple-ios-sim       → simulator (abi = "sim")
+            // x86_64-apple-ios            → simulator (x64 is always sim)
+            let is_sim = abi == "sim" || arch == "x86_64";
+            Some(if is_sim { "ios-arm64-simulator" } else { "ios-arm64-device" })
+        }
+        "linux" => match arch.as_str() {
+            "x86_64" => Some("linux-x64"),
+            "aarch64" => Some("linux-arm64"),
+            _ => None,
+        },
+        "android" => match arch.as_str() {
+            "aarch64" => Some("android-arm64"),
+            _ => None,
+        },
+        "windows" => match arch.as_str() {
+            "x86_64" => Some("win-x64"),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Download and parse the `.sha256` sidecar file for a prebuilt asset.
+/// Returns the hex digest on success, or `None` if the download fails.
+fn fetch_sha256(sha_url: &str) -> Option<String> {
+    let tmp = PathBuf::from(env::var("OUT_DIR").unwrap()).join("prebuilt.sha256");
+    let mut cmd = std::process::Command::new("curl");
+    cmd.args(["-fsSL", "--retry", "3", "-o"]).arg(&tmp).arg(sha_url);
+    if let Ok(token) = env::var("REACTOR_WEBRTC_PREBUILT_TOKEN") {
+        cmd.arg("-H").arg(format!("Authorization: Bearer {token}"))
+           .arg("-H").arg("Accept: application/octet-stream");
+    }
+    let ok = cmd.status().map(|s| s.success()).unwrap_or(false);
+    if !ok {
+        return None;
+    }
+    let content = std::fs::read_to_string(&tmp).ok()?;
+    Some(content.split_whitespace().next()?.to_string())
 }
 
 /// Download our prebuilt archive (`.tar.zst`, the layout `package.sh` /

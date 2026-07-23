@@ -14,15 +14,16 @@ instead**, which wraps this crate in a safe, idiomatic API.
 
 ## Native library resolution
 
-A native `libwebrtc` must be present at link time. Set one of:
+The build script automatically downloads the correct `libwebrtc` prebuilt for
+your target (`cargo build` just works for all published targets). Override with:
 
 | Variable | Effect |
 |----------|--------|
-| `REACTOR_WEBRTC_LIB_DIR=/path` | Link a local build or extracted prebuilt |
-| `REACTOR_WEBRTC_PREBUILT_URL=https://…` | Download + verify the prebuilt for this target |
+| `REACTOR_WEBRTC_LIB_DIR=/path` | Use a local build or extracted prebuilt |
+| `REACTOR_WEBRTC_PREBUILT_URL=https://…` | Use a specific archive URL |
 
-Without either, `cargo check` and rlib builds succeed; only the final link of a
-binary or test requires the library.
+`cargo check` and rlib builds always succeed without a native library;
+only the final link of a binary or test requires it.
 
 ## ABI
 

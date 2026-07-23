@@ -86,14 +86,15 @@ Requires **Python ≥ 3.10** (stable ABI `abi3-py310`).
 `reactor-webrtc-sys`'s build script links the native `libwebrtc` in one of three
 modes (priority order):
 
-1. `REACTOR_WEBRTC_LIB_DIR=/path` — link a locally built/extracted lib
+1. Nothing set — **auto-detect**: `build.rs` derives the correct prebuilt URL
+   from the baked-in version tag and the Cargo target triple, downloads +
+   verifies + links automatically. `cargo add reactor-webrtc && cargo build`
+   just works for all published targets.
+2. `REACTOR_WEBRTC_LIB_DIR=/path` — link a locally built/extracted lib
    (packaged layout `<dir>/lib` + `<dir>/include`, or a bare dir + optional
    `REACTOR_WEBRTC_INCLUDE_DIR`).
-2. `REACTOR_WEBRTC_PREBUILT_URL=…` (+ `…_SHA256`) — download + verify our
-   prebuilt for the target, extract, and link. **Default production path.**
-3. Nothing set — **API/dev mode**: no link directives, so `cargo check` and
-   rlib builds of the API succeed without a native library. A final binary that
-   actually calls WebRTC must use mode 1 or 2.
+3. `REACTOR_WEBRTC_PREBUILT_URL=…` (+ `…_SHA256`) — download a specific
+   prebuilt archive (overrides the auto-detected URL).
 
 ```bash
 cargo check        # ✅ builds the API surface (no native lib needed)
