@@ -1,0 +1,76 @@
+# mise is the task runner + toolchain manager. Monorepo mode: tasks are
+# addressable as //:verb (root), //crates/reactor-webrtc-py:verb, and
+# //webrtc-build:verb. Run `mise run <task>` or `make <target>` (a thin shim
+# forwards to mise). `mise install` installs the pinned toolchain; `mise lock`
+# refreshes the committed mise.lock.
+min_version = "2026.6.12"
+monorepo_root = true
+
+[monorepo]
+# Each config_root must contain a mise.toml. The root carries the Cargo-workspace
+# tasks; the two modules carry the Python wheel and the libwebrtc build pipeline.
+config_roots = ["crates/reactor-webrtc-py", "webrtc-build"]
+
+[tools]
+# THE ONLY [tools] TABLE IN THE REPO. Every entry is exact-pinned + locked; no
+# `latest` (it floats) — the sole exception is rustup (see note).
+"cargo:cargo-nextest" = "0.9.140"
+"cargo:maturin" = "1.14.1"
+uv = "0.11.31"
+ruff = "0.15.22"
+shellcheck = "0.11.0"
+# EXCEPTION: rustup may be "latest". It is the installer, not the compiler — the
+# toolchain (channel/components/targets) is pinned by rust-toolchain.toml, and CI
+# never uses mise's rustup (MISE_DISABLE_TOOLS + actions-rust-lang/setup-rust-
+# toolchain). A floating rustup binary does not float the build; `mise lock` still
+# pins a concrete rustup version. The lock-drift check allows a "latest" spec.
+"aqua:rust-lang/rustup" = "latest"
+
+[settings]
+experimental = true
+lockfile = true
+lockfile_platforms = ["macos-arm64", "macos-x64", "linux-x64", "linux-arm64"]
+# Rust version comes from rust-toolchain.toml (idiomatic), not a [tools] pin —
+# mirrors reactor's /.go-version pattern.
+idiomatic_version_file_enable_tools = ["rust"]
+# Content-hash freshness for sources/outputs: mtime is unreliable across git
+# checkouts/clones (build & wheel tasks depend on this being accurate).
+task.source_freshness_hash_contents = true
+
+[env]
+# Homed at this root config so config_root resolves to the repo root for every
+# inheriting module; the Makefile shim reads it to compute a module's // address.
+REPO_ROOT = "{{ env.REPO_ROOT | default(value=config_root) }}"
+
+# --- root aggregators + Cargo-workspace one-liners -------------------------
+# One-liners live inline; anything with logic is a file-task under mise-tasks/.
+
+[tasks.fmt]
+description = "[Format] Format all Rust code"
+run = "cargo fmt --all"
+
+[tasks."fmt:check"]
+description = "[Format] Check Rust formatting"
+run = "cargo fmt --all -- --check"
+
+[tasks.check]
+description = "[Build] cargo check the workspace (no native lib needed)"
+run = "cargo check --workspace"
+
+[tasks.clippy]
+description = "[Quality] Clippy with warnings denied"
+run = "cargo clippy --workspace -- -D warnings"
+
+[tasks.test]
+description = "[Testing] cargo test the workspace (requires a prebuilt libwebrtc)"
+# Needs a native lib: set REACTOR_WEBRTC_LIB_DIR to a staged build, or
+# REACTOR_WEBRTC_PREBUILT_URL/_SHA256 to a published prebuilt (see README).
+run = "cargo test --workspace"
+
+[tasks.lint]
+description = "[Quality] Run all linters"
+depends = ["fmt:check", "clippy", "lint:shell", "lint:mise-lock", "lint:mise-tools-root"]
+
+[tasks.ci]
+description = "[Quality] fmt-check + check + clippy + lint (no native lib)"
+depends = ["fmt:check", "check", "clippy", "lint"]

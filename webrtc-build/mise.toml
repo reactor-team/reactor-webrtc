@@ -1,0 +1,3 @@
+# Module: webrtc-build (libwebrtc build pipeline). Tasks addressed
+# //webrtc-build:verb are THIN wrappers over the existing *.sh scripts — the
+# heavy depot_tools/gn/ninja logic stays in the scripts, unchanged. NO [tools].
