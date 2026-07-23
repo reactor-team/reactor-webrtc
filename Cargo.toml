@@ -13,9 +13,8 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.0.0"
 edition = "2021"
-license = "LicenseRef-Reactor-Proprietary"
+license = "Apache-2.0"
 repository = "https://github.com/reactor-team/reactor-webrtc"
 
 # The pinned upstream WebRTC milestone is tracked in ./WEBRTC_VERSION and baked

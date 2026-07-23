@@ -67,7 +67,11 @@ fn link(root: &Path) {
         (root.to_path_buf(), inc)
     };
 
-    compile_glue(&include_dir);
+    let is_debug_prebuilt = std::fs::read_to_string(lib_dir.join("build_profile"))
+        .ok()
+        .map(|s| s.trim() == "debug")
+        .unwrap_or(false); // no marker = old prebuilt without the file; treat as release
+    compile_glue(&include_dir, is_debug_prebuilt);
 
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
     // libwebrtc.a is one monolithic archive (gn complete_static_lib) with
@@ -83,7 +87,7 @@ fn link(root: &Path) {
 }
 
 /// Compile `glue/*.cpp` against the WebRTC public headers (+ vendored abseil).
-fn compile_glue(include_dir: &Path) {
+fn compile_glue(include_dir: &Path, is_debug_prebuilt: bool) {
     println!("cargo:rerun-if-changed=glue/reactor_webrtc.cpp");
 
     let mut build = cc::Build::new();
@@ -148,10 +152,15 @@ fn compile_glue(include_dir: &Path) {
             // Don't let cc auto-link the system C++ stdlib (stdc++); we link the
             // bundled libc++.a/libc++abi.a ourselves in link_system_deps.
             build.cpp_link_stdlib(None);
-            // Match the RELEASE lib's DCHECK config: without NDEBUG the glue
-            // enables RTC_DCHECK_IS_ON and references debug-only symbols the
-            // release archive omits (e.g. SequenceCheckerImpl::ExpectationToString).
-            build.define("NDEBUG", None);
+            // NDEBUG controls RTC_DCHECK_IS_ON, which gates extra SequenceChecker
+            // members on WebRTC base classes. The glue must match the prebuilt:
+            //   • release (NDEBUG set)   → small structs, no debug symbols
+            //   • debug  (NDEBUG absent) → larger structs, debug symbols present
+            // A mismatch makes the glue size objects incorrectly → heap overflow
+            // (glibc: "malloc(): invalid size (unsorted)").
+            if !is_debug_prebuilt {
+                build.define("NDEBUG", None);
+            }
             // WebRTC sets the hardening mode via -D (its __config_site leaves
             // _LIBCPP_HARDENING_MODE_DEFAULT unset); match it or <__config> errors.
             build.define("_LIBCPP_HARDENING_MODE", "_LIBCPP_HARDENING_MODE_NONE");

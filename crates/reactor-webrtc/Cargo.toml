@@ -1,14 +1,16 @@
 [package]
 name = "reactor-webrtc"
-version.workspace = true
+version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Safe, idiomatic Rust API over Reactor's owned libwebrtc build. The WebRTC engine shared by the client SDKs (reactor-sdk-core) and the server runtime."
+keywords = ["webrtc", "peer-connection", "real-time", "audio", "video"]
+categories = ["multimedia", "network-programming", "api-bindings"]
 build = "build.rs"
 
 [lib]
 doctest = false
 
 [dependencies]
-reactor-webrtc-sys = { path = "../reactor-webrtc-sys", version = "0.0.0" }
+reactor-webrtc-sys = { path = "../reactor-webrtc-sys", version = "0.1.0" }
