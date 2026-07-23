@@ -1,8 +1,7 @@
 # reactor-webrtc
 
 Safe, idiomatic Rust API over an owned build of Google's WebRTC engine
-(`libwebrtc`). The wheel embeds the native library statically — no separate
-runtime dependency.
+(`libwebrtc`). The low-level FFI lives in the `reactor-webrtc-sys` crate.
 
 ## Quick start
 
