@@ -28,6 +28,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 // ── Prebuilt location ─────────────────────────────────────────────────────────
+const PREBUILT_REPO: &str = "reactor-team/reactor-webrtc";
 const PREBUILT_BASE: &str = "https://github.com/reactor-team/reactor-webrtc/releases/download";
 
 // Fallback tag used when WEBRTC_VERSION is not accessible (e.g. builds from a
@@ -57,11 +58,29 @@ fn main() {
 
     // Mode 3: auto-detect the correct prebuilt from WEBRTC_VERSION (or the
     // baked-in fallback tag) and the current Cargo target triple.
+    //
+    // Private repos: github.com/releases/download/... rejects Bearer auth;
+    // must use the GitHub API asset URL instead. When a token is present we
+    // resolve the API URL first; without a token we fall back to the direct
+    // URL (works once the repo is public).
     if let Some(platform) = prebuilt_platform() {
         let tag = prebuilt_tag();
         let asset = format!("reactor-webrtc-{platform}-release.tar.zst");
-        let url = format!("{PREBUILT_BASE}/{tag}/{asset}");
-        let sha_url = format!("{url}.sha256");
+        let sha_asset = format!("{asset}.sha256");
+
+        let (url, sha_url) = if let Ok(token) = env::var("REACTOR_WEBRTC_PREBUILT_TOKEN") {
+            let u = resolve_github_asset_url(&tag, &asset, &token)
+                .unwrap_or_else(|| format!("{PREBUILT_BASE}/{tag}/{asset}"));
+            let su = resolve_github_asset_url(&tag, &sha_asset, &token)
+                .unwrap_or_else(|| format!("{PREBUILT_BASE}/{tag}/{sha_asset}"));
+            (u, su)
+        } else {
+            (
+                format!("{PREBUILT_BASE}/{tag}/{asset}"),
+                format!("{PREBUILT_BASE}/{tag}/{sha_asset}"),
+            )
+        };
+
         let sha256 = fetch_sha256(&sha_url);
         let dir = download_prebuilt(&url, sha256.as_deref());
         link(&dir);
@@ -387,6 +406,44 @@ fn prebuilt_platform() -> Option<&'static str> {
         },
         _ => None,
     }
+}
+
+/// Query the GitHub Releases API to obtain the API asset URL for `asset_name`
+/// in the given `tag`. Returns None on any failure (network, 404, parse).
+///
+/// The direct download URL (github.com/releases/download/…) drops Bearer auth
+/// on the cross-host redirect to S3, so private repos always return 404 that
+/// way. The API URL (api.github.com/repos/…/releases/assets/<id>) with
+/// `Accept: application/octet-stream` issues a pre-signed redirect that works.
+fn resolve_github_asset_url(tag: &str, asset_name: &str, token: &str) -> Option<String> {
+    let api_url = format!("https://api.github.com/repos/{PREBUILT_REPO}/releases/tags/{tag}");
+    let tmp = PathBuf::from(env::var("OUT_DIR").unwrap()).join("release_meta.json");
+    let ok = std::process::Command::new("curl")
+        .args(["-fsSL", "--retry", "3", "-o"])
+        .arg(&tmp)
+        .arg(&api_url)
+        .arg("-H")
+        .arg(format!("Authorization: Bearer {token}"))
+        .arg("-H")
+        .arg("Accept: application/vnd.github.v3+json")
+        .arg("-H")
+        .arg("User-Agent: reactor-webrtc-build-rs/1.0")
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        return None;
+    }
+    let json = std::fs::read_to_string(&tmp).ok()?;
+    // GitHub asset JSON has "url" before "name" in each asset object.
+    // Search backward from the "name" match to find the matching "url".
+    let name_pat = format!("\"name\":\"{}\"", asset_name);
+    let pos = json.find(&name_pat)?;
+    let before = &json[..pos];
+    let url_key = "\"url\":\"";
+    let url_start = before.rfind(url_key)? + url_key.len();
+    let url_end = before[url_start..].find('"')? + url_start;
+    Some(before[url_start..url_end].to_string())
 }
 
 /// Download and parse the `.sha256` sidecar file for a prebuilt asset.
