@@ -78,8 +78,7 @@ jobs:
           t="${{ github.event.inputs.targets }}"
           prof="${{ github.event.inputs.profile }}"
           if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
-            # TODO: restore t=full once custom_encoder passes on linux-x64
-            t=linux-x64
+            t=full
             prof=debug
           fi
           t="${t:-mac}"
