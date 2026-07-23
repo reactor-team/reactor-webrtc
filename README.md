@@ -59,7 +59,7 @@ mise install                 # rust (via rust-toolchain.toml) + uv/ruff/maturin/
 make check                   # fmt-check + cargo check + clippy (no native lib needed)
 
 export REACTOR_WEBRTC_LIB_DIR=/path/to/libwebrtc   # a prebuilt is required to link/test
-make test                                          # cargo test --workspace
+make test                                          # cargo nextest run + doctests
 mise run //crates/reactor-webrtc-py:build          # build the wheel
 mise run //crates/reactor-webrtc-py:test           # pytest the wheel
 ```

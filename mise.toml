@@ -14,8 +14,16 @@ config_roots = ["crates/reactor-webrtc-py", "webrtc-build"]
 [tools]
 # THE ONLY [tools] TABLE IN THE REPO. Every entry is exact-pinned + locked; no
 # `latest` (it floats) — the sole exception is rustup (see note).
-"cargo:cargo-nextest" = "0.9.140"
-"cargo:maturin" = "1.14.1"
+#
+# cargo-binstall (aqua-backed prebuilt) MUST be present so the cargo: backend
+# installs cargo-nextest as a prebuilt binary instead of compiling it from
+# source (minutes on a cold CI runner).
+"aqua:cargo-bins/cargo-binstall" = "1.21.0"
+"cargo:cargo-nextest" = "0.9.140"   # test runner; installed fast via cargo-binstall
+# maturin ships prebuilt release binaries; the bare name resolves to the github:
+# backend, which locks a per-platform URL+checksum (fully reproducible under
+# MISE_LOCKED) — faster and better-pinned than cargo:maturin + binstall.
+maturin = "1.14.1"
 uv = "0.11.31"
 ruff = "0.15.22"
 shellcheck = "0.11.0"
@@ -62,10 +70,17 @@ description = "[Quality] Clippy with warnings denied"
 run = "cargo clippy --workspace -- -D warnings"
 
 [tasks.test]
-description = "[Testing] cargo test the workspace (requires a prebuilt libwebrtc)"
+description = "[Testing] Workspace tests via nextest + doctests (requires a prebuilt libwebrtc)"
 # Needs a native lib: set REACTOR_WEBRTC_LIB_DIR to a staged build, or
 # REACTOR_WEBRTC_PREBUILT_URL/_SHA256 to a published prebuilt (see README).
-run = "cargo test --workspace"
+# nextest runs the unit/integration tests (fast, per-test process isolation) but
+# does NOT run doctests, so `cargo test --doc` covers reactor-webrtc's doc
+# examples. reactor-webrtc-py has no Rust tests (it is covered by pytest) — its
+# cdylib is excluded here so the Rust test run stays free of a Python build dep.
+run = [
+  "cargo nextest run --workspace --exclude reactor-webrtc-py --no-tests=pass",
+  "cargo test --workspace --exclude reactor-webrtc-py --doc",
+]
 
 [tasks.lint]
 description = "[Quality] Run all linters"
