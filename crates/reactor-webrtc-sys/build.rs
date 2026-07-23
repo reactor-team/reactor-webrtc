@@ -98,15 +98,17 @@ fn main() {
 /// lib + its system dependencies, and compile the C++ glue against the headers.
 fn link(root: &Path) {
     // Packaged layout (webrtc-build/package.sh): <root>/lib + <root>/include.
-    // Bare layout: <root> holds libwebrtc.a directly.
-    let (lib_dir, include_dir) = if root.join("lib/libwebrtc.a").is_file() {
-        (root.join("lib"), root.join("include"))
-    } else {
-        let inc = env::var("REACTOR_WEBRTC_INCLUDE_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| root.join("include"));
-        (root.to_path_buf(), inc)
-    };
+    // Windows uses webrtc.lib (MSVC, no lib prefix); Unix uses libwebrtc.a.
+    // Bare layout: <root> holds the lib directly.
+    let (lib_dir, include_dir) =
+        if root.join("lib/libwebrtc.a").is_file() || root.join("lib/webrtc.lib").is_file() {
+            (root.join("lib"), root.join("include"))
+        } else {
+            let inc = env::var("REACTOR_WEBRTC_INCLUDE_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| root.join("include"));
+            (root.to_path_buf(), inc)
+        };
 
     let is_debug_prebuilt = std::fs::read_to_string(lib_dir.join("build_profile"))
         .ok()
@@ -482,7 +484,7 @@ fn download_prebuilt(url: &str, sha256: Option<&str>) -> PathBuf {
     let archive = out_root.join("prebuilt.tar.zst");
 
     // Cached from a previous build of this OUT_DIR.
-    if out.join("lib/libwebrtc.a").is_file() {
+    if out.join("lib/libwebrtc.a").is_file() || out.join("lib/webrtc.lib").is_file() {
         return out;
     }
 
@@ -538,9 +540,10 @@ fn download_prebuilt(url: &str, sha256: Option<&str>) -> PathBuf {
         );
     }
 
-    if !out.join("lib/libwebrtc.a").is_file() {
+    if !out.join("lib/libwebrtc.a").is_file() && !out.join("lib/webrtc.lib").is_file() {
         panic!(
-            "reactor-webrtc-sys: extracted prebuilt has no lib/libwebrtc.a (bad archive layout?)"
+            "reactor-webrtc-sys: extracted prebuilt has no lib/libwebrtc.a or \
+             lib/webrtc.lib (bad archive layout?)"
         );
     }
     out

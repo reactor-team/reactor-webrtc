@@ -14,8 +14,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      # The bundled libc++ in the p2 prebuilt (Chromium llvm-23) uses builtins
-      # (__builtin_clzg, __builtin_popcountg, …) that require clang ≥ 20.
+      # The bundled libc++ headers in the p2 prebuilt (Chromium llvm-23) require
+      # clang ≥ 20 (builtins like __builtin_clzg added in that toolchain era).
       - name: Install clang-21
         run: |
           wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
