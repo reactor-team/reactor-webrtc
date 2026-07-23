@@ -121,7 +121,10 @@ mod tests {
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 let r = pc1.get_stats().expect("get_stats");
-                if r.candidate_pairs.iter().any(|p| p.state == IceCandidatePairState::Succeeded) {
+                if r.candidate_pairs
+                    .iter()
+                    .any(|p| p.state == IceCandidatePairState::Succeeded)
+                {
                     break r;
                 }
                 if Instant::now() >= deadline {
