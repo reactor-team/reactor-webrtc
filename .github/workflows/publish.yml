@@ -158,7 +158,7 @@ jobs:
           # extracts the prebuilt directly inside the container (avoiding any
           # host→container path-mapping issues with the 697MB extracted tree).
           before-script-linux: |
-            dnf install -y clang
+            dnf install -y clang zstd
             export CXX=clang++
             export REACTOR_WEBRTC_PREBUILT_URL="${{ steps.prebuilt.outputs.url }}"
             export REACTOR_WEBRTC_PREBUILT_TOKEN="${{ secrets.GITHUB_TOKEN }}"

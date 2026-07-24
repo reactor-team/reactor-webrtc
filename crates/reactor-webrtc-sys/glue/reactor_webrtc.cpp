@@ -624,6 +624,28 @@ class StatsCallback : public webrtc::RTCStatsCollectorCallback {
 
 }  // namespace
 
+// APM flags bitmask (OR together to enable processing stages):
+//   0x01  echo_canceller (AEC3)
+//   0x02  noise_suppression (kHigh when enabled)
+//   0x04  gain_controller1 (AGC)
+//   0x08  high_pass_filter
+//
+// Declared outside extern "C": returns a C++ type (scoped_refptr), which MSVC
+// rejects inside extern "C" blocks even for static helper functions.
+static webrtc::scoped_refptr<webrtc::AudioProcessing> build_apm(int apm_flags) {
+  if (apm_flags == 0) return nullptr;  // no processing → true passthrough
+  webrtc::AudioProcessing::Config cfg;
+  cfg.echo_canceller.enabled    = (apm_flags & 0x01) != 0;
+  cfg.noise_suppression.enabled = (apm_flags & 0x02) != 0;
+  if (cfg.noise_suppression.enabled)
+    cfg.noise_suppression.level =
+        webrtc::AudioProcessing::Config::NoiseSuppression::kHigh;
+  cfg.gain_controller1.enabled = (apm_flags & 0x04) != 0;
+  cfg.high_pass_filter.enabled = (apm_flags & 0x08) != 0;
+  return webrtc::BuiltinAudioProcessingBuilder(cfg)
+      .Build(webrtc::CreateEnvironment());
+}
+
 extern "C" {
 
 // ABI version of this native build. The safe crate asserts compatibility.
@@ -658,25 +680,6 @@ int reactor_webrtc_selftest(char* out, int cap) {
     out[cap - 1] = '\0';
   }
   return count;
-}
-
-// APM flags bitmask (OR together to enable processing stages):
-//   0x01  echo_canceller (AEC3)
-//   0x02  noise_suppression (kHigh when enabled)
-//   0x04  gain_controller1 (AGC)
-//   0x08  high_pass_filter
-static webrtc::scoped_refptr<webrtc::AudioProcessing> build_apm(int apm_flags) {
-  if (apm_flags == 0) return nullptr;  // no processing → true passthrough
-  webrtc::AudioProcessing::Config cfg;
-  cfg.echo_canceller.enabled    = (apm_flags & 0x01) != 0;
-  cfg.noise_suppression.enabled = (apm_flags & 0x02) != 0;
-  if (cfg.noise_suppression.enabled)
-    cfg.noise_suppression.level =
-        webrtc::AudioProcessing::Config::NoiseSuppression::kHigh;
-  cfg.gain_controller1.enabled = (apm_flags & 0x04) != 0;
-  cfg.high_pass_filter.enabled = (apm_flags & 0x08) != 0;
-  return webrtc::BuiltinAudioProcessingBuilder(cfg)
-      .Build(webrtc::CreateEnvironment());
 }
 
 // Create a PeerConnectionFactory: start the network/worker/signaling threads
