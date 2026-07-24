@@ -3,11 +3,11 @@ amends "package://github.com/jdx/hk/releases/download/v1.52.0/hk@1.52.0#/Config.
 // Git hooks for reactor-webrtc, managed by hk (`mise run install-hooks`).
 //
 // Every step shells out to a `mise run <task>`, so the hooks and CI run the
-// IDENTICAL checks — hk only decides WHEN they run. hk reads this file with its
+// IDENTICAL checks - hk only decides WHEN they run. hk reads this file with its
 // built-in pkl evaluator (no separate pkl tool); `hk validate` (run in CI)
 // proves it parses.
 hooks {
-  // Fast, offline checks — nothing here compiles or hits the network.
+  // Fast, offline checks - nothing here compiles or hits the network.
   ["pre-commit"] {
     steps {
       ["fmt"] {
@@ -28,7 +28,7 @@ hooks {
   }
   // Heavier checks before pushing: clippy compiles (and, via build.rs
   // auto-detect, may fetch the prebuilt), and the lockfile drift check runs
-  // against HEAD (matches the CI job's MISE_LOCK_CHECK_FROM).
+  // (skipped when mise.toml + mise.lock already match the merge-base with main).
   ["pre-push"] {
     steps {
       ["clippy"] {
@@ -37,16 +37,13 @@ hooks {
         exclusive = true
       }
       ["mise-lock"] {
-        env {
-          ["MISE_LOCK_CHECK_FROM"] = "head"
-        }
         check = "mise run lint:mise-lock"
         exclusive = true
       }
     }
   }
-  // Auto-trust mise on every checkout — including `git worktree add`, which
-  // fires post-checkout inside the new worktree — so the pinned tools resolve
+  // Auto-trust mise on every checkout - including `git worktree add`, which
+  // fires post-checkout inside the new worktree - so the pinned tools resolve
   // without a manual `mise trust`. Mirrors reactor's post-checkout leaning.
   ["post-checkout"] {
     steps {

@@ -19,11 +19,6 @@ checksum = "sha256:e44737132b2d0543e72a6f128307ebbf204b171f57b2ea9db55b8bbe54b6b
 url = "https://github.com/cargo-bins/cargo-binstall/releases/download/v1.21.0/cargo-binstall-aarch64-apple-darwin.zip"
 provenance = "github-attestations"
 
-[tools."aqua:cargo-bins/cargo-binstall"."platforms.macos-x64"]
-checksum = "sha256:ad7cd72d8074ef613ab392cae291c7c8bcc25a4f6690e726ed665ded8640871e"
-url = "https://github.com/cargo-bins/cargo-binstall/releases/download/v1.21.0/cargo-binstall-x86_64-apple-darwin.zip"
-provenance = "github-attestations"
-
 [[tools."aqua:rust-lang/rustup"]]
 version = "1.28.2"
 backend = "aqua:rust-lang/rustup"
@@ -39,10 +34,6 @@ url = "https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-g
 [tools."aqua:rust-lang/rustup"."platforms.macos-arm64"]
 checksum = "sha256:20ef5516c31b1ac2290084199ba77dbbcaa1406c45c1d978ca68558ef5964ef5"
 url = "https://static.rust-lang.org/rustup/archive/1.28.2/aarch64-apple-darwin/rustup-init"
-
-[tools."aqua:rust-lang/rustup"."platforms.macos-x64"]
-checksum = "sha256:9c331076f62b4d0edeae63d9d1c9442d5fe39b37b05025ec8d41c5ed35486496"
-url = "https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-apple-darwin/rustup-init"
 
 [[tools."cargo:cargo-nextest"]]
 version = "0.9.140"
@@ -86,12 +77,6 @@ url = "https://github.com/PyO3/maturin/releases/download/v1.14.1/maturin-aarch64
 url_api = "https://api.github.com/repos/PyO3/maturin/releases/assets/451881391"
 provenance = "github-attestations"
 
-[tools.maturin."platforms.macos-x64"]
-checksum = "sha256:c7ced606524a7aaa1c9b38483d9941d76e838aba28cec70d8fcb47e44ee11d63"
-url = "https://github.com/PyO3/maturin/releases/download/v1.14.1/maturin-x86_64-apple-darwin.tar.gz"
-url_api = "https://api.github.com/repos/PyO3/maturin/releases/assets/451881379"
-provenance = "github-attestations"
-
 [[tools.ruff]]
 version = "0.15.22"
 backend = "aqua:astral-sh/ruff"
@@ -109,11 +94,6 @@ provenance = "github-attestations"
 [tools.ruff."platforms.macos-arm64"]
 checksum = "sha256:a2881af26fd1d19f4932c4ddf1e70b4e0efcf48513c5dae082564e03f0b467a3"
 url = "https://github.com/astral-sh/ruff/releases/download/0.15.22/ruff-aarch64-apple-darwin.tar.gz"
-provenance = "github-attestations"
-
-[tools.ruff."platforms.macos-x64"]
-checksum = "sha256:687a9ceb88ab85dab061026d5017218225a481121b1a40862cc8f92b56f18090"
-url = "https://github.com/astral-sh/ruff/releases/download/0.15.22/ruff-x86_64-apple-darwin.tar.gz"
 provenance = "github-attestations"
 
 [[tools.rust]]
@@ -140,10 +120,6 @@ url = "https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellche
 checksum = "sha256:56affdd8de5527894dca6dc3d7e0a99a873b0f004d7aabc30ae407d3f48b0a79"
 url = "https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.darwin.aarch64.tar.xz"
 
-[tools.shellcheck."platforms.macos-x64"]
-checksum = "sha256:3c89db4edcab7cf1c27bff178882e0f6f27f7afdf54e859fa041fca10febe4c6"
-url = "https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.darwin.x86_64.tar.xz"
-
 [[tools.uv]]
 version = "0.11.31"
 backend = "aqua:astral-sh/uv"
@@ -161,9 +137,4 @@ provenance = "github-attestations"
 [tools.uv."platforms.macos-arm64"]
 checksum = "sha256:b2b93e82a6786f9c7cb89fd4ca0e859a147b292ae8f6f95784f9742f0efec39e"
 url = "https://github.com/astral-sh/uv/releases/download/0.11.31/uv-aarch64-apple-darwin.tar.gz"
-provenance = "github-attestations"
-
-[tools.uv."platforms.macos-x64"]
-checksum = "sha256:33ee6bd62b57fcd77a499deb54e4432dc1e1a2f3d34930ba987ad8b43f9c7bc7"
-url = "https://github.com/astral-sh/uv/releases/download/0.11.31/uv-x86_64-apple-darwin.tar.gz"
 provenance = "github-attestations"

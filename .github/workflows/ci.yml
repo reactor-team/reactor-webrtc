@@ -15,7 +15,7 @@ env:
   MISE_LOCKED: "1"            # install/run only mise.lock versions; never float
   # CI installs the Rust toolchain via actions-rust-lang/setup-rust-toolchain
   # (reads rust-toolchain.toml). Disable mise's rust/rustup so the action owns it.
-  # That action also exports RUSTFLAGS="-D warnings" — kept on purpose: warnings
+  # That action also exports RUSTFLAGS="-D warnings" - kept on purpose: warnings
   # are errors in CI.
   MISE_DISABLE_TOOLS: "rust,rustup,aqua:rust-lang/rustup"
 
@@ -49,16 +49,14 @@ jobs:
       - run: mise run clippy
       - run: mise run lint:shell
       - run: mise run lint:mise-tools-root
-      - name: mise.lock drift (vs committed)
+      - name: mise.lock drift (vs merge-base)
         run: mise run lint:mise-lock
-        env:
-          MISE_LOCK_CHECK_FROM: head
 
   test:
     name: cargo test (linux-x64, libwebrtc prebuilt)
     runs-on: ubuntu-latest
     env:
-      # Release: webrtc-7907-a5ddff60-p1 — reactor-webrtc-linux-x64-release.tar.zst
+      # Release: webrtc-7907-a5ddff60-p1 - reactor-webrtc-linux-x64-release.tar.zst
       REACTOR_WEBRTC_PREBUILT_URL: https://api.github.com/repos/reactor-team/reactor-webrtc/releases/assets/475845307
       REACTOR_WEBRTC_PREBUILT_SHA256: 4b8b99f45859ab78c3b236c90e8907830a418cb2f2729a56eccaaccda6d3c832
       REACTOR_WEBRTC_PREBUILT_TOKEN: ${{ secrets.GITHUB_TOKEN }}

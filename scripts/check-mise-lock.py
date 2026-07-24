@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
-"""Verify mise.lock is complete against mise.toml.
+"""Verify mise.lock is complete against the declared tools.
 
-For every tool in mise.toml [tools], assert mise.lock has a version-matching
-[[tools.<name>]] entry covering every platform in [settings].lockfile_platforms
-(falling back to the lockfile's own platform union when the setting is absent).
+Declared tools + versions come from `mise ls --local -J`, and the expected
+platform set from `mise settings get lockfile_platforms` -- both mise's own view
+of the config -- so the ONLY thing this script parses as TOML is mise.lock.
 
-A `latest` spec (only rustup uses one) is matched by presence, not version — the
-lock still pins a concrete version, and platform coverage is still enforced.
+For every declared tool it asserts mise.lock has a version-matching
+[[tools.<name>]] entry covering every lockfile platform. A `latest` spec (only
+rustup uses one) is matched by presence, not version -- the lock still pins a
+concrete version, and platform coverage is still enforced. Backends with no
+per-platform binary artifacts (go:, npm:, cargo:, pipx:, core:) get a lock entry
+with no platforms.* sub-tables; their coverage is skipped.
 
-Tools whose backend has no per-platform binary artifacts (go:, npm:, cargo:,
-pipx:) get a lock entry with no platforms.* sub-tables; skip their coverage.
-
-MISE_LOCK_CHECK_FROM selects the source: "worktree" (default, files on disk),
-"index" (staged, pre-commit), "head" (committed, pre-push/CI). The check is
-skipped when the selected source matches the merge-base with BASE_REF
-(default origin/main), so unrelated commits aren't blocked by local edits.
+The check is skipped when mise.toml AND mise.lock are byte-identical to the
+merge-base with BASE_REF (default origin/main), so PRs that don't touch the
+toolchain aren't blocked by a pre-existing lock state on main.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -30,20 +31,15 @@ except ModuleNotFoundError:  # pragma: no cover - py<3.11
     import tomli as tomllib  # type: ignore
 
 BASE_REF = os.environ.get("BASE_REF", "origin/main")
-SOURCE = os.environ.get("MISE_LOCK_CHECK_FROM", "worktree")
-_VALID_SOURCES = ("worktree", "index", "head")
 # Backends with no per-platform binary artifacts (mise emits no platforms.*).
-_NO_PLATFORM_BACKENDS = ("go:", "npm:", "cargo:", "pipx:")
+_NO_PLATFORM_BACKENDS = ("go:", "npm:", "cargo:", "pipx:", "core:")
 
-# Tools that legitimately ship no binary for a given platform, so `mise lock`
-# cannot (and never will) produce an entry for it. Exempt the specific pair
-# rather than dropping the platform for every tool. Keep this list tiny and
-# justified; a stale exemption silently hides a real coverage gap.
-_PLATFORM_EXEMPTIONS: dict[str, set[str]] = {
-    # hk publishes only aarch64-apple-darwin for macOS (no x86_64); an Intel Mac
-    # falls back to `cargo install hk`. https://github.com/jdx/hk/releases
-    "hk": {"macos-x64"},
-}
+# Tools that legitimately ship no binary for a lockfile platform, so `mise lock`
+# cannot produce an entry for it. Exempt the specific tool -> platforms pair
+# rather than dropping the platform for every tool. Currently empty: the 3
+# lockfile platforms (macos-arm64, linux-x64, linux-arm64) are all covered by
+# every tool. Keep this tiny and justified -- a stale exemption hides a real gap.
+_PLATFORM_EXEMPTIONS: dict[str, set[str]] = {}
 
 
 def die(msg: str) -> None:
@@ -51,26 +47,52 @@ def die(msg: str) -> None:
     sys.exit(1)
 
 
+def run_json(cmd: list[str]) -> object:
+    r = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if r.returncode != 0:
+        die(f"`{' '.join(cmd)}` failed: {r.stderr.strip()}")
+    try:
+        return json.loads(r.stdout)
+    except json.JSONDecodeError as e:
+        die(f"`{' '.join(cmd)}` did not return JSON: {e}")
+
+
 def git_show(spec: str) -> bytes | None:
     r = subprocess.run(["git", "show", spec], capture_output=True, check=False)
     return r.stdout if r.returncode == 0 else None
 
 
-def read_source(path: str) -> bytes:
-    if SOURCE == "worktree":
-        return Path(path).read_bytes()
-    spec = f":{path}" if SOURCE == "index" else f"HEAD:{path}"
-    content = git_show(spec)
-    if content is None:
-        die(f"git show {spec}: file not found or not a git repo")
-    return content
+def declared_tools() -> dict[str, str]:
+    """Tool -> requested spec, from mise's view of the root mise.toml [tools].
+
+    Filtered to mise.toml sources, so idiomatic version files (rust-toolchain.toml
+    -> rust) and the global config are excluded, matching the [tools] table.
+    """
+    data = run_json(["mise", "ls", "--local", "-J"])
+    out: dict[str, str] = {}
+    for name, entries in data.items():  # type: ignore[union-attr]
+        for e in entries:
+            src = e.get("source") or {}
+            if src.get("type") == "mise.toml":
+                out[name] = str(e.get("requested_version") or e.get("version") or "")
+                break
+    return out
 
 
-def parse_toml(data: bytes, label: str) -> dict:
-    try:
-        return tomllib.loads(data.decode("utf-8"))
-    except tomllib.TOMLDecodeError as e:
-        die(f"failed to parse {label}: {e}")
+def lockfile_platforms() -> set[str]:
+    """Expected platform set from `mise settings`; empty -> caller uses the lock union."""
+    r = subprocess.run(
+        ["mise", "settings", "get", "lockfile_platforms"],
+        capture_output=True, text=True, check=False,
+    )
+    if r.returncode == 0 and r.stdout.strip():
+        try:
+            val = json.loads(r.stdout)
+            if isinstance(val, list):
+                return {str(p) for p in val}
+        except json.JSONDecodeError:
+            pass
+    return set()
 
 
 def platforms_in(entry: dict) -> set[str]:
@@ -82,18 +104,13 @@ def version_matches(spec: str, locked: str) -> bool:
 
 
 def main() -> int:
-    if SOURCE not in _VALID_SOURCES:
-        die(f"MISE_LOCK_CHECK_FROM must be one of {_VALID_SOURCES}, got '{SOURCE}'")
-
     os.chdir(os.environ.get("MISE_LOCK_CHECK_ROOT", "."))
+    for f in ("mise.toml", "mise.lock"):
+        if not Path(f).is_file():
+            die(f"{f} not found in {Path.cwd()}")
 
-    if SOURCE == "worktree":
-        for f in ("mise.toml", "mise.lock"):
-            if not Path(f).is_file():
-                die(f"{f} not found in {Path.cwd()}")
-
-    toml_bytes = read_source("mise.toml")
-    lock_bytes = read_source("mise.lock")
+    toml_bytes = Path("mise.toml").read_bytes()
+    lock_bytes = Path("mise.lock").read_bytes()
 
     base = subprocess.run(
         ["git", "merge-base", "HEAD", BASE_REF],
@@ -106,42 +123,33 @@ def main() -> int:
             print(f"✓ mise.lock check skipped: no changes vs {BASE_REF}")
             return 0
 
-    toml_data = parse_toml(toml_bytes, "mise.toml")
-    lock_data = parse_toml(lock_bytes, "mise.lock")
-
-    declared = toml_data.get("tools", {})
+    declared = declared_tools()
     if not declared:
-        die("mise.toml has no [tools] section")
-    locked = lock_data.get("tools", {})
+        die("`mise ls --local -J` reported no mise.toml tools")
+    locked = tomllib.loads(lock_bytes.decode("utf-8")).get("tools", {})
 
-    configured = toml_data.get("settings", {}).get("lockfile_platforms")
-    if configured is not None:
-        expected = set(configured)
-    else:
-        expected = set()
+    expected = lockfile_platforms()
+    if not expected:  # fall back to the lockfile's own platform union
         for entries in locked.values():
             for entry in entries:
                 expected |= platforms_in(entry)
 
     errors: list[str] = []
     for tool, spec in declared.items():
-        version = spec.get("version", "") if isinstance(spec, dict) else spec
         entries = locked.get(tool, [])
-        if str(version) == "latest":
-            # rustup: version floats but is still locked concretely; match by presence.
+        if spec == "latest":
             match = entries[0] if entries else None
         else:
             match = next(
                 (e for e in entries
-                 if version_matches(str(version), str(e.get("version", "")))),
+                 if version_matches(spec, str(e.get("version", "")))),
                 None,
             )
         if match is None:
             found = ", ".join(e.get("version", "?") for e in entries) or "none"
-            errors.append(f"{tool}@{version}: no matching entry in mise.lock (found: {found})")
+            errors.append(f"{tool}@{spec}: no matching entry in mise.lock (found: {found})")
             continue
-        backend = match.get("backend", "")
-        if backend.startswith(_NO_PLATFORM_BACKENDS):
+        if str(match.get("backend", "")).startswith(_NO_PLATFORM_BACKENDS):
             continue
         missing = expected - platforms_in(match) - _PLATFORM_EXEMPTIONS.get(tool, set())
         if missing:
