@@ -333,7 +333,25 @@ fn link_system_deps(lib_dir: &Path) {
             }
         }
         "windows" => {
-            for l in ["winmm", "secur32", "ole32", "ws2_32", "dmoguids", "msdmo"] {
+            for l in [
+                // Core/networking
+                "winmm",
+                "secur32",
+                "ole32",
+                "ws2_32",
+                "iphlpapi",
+                // Screen capture (WGC path: DXGI + D3D11 + DWM + GDI + DPI)
+                "dxgi",
+                "d3d11",
+                "dwmapi",
+                "gdi32",
+                "shcore",
+                // Audio DSP (DirectShow + Windows Media DSP GUIDs)
+                "dmoguids",
+                "msdmo",
+                "strmiids",
+                "wmcodecdspuuid",
+            ] {
                 println!("cargo:rustc-link-lib=dylib={l}");
             }
         }

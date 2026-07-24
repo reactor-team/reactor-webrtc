@@ -158,8 +158,18 @@ jobs:
           # extracts the prebuilt directly inside the container (avoiding any
           # host→container path-mapping issues with the 697MB extracted tree).
           before-script-linux: |
-            dnf install -y clang zstd
+            dnf install -y clang lld zstd
             export CXX=clang++
+            # Use clang+lld as the Rust linker. GNU ld (from gcc-toolset) rejects
+            # libwebrtc.a objects that may be LLVM ThinLTO bitcode; lld handles both
+            # native ELF and LTO bitcode objects correctly.
+            ARCH=$(uname -m)
+            if [ "$ARCH" = "aarch64" ]; then
+              export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=clang
+            else
+              export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=clang
+            fi
+            export RUSTFLAGS="-C link-arg=-fuse-ld=lld"
             export REACTOR_WEBRTC_PREBUILT_URL="${{ steps.prebuilt.outputs.url }}"
             export REACTOR_WEBRTC_PREBUILT_TOKEN="${{ secrets.GITHUB_TOKEN }}"
         env:
