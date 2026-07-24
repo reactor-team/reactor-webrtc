@@ -97,7 +97,7 @@ jobs:
           - platform: linux-x64
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            manylinux: "2_34"  # AlmaLinux 9; clang-20+ via LLVM snapshot COPR
+            manylinux: "2_34"  # AlmaLinux 9; clang-21 available in AppStream
 
           - platform: linux-arm64
             os: ubuntu-24.04-arm
@@ -143,39 +143,6 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # For Linux manylinux builds the maturin Docker container does not inherit
-      # step-level env vars. Download the prebuilt on the host runner and mount
-      # it into the container via REACTOR_WEBRTC_LIB_DIR (set in before-script-linux).
-      # Verify sha256 before extracting to match the integrity check build.rs
-      # enforces on its own download paths (modes 2/3).
-      - name: Download and extract libwebrtc prebuilt (Linux)
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          mkdir -p prebuilt
-          curl -fSL --retry 3 \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/octet-stream" \
-            -o prebuilt.tar.zst \
-            "${{ steps.prebuilt.outputs.url }}"
-          if [ -n "${{ steps.prebuilt.outputs.sha_url }}" ]; then
-            curl -fSL --retry 3 \
-              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-              -H "Accept: application/octet-stream" \
-              -o prebuilt.tar.zst.sha256 \
-              "${{ steps.prebuilt.outputs.sha_url }}"
-            EXPECTED=$(awk '{print $1}' prebuilt.tar.zst.sha256)
-            ACTUAL=$(sha256sum prebuilt.tar.zst | awk '{print $1}')
-            if [ "$EXPECTED" != "$ACTUAL" ]; then
-              echo "::error::sha256 mismatch for ${{ matrix.platform }} prebuilt"
-              echo "  expected: $EXPECTED"
-              echo "  got:      $ACTUAL"
-              exit 1
-            fi
-            echo "sha256 OK: $EXPECTED"
-          fi
-          tar -xf prebuilt.tar.zst -C prebuilt
-
       - uses: PyO3/maturin-action@v1
         with:
           command: build
@@ -185,18 +152,19 @@ jobs:
             --out dist
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
-          # Install clang from AlmaLinux 9 AppStream (llvm-toolset module, which
-          # ships clang-18+ in AlmaLinux 9.4+). clang-18 introduced __builtin_clzg
-          # and the other builtins needed by the bundled libc++ headers in the
-          # p2 prebuilt. Point build.rs at the prebuilt extracted on the host
-          # (workspace is mounted at /project inside the manylinux container).
+          # For Linux manylinux builds, maturin runs inside a Docker container
+          # and step-level env vars are not forwarded. Set PREBUILT_URL and
+          # PREBUILT_TOKEN via before-script-linux so build.rs downloads and
+          # extracts the prebuilt directly inside the container (avoiding any
+          # host→container path-mapping issues with the 697MB extracted tree).
           before-script-linux: |
-            dnf module install -y llvm-toolset || dnf install -y clang
+            dnf install -y clang
             export CXX=clang++
-            export REACTOR_WEBRTC_LIB_DIR=/project/prebuilt
+            export REACTOR_WEBRTC_PREBUILT_URL="${{ steps.prebuilt.outputs.url }}"
+            export REACTOR_WEBRTC_PREBUILT_TOKEN="${{ secrets.GITHUB_TOKEN }}"
         env:
-          # mac/windows: maturin runs natively and receives these env vars fine.
-          # linux: LIB_DIR is used instead (set above in before-script-linux).
+          # mac/windows: maturin runs natively and inherits step-level env vars.
+          # linux: PREBUILT_URL/TOKEN are set in before-script-linux above instead.
           REACTOR_WEBRTC_PREBUILT_URL: ${{ steps.prebuilt.outputs.url }}
           REACTOR_WEBRTC_PREBUILT_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

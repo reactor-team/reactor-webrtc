@@ -179,6 +179,9 @@ fn compile_glue(include_dir: &Path, is_debug_prebuilt: bool) {
         }
         "windows" => {
             build.define("WEBRTC_WIN", None);
+            // Windows SDK headers define min/max as macros, which conflicts with
+            // std::numeric_limits<T>::max() in WebRTC's video_timing.h.
+            build.define("NOMINMAX", None);
         }
         _ => {}
     }
