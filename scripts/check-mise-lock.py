@@ -35,6 +35,16 @@ _VALID_SOURCES = ("worktree", "index", "head")
 # Backends with no per-platform binary artifacts (mise emits no platforms.*).
 _NO_PLATFORM_BACKENDS = ("go:", "npm:", "cargo:", "pipx:")
 
+# Tools that legitimately ship no binary for a given platform, so `mise lock`
+# cannot (and never will) produce an entry for it. Exempt the specific pair
+# rather than dropping the platform for every tool. Keep this list tiny and
+# justified; a stale exemption silently hides a real coverage gap.
+_PLATFORM_EXEMPTIONS: dict[str, set[str]] = {
+    # hk publishes only aarch64-apple-darwin for macOS (no x86_64); an Intel Mac
+    # falls back to `cargo install hk`. https://github.com/jdx/hk/releases
+    "hk": {"macos-x64"},
+}
+
 
 def die(msg: str) -> None:
     print(f"ERROR: {msg}", file=sys.stderr)
@@ -133,7 +143,7 @@ def main() -> int:
         backend = match.get("backend", "")
         if backend.startswith(_NO_PLATFORM_BACKENDS):
             continue
-        missing = expected - platforms_in(match)
+        missing = expected - platforms_in(match) - _PLATFORM_EXEMPTIONS.get(tool, set())
         if missing:
             errors.append(
                 f"{tool}@{match.get('version')}: missing platforms: {','.join(sorted(missing))}"

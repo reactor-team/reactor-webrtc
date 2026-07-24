@@ -48,6 +48,22 @@ url = "https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-apple-darwin/ru
 version = "0.9.140"
 backend = "cargo:cargo-nextest"
 
+[[tools.hk]]
+version = "1.52.0"
+backend = "aqua:jdx/hk"
+
+[tools.hk."platforms.linux-arm64"]
+checksum = "sha256:84504df54a3a945493eeb739d2fe6bf0eef392d74795eeb02eabadfee78a53f8"
+url = "https://github.com/jdx/hk/releases/download/v1.52.0/hk-aarch64-unknown-linux-gnu.tar.gz"
+
+[tools.hk."platforms.linux-x64"]
+checksum = "sha256:d381ec061fda51d5765e7831757107e4c565f195b206feae6fdd298162ab8baa"
+url = "https://github.com/jdx/hk/releases/download/v1.52.0/hk-x86_64-unknown-linux-gnu.tar.gz"
+
+[tools.hk."platforms.macos-arm64"]
+checksum = "sha256:a711ed6d6359ca3084c73e1025af4e9a158727297a8dbe308d6eab44bcad372c"
+url = "https://github.com/jdx/hk/releases/download/v1.52.0/hk-aarch64-apple-darwin.tar.gz"
+
 [[tools.maturin]]
 version = "1.14.1"
 backend = "github:PyO3/maturin"

@@ -44,6 +44,7 @@ jobs:
       - uses: jdx/mise-action@v2
         with:
           version: ${{ env.MISE_VERSION }}
+      - run: hk validate   # the hk.pkl that drives local git hooks parses
       - run: mise run fmt:check
       - run: mise run clippy
       - run: mise run lint:shell

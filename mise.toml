@@ -27,6 +27,9 @@ maturin = "1.14.1"
 uv = "0.11.31"
 ruff = "0.15.22"
 shellcheck = "0.11.0"
+# hk drives the git hooks (pre-commit/pre-push/post-checkout). It reads hk.pkl
+# with its built-in pkl evaluator, so no separate pkl tool is needed.
+hk = "1.52.0"
 # EXCEPTION: rustup may be "latest". It is the installer, not the compiler — the
 # toolchain (channel/components/targets) is pinned by rust-toolchain.toml, and CI
 # never uses mise's rustup (MISE_DISABLE_TOOLS + actions-rust-lang/setup-rust-
@@ -89,3 +92,15 @@ depends = ["fmt:check", "clippy", "lint:shell", "lint:mise-lock", "lint:mise-too
 [tasks.ci]
 description = "[Quality] fmt-check + check + clippy + lint (no native lib)"
 depends = ["fmt:check", "check", "clippy", "lint"]
+
+[tasks.install-hooks]
+description = "[Setup] Install git hooks via hk (works from the main repo and worktrees)"
+# hk writes `hook.hk-<event>.command` entries into the shared git config, so one
+# install covers the main checkout AND every worktree — no core.hooksPath pin
+# needed (unlike lefthook). --mise wraps the hooks in `mise x` so they run with
+# the pinned toolchain even for contributors who have not activated mise.
+run = "hk install --mise"
+
+[tasks.uninstall-hooks]
+description = "[Setup] Remove the hk-managed git hooks (main repo and worktrees)"
+run = "hk uninstall"
