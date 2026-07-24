@@ -485,14 +485,16 @@ impl From<rw::StatsReport> for StatsReport {
 /// Metadata attached to a video frame via the packet trailer.
 ///
 /// All fields default to zero / empty when not set by the sender.
-#[pyclass(get_all, set_all)]
+#[pyclass]
 #[derive(Clone, Default)]
 pub struct FrameMetadata {
     /// Application-level frame counter (0 = unset).
+    #[pyo3(get, set)]
     pub frame_id: u64,
     /// Wall-clock timestamp in microseconds (0 = unset).
+    #[pyo3(get, set)]
     pub timestamp: u64,
-    /// Arbitrary application payload.
+    /// Arbitrary application payload (bytes).
     pub user_data: Vec<u8>,
 }
 
@@ -507,6 +509,18 @@ impl FrameMetadata {
             user_data,
         }
     }
+    /// Returns `user_data` as Python `bytes`.
+    #[getter]
+    fn user_data<'py>(&self, py: Python<'py>) -> pyo3::Bound<'py, PyBytes> {
+        PyBytes::new_bound(py, &self.user_data)
+    }
+
+    /// Sets `user_data` from Python `bytes` or any buffer.
+    #[setter]
+    fn set_user_data(&mut self, data: Vec<u8>) {
+        self.user_data = data;
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "FrameMetadata(frame_id={}, timestamp={}, user_data={} bytes)",
@@ -618,21 +632,37 @@ impl Track {
         }
     }
 
-    /// Register `callback(bgra: bytes, width: int, height: int, metadata: FrameMetadata | None)`
-    /// for decoded video frames from a remote track. Fires on a WebRTC thread.
+    /// Register a callback for decoded video frames from a remote track.
+    ///
+    /// Signature: `callback(bgra: bytes, width: int, height: int, metadata: FrameMetadata | None)`
+    ///
+    /// For backward compatibility with 3-argument callbacks
+    /// `callback(bgra, width, height)`, the 4-argument call is retried as a
+    /// 3-argument call on `TypeError` when `metadata` is `None`.
     fn on_video_frame(&mut self, callback: PyObject) {
         self.inner.on_video_frame(move |frame| {
             Python::with_gil(|py| {
                 let bytes = PyBytes::new_bound(py, frame.bgra);
-                let meta = frame
-                    .metadata
-                    .map(|m| {
-                        Py::new(py, FrameMetadata::from(m))
-                            .map(|p| p.into_any())
-                            .unwrap_or_else(|_| py.None())
-                    })
-                    .unwrap_or_else(|| py.None());
-                let _ = callback.call1(py, (bytes, frame.width, frame.height, meta));
+                let meta = frame.metadata.map(|m| {
+                    Py::new(py, FrameMetadata::from(m))
+                        .map(|p| p.into_any())
+                        .unwrap_or_else(|_| py.None())
+                });
+                match meta {
+                    Some(m) => {
+                        let _ = callback.call1(py, (bytes, frame.width, frame.height, m));
+                    }
+                    None => {
+                        // Try 4-arg (with None); fall back to legacy 3-arg on TypeError.
+                        let result = callback.call1(
+                            py,
+                            (bytes.clone(), frame.width, frame.height, py.None()),
+                        );
+                        if result.is_err() {
+                            let _ = callback.call1(py, (bytes, frame.width, frame.height));
+                        }
+                    }
+                }
             });
         });
     }

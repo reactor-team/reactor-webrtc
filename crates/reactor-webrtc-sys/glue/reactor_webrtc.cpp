@@ -1000,8 +1000,15 @@ void* reactor_webrtc_video_track_create(void* factory, const char* id) {
 
 // Push a BGRA frame (width*height*4 bytes) into a local video track's source.
 // Converted to I420 and timestamped here.
-void reactor_webrtc_video_track_push_frame(void* track, const uint8_t* bgra,
-                                           int width, int height) {
+// Returns the current monotonic clock in microseconds — the same epoch used
+// by VideoFrame::set_timestamp_us and EncodedImage::CaptureTime().
+int64_t reactor_webrtc_time_micros() { return webrtc::TimeMicros(); }
+
+// Like reactor_webrtc_video_track_push_frame but uses a caller-supplied
+// capture timestamp so Rust can key per-frame metadata by that timestamp.
+void reactor_webrtc_video_track_push_frame_ts(void* track, const uint8_t* bgra,
+                                              int width, int height,
+                                              int64_t capture_time_us) {
   auto* h = reinterpret_cast<ReactorMediaStreamTrack*>(track);
   if (!h || !h->source || !bgra || width <= 0 || height <= 0) return;
   webrtc::scoped_refptr<webrtc::I420Buffer> buffer =
@@ -1012,9 +1019,15 @@ void reactor_webrtc_video_track_push_frame(void* track, const uint8_t* bgra,
                      buffer->MutableDataV(), buffer->StrideV(), width, height);
   webrtc::VideoFrame frame = webrtc::VideoFrame::Builder()
                                  .set_video_frame_buffer(buffer)
-                                 .set_timestamp_us(webrtc::TimeMicros())
+                                 .set_timestamp_us(capture_time_us)
                                  .build();
   h->source->PushFrame(frame);
+}
+
+void reactor_webrtc_video_track_push_frame(void* track, const uint8_t* bgra,
+                                           int width, int height) {
+  reactor_webrtc_video_track_push_frame_ts(track, bgra, width, height,
+                                           webrtc::TimeMicros());
 }
 
 // Add a (local) audio or video track to the peer connection, creating a
@@ -1203,16 +1216,17 @@ extern "C" {
 // Encoded frame handed to the callback. `data`/`mime_type` are valid only for
 // the duration of the call. `frame` is an opaque handle for set_data.
 struct ReactorEncodedFrame {
-  int direction;        // 0 = send (egress), 1 = receive (ingress)
-  int is_audio;         // 1 = audio, 0 = video
-  int is_key_frame;     // video only (0 for audio)
+  int direction;           // 0 = send (egress), 1 = receive (ingress)
+  int is_audio;            // 1 = audio, 0 = video
+  int is_key_frame;        // video only (0 for audio)
   uint8_t payload_type;
   uint32_t ssrc;
-  uint32_t timestamp;
-  const uint8_t* data;  // encoded payload
+  uint32_t timestamp;      // RTP timestamp
+  int64_t capture_time_ms; // capture timestamp in ms (same epoch as TimeMicros); 0 if unavailable
+  const uint8_t* data;     // encoded payload
   size_t data_len;
-  const char* mime_type;  // e.g. "video/VP8", "audio/opus"
-  void* frame;          // opaque -> reactor_webrtc_encoded_frame_set_data
+  const char* mime_type;   // e.g. "video/VP8", "audio/opus"
+  void* frame;             // opaque -> reactor_webrtc_encoded_frame_set_data
 };
 // Return 0 to emit the frame downstream (after any set_data), non-zero to drop
 // it (receive side: bypasses the decoder; send side: nothing is sent).
@@ -1607,6 +1621,8 @@ class ReactorFrameTransformer : public webrtc::FrameTransformerInterface {
                   webrtc::TransformableFrameInterface::Direction::kReceiver
               ? 1
               : 0;
+      auto ct = frame->CaptureTime();
+      int64_t capture_ms = ct.has_value() ? ct->ms() : 0;
       ReactorEncodedFrame ef{
           direction,
           is_audio,
@@ -1614,6 +1630,7 @@ class ReactorFrameTransformer : public webrtc::FrameTransformerInterface {
           frame->GetPayloadType(),
           frame->GetSsrc(),
           frame->GetTimestamp(),
+          capture_ms,
           data.data(),
           data.size(),
           mime.c_str(),

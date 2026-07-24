@@ -8,9 +8,13 @@
 //! a frame sink attached. Audio send is via the factory ADM
 //! ([`crate::PeerConnectionFactory::push_audio_frame`]).
 
+use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::os::raw::c_int;
 use std::sync::{Arc, Mutex};
+
+const SENDER_META_CAP: usize = 300;
+const RECEIVER_META_CAP: usize = 300;
 
 /// Audio vs. video.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,13 +57,21 @@ pub struct AudioFrame<'a> {
 
 type VideoSinkCb = Box<dyn for<'a> FnMut(VideoFrame<'a>) + Send>;
 type AudioSinkCb = Box<dyn for<'a> FnMut(AudioFrame<'a>) + Send>;
-type MetadataSlot = Arc<Mutex<Option<crate::metadata::FrameMetadata>>>;
+
+// sender: HashMap keyed by capture_time_ms (no-erase for simulcast), evicted
+// FIFO when the 300-entry cap is reached.
+type SenderMetaMap =
+    Arc<Mutex<(HashMap<i64, crate::metadata::FrameMetadata>, VecDeque<i64>)>>;
+
+// receiver: FIFO queue written by the receiver FrameTransform and drained by
+// video_sink_tramp; preserves ordering when there is no packet loss.
+type ReceiverMetaQueue = Arc<Mutex<VecDeque<crate::metadata::FrameMetadata>>>;
 
 // Heap-pinned sink state behind the C userdata pointer.
 struct VideoSinkState {
     cb: Mutex<VideoSinkCb>,
     // Populated by receiver_metadata_transform(); None when metadata is not in use.
-    receiver_meta: Option<MetadataSlot>,
+    receiver_meta: Option<ReceiverMetaQueue>,
 }
 struct AudioSinkState {
     cb: Mutex<AudioSinkCb>,
@@ -72,7 +84,7 @@ extern "C" fn video_sink_tramp(ud: *mut c_void, bgra: *const u8, width: c_int, h
     let metadata = st
         .receiver_meta
         .as_ref()
-        .and_then(|slot| slot.lock().ok()?.take());
+        .and_then(|q| q.lock().ok()?.pop_front());
     if let Ok(mut cb) = st.cb.lock() {
         cb(VideoFrame {
             bgra: slice,
@@ -110,10 +122,10 @@ pub struct Track {
     kind: MediaKind,
     video_sink: Option<Box<VideoSinkState>>,
     audio_sink: Option<Box<AudioSinkState>>,
-    // Set by sender_metadata_transform(); read by push_video_frame_with_metadata.
-    sender_meta: Option<MetadataSlot>,
-    // Set by receiver_metadata_transform(); shared with the VideoSinkState trampoline.
-    receiver_meta: Option<MetadataSlot>,
+    // Set by sender_metadata_transform(); populated by push_video_frame_with_metadata.
+    sender_meta: Option<SenderMetaMap>,
+    // Set by receiver_metadata_transform(); shared with VideoSinkState.
+    receiver_meta: Option<ReceiverMetaQueue>,
 }
 
 // SAFETY: the native track is internally thread-safe; sink callbacks are
@@ -170,6 +182,10 @@ impl Track {
     /// Call `sender_metadata_transform` and attach it to the sender transceiver
     /// before pushing frames with metadata; otherwise this is a no-op for the
     /// metadata (the frame still goes out, just without a trailer).
+    ///
+    /// The capture timestamp is computed internally; the same value is used as
+    /// the HashMap key and as the VideoFrame timestamp so the sender transform
+    /// can correlate them reliably. No-op for non-video tracks.
     pub fn push_video_frame_with_metadata(
         &self,
         bgra: &[u8],
@@ -177,12 +193,40 @@ impl Track {
         height: u32,
         meta: crate::metadata::FrameMetadata,
     ) {
-        if let Some(slot) = &self.sender_meta {
-            if let Ok(mut guard) = slot.lock() {
-                *guard = Some(meta);
+        if self.kind != MediaKind::Video {
+            return;
+        }
+        // Sample the clock once and use it for both the HashMap key and the
+        // VideoFrame capture timestamp — the transform callback reads
+        // CaptureTime()->ms() which equals capture_us/1000.
+        let capture_us =
+            unsafe { reactor_webrtc_sys::reactor_webrtc_time_micros() };
+        let capture_ms = capture_us / 1000;
+
+        if let Some(map) = &self.sender_meta {
+            if let Ok(mut guard) = map.lock() {
+                let (ref mut hmap, ref mut order) = *guard;
+                if order.len() >= SENDER_META_CAP {
+                    if let Some(old_key) = order.pop_front() {
+                        hmap.remove(&old_key);
+                    }
+                }
+                // No-erase on insert: simulcast layers share the same
+                // capture_time_ms so all of them should find the entry.
+                hmap.entry(capture_ms).or_insert(meta);
+                order.push_back(capture_ms);
             }
         }
-        self.push_video_frame(bgra, width, height);
+
+        unsafe {
+            reactor_webrtc_sys::reactor_webrtc_video_track_push_frame_ts(
+                self.raw,
+                bgra.as_ptr(),
+                width as c_int,
+                height as c_int,
+                capture_us,
+            );
+        }
     }
 
     /// Return a [`FrameTransform`](crate::FrameTransform) that appends a
@@ -196,13 +240,22 @@ impl Track {
     /// If `push_video_frame` is called (no metadata), the transform forwards
     /// the frame unchanged.
     pub fn sender_metadata_transform(&mut self) -> crate::encoded::FrameTransform {
-        let slot: MetadataSlot = Arc::new(Mutex::new(None));
-        self.sender_meta = Some(slot.clone());
+        let map: SenderMetaMap =
+            Arc::new(Mutex::new((HashMap::new(), VecDeque::new())));
+        self.sender_meta = Some(map.clone());
         crate::encoded::FrameTransform::new(move |frame| {
             if frame.direction != crate::encoded::FrameDirection::Send {
                 return crate::encoded::FrameAction::Forward;
             }
-            let meta = slot.lock().ok().and_then(|mut g| g.take());
+            // Look up by the frame's capture timestamp (ms precision). No-erase
+            // so simulcast layers sharing the same capture_time_ms all find it.
+            let meta = if frame.capture_time_ms > 0 {
+                map.lock()
+                    .ok()
+                    .and_then(|g| g.0.get(&frame.capture_time_ms).cloned())
+            } else {
+                None
+            };
             if let Some(ref m) = meta {
                 let trailer = crate::metadata::encode_trailer(m);
                 let mut new_data = frame.data.to_vec();
@@ -214,25 +267,36 @@ impl Track {
     }
 
     /// Return a [`FrameTransform`](crate::FrameTransform) that strips the
-    /// protobuf metadata trailer from received encoded frames and makes the
-    /// metadata available in subsequent [`on_video_frame`](Self::on_video_frame)
-    /// callbacks via [`VideoFrame::metadata`].
+    /// protobuf metadata trailer from received encoded frames and delivers the
+    /// metadata to subsequent [`on_video_frame`](Self::on_video_frame) callbacks
+    /// via [`VideoFrame::metadata`].
     ///
-    /// Attach this to the receiver transceiver with
-    /// `Transceiver::set_receiver_transform` **before** the first SDP exchange.
-    /// Then call `on_video_frame` on this track; each callback will carry the
-    /// metadata decoded from the corresponding encoded frame (or `None` when no
-    /// trailer was present).
+    /// Can be called before or after `on_video_frame` — the shared queue is
+    /// back-filled into an already-attached sink automatically.
+    ///
+    /// Metadata is delivered in FIFO order (one entry per decoded frame).
+    /// Under packet loss a dropped encoded frame consumes its metadata slot,
+    /// so `VideoFrame::metadata` may occasionally belong to a different frame
+    /// than the BGRA buffer it arrives with.
     pub fn receiver_metadata_transform(&mut self) -> crate::encoded::FrameTransform {
-        let slot: MetadataSlot = Arc::new(Mutex::new(None));
-        self.receiver_meta = Some(slot.clone());
+        let queue: ReceiverMetaQueue = Arc::new(Mutex::new(VecDeque::new()));
+        self.receiver_meta = Some(queue.clone());
+        // Back-fill into an already-attached sink so call order doesn't matter.
+        if let Some(sink) = &mut self.video_sink {
+            sink.receiver_meta = Some(queue.clone());
+        }
         crate::encoded::FrameTransform::new(move |frame| {
             if frame.direction != crate::encoded::FrameDirection::Receive {
                 return crate::encoded::FrameAction::Forward;
             }
-            if let Some((meta, stripped)) = crate::metadata::decode_and_strip_trailer(frame.data) {
-                if let Ok(mut guard) = slot.lock() {
-                    *guard = Some(meta);
+            if let Some((meta, stripped)) =
+                crate::metadata::decode_and_strip_trailer(frame.data)
+            {
+                if let Ok(mut guard) = queue.lock() {
+                    if guard.len() >= RECEIVER_META_CAP {
+                        guard.pop_front();
+                    }
+                    guard.push_back(meta);
                 }
                 frame.replace_data(&stripped);
             }

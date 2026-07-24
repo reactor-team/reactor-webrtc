@@ -56,6 +56,9 @@ pub struct EncodedFrame<'a> {
     pub ssrc: u32,
     /// The frame's RTP timestamp.
     pub timestamp: u32,
+    /// Capture timestamp in milliseconds (monotonic, same epoch as
+    /// `webrtc::TimeMicros`). Zero when unavailable.
+    pub capture_time_ms: i64,
     /// e.g. `"video/VP8"`, `"audio/opus"`.
     pub mime_type: &'a str,
     /// The encoded payload.
@@ -125,6 +128,7 @@ extern "C" fn encoded_tramp(
         payload_type: f.payload_type,
         ssrc: f.ssrc,
         timestamp: f.timestamp,
+        capture_time_ms: f.capture_time_ms,
         mime_type: mime,
         data,
         frame: f.frame,
