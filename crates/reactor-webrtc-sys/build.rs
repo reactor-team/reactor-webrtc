@@ -97,11 +97,15 @@ fn main() {
 /// Resolve `(lib_dir, include_dir)` from the configured root, link the static
 /// lib + its system dependencies, and compile the C++ glue against the headers.
 fn link(root: &Path) {
-    // Packaged layout (webrtc-build/package.sh): <root>/lib + <root>/include.
-    // Windows uses webrtc.lib (MSVC, no lib prefix); Unix uses libwebrtc.a.
-    // Bare layout: <root> holds the lib directly.
+    // Packaged layout produced by webrtc-build scripts:
+    //   Unix (build.sh / package.sh): lib/libwebrtc.a  + include/
+    //   Windows (build.ps1):          lib/libwebrtc.lib + include/
+    // build.ps1 preserves the "lib" prefix (libwebrtc$ext) so that the link
+    // name is consistent: on Unix `-lwebrtc` → libwebrtc.a; on MSVC
+    // `libwebrtc` → libwebrtc.lib (MSVC does not add a lib prefix itself).
+    // Bare layout: <root> holds the lib directly (REACTOR_WEBRTC_LIB_DIR).
     let (lib_dir, include_dir) =
-        if root.join("lib/libwebrtc.a").is_file() || root.join("lib/webrtc.lib").is_file() {
+        if root.join("lib/libwebrtc.a").is_file() || root.join("lib/libwebrtc.lib").is_file() {
             (root.join("lib"), root.join("include"))
         } else {
             let inc = env::var("REACTOR_WEBRTC_INCLUDE_DIR")
@@ -117,12 +121,16 @@ fn link(root: &Path) {
     compile_glue(&include_dir, is_debug_prebuilt);
 
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
-    // libwebrtc.a is one monolithic archive (gn complete_static_lib) with
-    // back-references between members (e.g. the simulcast adapter references the
-    // software-fallback wrapper). A plain `-lwebrtc` leaves those unresolved
-    // because the linker won't revisit earlier members; +whole-archive loads
-    // every member, and the final `-dead_strip` drops what the FFI doesn't use.
-    println!("cargo:rustc-link-lib=static:+whole-archive=webrtc");
+    // libwebrtc.a / libwebrtc.lib is a monolithic archive (gn complete_static_lib)
+    // with back-references between members. +whole-archive loads every member so
+    // all symbols resolve; -dead_strip / /OPT:REF trims unused code at final link.
+    // On Unix rustc prepends "lib" → libwebrtc.a; on MSVC "libwebrtc" → libwebrtc.lib.
+    let link_name = if lib_dir.join("libwebrtc.lib").is_file() {
+        "libwebrtc"
+    } else {
+        "webrtc"
+    };
+    println!("cargo:rustc-link-lib=static:+whole-archive={link_name}");
     link_system_deps(&lib_dir);
 
     // A real lib is present: enable link-dependent tests/examples.
@@ -484,7 +492,7 @@ fn download_prebuilt(url: &str, sha256: Option<&str>) -> PathBuf {
     let archive = out_root.join("prebuilt.tar.zst");
 
     // Cached from a previous build of this OUT_DIR.
-    if out.join("lib/libwebrtc.a").is_file() || out.join("lib/webrtc.lib").is_file() {
+    if out.join("lib/libwebrtc.a").is_file() || out.join("lib/libwebrtc.lib").is_file() {
         return out;
     }
 
@@ -540,10 +548,10 @@ fn download_prebuilt(url: &str, sha256: Option<&str>) -> PathBuf {
         );
     }
 
-    if !out.join("lib/libwebrtc.a").is_file() && !out.join("lib/webrtc.lib").is_file() {
+    if !out.join("lib/libwebrtc.a").is_file() && !out.join("lib/libwebrtc.lib").is_file() {
         panic!(
             "reactor-webrtc-sys: extracted prebuilt has no lib/libwebrtc.a or \
-             lib/webrtc.lib (bad archive layout?)"
+             lib/libwebrtc.lib (bad archive layout?)"
         );
     }
     out

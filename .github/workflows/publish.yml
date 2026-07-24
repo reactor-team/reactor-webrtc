@@ -185,14 +185,14 @@ jobs:
             --out dist
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
-          # The manylinux_2_34 container (AlmaLinux 9) doesn't have clang-20+
-          # in standard repos. Install it from the LLVM snapshot COPR, then
-          # point build.rs at the prebuilt extracted on the host (workspace is
-          # mounted at /project inside the container).
+          # Install clang from AlmaLinux 9 AppStream (llvm-toolset module, which
+          # ships clang-18+ in AlmaLinux 9.4+). clang-18 introduced __builtin_clzg
+          # and the other builtins needed by the bundled libc++ headers in the
+          # p2 prebuilt. Point build.rs at the prebuilt extracted on the host
+          # (workspace is mounted at /project inside the manylinux container).
           before-script-linux: |
-            dnf install -y 'dnf-command(copr)' || yum install -y 'dnf-command(copr)'
-            dnf copr enable -y @fedora-llvm-team/llvm-snapshot
-            dnf install -y clang
+            dnf module install -y llvm-toolset || dnf install -y clang
+            export CXX=clang++
             export REACTOR_WEBRTC_LIB_DIR=/project/prebuilt
         env:
           # mac/windows: maturin runs natively and receives these env vars fine.
