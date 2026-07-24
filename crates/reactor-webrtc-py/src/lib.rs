@@ -642,11 +642,11 @@ impl EncodedAudioTrack {
         });
     }
 
-    /// Add this track to a peer connection with a sendrecv transceiver and
-    /// automatically attach the sender frame transform.
+    /// Add this track to a peer connection with a sendrecv transceiver.
     fn add_to_peer_connection(&self, py: Python, pc: &PeerConnection) -> PyResult<()> {
-        // Use add_transceiver(SendRecv) so we have an explicit handle to wire
-        // the sender transform — equivalent to add_track for local send tracks.
+        // Use add_transceiver(SendRecv) — equivalent to add_track for local
+        // send tracks. No FrameTransform needed: the factory's custom audio
+        // encoder pops pre-encoded packets directly from the queue.
         let t = py
             .allow_threads(|| {
                 pc.inner
@@ -655,13 +655,12 @@ impl EncodedAudioTrack {
             .map_err(err)?;
         let track = self.inner.track();
         py.allow_threads(|| t.set_track(track)).map_err(err)?;
-        py.allow_threads(|| t.set_sender_transform(self.inner.frame_transform()))
-            .map_err(err)?;
         Ok(())
     }
 
-    /// Add a transceiver of the given `direction` for this track, automatically
-    /// wiring the sender frame transform. Returns the `Transceiver`.
+    /// Add a transceiver of the given `direction` for this track. Returns the
+    /// `Transceiver`. No `FrameTransform` is needed — the factory's custom audio
+    /// encoder pops pre-encoded packets directly from the queue.
     fn add_transceiver(
         &self,
         py: Python,
@@ -678,8 +677,6 @@ impl EncodedAudioTrack {
             .map_err(err)?;
         let track = self.inner.track();
         py.allow_threads(|| t.set_track(track)).map_err(err)?;
-        py.allow_threads(|| t.set_sender_transform(self.inner.frame_transform()))
-            .map_err(err)?;
         Ok(Transceiver { inner: t })
     }
 }

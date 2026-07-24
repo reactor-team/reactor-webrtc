@@ -96,6 +96,20 @@ pub struct ReactorRawVideoFrame {
     pub encoder_id: u64,
 }
 
+/// Filled by the custom audio encoder callback to deliver a pre-encoded Opus
+/// packet. Set `data` to null (or `len` to 0) to drop the frame silently.
+/// Layout must match `ReactorEncodedAudioOutput` in the C++ glue.
+#[repr(C)]
+pub struct ReactorEncodedAudioOutput {
+    pub data: *const u8,
+    pub len: usize,
+    /// RTP timestamp for this packet. 0 = inherit from the `EncodeImpl` call.
+    pub rtp_timestamp: u32,
+    /// Called by C++ after the encoded bytes are appended to the audio buffer;
+    /// frees the buffer. May be null for static/frame-lifetime buffers.
+    pub free_data: Option<extern "C" fn(data: *const u8, len: usize)>,
+}
+
 /// Filled by the custom encoder callback to deliver an encoded frame.
 /// Set `data` to null (or return non-zero) to drop the frame.
 /// Layout must match `ReactorEncodedVideoOutput` in the C++ glue.
@@ -206,6 +220,21 @@ extern "C" {
         use_platform_adm: c_int,
     ) -> *mut PeerConnectionFactory;
     pub fn reactor_webrtc_factory_destroy(factory: *mut PeerConnectionFactory);
+
+    /// Create a factory that replaces the builtin Opus encoder with a custom one.
+    /// `on_encode` is called synchronously within `AudioEncoder::EncodeImpl()`;
+    /// fill `*out` with a pre-encoded Opus packet, or set `out.data = null` to
+    /// drop. Always uses the synthetic ADM so `push_audio_frame` ticks EncodeImpl.
+    /// `free_ud` is called once when all encoder instances are released.
+    pub fn reactor_webrtc_factory_create_with_custom_audio_encoder(
+        on_encode: extern "C" fn(
+            userdata: *mut c_void,
+            rtp_timestamp: u32,
+            out: *mut ReactorEncodedAudioOutput,
+        ),
+        userdata: *mut c_void,
+        free_ud: Option<extern "C" fn(userdata: *mut c_void)>,
+    ) -> *mut PeerConnectionFactory;
 
     /// Create a factory that routes all video encoding through `on_encode`.
     /// `on_encode` is called synchronously within `VideoEncoder::Encode()` with

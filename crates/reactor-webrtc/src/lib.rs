@@ -266,10 +266,12 @@ impl PeerConnectionFactory {
 
     /// Create a factory pre-wired for push-based pre-encoded audio.
     ///
-    /// Returns `(factory, EncodedAudioTrack)`. Wire the track + transform into a
+    /// Returns `(factory, EncodedAudioTrack)`. Wire the track into a
     /// send-direction transceiver, then call
     /// [`EncodedAudioTrack::push_encoded_frame`] whenever your Opus encoder
-    /// produces a packet.
+    /// produces a packet. No [`FrameTransform`] is needed — the factory
+    /// replaces the builtin Opus encoder with a custom one that pops
+    /// pre-encoded packets directly from the queue.
     ///
     /// ```rust,ignore
     /// let (factory, audio) =
@@ -278,7 +280,6 @@ impl PeerConnectionFactory {
     /// let pc  = factory.create_peer_connection(&config, observer)?;
     /// let tx  = pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendOnly)?;
     /// tx.set_track(audio.track())?;
-    /// tx.set_sender_transform(audio.frame_transform())?;
     ///
     /// // … later, on your encoder thread:
     /// audio.push_encoded_frame(EncodedAudioFrame {
@@ -287,29 +288,36 @@ impl PeerConnectionFactory {
     /// });
     /// ```
     pub fn with_encoded_audio_track(track_id: &str) -> Result<(Self, crate::EncodedAudioTrack)> {
-        let factory = Self::new()?;
-        let track = factory.create_audio_track(track_id)?;
-        let raw = factory.raw;
-
+        // Build the shared queue that bridges push_encoded_frame (Rust) and
+        // audio_encode_tramp (C++ EncodeImpl callback).
         let queue: Arc<Mutex<VecDeque<crate::EncodedAudioFrame>>> =
             Arc::new(Mutex::new(VecDeque::new()));
-        let q = queue.clone();
-        let transform = crate::encoded::FrameTransform::new(move |frame| {
-            // Only intercept outgoing (send) audio frames.
-            if frame.direction != crate::encoded::FrameDirection::Send {
-                return crate::encoded::FrameAction::Forward;
-            }
-            match q.lock().unwrap().pop_front() {
-                Some(enc) => {
-                    frame.replace_data(&enc.data);
-                    crate::encoded::FrameAction::Forward
-                }
-                // No pre-encoded frame queued — forward the silence-Opus frame.
-                None => crate::encoded::FrameAction::Forward,
-            }
-        });
 
-        let encoded = crate::EncodedAudioTrack::new(track, queue, transform, raw);
+        // Leak the AudioEncoderState; the C++ factory holds it via userdata and
+        // frees it through free_audio_encoder_state_tramp when all encoder
+        // instances are released.
+        let state = Box::into_raw(Box::new(crate::encoded::AudioEncoderState {
+            queue: queue.clone(),
+        }));
+
+        let raw = unsafe {
+            reactor_webrtc_sys::reactor_webrtc_factory_create_with_custom_audio_encoder(
+                crate::encoded::audio_encode_tramp,
+                state as *mut std::ffi::c_void,
+                Some(crate::encoded::free_audio_encoder_state_tramp),
+            )
+        };
+        if raw.is_null() {
+            // Factory did not take ownership — free the leaked state ourselves.
+            drop(unsafe { Box::from_raw(state) });
+            return Err(Error::Webrtc(
+                "factory with custom audio encoder returned null".into(),
+            ));
+        }
+
+        let factory = Self { raw };
+        let track = factory.create_audio_track(track_id)?;
+        let encoded = crate::EncodedAudioTrack::new(track, queue, raw);
         Ok((factory, encoded))
     }
 
