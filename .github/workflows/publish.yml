@@ -113,6 +113,8 @@ jobs:
             os: windows-latest
             target: x86_64-pc-windows-msvc
             manylinux: "off"
+            # libwebrtc.lib uses /MT (static CRT); Rust must match to avoid LNK2038.
+            rustflags: "-C target-feature=+crt-static"
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -177,6 +179,9 @@ jobs:
           # linux: PREBUILT_URL/TOKEN are set in before-script-linux above instead.
           REACTOR_WEBRTC_PREBUILT_URL: ${{ steps.prebuilt.outputs.url }}
           REACTOR_WEBRTC_PREBUILT_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # win-x64 only: libwebrtc.lib uses /MT; Rust must match (see matrix.rustflags).
+          # Linux overrides RUSTFLAGS inside before-script-linux; mac has no RUSTFLAGS.
+          RUSTFLAGS: ${{ matrix.rustflags }}
 
       - uses: actions/upload-artifact@v4
         with:

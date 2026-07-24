@@ -182,6 +182,9 @@ fn compile_glue(include_dir: &Path, is_debug_prebuilt: bool) {
             // Windows SDK headers define min/max as macros, which conflicts with
             // std::numeric_limits<T>::max() in WebRTC's video_timing.h.
             build.define("NOMINMAX", None);
+            // libwebrtc.lib is compiled with /MT (static CRT). The cc crate
+            // defaults to /MD; mismatch causes LNK2038. Match /MT here.
+            build.static_crt(true);
         }
         _ => {}
     }
