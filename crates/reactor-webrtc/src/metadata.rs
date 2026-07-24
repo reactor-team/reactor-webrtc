@@ -19,7 +19,7 @@ const FRAMING: usize = 4 /* proto_len: u32 */ + 4 /* magic */;
 ///
 /// All fields are optional at the wire level — omitted fields decode to their
 /// zero value. Set only the fields that are meaningful for your use case.
-#[derive(Clone, Default, PartialEq, prost::Message)]
+#[derive(Clone, PartialEq, prost::Message)]
 pub struct FrameMetadata {
     /// Application-level frame counter (0 = unset).
     #[prost(uint64, tag = "1")]
