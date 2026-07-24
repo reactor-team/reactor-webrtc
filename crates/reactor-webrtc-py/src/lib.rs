@@ -480,6 +480,63 @@ impl From<rw::StatsReport> for StatsReport {
     }
 }
 
+// ── FrameMetadata ─────────────────────────────────────────────────────────────
+
+/// Metadata attached to a video frame via the packet trailer.
+///
+/// All fields default to zero / empty when not set by the sender.
+#[pyclass(get_all, set_all)]
+#[derive(Clone, Default)]
+pub struct FrameMetadata {
+    /// Application-level frame counter (0 = unset).
+    pub frame_id: u64,
+    /// Wall-clock timestamp in microseconds (0 = unset).
+    pub timestamp: u64,
+    /// Arbitrary application payload.
+    pub user_data: Vec<u8>,
+}
+
+#[pymethods]
+impl FrameMetadata {
+    #[new]
+    #[pyo3(signature = (frame_id=0, timestamp=0, user_data=vec![]))]
+    fn new(frame_id: u64, timestamp: u64, user_data: Vec<u8>) -> Self {
+        Self {
+            frame_id,
+            timestamp,
+            user_data,
+        }
+    }
+    fn __repr__(&self) -> String {
+        format!(
+            "FrameMetadata(frame_id={}, timestamp={}, user_data={} bytes)",
+            self.frame_id,
+            self.timestamp,
+            self.user_data.len()
+        )
+    }
+}
+
+impl From<rw::FrameMetadata> for FrameMetadata {
+    fn from(m: rw::FrameMetadata) -> Self {
+        Self {
+            frame_id: m.frame_id,
+            timestamp: m.timestamp,
+            user_data: m.user_data,
+        }
+    }
+}
+
+impl From<&FrameMetadata> for rw::FrameMetadata {
+    fn from(m: &FrameMetadata) -> Self {
+        rw::FrameMetadata {
+            frame_id: m.frame_id,
+            timestamp: m.timestamp,
+            user_data: m.user_data.clone(),
+        }
+    }
+}
+
 // ── Track ─────────────────────────────────────────────────────────────────────
 
 /// A media track — local (push frames) or remote (attach a sink).
@@ -498,7 +555,19 @@ impl Track {
     }
 
     /// Push a raw BGRA video frame into a local video track.
-    fn push_video_frame(&self, py: Python, bgra: &[u8], width: u32, height: u32) -> PyResult<()> {
+    ///
+    /// Pass `metadata` to embed frame metadata in the encoded packet trailer.
+    /// Requires [`sender_metadata_transform`] to be attached to the sender
+    /// transceiver beforehand; otherwise `metadata` is silently ignored.
+    #[pyo3(signature = (bgra, width, height, metadata=None))]
+    fn push_video_frame(
+        &self,
+        py: Python,
+        bgra: &[u8],
+        width: u32,
+        height: u32,
+        metadata: Option<&FrameMetadata>,
+    ) -> PyResult<()> {
         let expected = (width as usize)
             .checked_mul(height as usize)
             .and_then(|n| n.checked_mul(4))
@@ -514,17 +583,56 @@ impl Track {
             )));
         }
         let owned = bgra.to_vec();
-        py.allow_threads(|| self.inner.push_video_frame(&owned, width, height));
+        match metadata {
+            Some(m) => {
+                let rust_meta = rw::FrameMetadata::from(m);
+                py.allow_threads(|| {
+                    self.inner
+                        .push_video_frame_with_metadata(&owned, width, height, rust_meta)
+                });
+            }
+            None => {
+                py.allow_threads(|| self.inner.push_video_frame(&owned, width, height));
+            }
+        }
         Ok(())
     }
 
-    /// Register `callback(bgra: bytes, width: int, height: int)` for decoded
-    /// video frames from a remote track. Fires on a WebRTC thread.
+    /// Return a `FrameTransform` that appends a metadata trailer to encoded
+    /// frames on the send path. Attach it to the sender transceiver with
+    /// `Transceiver.set_sender_transform` before the SDP exchange.
+    fn sender_metadata_transform(&mut self) -> FrameTransform {
+        FrameTransform {
+            inner: self.inner.sender_metadata_transform(),
+        }
+    }
+
+    /// Return a `FrameTransform` that strips the metadata trailer from received
+    /// encoded frames. Attach it to the receiver transceiver with
+    /// `Transceiver.set_receiver_transform` before the SDP exchange. After
+    /// attachment, `on_video_frame` callbacks will carry `metadata` when the
+    /// sender included a trailer.
+    fn receiver_metadata_transform(&mut self) -> FrameTransform {
+        FrameTransform {
+            inner: self.inner.receiver_metadata_transform(),
+        }
+    }
+
+    /// Register `callback(bgra: bytes, width: int, height: int, metadata: FrameMetadata | None)`
+    /// for decoded video frames from a remote track. Fires on a WebRTC thread.
     fn on_video_frame(&mut self, callback: PyObject) {
         self.inner.on_video_frame(move |frame| {
             Python::with_gil(|py| {
                 let bytes = PyBytes::new_bound(py, frame.bgra);
-                let _ = callback.call1(py, (bytes, frame.width, frame.height));
+                let meta = frame
+                    .metadata
+                    .map(|m| {
+                        Py::new(py, FrameMetadata::from(m))
+                            .map(|p| p.into_any())
+                            .unwrap_or_else(|_| py.None())
+                    })
+                    .unwrap_or_else(|| py.None());
+                let _ = callback.call1(py, (bytes, frame.width, frame.height, meta));
             });
         });
     }
@@ -615,6 +723,18 @@ impl EncodedVideoTrack {
     }
 }
 
+// ── FrameTransform ────────────────────────────────────────────────────────────
+
+/// An encoded-frame transformer. Attach to a transceiver's sender or receiver
+/// via `Transceiver.set_sender_transform` / `set_receiver_transform`.
+///
+/// Obtain from `Track.sender_metadata_transform()` or
+/// `Track.receiver_metadata_transform()`.
+#[pyclass]
+pub struct FrameTransform {
+    inner: rw::FrameTransform,
+}
+
 // ── Transceiver ───────────────────────────────────────────────────────────────
 
 /// An RTP transceiver (one m-section in the SDP).
@@ -650,6 +770,20 @@ impl Transceiver {
                 .set_direction(rw::TransceiverDirection::from(direction))
         })
         .map_err(err)
+    }
+
+    /// Attach a `FrameTransform` to the sender path of this transceiver.
+    /// The transform runs after the encoder, before RTP packetization.
+    fn set_sender_transform(&self, py: Python, transform: &FrameTransform) -> PyResult<()> {
+        py.allow_threads(|| self.inner.set_sender_transform(&transform.inner))
+            .map_err(err)
+    }
+
+    /// Attach a `FrameTransform` to the receiver path of this transceiver.
+    /// The transform runs after RTP depacketization, before the decoder.
+    fn set_receiver_transform(&self, py: Python, transform: &FrameTransform) -> PyResult<()> {
+        py.allow_threads(|| self.inner.set_receiver_transform(&transform.inner))
+            .map_err(err)
     }
 }
 
@@ -1123,6 +1257,8 @@ fn reactor_webrtc(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<OutboundRtpStats>()?;
     m.add_class::<IceCandidatePairStats>()?;
     m.add_class::<StatsReport>()?;
+    m.add_class::<FrameMetadata>()?;
+    m.add_class::<FrameTransform>()?;
     m.add_class::<Track>()?;
     m.add_class::<EncodedVideoTrack>()?;
     m.add_class::<Transceiver>()?;

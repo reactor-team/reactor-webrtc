@@ -16,6 +16,7 @@ mod builder;
 mod config;
 mod encoded;
 mod media;
+pub mod metadata;
 mod observer;
 mod peer_connection;
 pub mod platform;
@@ -32,6 +33,7 @@ pub use encoded::{
     FrameDirection, FrameTransform, RawVideoFrame, VideoCodec,
 };
 pub use media::{AudioFrame, MediaKind, Track, VideoFrame};
+pub use metadata::FrameMetadata;
 pub use observer::PeerConnectionObserver;
 pub use peer_connection::{
     DataChannel, DataChannelState, IceCandidate, IceCandidatePairState, IceCandidatePairStats,

@@ -10,7 +10,7 @@
 
 use std::ffi::c_void;
 use std::os::raw::c_int;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// Audio vs. video.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +36,10 @@ pub struct VideoFrame<'a> {
     pub bgra: &'a [u8],
     pub width: u32,
     pub height: u32,
+    /// Metadata attached by the sender via [`Track::push_video_frame_with_metadata`]
+    /// or [`Track::sender_metadata_transform`], decoded from the packet trailer.
+    /// `None` when no trailer was present in the encoded frame.
+    pub metadata: Option<crate::metadata::FrameMetadata>,
 }
 
 /// A chunk of decoded audio, borrowed for the duration of the callback:
@@ -49,10 +53,13 @@ pub struct AudioFrame<'a> {
 
 type VideoSinkCb = Box<dyn for<'a> FnMut(VideoFrame<'a>) + Send>;
 type AudioSinkCb = Box<dyn for<'a> FnMut(AudioFrame<'a>) + Send>;
+type MetadataSlot = Arc<Mutex<Option<crate::metadata::FrameMetadata>>>;
 
 // Heap-pinned sink state behind the C userdata pointer.
 struct VideoSinkState {
     cb: Mutex<VideoSinkCb>,
+    // Populated by receiver_metadata_transform(); None when metadata is not in use.
+    receiver_meta: Option<MetadataSlot>,
 }
 struct AudioSinkState {
     cb: Mutex<AudioSinkCb>,
@@ -62,11 +69,16 @@ extern "C" fn video_sink_tramp(ud: *mut c_void, bgra: *const u8, width: c_int, h
     let st = unsafe { &*(ud as *const VideoSinkState) };
     let len = (width as usize) * (height as usize) * 4;
     let slice = unsafe { std::slice::from_raw_parts(bgra, len) };
+    let metadata = st
+        .receiver_meta
+        .as_ref()
+        .and_then(|slot| slot.lock().ok()?.take());
     if let Ok(mut cb) = st.cb.lock() {
         cb(VideoFrame {
             bgra: slice,
             width: width as u32,
             height: height as u32,
+            metadata,
         });
     }
 }
@@ -98,6 +110,10 @@ pub struct Track {
     kind: MediaKind,
     video_sink: Option<Box<VideoSinkState>>,
     audio_sink: Option<Box<AudioSinkState>>,
+    // Set by sender_metadata_transform(); read by push_video_frame_with_metadata.
+    sender_meta: Option<MetadataSlot>,
+    // Set by receiver_metadata_transform(); shared with the VideoSinkState trampoline.
+    receiver_meta: Option<MetadataSlot>,
 }
 
 // SAFETY: the native track is internally thread-safe; sink callbacks are
@@ -117,6 +133,8 @@ impl Track {
             kind,
             video_sink: None,
             audio_sink: None,
+            sender_meta: None,
+            receiver_meta: None,
         }
     }
 
@@ -144,11 +162,95 @@ impl Track {
         }
     }
 
+    /// Push a BGRA frame with attached metadata. The metadata is encoded as a
+    /// protobuf trailer and appended to the encoded frame by the
+    /// [`FrameTransform`](crate::FrameTransform) returned from
+    /// [`sender_metadata_transform`](Self::sender_metadata_transform).
+    ///
+    /// Call `sender_metadata_transform` and attach it to the sender transceiver
+    /// before pushing frames with metadata; otherwise this is a no-op for the
+    /// metadata (the frame still goes out, just without a trailer).
+    pub fn push_video_frame_with_metadata(
+        &self,
+        bgra: &[u8],
+        width: u32,
+        height: u32,
+        meta: crate::metadata::FrameMetadata,
+    ) {
+        if let Some(slot) = &self.sender_meta {
+            if let Ok(mut guard) = slot.lock() {
+                *guard = Some(meta);
+            }
+        }
+        self.push_video_frame(bgra, width, height);
+    }
+
+    /// Return a [`FrameTransform`](crate::FrameTransform) that appends a
+    /// protobuf metadata trailer to each encoded frame on the send path.
+    ///
+    /// Attach this to the sender transceiver with
+    /// `Transceiver::set_sender_transform` **before** the first SDP exchange.
+    /// Then call [`push_video_frame_with_metadata`](Self::push_video_frame_with_metadata)
+    /// to include metadata with each frame.
+    ///
+    /// If `push_video_frame` is called (no metadata), the transform forwards
+    /// the frame unchanged.
+    pub fn sender_metadata_transform(&mut self) -> crate::encoded::FrameTransform {
+        let slot: MetadataSlot = Arc::new(Mutex::new(None));
+        self.sender_meta = Some(slot.clone());
+        crate::encoded::FrameTransform::new(move |frame| {
+            if frame.direction != crate::encoded::FrameDirection::Send {
+                return crate::encoded::FrameAction::Forward;
+            }
+            let meta = slot.lock().ok().and_then(|mut g| g.take());
+            if let Some(ref m) = meta {
+                let trailer = crate::metadata::encode_trailer(m);
+                let mut new_data = frame.data.to_vec();
+                new_data.extend_from_slice(&trailer);
+                frame.replace_data(&new_data);
+            }
+            crate::encoded::FrameAction::Forward
+        })
+    }
+
+    /// Return a [`FrameTransform`](crate::FrameTransform) that strips the
+    /// protobuf metadata trailer from received encoded frames and makes the
+    /// metadata available in subsequent [`on_video_frame`](Self::on_video_frame)
+    /// callbacks via [`VideoFrame::metadata`].
+    ///
+    /// Attach this to the receiver transceiver with
+    /// `Transceiver::set_receiver_transform` **before** the first SDP exchange.
+    /// Then call `on_video_frame` on this track; each callback will carry the
+    /// metadata decoded from the corresponding encoded frame (or `None` when no
+    /// trailer was present).
+    pub fn receiver_metadata_transform(&mut self) -> crate::encoded::FrameTransform {
+        let slot: MetadataSlot = Arc::new(Mutex::new(None));
+        self.receiver_meta = Some(slot.clone());
+        crate::encoded::FrameTransform::new(move |frame| {
+            if frame.direction != crate::encoded::FrameDirection::Receive {
+                return crate::encoded::FrameAction::Forward;
+            }
+            if let Some((meta, stripped)) = crate::metadata::decode_and_strip_trailer(frame.data) {
+                if let Ok(mut guard) = slot.lock() {
+                    *guard = Some(meta);
+                }
+                frame.replace_data(&stripped);
+            }
+            crate::encoded::FrameAction::Forward
+        })
+    }
+
     /// Subscribe to decoded frames from a (remote) video track. Replaces any
     /// previous sink. The closure runs on a WebRTC thread.
+    ///
+    /// If [`receiver_metadata_transform`](Self::receiver_metadata_transform) was
+    /// called and its transform is attached to the receiver transceiver,
+    /// [`VideoFrame::metadata`] is populated whenever the sender included a
+    /// metadata trailer.
     pub fn on_video_frame(&mut self, cb: impl for<'a> FnMut(VideoFrame<'a>) + Send + 'static) {
         let state = Box::new(VideoSinkState {
             cb: Mutex::new(Box::new(cb)),
+            receiver_meta: self.receiver_meta.clone(),
         });
         let ud = &*state as *const VideoSinkState as *mut c_void;
         unsafe {
