@@ -97,12 +97,12 @@ jobs:
           - platform: linux-x64
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            manylinux: "2_28"  # AlmaLinux 8; clang installed via before-script
+            manylinux: "2_34"  # AlmaLinux 9; clang-21 available in AppStream
 
           - platform: linux-arm64
             os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            manylinux: "2_28"
+            manylinux: "2_34"
 
           - platform: mac-arm64
             os: macos-latest
@@ -113,13 +113,15 @@ jobs:
             os: windows-latest
             target: x86_64-pc-windows-msvc
             manylinux: "off"
+            # libwebrtc.lib uses /MT (static CRT); Rust must match to avoid LNK2038.
+            rustflags: "-C target-feature=+crt-static"
 
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
       # Derive the libwebrtc release tag from WEBRTC_VERSION and look up the
-      # matching prebuilt asset URL via the GitHub API.
+      # matching prebuilt asset URLs (archive + sha256 sidecar) via the GitHub API.
       - name: Resolve libwebrtc prebuilt URL
         id: prebuilt
         shell: bash
@@ -129,14 +131,17 @@ jobs:
           COMMIT_SHORT=${WEBRTC_COMMIT:0:8}
           TAG="webrtc-${MILESTONE}-${COMMIT_SHORT}-p${REACTOR_PATCH_LEVEL}"
           ASSET="reactor-webrtc-${{ matrix.platform }}-release.tar.zst"
-          echo "Looking up asset '${ASSET}' in release '${TAG}'..."
-          URL=$(gh api "repos/${{ github.repository }}/releases/tags/${TAG}" \
-                --jq ".assets[] | select(.name == \"${ASSET}\") | .url")
+          SHA_ASSET="${ASSET}.sha256"
+          echo "Looking up assets in release '${TAG}'..."
+          RELEASE=$(gh api "repos/${{ github.repository }}/releases/tags/${TAG}")
+          URL=$(echo "$RELEASE" | jq -r ".assets[] | select(.name == \"${ASSET}\") | .url")
+          SHA_URL=$(echo "$RELEASE" | jq -r ".assets[] | select(.name == \"${SHA_ASSET}\") | .url")
           if [ -z "$URL" ]; then
             echo "::error::Asset '${ASSET}' not found in release '${TAG}'"
             exit 1
           fi
           echo "url=${URL}" >> "$GITHUB_OUTPUT"
+          echo "sha_url=${SHA_URL}" >> "$GITHUB_OUTPUT"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -149,13 +154,34 @@ jobs:
             --out dist
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
-          # build.rs selects clang++ on Linux automatically; install it in the
-          # manylinux_2_28 (AlmaLinux 8) container before building.
+          # For Linux manylinux builds, maturin runs inside a Docker container
+          # and step-level env vars are not forwarded. Set PREBUILT_URL and
+          # PREBUILT_TOKEN via before-script-linux so build.rs downloads and
+          # extracts the prebuilt directly inside the container (avoiding any
+          # host→container path-mapping issues with the 697MB extracted tree).
           before-script-linux: |
-            yum install -y clang
+            dnf install -y clang lld zstd
+            export CXX=clang++
+            # Use clang+lld as the Rust linker. GNU ld (from gcc-toolset) rejects
+            # libwebrtc.a objects that may be LLVM ThinLTO bitcode; lld handles both
+            # native ELF and LTO bitcode objects correctly.
+            ARCH=$(uname -m)
+            if [ "$ARCH" = "aarch64" ]; then
+              export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=clang
+            else
+              export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=clang
+            fi
+            export RUSTFLAGS="-C link-arg=-fuse-ld=lld"
+            export REACTOR_WEBRTC_PREBUILT_URL="${{ steps.prebuilt.outputs.url }}"
+            export REACTOR_WEBRTC_PREBUILT_TOKEN="${{ secrets.GITHUB_TOKEN }}"
         env:
+          # mac/windows: maturin runs natively and inherits step-level env vars.
+          # linux: PREBUILT_URL/TOKEN are set in before-script-linux above instead.
           REACTOR_WEBRTC_PREBUILT_URL: ${{ steps.prebuilt.outputs.url }}
           REACTOR_WEBRTC_PREBUILT_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # win-x64 only: libwebrtc.lib uses /MT; Rust must match (see matrix.rustflags).
+          # Linux overrides RUSTFLAGS inside before-script-linux; mac has no RUSTFLAGS.
+          RUSTFLAGS: ${{ matrix.rustflags }}
 
       - uses: actions/upload-artifact@v4
         with:

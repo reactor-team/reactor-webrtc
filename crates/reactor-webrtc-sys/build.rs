@@ -97,16 +97,22 @@ fn main() {
 /// Resolve `(lib_dir, include_dir)` from the configured root, link the static
 /// lib + its system dependencies, and compile the C++ glue against the headers.
 fn link(root: &Path) {
-    // Packaged layout (webrtc-build/package.sh): <root>/lib + <root>/include.
-    // Bare layout: <root> holds libwebrtc.a directly.
-    let (lib_dir, include_dir) = if root.join("lib/libwebrtc.a").is_file() {
-        (root.join("lib"), root.join("include"))
-    } else {
-        let inc = env::var("REACTOR_WEBRTC_INCLUDE_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| root.join("include"));
-        (root.to_path_buf(), inc)
-    };
+    // Packaged layout produced by webrtc-build scripts:
+    //   Unix (build.sh / package.sh): lib/libwebrtc.a  + include/
+    //   Windows (build.ps1):          lib/libwebrtc.lib + include/
+    // build.ps1 preserves the "lib" prefix (libwebrtc$ext) so that the link
+    // name is consistent: on Unix `-lwebrtc` → libwebrtc.a; on MSVC
+    // `libwebrtc` → libwebrtc.lib (MSVC does not add a lib prefix itself).
+    // Bare layout: <root> holds the lib directly (REACTOR_WEBRTC_LIB_DIR).
+    let (lib_dir, include_dir) =
+        if root.join("lib/libwebrtc.a").is_file() || root.join("lib/libwebrtc.lib").is_file() {
+            (root.join("lib"), root.join("include"))
+        } else {
+            let inc = env::var("REACTOR_WEBRTC_INCLUDE_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| root.join("include"));
+            (root.to_path_buf(), inc)
+        };
 
     let is_debug_prebuilt = std::fs::read_to_string(lib_dir.join("build_profile"))
         .ok()
@@ -115,12 +121,16 @@ fn link(root: &Path) {
     compile_glue(&include_dir, is_debug_prebuilt);
 
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
-    // libwebrtc.a is one monolithic archive (gn complete_static_lib) with
-    // back-references between members (e.g. the simulcast adapter references the
-    // software-fallback wrapper). A plain `-lwebrtc` leaves those unresolved
-    // because the linker won't revisit earlier members; +whole-archive loads
-    // every member, and the final `-dead_strip` drops what the FFI doesn't use.
-    println!("cargo:rustc-link-lib=static:+whole-archive=webrtc");
+    // libwebrtc.a / libwebrtc.lib is a monolithic archive (gn complete_static_lib)
+    // with back-references between members. +whole-archive loads every member so
+    // all symbols resolve; -dead_strip / /OPT:REF trims unused code at final link.
+    // On Unix rustc prepends "lib" → libwebrtc.a; on MSVC "libwebrtc" → libwebrtc.lib.
+    let link_name = if lib_dir.join("libwebrtc.lib").is_file() {
+        "libwebrtc"
+    } else {
+        "webrtc"
+    };
+    println!("cargo:rustc-link-lib=static:+whole-archive={link_name}");
     link_system_deps(&lib_dir);
 
     // A real lib is present: enable link-dependent tests/examples.
@@ -169,8 +179,24 @@ fn compile_glue(include_dir: &Path, is_debug_prebuilt: bool) {
         }
         "windows" => {
             build.define("WEBRTC_WIN", None);
+            // Windows SDK headers define min/max as macros, which conflicts with
+            // std::numeric_limits<T>::max() in WebRTC's video_timing.h.
+            build.define("NOMINMAX", None);
+            // libwebrtc.lib is compiled with /MT (static CRT). The cc crate
+            // defaults to /MD; mismatch causes LNK2038. Match /MT here.
+            build.static_crt(true);
         }
         _ => {}
+    }
+
+    // NDEBUG controls RTC_DCHECK_IS_ON, which gates out-of-line SequenceChecker
+    // methods and extra struct members. The glue must match the prebuilt:
+    //   • release (NDEBUG set)   → inline stubs, small structs
+    //   • debug  (NDEBUG absent) → out-of-line methods, larger structs
+    // A mismatch on any platform causes either LNK2019 (missing symbol) or a
+    // heap corruption (wrong struct size). Apply unconditionally, all targets.
+    if !is_debug_prebuilt {
+        build.define("NDEBUG", None);
     }
 
     // linux/android link WebRTC's *bundled* libc++, whose ABI namespace is __Cr
@@ -193,15 +219,6 @@ fn compile_glue(include_dir: &Path, is_debug_prebuilt: bool) {
             // Don't let cc auto-link the system C++ stdlib (stdc++); we link the
             // bundled libc++.a/libc++abi.a ourselves in link_system_deps.
             build.cpp_link_stdlib(None);
-            // NDEBUG controls RTC_DCHECK_IS_ON, which gates extra SequenceChecker
-            // members on WebRTC base classes. The glue must match the prebuilt:
-            //   • release (NDEBUG set)   → small structs, no debug symbols
-            //   • debug  (NDEBUG absent) → larger structs, debug symbols present
-            // A mismatch makes the glue size objects incorrectly → heap overflow
-            // (glibc: "malloc(): invalid size (unsorted)").
-            if !is_debug_prebuilt {
-                build.define("NDEBUG", None);
-            }
             // WebRTC sets the hardening mode via -D (its __config_site leaves
             // _LIBCPP_HARDENING_MODE_DEFAULT unset); match it or <__config> errors.
             build.define("_LIBCPP_HARDENING_MODE", "_LIBCPP_HARDENING_MODE_NONE");
@@ -320,7 +337,25 @@ fn link_system_deps(lib_dir: &Path) {
             }
         }
         "windows" => {
-            for l in ["winmm", "secur32", "ole32", "ws2_32", "dmoguids", "msdmo"] {
+            for l in [
+                // Core/networking
+                "winmm",
+                "secur32",
+                "ole32",
+                "ws2_32",
+                "iphlpapi",
+                // Screen capture (WGC path: DXGI + D3D11 + DWM + GDI + DPI)
+                "dxgi",
+                "d3d11",
+                "dwmapi",
+                "gdi32",
+                "shcore",
+                // Audio DSP (DirectShow + Windows Media DSP GUIDs)
+                "dmoguids",
+                "msdmo",
+                "strmiids",
+                "wmcodecdspuuid",
+            ] {
                 println!("cargo:rustc-link-lib=dylib={l}");
             }
         }
@@ -482,7 +517,7 @@ fn download_prebuilt(url: &str, sha256: Option<&str>) -> PathBuf {
     let archive = out_root.join("prebuilt.tar.zst");
 
     // Cached from a previous build of this OUT_DIR.
-    if out.join("lib/libwebrtc.a").is_file() {
+    if out.join("lib/libwebrtc.a").is_file() || out.join("lib/libwebrtc.lib").is_file() {
         return out;
     }
 
@@ -538,9 +573,10 @@ fn download_prebuilt(url: &str, sha256: Option<&str>) -> PathBuf {
         );
     }
 
-    if !out.join("lib/libwebrtc.a").is_file() {
+    if !out.join("lib/libwebrtc.a").is_file() && !out.join("lib/libwebrtc.lib").is_file() {
         panic!(
-            "reactor-webrtc-sys: extracted prebuilt has no lib/libwebrtc.a (bad archive layout?)"
+            "reactor-webrtc-sys: extracted prebuilt has no lib/libwebrtc.a or \
+             lib/libwebrtc.lib (bad archive layout?)"
         );
     }
     out
