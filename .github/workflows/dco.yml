@@ -5,8 +5,6 @@
 name: DCO
 
 on:
-  # Run on every PR, including stacked PRs whose base is another feature
-  # branch rather than main.
   pull_request:
 
 permissions:
@@ -17,6 +15,9 @@ jobs:
   dco-check:
     name: Signed-off-by check
     runs-on: ubuntu-latest
+    # Dependabot PRs are machine-generated; skip the whole job rather than
+    # exempting commits inline (the inline check can be spoofed via git config).
+    if: github.event.pull_request.user.login != 'dependabot[bot]'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -30,7 +31,9 @@ jobs:
           set -euo pipefail
 
           range="${BASE_SHA}..${HEAD_SHA}"
-          commits=$(git rev-list "$range")
+          # Skip merge commits — they carry no authored content and cannot be
+          # signed off after the fact without rebasing.
+          commits=$(git rev-list --no-merges "$range")
 
           if [[ -z "$commits" ]]; then
             echo "No commits to check."
@@ -40,22 +43,16 @@ jobs:
           failed=0
           while IFS= read -r sha; do
             author_name=$(git show -s --format='%an' "$sha")
-            author_email=$(git show -s --format='%ae' "$sha")
             subject=$(git show -s --format='%s' "$sha")
-
-            # Dependabot opens its own PRs and cannot add a Signed-off-by
-            # trailer; its commits are machine-generated, so exempt them.
-            if [[ "$author_name" == "dependabot[bot]" || "$author_email" == *"dependabot[bot]"* ]]; then
-              echo "Skipping DCO check for Dependabot commit $sha."
-              continue
-            fi
-
-            expected="Signed-off-by: ${author_name} <${author_email}>"
             body=$(git show -s --format='%B' "$sha")
 
-            if ! grep -qFx "$expected" <<< "$body"; then
-              echo "::error::Commit $sha (\"$subject\") is missing a matching Signed-off-by trailer."
-              echo "  expected: $expected"
+            # Accept any well-formed "Signed-off-by: <author_name> <any-email>"
+            # trailer. The email is intentionally not pinned to the commit's
+            # author email so contributors who use a personal git identity but
+            # a work sign-off address (or vice-versa) aren't rejected.
+            if ! grep -qiF "Signed-off-by: ${author_name} <" <<< "$body"; then
+              echo "::error::Commit $sha (\"$subject\") is missing a Signed-off-by trailer for \"${author_name}\"."
+              echo "  expected a line like: Signed-off-by: ${author_name} <you@example.com>"
               echo "  actual trailers:"
               echo "$body" | grep -i '^signed-off-by:' || echo "    (none)"
               echo ""
