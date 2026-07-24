@@ -5,7 +5,7 @@ shopt -s nullglob
 wheels=("$REPO_ROOT"/target/wheels/reactor_webrtc-*.whl)
 WHEEL="${wheels[0]:-}"
 if [ -z "$WHEEL" ]; then
-  echo "no wheel found in target/wheels — run //crates/reactor-webrtc-py:build first" >&2
+  echo "no wheel found in target/wheels - run //crates/reactor-webrtc-py:build first" >&2
   exit 1
 fi
 # venv under target/ (already gitignored), so the test leaves no untracked files.

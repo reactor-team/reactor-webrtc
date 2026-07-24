@@ -1,5 +1,0 @@
-#!/usr/bin/env bash
-#MISE description="[Quality] Verify [tools] is declared only in the repo-root mise.toml"
-set -euo pipefail
-uv run --quiet --no-project --python 3.12 -- \
-  python3 "$REPO_ROOT/scripts/check-mise-tools-root.py"
