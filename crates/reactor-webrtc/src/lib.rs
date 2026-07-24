@@ -28,8 +28,8 @@ use std::sync::{Arc, Mutex};
 pub use builder::{EncodedVideoBuilder, MixedVideoTrack};
 pub use config::{ContinualGatheringPolicy, IceServer, IceTransportsType, RtcConfiguration};
 pub use encoded::{
-    CustomVideoEncoder, EncodedFrame, EncodedVideoFrame, EncodedVideoTrack, FrameAction,
-    FrameDirection, FrameTransform, RawVideoFrame, VideoCodec,
+    CustomVideoEncoder, EncodedAudioFrame, EncodedAudioTrack, EncodedFrame, EncodedVideoFrame,
+    EncodedVideoTrack, FrameAction, FrameDirection, FrameTransform, RawVideoFrame, VideoCodec,
 };
 pub use media::{AudioFrame, MediaKind, Track, VideoFrame};
 pub use observer::PeerConnectionObserver;
@@ -261,6 +261,55 @@ impl PeerConnectionFactory {
         let factory = Self::with_custom_video_encoder(encoder)?;
         let track = factory.create_video_track(track_id)?;
         let encoded = crate::EncodedVideoTrack::new(track, queue, width, height);
+        Ok((factory, encoded))
+    }
+
+    /// Create a factory pre-wired for push-based pre-encoded audio.
+    ///
+    /// Returns `(factory, EncodedAudioTrack)`. Wire the track + transform into a
+    /// send-direction transceiver, then call
+    /// [`EncodedAudioTrack::push_encoded_frame`] whenever your Opus encoder
+    /// produces a packet.
+    ///
+    /// ```rust,ignore
+    /// let (factory, audio) =
+    ///     PeerConnectionFactory::with_encoded_audio_track("mic")?;
+    ///
+    /// let pc  = factory.create_peer_connection(&config, observer)?;
+    /// let tx  = pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendOnly)?;
+    /// tx.set_track(audio.track())?;
+    /// tx.set_sender_transform(audio.frame_transform())?;
+    ///
+    /// // … later, on your encoder thread:
+    /// audio.push_encoded_frame(EncodedAudioFrame {
+    ///     data: opus_packet_bytes,
+    ///     rtp_timestamp: 0,
+    /// });
+    /// ```
+    pub fn with_encoded_audio_track(track_id: &str) -> Result<(Self, crate::EncodedAudioTrack)> {
+        let factory = Self::new()?;
+        let track = factory.create_audio_track(track_id)?;
+        let raw = factory.raw;
+
+        let queue: Arc<Mutex<VecDeque<crate::EncodedAudioFrame>>> =
+            Arc::new(Mutex::new(VecDeque::new()));
+        let q = queue.clone();
+        let transform = crate::encoded::FrameTransform::new(move |frame| {
+            // Only intercept outgoing (send) audio frames.
+            if frame.direction != crate::encoded::FrameDirection::Send {
+                return crate::encoded::FrameAction::Forward;
+            }
+            match q.lock().unwrap().pop_front() {
+                Some(enc) => {
+                    frame.replace_data(&enc.data);
+                    crate::encoded::FrameAction::Forward
+                }
+                // No pre-encoded frame queued — forward the silence-Opus frame.
+                None => crate::encoded::FrameAction::Forward,
+            }
+        });
+
+        let encoded = crate::EncodedAudioTrack::new(track, queue, transform, raw);
         Ok((factory, encoded))
     }
 

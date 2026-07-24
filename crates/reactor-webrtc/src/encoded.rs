@@ -548,6 +548,114 @@ impl CustomVideoEncoder {
     }
 }
 
+// ── Push-based encoded audio track ───────────────────────────────────────────
+
+/// A single pre-encoded Opus packet delivered by [`EncodedAudioTrack::push_encoded_frame`].
+pub struct EncodedAudioFrame {
+    /// Raw Opus packet bytes — one packet corresponds to one encode interval
+    /// (typically 20ms at 48kHz).
+    pub data: Vec<u8>,
+    /// RTP timestamp for this packet. Stored for API consistency and future use;
+    /// the on-wire RTP timestamp is currently derived from the silence-PCM trigger
+    /// cadence by the libwebrtc Opus encoder.
+    pub rtp_timestamp: u32,
+}
+
+/// An audio track that accepts **pre-encoded** Opus frames directly, bypassing
+/// the libwebrtc Opus encoder.
+///
+/// Obtain one via [`PeerConnectionFactory::with_encoded_audio_track`], then:
+///
+/// 1. Create a send-direction transceiver, set its track to [`track()`], and
+///    attach [`frame_transform()`] to the sender.
+/// 2. Call [`push_encoded_frame`] whenever your encoder produces a packet.
+///
+/// Internally, each `push_encoded_frame` injects a 20ms mono silence block into
+/// the factory's ADM so the Opus encoder fires and produces a frame for the
+/// [`FrameTransform`] to intercept. The transform replaces the silence-Opus
+/// payload with the pre-encoded bytes before the frame is packetized.
+///
+/// # Lifetime
+///
+/// The factory **must outlive** this handle. The typical pattern — keeping the
+/// `(factory, track)` pair returned by `with_encoded_audio_track` together and
+/// dropping the factory last — upholds this automatically.
+pub struct EncodedAudioTrack {
+    pub(crate) track: crate::media::Track,
+    pub(crate) queue: Arc<Mutex<VecDeque<EncodedAudioFrame>>>,
+    pub(crate) transform: FrameTransform,
+    // Raw factory pointer used to push silence PCM and trigger the Opus encoder.
+    // SAFETY: the factory is created before this struct and must be dropped after
+    // it (upheld by the `(factory, track)` tuple contract).
+    factory_raw: *mut reactor_webrtc_sys::PeerConnectionFactory,
+}
+
+// SAFETY: the queue is Mutex-guarded; FrameTransform is ref-counted and
+// thread-safe; factory_raw outlives this struct (see above).
+unsafe impl Send for EncodedAudioTrack {}
+unsafe impl Sync for EncodedAudioTrack {}
+
+impl EncodedAudioTrack {
+    pub(crate) fn new(
+        track: crate::media::Track,
+        queue: Arc<Mutex<VecDeque<EncodedAudioFrame>>>,
+        transform: FrameTransform,
+        factory_raw: *mut reactor_webrtc_sys::PeerConnectionFactory,
+    ) -> Self {
+        Self {
+            track,
+            queue,
+            transform,
+            factory_raw,
+        }
+    }
+
+    /// The underlying audio [`Track`](crate::media::Track). Pass to
+    /// [`Transceiver::set_track`](crate::Transceiver::set_track).
+    pub fn track(&self) -> &crate::media::Track {
+        &self.track
+    }
+
+    /// The sender [`FrameTransform`] that replaces encoded Opus payloads.
+    ///
+    /// Attach to the transceiver's sender after creating it:
+    /// ```rust,ignore
+    /// let tx = pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendOnly)?;
+    /// tx.set_track(audio.track())?;
+    /// tx.set_sender_transform(audio.frame_transform())?;
+    /// ```
+    pub fn frame_transform(&self) -> &FrameTransform {
+        &self.transform
+    }
+
+    /// Inject a pre-encoded Opus packet into the WebRTC RTP stack.
+    ///
+    /// 1. Enqueues the frame for the sender transform.
+    /// 2. Pushes a 20ms mono silence block (960 samples @ 48kHz) to the ADM so
+    ///    the Opus encoder fires, giving the transform a frame to intercept and
+    ///    replace. This mirrors the dummy-frame trigger used by [`EncodedVideoTrack`].
+    ///
+    /// Thread-safe — call from any thread, including a codec callback.
+    pub fn push_encoded_frame(&self, frame: EncodedAudioFrame) {
+        self.queue.lock().unwrap().push_back(frame);
+        // 20ms @ 48kHz mono = 960 samples/channel — one push yields one Opus packet
+        // and thus one FrameTransform callback on the sender path.
+        const SAMPLE_RATE: c_int = 48_000;
+        const CHANNELS: c_int = 1;
+        const SAMPLES_PER_CHANNEL: c_int = SAMPLE_RATE / 50; // 960
+        let silence = [0i16; SAMPLES_PER_CHANNEL as usize];
+        unsafe {
+            reactor_webrtc_sys::reactor_webrtc_factory_push_audio_frame(
+                self.factory_raw,
+                silence.as_ptr(),
+                SAMPLES_PER_CHANNEL,
+                SAMPLE_RATE,
+                CHANNELS,
+            );
+        }
+    }
+}
+
 // ── Push-based encoded video track ───────────────────────────────────────────
 
 /// A video track that accepts **pre-encoded** frames directly, bypassing the
