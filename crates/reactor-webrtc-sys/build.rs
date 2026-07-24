@@ -189,6 +189,16 @@ fn compile_glue(include_dir: &Path, is_debug_prebuilt: bool) {
         _ => {}
     }
 
+    // NDEBUG controls RTC_DCHECK_IS_ON, which gates out-of-line SequenceChecker
+    // methods and extra struct members. The glue must match the prebuilt:
+    //   • release (NDEBUG set)   → inline stubs, small structs
+    //   • debug  (NDEBUG absent) → out-of-line methods, larger structs
+    // A mismatch on any platform causes either LNK2019 (missing symbol) or a
+    // heap corruption (wrong struct size). Apply unconditionally, all targets.
+    if !is_debug_prebuilt {
+        build.define("NDEBUG", None);
+    }
+
     // linux/android link WebRTC's *bundled* libc++, whose ABI namespace is __Cr
     // (not the platform libc++'s __1). Compile the glue against those exact
     // headers (shipped by package.sh) so std:: types match the archive; without
@@ -209,15 +219,6 @@ fn compile_glue(include_dir: &Path, is_debug_prebuilt: bool) {
             // Don't let cc auto-link the system C++ stdlib (stdc++); we link the
             // bundled libc++.a/libc++abi.a ourselves in link_system_deps.
             build.cpp_link_stdlib(None);
-            // NDEBUG controls RTC_DCHECK_IS_ON, which gates extra SequenceChecker
-            // members on WebRTC base classes. The glue must match the prebuilt:
-            //   • release (NDEBUG set)   → small structs, no debug symbols
-            //   • debug  (NDEBUG absent) → larger structs, debug symbols present
-            // A mismatch makes the glue size objects incorrectly → heap overflow
-            // (glibc: "malloc(): invalid size (unsorted)").
-            if !is_debug_prebuilt {
-                build.define("NDEBUG", None);
-            }
             // WebRTC sets the hardening mode via -D (its __config_site leaves
             // _LIBCPP_HARDENING_MODE_DEFAULT unset); match it or <__config> errors.
             build.define("_LIBCPP_HARDENING_MODE", "_LIBCPP_HARDENING_MODE_NONE");
