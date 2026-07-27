@@ -88,7 +88,9 @@ pub enum AdmMode {
 ///
 /// All fields default to `false` (no processing). Enable selectively:
 /// ```
-/// ApmConfig { echo_canceller: true, noise_suppression: true, ..Default::default() }
+/// use reactor_webrtc::ApmConfig;
+///
+/// let apm = ApmConfig { echo_canceller: true, noise_suppression: true, ..Default::default() };
 /// ```
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ApmConfig {
