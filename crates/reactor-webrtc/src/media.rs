@@ -62,8 +62,7 @@ type AudioSinkCb = Box<dyn for<'a> FnMut(AudioFrame<'a>) + Send>;
 
 // sender: HashMap keyed by capture_time_ms (no-erase for simulcast), evicted
 // FIFO when the 300-entry cap is reached.
-type SenderMetaMap =
-    Arc<Mutex<(HashMap<i64, crate::metadata::FrameMetadata>, VecDeque<i64>)>>;
+type SenderMetaMap = Arc<Mutex<(HashMap<i64, crate::metadata::FrameMetadata>, VecDeque<i64>)>>;
 
 // receiver: FIFO queue written by the receiver FrameTransform and drained by
 // video_sink_tramp; preserves ordering when there is no packet loss.
@@ -217,8 +216,7 @@ impl Track {
         // Sample the clock once and use it for both the HashMap key and the
         // VideoFrame capture timestamp — the transform callback reads
         // CaptureTime()->ms() which equals capture_us/1000.
-        let capture_us =
-            unsafe { reactor_webrtc_sys::reactor_webrtc_time_micros() };
+        let capture_us = unsafe { reactor_webrtc_sys::reactor_webrtc_time_micros() };
         let capture_ms = capture_us / 1000;
 
         if let Some(map) = &self.sender_meta {
@@ -259,8 +257,7 @@ impl Track {
     /// If `push_video_frame` is called (no metadata), the transform forwards
     /// the frame unchanged.
     pub fn sender_metadata_transform(&mut self) -> crate::encoded::FrameTransform {
-        let map: SenderMetaMap =
-            Arc::new(Mutex::new((HashMap::new(), VecDeque::new())));
+        let map: SenderMetaMap = Arc::new(Mutex::new((HashMap::new(), VecDeque::new())));
         self.sender_meta = Some(map.clone());
         crate::encoded::FrameTransform::new(move |frame| {
             if frame.direction != crate::encoded::FrameDirection::Send {
@@ -293,10 +290,12 @@ impl Track {
     /// Can be called before or after `on_video_frame` — the shared queue is
     /// back-filled into an already-attached sink automatically.
     ///
-    /// Metadata is delivered in FIFO order (one entry per decoded frame).
-    /// Under packet loss a dropped encoded frame consumes its metadata slot,
-    /// so `VideoFrame::metadata` may occasionally belong to a different frame
-    /// than the BGRA buffer it arrives with.
+    /// Metadata is delivered in FIFO order. The `FrameTransformerInterface`
+    /// fires once per fully-reassembled encoded frame, so packet loss causes
+    /// both the metadata push and the decoded BGRA to be skipped together —
+    /// the queue does not drift under normal packet loss. A mismatch can only
+    /// occur in rare decoder-level edge cases (e.g. synthesised concealment
+    /// frames or H.264 non-reference frame discard).
     pub fn receiver_metadata_transform(&mut self) -> crate::encoded::FrameTransform {
         let queue: ReceiverMetaQueue = Arc::new(Mutex::new(VecDeque::new()));
         self.receiver_meta = Some(queue.clone());
@@ -308,9 +307,7 @@ impl Track {
             if frame.direction != crate::encoded::FrameDirection::Receive {
                 return crate::encoded::FrameAction::Forward;
             }
-            if let Some((meta, stripped)) =
-                crate::metadata::decode_and_strip_trailer(frame.data)
-            {
+            if let Some((meta, stripped)) = crate::metadata::decode_and_strip_trailer(frame.data) {
                 if let Ok(mut guard) = queue.lock() {
                     if guard.len() >= RECEIVER_META_CAP {
                         guard.pop_front();

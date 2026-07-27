@@ -541,7 +541,6 @@ impl From<rw::FrameMetadata> for FrameMetadata {
     }
 }
 
-
 // ── Track ─────────────────────────────────────────────────────────────────────
 
 /// A media track — local (push frames) or remote (attach a sink).
@@ -646,10 +645,8 @@ impl Track {
                     }
                     None => {
                         // Try 4-arg (with None); fall back to legacy 3-arg on TypeError.
-                        let result = callback.call1(
-                            py,
-                            (bytes.clone(), frame.width, frame.height, py.None()),
-                        );
+                        let result = callback
+                            .call1(py, (bytes.clone(), frame.width, frame.height, py.None()));
                         if result.is_err() {
                             let _ = callback.call1(py, (bytes, frame.width, frame.height));
                         }

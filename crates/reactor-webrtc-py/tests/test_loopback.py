@@ -410,3 +410,95 @@ class TestStats:
         assert s.packets_received >= 0
         assert s.bytes_received >= 0
         assert s.jitter_s >= 0.0
+
+
+# ── Frame metadata ────────────────────────────────────────────────────────────
+
+
+class TestFrameMetadata:
+    """End-to-end tests for per-frame metadata embedded via the packet trailer."""
+
+    def test_frame_metadata_roundtrip(self, factory):
+        """Metadata pushed by the sender arrives in on_video_frame as FrameMetadata."""
+        recv_tf_ref: list = []  # keeps the FrameTransform alive
+        received_meta: list[rw.FrameMetadata] = []
+
+        def on_track(kind, track):
+            if kind == rw.MediaKind.Video:
+                recv_tf = track.receiver_metadata_transform()
+                recv_tf_ref.append(recv_tf)
+                track.on_video_frame(
+                    lambda bgra, w, h, meta: received_meta.append(meta) if meta is not None else None
+                )
+
+        p1 = make_peer(factory)
+        p2 = make_peer(factory, on_track=on_track)
+
+        video = factory.create_video_track("meta-video")
+        tx1 = p1.pc.add_transceiver(rw.MediaKind.Video, rw.TransceiverDirection.SendOnly)
+        tx1.set_track(video)
+        send_tf = video.sender_metadata_transform()  # noqa: F841 — must stay alive
+        tx1.set_sender_transform(send_tf)
+
+        ok = connect(p1, p2)
+        assert ok, "peers did not connect within timeout"
+
+        # on_track fired during negotiate(); the receiver transform is ready.
+        # Wire it to the transceiver now that we have the pc2 handle.
+        assert recv_tf_ref, "on_track was not called during SDP negotiation"
+        for t in p2.pc.transceivers():
+            if t.kind() == rw.MediaKind.Video:
+                t.set_receiver_transform(recv_tf_ref[0])
+                break
+
+        user_data = b"reactor-py-e2e"
+        bgra = bytes(320 * 240 * 4)
+
+        for _ in range(90):
+            if received_meta:
+                break
+            video.push_video_frame(bgra, 320, 240, user_data=user_data)
+            time.sleep(0.033)
+
+        ok = wait_for(lambda: len(received_meta) > 0)
+        assert ok, "no metadata received within timeout"
+
+        meta = received_meta[0]
+        assert bytes(meta.user_data) == user_data, f"user_data mismatch: {meta.user_data!r}"
+        assert meta.frame_id > 0, "frame_id must be non-zero"
+        assert meta.timestamp > 0, "timestamp must be non-zero"
+
+    def test_no_transform_peer_decodes_cleanly(self, factory):
+        """A receiver without receiver_metadata_transform still decodes frames; metadata is None."""
+        received_frames: list = []
+
+        def on_track(kind, track):
+            if kind == rw.MediaKind.Video:
+                track.on_video_frame(
+                    lambda bgra, w, h, meta: received_frames.append((w, h, meta))
+                )
+
+        p1 = make_peer(factory)
+        p2 = make_peer(factory, on_track=on_track)
+
+        video = factory.create_video_track("notf-video")
+        tx1 = p1.pc.add_transceiver(rw.MediaKind.Video, rw.TransceiverDirection.SendOnly)
+        tx1.set_track(video)
+        send_tf = video.sender_metadata_transform()  # noqa: F841 — must stay alive
+        tx1.set_sender_transform(send_tf)
+
+        ok = connect(p1, p2)
+        assert ok, "peers did not connect within timeout"
+
+        bgra = bytes(320 * 240 * 4)
+        for _ in range(90):
+            if received_frames:
+                break
+            video.push_video_frame(bgra, 320, 240, user_data=b"dropped")
+            time.sleep(0.033)
+
+        ok = wait_for(lambda: len(received_frames) > 0)
+        assert ok, "no decoded frame received within timeout"
+
+        _, _, meta = received_frames[0]
+        assert meta is None, "expected metadata=None without receiver_metadata_transform"
