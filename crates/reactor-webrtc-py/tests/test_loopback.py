@@ -420,11 +420,13 @@ class TestFrameMetadata:
 
     def test_frame_metadata_roundtrip(self, factory):
         """Metadata pushed by the sender arrives in on_video_frame as FrameMetadata."""
+        recv_track_ref: list = []  # keeps the Track alive — Drop removes the sink
         recv_tf_ref: list = []  # keeps the FrameTransform alive
         received_meta: list[rw.FrameMetadata] = []
 
         def on_track(kind, track):
             if kind == rw.MediaKind.Video:
+                recv_track_ref.append(track)  # prevent GC → Drop → RemoveSink
                 recv_tf = track.receiver_metadata_transform()
                 recv_tf_ref.append(recv_tf)
                 track.on_video_frame(
@@ -470,10 +472,12 @@ class TestFrameMetadata:
 
     def test_no_transform_peer_decodes_cleanly(self, factory):
         """A receiver without receiver_metadata_transform still decodes frames; metadata is None."""
+        recv_track_ref: list = []  # keeps the Track alive — Drop removes the sink
         received_frames: list = []
 
         def on_track(kind, track):
             if kind == rw.MediaKind.Video:
+                recv_track_ref.append(track)  # prevent GC → Drop → RemoveSink
                 track.on_video_frame(
                     lambda bgra, w, h, meta: received_frames.append((w, h, meta))
                 )
