@@ -56,7 +56,7 @@ With [mise](https://mise.jdx.dev) (recommended - pins the whole toolchain):
 
 ```bash
 mise install                 # rust (via rust-toolchain.toml) + uv/ruff/maturin/nextest/shellcheck
-make check                   # fmt-check + cargo check + clippy (no native lib needed)
+make ci                      # fmt-check + clippy + repo lints (auto-fetches the prebuilt)
 
 export REACTOR_WEBRTC_LIB_DIR=/path/to/libwebrtc   # a prebuilt is required to link/test
 make test                                          # cargo nextest run + doctests
@@ -113,7 +113,7 @@ modes (priority order):
    prebuilt archive (overrides the auto-detected URL).
 
 ```bash
-cargo check        # ✅ builds the API surface (no native lib needed)
+cargo check        # ✅ auto-downloads the prebuilt on first run (mode 1 above)
 cargo build        # ✅ builds the rlibs; linking a binary needs a prebuilt
 
 # link + run the FFI/integration tests against a locally staged build:

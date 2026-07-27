@@ -72,7 +72,10 @@ description = "[Format] Check Rust formatting"
 run = "cargo fmt --all -- --check"
 
 [tasks.check]
-description = "[Build] cargo check the workspace (no native lib needed)"
+# build.rs auto-detects: with nothing set it downloads the libwebrtc prebuilt
+# (headers + lib) for the sys crate's C++ glue, so the first run needs network
+# (and REACTOR_WEBRTC_PREBUILT_TOKEN while the release repo is private).
+description = "[Build] cargo check the workspace (auto-fetches the libwebrtc prebuilt)"
 run = "cargo check --workspace"
 
 [tasks.clippy]
@@ -108,8 +111,10 @@ description = "[Quality] Enforce a single root [tools] table (no module-declared
 run = "python3 scripts/check-mise-tools-root.py"
 
 [tasks.ci]
-description = "[Quality] fmt-check + check + clippy + lint (no native lib)"
-depends = ["fmt:check", "check", "clippy", "lint"]
+# No `check` here: clippy IS cargo check plus lints, so listing both compiles
+# the workspace twice (different rustc wrappers = disjoint fingerprints).
+description = "[Quality] Everything the CI lint job runs (fmt-check + clippy + repo lints)"
+depends = ["lint"]
 
 [tasks.install-hooks]
 description = "[Setup] Install git hooks via hk (works from the main repo and worktrees)"

@@ -33,6 +33,8 @@ jobs:
         with:
           fetch-depth: 0   # mise.lock drift check diffs against the merge-base
       - uses: actions-rust-lang/setup-rust-toolchain@v1   # reads rust-toolchain.toml
+        with:
+          cache-on-failure: true   # keep the dep cache from red runs; PR iteration is the hot path
       # The bundled libc++ headers in the prebuilt (Chromium llvm-23) require
       # clang >= 20 (builtins like __builtin_clzg added in that toolchain era).
       - name: Install clang-21
@@ -64,6 +66,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache-on-failure: true   # keep the dep cache from red runs; PR iteration is the hot path
       - name: Install clang-21
         run: |
           wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/llvm.asc
@@ -86,6 +90,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache-on-failure: true   # keep the dep cache from red runs; PR iteration is the hot path
       - name: Install clang-21
         run: |
           wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/llvm.asc
