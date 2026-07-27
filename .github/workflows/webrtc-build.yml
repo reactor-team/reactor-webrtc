@@ -201,6 +201,11 @@ jobs:
     needs: build
     if: github.event_name == 'workflow_dispatch' && inputs.publish
     runs-on: ubuntu-latest
+    # Cutting a release ships prebuilt native binaries that downstream packages
+    # link against, so the publish is gated on the `release` environment: its
+    # required reviewers put a human approval between a dispatch and a public
+    # release, rather than letting anyone with write publish unilaterally.
+    environment: release
     permissions:
       contents: write
     steps:
