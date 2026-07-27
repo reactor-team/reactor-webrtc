@@ -692,10 +692,16 @@ pub struct EncodedVideoTrack {
 impl EncodedVideoTrack {
     /// Push a compressed video frame.
     ///
+    /// Push a compressed video frame.
+    ///
     /// `data` — Annex-B H.264 or VP8/VP9 payload.
     /// Pass `width=0`, `height=0`, `rtp_timestamp=0` to inherit from the
     /// track's configured resolution.
-    #[pyo3(signature = (data, is_key_frame=false, width=0, height=0, rtp_timestamp=0))]
+    /// Pass `user_data` (bytes) to embed per-frame metadata in the encoded
+    /// packet trailer (same mechanism as `Track.push_video_frame`). Requires
+    /// `Track.sender_metadata_transform` to be attached to the sender
+    /// transceiver beforehand; otherwise `user_data` is silently ignored.
+    #[pyo3(signature = (data, is_key_frame=false, width=0, height=0, rtp_timestamp=0, user_data=None))]
     fn push_encoded_frame(
         &self,
         data: &[u8],
@@ -703,14 +709,29 @@ impl EncodedVideoTrack {
         width: u32,
         height: u32,
         rtp_timestamp: u32,
+        user_data: Option<&[u8]>,
     ) {
-        self.inner.push_encoded_frame(rw::EncodedVideoFrame {
+        let frame = rw::EncodedVideoFrame {
             data: data.to_vec(),
             is_key_frame,
             width,
             height,
             rtp_timestamp,
-        });
+        };
+        match user_data {
+            Some(ud) => self.inner.push_encoded_frame_with_metadata(frame, ud),
+            None => self.inner.push_encoded_frame(frame),
+        }
+    }
+
+    /// Return a sender [`FrameTransform`] that embeds per-frame metadata
+    /// trailers. Call before the first SDP exchange and attach the result to
+    /// the sender transceiver with `Transceiver.set_sender_transform`. After
+    /// that, `push_encoded_frame(data, user_data=...)` will embed metadata.
+    fn sender_metadata_transform(&mut self) -> FrameTransform {
+        FrameTransform {
+            inner: self.inner.sender_metadata_transform(),
+        }
     }
 
     /// Add this track to a peer connection via `add_track` (creates a sendrecv

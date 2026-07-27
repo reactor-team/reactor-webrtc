@@ -11,7 +11,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::os::raw::c_int;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -129,6 +129,10 @@ pub struct Track {
     receiver_meta: Option<ReceiverMetaQueue>,
     // Monotonic per-track frame counter; wraps from u64::MAX to 1 (0 = unset).
     frame_counter: AtomicU64,
+    // Last capture_ms allocated by alloc_send_capture_us; ensures strictly-
+    // increasing keys in the sender map even when two pushes land in the
+    // same millisecond.
+    last_send_ms: AtomicI64,
 }
 
 // SAFETY: the native track is internally thread-safe; sink callbacks are
@@ -151,6 +155,7 @@ impl Track {
             sender_meta: None,
             receiver_meta: None,
             frame_counter: AtomicU64::new(0),
+            last_send_ms: AtomicI64::new(0),
         }
     }
 
@@ -197,28 +202,58 @@ impl Track {
         if self.kind != MediaKind::Video {
             return;
         }
-
-        // frame_id: monotonic, wraps from u64::MAX back to 1 (0 means unset).
-        let raw = self.frame_counter.fetch_add(1, Ordering::Relaxed);
-        let frame_id = if raw == u64::MAX { 1 } else { raw + 1 };
-
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_micros() as u64;
-
+        let capture_us = self.alloc_send_capture_us();
         let meta = crate::metadata::FrameMetadata {
-            frame_id,
-            timestamp,
+            frame_id: self.next_frame_id(),
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros() as u64,
             user_data: user_data.to_vec(),
         };
+        self.insert_sender_meta(capture_us / 1000, meta);
+        self.push_video_frame_ts(bgra, width, height, capture_us);
+    }
 
-        // Sample the clock once and use it for both the HashMap key and the
-        // VideoFrame capture timestamp — the transform callback reads
-        // CaptureTime()->ms() which equals capture_us/1000.
-        let capture_us = unsafe { reactor_webrtc_sys::reactor_webrtc_time_micros() };
-        let capture_ms = capture_us / 1000;
+    /// Return a strictly-increasing capture timestamp in microseconds for use
+    /// as the sender-map key and `push_video_frame_ts` argument.
+    ///
+    /// Two calls in the same millisecond would produce the same `capture_ms`
+    /// key, causing both frames to share the same metadata entry. This method
+    /// advances the counter by 1 ms if the real clock hasn't moved, guaranteeing
+    /// unique keys regardless of call frequency.
+    pub(crate) fn alloc_send_capture_us(&self) -> i64 {
+        let raw_ms = unsafe { reactor_webrtc_sys::reactor_webrtc_time_micros() } / 1000;
+        let mut prev = self.last_send_ms.load(Ordering::Relaxed);
+        loop {
+            let next = raw_ms.max(prev + 1);
+            match self.last_send_ms.compare_exchange_weak(
+                prev,
+                next,
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return next * 1000,
+                Err(actual) => prev = actual,
+            }
+        }
+    }
 
+    /// Advance the per-track frame counter and return the new value (1-based,
+    /// wraps from `u64::MAX` back to 1; 0 is reserved to mean "unset").
+    pub(crate) fn next_frame_id(&self) -> u64 {
+        let raw = self.frame_counter.fetch_add(1, Ordering::Relaxed);
+        if raw == u64::MAX {
+            1
+        } else {
+            raw + 1
+        }
+    }
+
+    /// Insert a metadata entry keyed by `capture_ms` into the sender map.
+    /// No-op when [`sender_metadata_transform`](Self::sender_metadata_transform)
+    /// has not been called.
+    pub(crate) fn insert_sender_meta(&self, capture_ms: i64, meta: crate::metadata::FrameMetadata) {
         if let Some(map) = &self.sender_meta {
             if let Ok(mut guard) = map.lock() {
                 let (ref mut hmap, ref mut order) = *guard;
@@ -228,13 +263,22 @@ impl Track {
                     }
                 }
                 // No-erase on insert: simulcast layers sharing the same
-                // capture_time_ms (same raw frame, multiple encoded layers)
-                // must all find the same entry.
+                // capture_time_ms must all find the same entry.
                 hmap.entry(capture_ms).or_insert(meta);
                 order.push_back(capture_ms);
             }
         }
+    }
 
+    /// Push a BGRA frame with an explicit WebRTC capture timestamp (µs).
+    /// Used internally to correlate metadata with the sender FrameTransform.
+    pub(crate) fn push_video_frame_ts(
+        &self,
+        bgra: &[u8],
+        width: u32,
+        height: u32,
+        capture_us: i64,
+    ) {
         unsafe {
             reactor_webrtc_sys::reactor_webrtc_video_track_push_frame_ts(
                 self.raw,

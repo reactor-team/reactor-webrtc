@@ -610,6 +610,17 @@ impl EncodedVideoTrack {
         &self.track
     }
 
+    /// Attach a per-frame metadata sender transform to this track.
+    ///
+    /// Call this before the first SDP exchange, then pass the returned
+    /// [`FrameTransform`](crate::FrameTransform) to
+    /// [`Transceiver::set_sender_transform`](crate::Transceiver::set_sender_transform).
+    /// After that, [`push_encoded_frame_with_metadata`](Self::push_encoded_frame_with_metadata)
+    /// will embed metadata into every encoded frame before packetization.
+    pub fn sender_metadata_transform(&mut self) -> crate::FrameTransform {
+        self.track.sender_metadata_transform()
+    }
+
     /// Inject a pre-encoded frame into the WebRTC RTP stack.
     ///
     /// The call returns immediately; the frame is queued and forwarded to the
@@ -629,5 +640,31 @@ impl EncodedVideoTrack {
         // encoded bytes come from the queue above.
         self.track
             .push_video_frame(&self.dummy, self.width, self.height);
+    }
+
+    /// Inject a pre-encoded frame with per-frame metadata embedded as a
+    /// protobuf trailer.
+    ///
+    /// `frame_id` and `timestamp` are computed internally; the caller
+    /// supplies only `user_data`. Requires
+    /// [`Track::sender_metadata_transform`](crate::Track::sender_metadata_transform)
+    /// to be called on [`self.track()`](Self::track) and the returned
+    /// [`FrameTransform`](crate::FrameTransform) to be attached to the sender
+    /// transceiver before the first SDP exchange.
+    pub fn push_encoded_frame_with_metadata(&self, frame: EncodedVideoFrame, user_data: &[u8]) {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let capture_us = self.track.alloc_send_capture_us();
+        let meta = crate::metadata::FrameMetadata {
+            frame_id: self.track.next_frame_id(),
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros() as u64,
+            user_data: user_data.to_vec(),
+        };
+        self.track.insert_sender_meta(capture_us / 1000, meta);
+        self.queue.lock().unwrap().push_back(frame);
+        self.track
+            .push_video_frame_ts(&self.dummy, self.width, self.height, capture_us);
     }
 }
