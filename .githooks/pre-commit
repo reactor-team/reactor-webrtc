@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Pre-commit quality gate — mirrors the CI fmt + check + clippy job.
+# Skip with: git commit --no-verify
+set -euo pipefail
+
+fail() { echo "pre-commit: $*" >&2; exit 1; }
+
+echo "pre-commit: cargo fmt --check"
+cargo fmt --all -- --check || fail "formatting issues found — run 'cargo fmt --all' and re-stage"
+
+echo "pre-commit: cargo check"
+cargo check --workspace --quiet
+
+echo "pre-commit: cargo clippy"
+cargo clippy --workspace --quiet -- -D warnings
+
+echo "pre-commit: OK"
