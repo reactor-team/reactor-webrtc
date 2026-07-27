@@ -52,7 +52,10 @@ concurrency:
   # Key on the event too: a push (mac smoke) and a workflow_dispatch (chosen
   # targets) on the same ref must not cancel each other.
   group: webrtc-build-${{ github.ref }}-${{ github.event_name }}
-  cancel-in-progress: true
+  # PRs: halt the in-flight matrix and run only the newest push. Main merges
+  # and manual release dispatches must never be cancelled mid-build - they
+  # block instead, queueing behind the running build until it completes.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # Compute the build matrix (a job-level `if` can't gate matrix combinations).

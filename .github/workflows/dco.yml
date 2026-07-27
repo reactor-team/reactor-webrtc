@@ -7,6 +7,11 @@ name: DCO
 on:
   pull_request:
 
+# PR-only workflow: a new push supersedes the old run entirely.
+concurrency:
+  group: dco-${{ github.head_ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
   pull-requests: read
