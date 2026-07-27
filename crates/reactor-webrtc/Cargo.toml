@@ -15,3 +15,4 @@ doctest = false
 
 [dependencies]
 reactor-webrtc-sys = { path = "../reactor-webrtc-sys", version = "0.1.0" }
+prost = "0.13"

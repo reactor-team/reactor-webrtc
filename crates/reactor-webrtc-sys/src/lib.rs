@@ -63,7 +63,11 @@ pub struct ReactorEncodedFrame {
     pub is_key_frame: c_int,
     pub payload_type: u8,
     pub ssrc: u32,
+    /// RTP timestamp.
     pub timestamp: u32,
+    /// Capture timestamp in milliseconds (same monotonic epoch as `reactor_webrtc_time_micros`).
+    /// Zero when unavailable (e.g. receive side before the sender sets CaptureTime).
+    pub capture_time_ms: i64,
     pub data: *const u8,
     pub data_len: usize,
     pub mime_type: *const c_char,
@@ -342,6 +346,9 @@ extern "C" {
         factory: *mut PeerConnectionFactory,
         id: *const c_char,
     ) -> *mut MediaStreamTrack;
+    /// Returns the current monotonic clock in microseconds — the same epoch
+    /// used by `VideoFrame::set_timestamp_us` and `EncodedImage::CaptureTime`.
+    pub fn reactor_webrtc_time_micros() -> i64;
     /// Push a BGRA frame (`width * height * 4` bytes) into a local video track's
     /// source; converted to I420 and timestamped internally.
     pub fn reactor_webrtc_video_track_push_frame(
@@ -349,6 +356,15 @@ extern "C" {
         bgra: *const u8,
         width: c_int,
         height: c_int,
+    );
+    /// Like `reactor_webrtc_video_track_push_frame` but uses a caller-supplied
+    /// capture timestamp (microseconds, same epoch as `reactor_webrtc_time_micros`).
+    pub fn reactor_webrtc_video_track_push_frame_ts(
+        track: *mut MediaStreamTrack,
+        bgra: *const u8,
+        width: c_int,
+        height: c_int,
+        capture_time_us: i64,
     );
     /// Add a local audio or video track to the peer connection (creates a
     /// sendrecv transceiver). Returns 1 on success, 0 on failure.

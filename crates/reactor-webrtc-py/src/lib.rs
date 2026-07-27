@@ -19,11 +19,12 @@
 // function named `reactor_webrtc` that this file also defines.
 use ::reactor_webrtc as rw;
 
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 // Process-wide guard: libwebrtc starts global threads on factory creation and
 // joins them on destruction.  Creating a second factory before the first is
@@ -480,6 +481,67 @@ impl From<rw::StatsReport> for StatsReport {
     }
 }
 
+// ── FrameMetadata ─────────────────────────────────────────────────────────────
+
+/// Metadata attached to a video frame via the packet trailer.
+///
+/// All fields default to zero / empty when not set by the sender.
+#[pyclass]
+#[derive(Clone, Default)]
+pub struct FrameMetadata {
+    /// Application-level frame counter (0 = unset).
+    #[pyo3(get, set)]
+    pub frame_id: u64,
+    /// Wall-clock timestamp in microseconds (0 = unset).
+    #[pyo3(get, set)]
+    pub timestamp: u64,
+    /// Arbitrary application payload (bytes).
+    pub user_data: Vec<u8>,
+}
+
+#[pymethods]
+impl FrameMetadata {
+    #[new]
+    #[pyo3(signature = (frame_id=0, timestamp=0, user_data=vec![]))]
+    fn new(frame_id: u64, timestamp: u64, user_data: Vec<u8>) -> Self {
+        Self {
+            frame_id,
+            timestamp,
+            user_data,
+        }
+    }
+    /// Returns `user_data` as Python `bytes`.
+    #[getter]
+    fn user_data<'py>(&self, py: Python<'py>) -> pyo3::Bound<'py, PyBytes> {
+        PyBytes::new_bound(py, &self.user_data)
+    }
+
+    /// Sets `user_data` from Python `bytes` or any buffer.
+    #[setter]
+    fn set_user_data(&mut self, data: Vec<u8>) {
+        self.user_data = data;
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "FrameMetadata(frame_id={}, timestamp={}, user_data={} bytes)",
+            self.frame_id,
+            self.timestamp,
+            self.user_data.len()
+        )
+    }
+}
+
+impl From<rw::FrameMetadata> for FrameMetadata {
+    fn from(m: rw::FrameMetadata) -> Self {
+        Self {
+            frame_id: m.frame_id,
+            timestamp: m.timestamp,
+            user_data: m.user_data,
+        }
+    }
+}
+
 // ── Track ─────────────────────────────────────────────────────────────────────
 
 /// A media track — local (push frames) or remote (attach a sink).
@@ -498,7 +560,20 @@ impl Track {
     }
 
     /// Push a raw BGRA video frame into a local video track.
-    fn push_video_frame(&self, py: Python, bgra: &[u8], width: u32, height: u32) -> PyResult<()> {
+    ///
+    /// Pass `user_data` (bytes) to embed per-frame metadata in the encoded
+    /// packet trailer. `frame_id` and `timestamp` are computed automatically.
+    /// Requires [`sender_metadata_transform`] to be attached to the sender
+    /// transceiver beforehand; otherwise `user_data` is silently ignored.
+    #[pyo3(signature = (bgra, width, height, user_data=None))]
+    fn push_video_frame(
+        &self,
+        py: Python,
+        bgra: &[u8],
+        width: u32,
+        height: u32,
+        user_data: Option<&[u8]>,
+    ) -> PyResult<()> {
         let expected = (width as usize)
             .checked_mul(height as usize)
             .and_then(|n| n.checked_mul(4))
@@ -514,17 +589,70 @@ impl Track {
             )));
         }
         let owned = bgra.to_vec();
-        py.allow_threads(|| self.inner.push_video_frame(&owned, width, height));
+        match user_data {
+            Some(ud) => {
+                let ud = ud.to_vec();
+                py.allow_threads(|| {
+                    self.inner
+                        .push_video_frame_with_metadata(&owned, width, height, &ud)
+                });
+            }
+            None => {
+                py.allow_threads(|| self.inner.push_video_frame(&owned, width, height));
+            }
+        }
         Ok(())
     }
 
-    /// Register `callback(bgra: bytes, width: int, height: int)` for decoded
-    /// video frames from a remote track. Fires on a WebRTC thread.
+    /// Return a `FrameTransform` that appends a metadata trailer to encoded
+    /// frames on the send path. Attach it to the sender transceiver with
+    /// `Transceiver.set_sender_transform` before the SDP exchange.
+    fn sender_metadata_transform(&mut self) -> FrameTransform {
+        FrameTransform {
+            inner: self.inner.sender_metadata_transform(),
+        }
+    }
+
+    /// Return a `FrameTransform` that strips the metadata trailer from received
+    /// encoded frames. Attach it to the receiver transceiver with
+    /// `Transceiver.set_receiver_transform` before the SDP exchange. After
+    /// attachment, `on_video_frame` callbacks will carry `metadata` when the
+    /// sender included a trailer.
+    fn receiver_metadata_transform(&mut self) -> FrameTransform {
+        FrameTransform {
+            inner: self.inner.receiver_metadata_transform(),
+        }
+    }
+
+    /// Register a callback for decoded video frames from a remote track.
+    ///
+    /// Signature: `callback(bgra: bytes, width: int, height: int, metadata: FrameMetadata | None)`
+    ///
+    /// For backward compatibility with 3-argument callbacks
+    /// `callback(bgra, width, height)`, the 4-argument call is retried as a
+    /// 3-argument call on `TypeError` when `metadata` is `None`.
     fn on_video_frame(&mut self, callback: PyObject) {
         self.inner.on_video_frame(move |frame| {
             Python::with_gil(|py| {
                 let bytes = PyBytes::new_bound(py, frame.bgra);
-                let _ = callback.call1(py, (bytes, frame.width, frame.height));
+                let meta = frame.metadata.map(|m| {
+                    Py::new(py, FrameMetadata::from(m))
+                        .map(|p| p.into_any())
+                        .unwrap_or_else(|_| py.None())
+                });
+                match meta {
+                    Some(m) => {
+                        let _ = callback.call1(py, (bytes, frame.width, frame.height, m));
+                    }
+                    None => {
+                        // Try 4-arg (with None); fall back to legacy 3-arg on TypeError.
+                        let result = callback
+                            .call1(py, (bytes.clone(), frame.width, frame.height, py.None()));
+                        if result.is_err() {
+                            let _ = callback.call1(py, (bytes, frame.width, frame.height));
+                        }
+                    }
+                }
             });
         });
     }
@@ -565,10 +693,16 @@ pub struct EncodedVideoTrack {
 impl EncodedVideoTrack {
     /// Push a compressed video frame.
     ///
+    /// Push a compressed video frame.
+    ///
     /// `data` — Annex-B H.264 or VP8/VP9 payload.
     /// Pass `width=0`, `height=0`, `rtp_timestamp=0` to inherit from the
     /// track's configured resolution.
-    #[pyo3(signature = (data, is_key_frame=false, width=0, height=0, rtp_timestamp=0))]
+    /// Pass `user_data` (bytes) to embed per-frame metadata in the encoded
+    /// packet trailer (same mechanism as `Track.push_video_frame`). Requires
+    /// `Track.sender_metadata_transform` to be attached to the sender
+    /// transceiver beforehand; otherwise `user_data` is silently ignored.
+    #[pyo3(signature = (data, is_key_frame=false, width=0, height=0, rtp_timestamp=0, user_data=None))]
     fn push_encoded_frame(
         &self,
         data: &[u8],
@@ -576,14 +710,29 @@ impl EncodedVideoTrack {
         width: u32,
         height: u32,
         rtp_timestamp: u32,
+        user_data: Option<&[u8]>,
     ) {
-        self.inner.push_encoded_frame(rw::EncodedVideoFrame {
+        let frame = rw::EncodedVideoFrame {
             data: data.to_vec(),
             is_key_frame,
             width,
             height,
             rtp_timestamp,
-        });
+        };
+        match user_data {
+            Some(ud) => self.inner.push_encoded_frame_with_metadata(frame, ud),
+            None => self.inner.push_encoded_frame(frame),
+        }
+    }
+
+    /// Return a sender [`FrameTransform`] that embeds per-frame metadata
+    /// trailers. Call before the first SDP exchange and attach the result to
+    /// the sender transceiver with `Transceiver.set_sender_transform`. After
+    /// that, `push_encoded_frame(data, user_data=...)` will embed metadata.
+    fn sender_metadata_transform(&mut self) -> FrameTransform {
+        FrameTransform {
+            inner: self.inner.sender_metadata_transform(),
+        }
     }
 
     /// Add this track to a peer connection via `add_track` (creates a sendrecv
@@ -615,6 +764,142 @@ impl EncodedVideoTrack {
     }
 }
 
+// ── FrameAction ───────────────────────────────────────────────────────────────
+
+/// What a FrameTransform callback should do with the frame.
+#[pyclass(eq, eq_int)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FrameAction {
+    /// Forward the frame downstream (send it / hand it to the decoder).
+    Forward = 0,
+    /// Drop the frame: on receive this bypasses the decoder; on send nothing
+    /// is transmitted.
+    Drop = 1,
+}
+
+impl From<rw::FrameAction> for FrameAction {
+    fn from(a: rw::FrameAction) -> Self {
+        match a {
+            rw::FrameAction::Forward => Self::Forward,
+            rw::FrameAction::Drop => Self::Drop,
+        }
+    }
+}
+
+impl From<FrameAction> for rw::FrameAction {
+    fn from(a: FrameAction) -> Self {
+        match a {
+            FrameAction::Forward => Self::Forward,
+            FrameAction::Drop => Self::Drop,
+        }
+    }
+}
+
+// ── EncodedFrame ──────────────────────────────────────────────────────────────
+
+/// A snapshot of an encoded frame passed to a `FrameTransform` callback.
+///
+/// `data` is a Python `bytes` object. Call `replace_data(new_bytes)` inside
+/// the callback to substitute the payload; the new bytes are forwarded
+/// downstream when the callback returns `FrameAction.Forward`.
+#[pyclass]
+pub struct EncodedFrame {
+    data: Vec<u8>,
+    is_key_frame: bool,
+    ssrc: u32,
+    timestamp: u32,
+    capture_time_ms: i64,
+    // Replacement written by replace_data(); read back by the transform
+    // closure after the Python callback returns.
+    replacement: Arc<Mutex<Option<Vec<u8>>>>,
+}
+
+#[pymethods]
+impl EncodedFrame {
+    #[getter]
+    fn data<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new_bound(py, &self.data)
+    }
+    #[getter]
+    fn is_key_frame(&self) -> bool {
+        self.is_key_frame
+    }
+    #[getter]
+    fn ssrc(&self) -> u32 {
+        self.ssrc
+    }
+    #[getter]
+    fn timestamp(&self) -> u32 {
+        self.timestamp
+    }
+    #[getter]
+    fn capture_time_ms(&self) -> i64 {
+        self.capture_time_ms
+    }
+    /// Replace this frame's encoded payload. Must be called inside the
+    /// FrameTransform callback.
+    fn replace_data(&self, new_data: Vec<u8>) {
+        if let Ok(mut g) = self.replacement.lock() {
+            *g = Some(new_data);
+        }
+    }
+}
+
+// ── FrameTransform ────────────────────────────────────────────────────────────
+
+/// An encoded-frame transformer. Attach to a transceiver's sender or receiver
+/// via `Transceiver.set_sender_transform` / `set_receiver_transform`.
+///
+/// Create from a Python callable with `FrameTransform(callback)`, or obtain
+/// from `Track.sender_metadata_transform()` / `receiver_metadata_transform()`.
+#[pyclass]
+pub struct FrameTransform {
+    inner: rw::FrameTransform,
+}
+
+#[pymethods]
+impl FrameTransform {
+    /// Create a transform from a Python callable.
+    ///
+    /// Signature: `callback(frame: EncodedFrame) -> FrameAction`
+    ///
+    /// The callback runs on a WebRTC thread; acquire the GIL automatically.
+    /// Call `frame.replace_data(bytes)` inside the callback to substitute the
+    /// encoded payload before returning `FrameAction.Forward`.
+    #[new]
+    fn new(cb: PyObject) -> Self {
+        let inner = rw::FrameTransform::new(move |frame| {
+            Python::with_gil(|py| {
+                let replacement = Arc::new(Mutex::new(None::<Vec<u8>>));
+                let py_frame = match Py::new(
+                    py,
+                    EncodedFrame {
+                        data: frame.data.to_vec(),
+                        is_key_frame: frame.is_key_frame,
+                        ssrc: frame.ssrc,
+                        timestamp: frame.timestamp,
+                        capture_time_ms: frame.capture_time_ms,
+                        replacement: replacement.clone(),
+                    },
+                ) {
+                    Ok(f) => f,
+                    Err(_) => return rw::FrameAction::Forward,
+                };
+                let action = cb
+                    .call1(py, (py_frame,))
+                    .ok()
+                    .and_then(|r| r.extract::<FrameAction>(py).ok())
+                    .unwrap_or(FrameAction::Forward);
+                if let Some(new_data) = replacement.lock().ok().and_then(|mut g| g.take()) {
+                    frame.replace_data(&new_data);
+                }
+                rw::FrameAction::from(action)
+            })
+        });
+        Self { inner }
+    }
+}
+
 // ── Transceiver ───────────────────────────────────────────────────────────────
 
 /// An RTP transceiver (one m-section in the SDP).
@@ -635,10 +920,20 @@ impl Transceiver {
         MediaKind::from(py.allow_threads(|| self.inner.kind()))
     }
 
-    /// Attach a local track to the sender slot.
-    fn set_track(&self, py: Python, track: &Track) -> PyResult<()> {
-        py.allow_threads(|| self.inner.set_track(&track.inner))
-            .map_err(err)
+    /// Attach a local track to the sender slot. Accepts either a `Track` or an
+    /// `EncodedVideoTrack`.
+    fn set_track(&self, track: &Bound<'_, PyAny>) -> PyResult<()> {
+        if let Ok(t) = track.downcast::<Track>() {
+            let t = t.borrow();
+            return self.inner.set_track(&t.inner).map_err(err);
+        }
+        if let Ok(enc) = track.downcast::<EncodedVideoTrack>() {
+            let enc = enc.borrow();
+            return self.inner.set_track(enc.inner.track()).map_err(err);
+        }
+        Err(PyTypeError::new_err(
+            "track must be a Track or EncodedVideoTrack",
+        ))
     }
 
     /// Set the transceiver direction (SendOnly, RecvOnly, SendRecv, Inactive).
@@ -650,6 +945,20 @@ impl Transceiver {
                 .set_direction(rw::TransceiverDirection::from(direction))
         })
         .map_err(err)
+    }
+
+    /// Attach a `FrameTransform` to the sender path of this transceiver.
+    /// The transform runs after the encoder, before RTP packetization.
+    fn set_sender_transform(&self, py: Python, transform: &FrameTransform) -> PyResult<()> {
+        py.allow_threads(|| self.inner.set_sender_transform(&transform.inner))
+            .map_err(err)
+    }
+
+    /// Attach a `FrameTransform` to the receiver path of this transceiver.
+    /// The transform runs after RTP depacketization, before the decoder.
+    fn set_receiver_transform(&self, py: Python, transform: &FrameTransform) -> PyResult<()> {
+        py.allow_threads(|| self.inner.set_receiver_transform(&transform.inner))
+            .map_err(err)
     }
 }
 
@@ -1123,6 +1432,10 @@ fn reactor_webrtc(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<OutboundRtpStats>()?;
     m.add_class::<IceCandidatePairStats>()?;
     m.add_class::<StatsReport>()?;
+    m.add_class::<FrameMetadata>()?;
+    m.add_class::<FrameAction>()?;
+    m.add_class::<EncodedFrame>()?;
+    m.add_class::<FrameTransform>()?;
     m.add_class::<Track>()?;
     m.add_class::<EncodedVideoTrack>()?;
     m.add_class::<Transceiver>()?;

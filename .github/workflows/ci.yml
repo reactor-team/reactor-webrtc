@@ -71,5 +71,9 @@ jobs:
         run: maturin build --manifest-path crates/reactor-webrtc-py/Cargo.toml
       - name: Install reactor-webrtc-py wheel
         run: pip install target/wheels/reactor_webrtc-*.whl
-      - name: Run Python tests
-        run: pytest crates/reactor-webrtc-py/tests/ -v
+      # Each invocation is a fresh process so the PeerConnectionFactory singleton
+      # constraint (one factory per process) is satisfied across test files.
+      - name: Run Python tests (standard factory)
+        run: pytest crates/reactor-webrtc-py/tests/test_loopback.py -v
+      - name: Run Python tests (encoded-video-track factory)
+        run: pytest crates/reactor-webrtc-py/tests/test_encoded_track.py -v

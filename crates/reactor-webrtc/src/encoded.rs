@@ -56,6 +56,9 @@ pub struct EncodedFrame<'a> {
     pub ssrc: u32,
     /// The frame's RTP timestamp.
     pub timestamp: u32,
+    /// Capture timestamp in milliseconds (monotonic, same epoch as
+    /// `webrtc::TimeMicros`). Zero when unavailable.
+    pub capture_time_ms: i64,
     /// e.g. `"video/VP8"`, `"audio/opus"`.
     pub mime_type: &'a str,
     /// The encoded payload.
@@ -125,6 +128,7 @@ extern "C" fn encoded_tramp(
         payload_type: f.payload_type,
         ssrc: f.ssrc,
         timestamp: f.timestamp,
+        capture_time_ms: f.capture_time_ms,
         mime_type: mime,
         data,
         frame: f.frame,
@@ -575,6 +579,13 @@ pub struct EncodedVideoTrack {
     dummy: Vec<u8>,
     width: u32,
     height: u32,
+    // FIFO metadata queue for push_encoded_frame_with_metadata. Set by
+    // sender_metadata_transform(); the sender FrameTransform pops one entry
+    // per encoded frame in push order. Using a FIFO avoids timestamp
+    // correlation: capture_time_ms is unreliable because VideoStreamEncoder
+    // clamps future timestamps back to post_time, which can collide when two
+    // pushes land in the same millisecond.
+    sender_meta_fifo: Option<Arc<Mutex<VecDeque<crate::metadata::FrameMetadata>>>>,
 }
 
 // SAFETY: the queue is Mutex-guarded and the dummy buffer is owned; both are
@@ -596,6 +607,7 @@ impl EncodedVideoTrack {
             dummy,
             width,
             height,
+            sender_meta_fifo: None,
         }
     }
 
@@ -604,6 +616,37 @@ impl EncodedVideoTrack {
     /// the send-only transceiver.
     pub fn track(&self) -> &crate::media::Track {
         &self.track
+    }
+
+    /// Attach a per-frame metadata sender transform to this track.
+    ///
+    /// Call this before the first SDP exchange, then pass the returned
+    /// [`FrameTransform`](crate::FrameTransform) to
+    /// [`Transceiver::set_sender_transform`](crate::Transceiver::set_sender_transform).
+    /// After that, [`push_encoded_frame_with_metadata`](Self::push_encoded_frame_with_metadata)
+    /// will embed metadata into every encoded frame before packetization.
+    ///
+    /// Uses a FIFO queue rather than `capture_time_ms` correlation: the encoder
+    /// fires the sender transform exactly once per encoded frame in push order,
+    /// so a simple queue pop is sufficient and avoids the timestamp-clamping
+    /// issue where `VideoStreamEncoder::OnFrame` discards future timestamps.
+    pub fn sender_metadata_transform(&mut self) -> crate::FrameTransform {
+        let fifo: Arc<Mutex<VecDeque<crate::metadata::FrameMetadata>>> =
+            Arc::new(Mutex::new(VecDeque::new()));
+        self.sender_meta_fifo = Some(fifo.clone());
+        crate::encoded::FrameTransform::new(move |frame| {
+            if frame.direction != FrameDirection::Send {
+                return FrameAction::Forward;
+            }
+            let meta = fifo.lock().ok().and_then(|mut g| g.pop_front());
+            if let Some(ref m) = meta {
+                let trailer = crate::metadata::encode_trailer(m);
+                let mut new_data = frame.data.to_vec();
+                new_data.extend_from_slice(&trailer);
+                frame.replace_data(&new_data);
+            }
+            FrameAction::Forward
+        })
     }
 
     /// Inject a pre-encoded frame into the WebRTC RTP stack.
@@ -623,6 +666,34 @@ impl EncodedVideoTrack {
         // Push a dummy raw frame to wake the WebRTC encoder thread.
         // The I420 data is thrown away in the encoder callback — the actual
         // encoded bytes come from the queue above.
+        self.track
+            .push_video_frame(&self.dummy, self.width, self.height);
+    }
+
+    /// Inject a pre-encoded frame with per-frame metadata embedded as a
+    /// protobuf trailer.
+    ///
+    /// `frame_id` and `timestamp` are computed internally; the caller
+    /// supplies only `user_data`. Requires
+    /// [`sender_metadata_transform`](Self::sender_metadata_transform) to be
+    /// called and the returned [`FrameTransform`](crate::FrameTransform) to
+    /// be attached to the sender transceiver before the first SDP exchange.
+    pub fn push_encoded_frame_with_metadata(&self, frame: EncodedVideoFrame, user_data: &[u8]) {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let meta = crate::metadata::FrameMetadata {
+            frame_id: self.track.next_frame_id(),
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros() as u64,
+            user_data: user_data.to_vec(),
+        };
+        // Enqueue metadata first so the FIFO entry is always present when the
+        // sender FrameTransform fires on the encoder thread.
+        if let Some(ref fifo) = self.sender_meta_fifo {
+            fifo.lock().unwrap().push_back(meta);
+        }
+        self.queue.lock().unwrap().push_back(frame);
         self.track
             .push_video_frame(&self.dummy, self.width, self.height);
     }
