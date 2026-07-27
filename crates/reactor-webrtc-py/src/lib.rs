@@ -541,15 +541,6 @@ impl From<rw::FrameMetadata> for FrameMetadata {
     }
 }
 
-impl From<&FrameMetadata> for rw::FrameMetadata {
-    fn from(m: &FrameMetadata) -> Self {
-        rw::FrameMetadata {
-            frame_id: m.frame_id,
-            timestamp: m.timestamp,
-            user_data: m.user_data.clone(),
-        }
-    }
-}
 
 // ── Track ─────────────────────────────────────────────────────────────────────
 
@@ -570,17 +561,18 @@ impl Track {
 
     /// Push a raw BGRA video frame into a local video track.
     ///
-    /// Pass `metadata` to embed frame metadata in the encoded packet trailer.
+    /// Pass `user_data` (bytes) to embed per-frame metadata in the encoded
+    /// packet trailer. `frame_id` and `timestamp` are computed automatically.
     /// Requires [`sender_metadata_transform`] to be attached to the sender
-    /// transceiver beforehand; otherwise `metadata` is silently ignored.
-    #[pyo3(signature = (bgra, width, height, metadata=None))]
+    /// transceiver beforehand; otherwise `user_data` is silently ignored.
+    #[pyo3(signature = (bgra, width, height, user_data=None))]
     fn push_video_frame(
         &self,
         py: Python,
         bgra: &[u8],
         width: u32,
         height: u32,
-        metadata: Option<&FrameMetadata>,
+        user_data: Option<&[u8]>,
     ) -> PyResult<()> {
         let expected = (width as usize)
             .checked_mul(height as usize)
@@ -597,12 +589,12 @@ impl Track {
             )));
         }
         let owned = bgra.to_vec();
-        match metadata {
-            Some(m) => {
-                let rust_meta = rw::FrameMetadata::from(m);
+        match user_data {
+            Some(ud) => {
+                let ud = ud.to_vec();
                 py.allow_threads(|| {
                     self.inner
-                        .push_video_frame_with_metadata(&owned, width, height, rust_meta)
+                        .push_video_frame_with_metadata(&owned, width, height, &ud)
                 });
             }
             None => {

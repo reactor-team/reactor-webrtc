@@ -11,7 +11,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::os::raw::c_int;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const SENDER_META_CAP: usize = 300;
 const RECEIVER_META_CAP: usize = 300;
@@ -126,6 +128,8 @@ pub struct Track {
     sender_meta: Option<SenderMetaMap>,
     // Set by receiver_metadata_transform(); shared with VideoSinkState.
     receiver_meta: Option<ReceiverMetaQueue>,
+    // Monotonic per-track frame counter; wraps from u64::MAX to 1 (0 = unset).
+    frame_counter: AtomicU64,
 }
 
 // SAFETY: the native track is internally thread-safe; sink callbacks are
@@ -147,6 +151,7 @@ impl Track {
             audio_sink: None,
             sender_meta: None,
             receiver_meta: None,
+            frame_counter: AtomicU64::new(0),
         }
     }
 
@@ -174,28 +179,41 @@ impl Track {
         }
     }
 
-    /// Push a BGRA frame with attached metadata. The metadata is encoded as a
-    /// protobuf trailer and appended to the encoded frame by the
-    /// [`FrameTransform`](crate::FrameTransform) returned from
-    /// [`sender_metadata_transform`](Self::sender_metadata_transform).
+    /// Push a BGRA frame with arbitrary `user_data` embedded in a protobuf
+    /// trailer. `frame_id` (monotonic counter) and `timestamp` (Unix epoch µs)
+    /// are computed internally.
     ///
-    /// Call `sender_metadata_transform` and attach it to the sender transceiver
-    /// before pushing frames with metadata; otherwise this is a no-op for the
-    /// metadata (the frame still goes out, just without a trailer).
+    /// Requires [`sender_metadata_transform`](Self::sender_metadata_transform)
+    /// to be attached to the sender transceiver; otherwise the frame goes out
+    /// without a trailer.
     ///
-    /// The capture timestamp is computed internally; the same value is used as
-    /// the HashMap key and as the VideoFrame timestamp so the sender transform
-    /// can correlate them reliably. No-op for non-video tracks.
+    /// No-op for non-video tracks.
     pub fn push_video_frame_with_metadata(
         &self,
         bgra: &[u8],
         width: u32,
         height: u32,
-        meta: crate::metadata::FrameMetadata,
+        user_data: &[u8],
     ) {
         if self.kind != MediaKind::Video {
             return;
         }
+
+        // frame_id: monotonic, wraps from u64::MAX back to 1 (0 means unset).
+        let raw = self.frame_counter.fetch_add(1, Ordering::Relaxed);
+        let frame_id = if raw == u64::MAX { 1 } else { raw + 1 };
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u64;
+
+        let meta = crate::metadata::FrameMetadata {
+            frame_id,
+            timestamp,
+            user_data: user_data.to_vec(),
+        };
+
         // Sample the clock once and use it for both the HashMap key and the
         // VideoFrame capture timestamp — the transform callback reads
         // CaptureTime()->ms() which equals capture_us/1000.
@@ -211,8 +229,9 @@ impl Track {
                         hmap.remove(&old_key);
                     }
                 }
-                // No-erase on insert: simulcast layers share the same
-                // capture_time_ms so all of them should find the entry.
+                // No-erase on insert: simulcast layers sharing the same
+                // capture_time_ms (same raw frame, multiple encoded layers)
+                // must all find the same entry.
                 hmap.entry(capture_ms).or_insert(meta);
                 order.push_back(capture_ms);
             }
