@@ -19,7 +19,7 @@
 // function named `reactor_webrtc` that this file also defines.
 use ::reactor_webrtc as rw;
 
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::mem::ManuallyDrop;
@@ -795,10 +795,20 @@ impl Transceiver {
         MediaKind::from(py.allow_threads(|| self.inner.kind()))
     }
 
-    /// Attach a local track to the sender slot.
-    fn set_track(&self, py: Python, track: &Track) -> PyResult<()> {
-        py.allow_threads(|| self.inner.set_track(&track.inner))
-            .map_err(err)
+    /// Attach a local track to the sender slot. Accepts either a `Track` or an
+    /// `EncodedVideoTrack`.
+    fn set_track(&self, track: &Bound<'_, PyAny>) -> PyResult<()> {
+        if let Ok(t) = track.downcast::<Track>() {
+            let t = t.borrow();
+            return self.inner.set_track(&t.inner).map_err(err);
+        }
+        if let Ok(enc) = track.downcast::<EncodedVideoTrack>() {
+            let enc = enc.borrow();
+            return self.inner.set_track(enc.inner.track()).map_err(err);
+        }
+        Err(PyTypeError::new_err(
+            "track must be a Track or EncodedVideoTrack",
+        ))
     }
 
     /// Set the transceiver direction (SendOnly, RecvOnly, SendRecv, Inactive).
