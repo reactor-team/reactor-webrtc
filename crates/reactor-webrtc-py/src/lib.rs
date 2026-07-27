@@ -615,6 +615,72 @@ impl EncodedVideoTrack {
     }
 }
 
+// ── EncodedAudioTrack ─────────────────────────────────────────────────────────
+
+/// A pre-encoded Opus audio track.
+///
+/// Obtain from `PeerConnectionFactory.with_encoded_audio_track()`. Push
+/// compressed Opus packets with `push_encoded_frame`. Use
+/// `add_to_peer_connection` or `add_transceiver` to wire it into a
+/// `PeerConnection`.
+#[pyclass]
+pub struct EncodedAudioTrack {
+    inner: rw::EncodedAudioTrack,
+}
+
+#[pymethods]
+impl EncodedAudioTrack {
+    /// Push a pre-encoded Opus packet.
+    ///
+    /// `data` — raw Opus packet bytes (one packet, typically 20ms at 48kHz).
+    /// `rtp_timestamp` — stored for future use; pass 0 to let libwebrtc assign it.
+    #[pyo3(signature = (data, rtp_timestamp=0))]
+    fn push_encoded_frame(&self, data: &[u8], rtp_timestamp: u32) {
+        self.inner.push_encoded_frame(rw::EncodedAudioFrame {
+            data: data.to_vec(),
+            rtp_timestamp,
+        });
+    }
+
+    /// Add this track to a peer connection with a sendrecv transceiver.
+    fn add_to_peer_connection(&self, py: Python, pc: &PeerConnection) -> PyResult<()> {
+        // Use add_transceiver(SendRecv) — equivalent to add_track for local
+        // send tracks. No FrameTransform needed: the factory's custom audio
+        // encoder pops pre-encoded packets directly from the queue.
+        let t = py
+            .allow_threads(|| {
+                pc.inner
+                    .add_transceiver(rw::MediaKind::Audio, rw::TransceiverDirection::SendRecv)
+            })
+            .map_err(err)?;
+        let track = self.inner.track();
+        py.allow_threads(|| t.set_track(track)).map_err(err)?;
+        Ok(())
+    }
+
+    /// Add a transceiver of the given `direction` for this track. Returns the
+    /// `Transceiver`. No `FrameTransform` is needed — the factory's custom audio
+    /// encoder pops pre-encoded packets directly from the queue.
+    fn add_transceiver(
+        &self,
+        py: Python,
+        pc: &PeerConnection,
+        direction: TransceiverDirection,
+    ) -> PyResult<Transceiver> {
+        let t = py
+            .allow_threads(|| {
+                pc.inner.add_transceiver(
+                    rw::MediaKind::Audio,
+                    rw::TransceiverDirection::from(direction),
+                )
+            })
+            .map_err(err)?;
+        let track = self.inner.track();
+        py.allow_threads(|| t.set_track(track)).map_err(err)?;
+        Ok(Transceiver { inner: t })
+    }
+}
+
 // ── Transceiver ───────────────────────────────────────────────────────────────
 
 /// An RTP transceiver (one m-section in the SDP).
@@ -1100,6 +1166,31 @@ impl PeerConnectionFactory {
             })
     }
 
+    /// Create a factory + pre-encoded audio track pair.
+    ///
+    /// Returns `(factory, encoded_track)`. Call
+    /// `encoded_track.add_to_peer_connection(pc)` or
+    /// `encoded_track.add_transceiver(pc, direction)` to wire it up, then
+    /// call `encoded_track.push_encoded_frame(data)` for each Opus packet.
+    ///
+    /// Example::
+    ///
+    ///     factory, audio = PeerConnectionFactory.with_encoded_audio_track("mic")
+    ///     pc = factory.create_peer_connection(config, observer)
+    ///     tc = audio.add_transceiver(pc, TransceiverDirection.SendOnly)
+    ///     # … later, from your encoder thread:
+    ///     audio.push_encoded_frame(opus_bytes)
+    #[staticmethod]
+    fn with_encoded_audio_track(track_id: &str) -> PyResult<(Self, EncodedAudioTrack)> {
+        claim_factory()?;
+        rw::PeerConnectionFactory::with_encoded_audio_track(track_id)
+            .map(|(f, t)| (Self { inner: f }, EncodedAudioTrack { inner: t }))
+            .map_err(|e| {
+                FACTORY_LIVE.store(false, Ordering::SeqCst);
+                err(e)
+            })
+    }
+
     fn set_adm_playout_enabled(&self, enabled: bool) {
         self.inner.set_adm_playout_enabled(enabled);
     }
@@ -1125,6 +1216,7 @@ fn reactor_webrtc(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<StatsReport>()?;
     m.add_class::<Track>()?;
     m.add_class::<EncodedVideoTrack>()?;
+    m.add_class::<EncodedAudioTrack>()?;
     m.add_class::<Transceiver>()?;
     m.add_class::<DataChannel>()?;
     m.add_class::<PeerConnectionObserver>()?;
