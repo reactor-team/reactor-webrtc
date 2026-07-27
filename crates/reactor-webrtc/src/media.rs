@@ -347,18 +347,38 @@ impl Track {
         if let Some(sink) = &mut self.video_sink {
             sink.receiver_meta = Some(queue.clone());
         }
+        // Dedup window: WebRTC can reassemble the same frame multiple times when
+        // NACK retransmissions arrive after the original packets were already
+        // consumed from the jitter buffer.  Track the last 32 (ssrc, rtp_ts)
+        // pairs; duplicates still have their trailer stripped but skip the
+        // metadata push so the queue stays in 1:1 sync with decoded frames.
+        let seen: Arc<Mutex<VecDeque<(u32, u32)>>> = Arc::new(Mutex::new(VecDeque::new()));
         crate::encoded::FrameTransform::new(move |frame| {
             if frame.direction != crate::encoded::FrameDirection::Receive {
                 return crate::encoded::FrameAction::Forward;
             }
             if let Some((meta, stripped)) = crate::metadata::decode_and_strip_trailer(frame.data) {
-                if let Ok(mut guard) = queue.lock() {
-                    if guard.len() >= RECEIVER_META_CAP {
-                        guard.pop_front();
-                    }
-                    guard.push_back(meta);
-                }
                 frame.replace_data(&stripped);
+                let key = (frame.ssrc, frame.timestamp);
+                let is_dup = seen.lock().ok().is_some_and(|mut g| {
+                    if g.contains(&key) {
+                        true
+                    } else {
+                        if g.len() >= 32 {
+                            g.pop_front();
+                        }
+                        g.push_back(key);
+                        false
+                    }
+                });
+                if !is_dup {
+                    if let Ok(mut guard) = queue.lock() {
+                        if guard.len() >= RECEIVER_META_CAP {
+                            guard.pop_front();
+                        }
+                        guard.push_back(meta);
+                    }
+                }
             }
             crate::encoded::FrameAction::Forward
         })
