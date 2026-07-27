@@ -24,6 +24,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 // Process-wide guard: libwebrtc starts global threads on factory creation and
 // joins them on destruction.  Creating a second factory before the first is
@@ -763,16 +764,140 @@ impl EncodedVideoTrack {
     }
 }
 
+// ── FrameAction ───────────────────────────────────────────────────────────────
+
+/// What a FrameTransform callback should do with the frame.
+#[pyclass(eq, eq_int)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FrameAction {
+    /// Forward the frame downstream (send it / hand it to the decoder).
+    Forward = 0,
+    /// Drop the frame: on receive this bypasses the decoder; on send nothing
+    /// is transmitted.
+    Drop = 1,
+}
+
+impl From<rw::FrameAction> for FrameAction {
+    fn from(a: rw::FrameAction) -> Self {
+        match a {
+            rw::FrameAction::Forward => Self::Forward,
+            rw::FrameAction::Drop => Self::Drop,
+        }
+    }
+}
+
+impl From<FrameAction> for rw::FrameAction {
+    fn from(a: FrameAction) -> Self {
+        match a {
+            FrameAction::Forward => Self::Forward,
+            FrameAction::Drop => Self::Drop,
+        }
+    }
+}
+
+// ── EncodedFrame ──────────────────────────────────────────────────────────────
+
+/// A snapshot of an encoded frame passed to a `FrameTransform` callback.
+///
+/// `data` is a Python `bytes` object. Call `replace_data(new_bytes)` inside
+/// the callback to substitute the payload; the new bytes are forwarded
+/// downstream when the callback returns `FrameAction.Forward`.
+#[pyclass]
+pub struct EncodedFrame {
+    data: Vec<u8>,
+    is_key_frame: bool,
+    ssrc: u32,
+    timestamp: u32,
+    capture_time_ms: i64,
+    // Replacement written by replace_data(); read back by the transform
+    // closure after the Python callback returns.
+    replacement: Arc<Mutex<Option<Vec<u8>>>>,
+}
+
+#[pymethods]
+impl EncodedFrame {
+    #[getter]
+    fn data<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new_bound(py, &self.data)
+    }
+    #[getter]
+    fn is_key_frame(&self) -> bool {
+        self.is_key_frame
+    }
+    #[getter]
+    fn ssrc(&self) -> u32 {
+        self.ssrc
+    }
+    #[getter]
+    fn timestamp(&self) -> u32 {
+        self.timestamp
+    }
+    #[getter]
+    fn capture_time_ms(&self) -> i64 {
+        self.capture_time_ms
+    }
+    /// Replace this frame's encoded payload. Must be called inside the
+    /// FrameTransform callback.
+    fn replace_data(&self, new_data: Vec<u8>) {
+        if let Ok(mut g) = self.replacement.lock() {
+            *g = Some(new_data);
+        }
+    }
+}
+
 // ── FrameTransform ────────────────────────────────────────────────────────────
 
 /// An encoded-frame transformer. Attach to a transceiver's sender or receiver
 /// via `Transceiver.set_sender_transform` / `set_receiver_transform`.
 ///
-/// Obtain from `Track.sender_metadata_transform()` or
-/// `Track.receiver_metadata_transform()`.
+/// Create from a Python callable with `FrameTransform(callback)`, or obtain
+/// from `Track.sender_metadata_transform()` / `receiver_metadata_transform()`.
 #[pyclass]
 pub struct FrameTransform {
     inner: rw::FrameTransform,
+}
+
+#[pymethods]
+impl FrameTransform {
+    /// Create a transform from a Python callable.
+    ///
+    /// Signature: `callback(frame: EncodedFrame) -> FrameAction`
+    ///
+    /// The callback runs on a WebRTC thread; acquire the GIL automatically.
+    /// Call `frame.replace_data(bytes)` inside the callback to substitute the
+    /// encoded payload before returning `FrameAction.Forward`.
+    #[new]
+    fn new(cb: PyObject) -> Self {
+        let inner = rw::FrameTransform::new(move |frame| {
+            Python::with_gil(|py| {
+                let replacement = Arc::new(Mutex::new(None::<Vec<u8>>));
+                let py_frame = match Py::new(
+                    py,
+                    EncodedFrame {
+                        data: frame.data.to_vec(),
+                        is_key_frame: frame.is_key_frame,
+                        ssrc: frame.ssrc,
+                        timestamp: frame.timestamp,
+                        capture_time_ms: frame.capture_time_ms,
+                        replacement: replacement.clone(),
+                    },
+                ) {
+                    Ok(f) => f,
+                    Err(_) => return rw::FrameAction::Forward,
+                };
+                let action = cb
+                    .call1(py, (py_frame,))
+                    .ok()
+                    .and_then(|r| r.extract::<FrameAction>(py).ok())
+                    .unwrap_or(FrameAction::Forward);
+                if let Some(new_data) = replacement.lock().ok().and_then(|mut g| g.take()) {
+                    frame.replace_data(&new_data);
+                }
+                rw::FrameAction::from(action)
+            })
+        });
+        Self { inner }
+    }
 }
 
 // ── Transceiver ───────────────────────────────────────────────────────────────
@@ -1308,6 +1433,8 @@ fn reactor_webrtc(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<IceCandidatePairStats>()?;
     m.add_class::<StatsReport>()?;
     m.add_class::<FrameMetadata>()?;
+    m.add_class::<FrameAction>()?;
+    m.add_class::<EncodedFrame>()?;
     m.add_class::<FrameTransform>()?;
     m.add_class::<Track>()?;
     m.add_class::<EncodedVideoTrack>()?;
