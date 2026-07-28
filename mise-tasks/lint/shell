@@ -5,13 +5,20 @@ cd "$REPO_ROOT"
 # Every tracked file that is a *.sh OR carries a bash/sh shebang (catches the
 # extensionless bash mise-tasks). Python tasks/scripts have a python3 shebang and
 # are skipped.
-mapfile -t files < <(
-  git ls-files | while read -r f; do
-    [ -f "$f" ] || continue
-    case "$f" in *.sh) echo "$f"; continue ;; esac
-    head -1 "$f" 2>/dev/null | grep -qE '^#!.*\b(bash|sh)\b' && echo "$f"
-  done
-)
+# Stay bash 3.2 compatible (the default /bin/bash on macOS): no `mapfile`
+# (a bash 4 builtin) and no `case` inside the <(...) generator (a `case` in a
+# process substitution trips a 3.2 parser bug: "syntax error near unexpected
+# token ;;"). A plain suffix test plus a while-read loop fed by process
+# substitution keeps the loop in this shell, so the array survives.
+files=()
+while read -r f; do
+  [ -f "$f" ] || continue
+  if [ "${f%.sh}" != "$f" ]; then
+    files+=("$f")
+  elif head -1 "$f" 2>/dev/null | grep -qE '^#!.*\b(bash|sh)\b'; then
+    files+=("$f")
+  fi
+done < <(git ls-files)
 if [ "${#files[@]}" -eq 0 ]; then echo "no shell scripts to check"; exit 0; fi
 shellcheck "${files[@]}"
 echo "✓ shellcheck OK: ${#files[@]} file(s)"
