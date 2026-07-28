@@ -25,6 +25,10 @@ jobs:
   publish-crates:
     name: Publish crates to crates.io
     runs-on: ubuntu-latest
+    environment: crates-io
+    permissions:
+      contents: read   # actions/checkout
+      id-token: write  # OIDC trusted publishing — no API token required
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -42,6 +46,15 @@ jobs:
           sed -i "s/const PREBUILT_TAG_FALLBACK: &str = \"[^\"]*\"/const PREBUILT_TAG_FALLBACK: \&str = \"${TAG}\"/" \
             crates/reactor-webrtc-sys/build.rs
           grep PREBUILT_TAG_FALLBACK crates/reactor-webrtc-sys/build.rs
+
+      # Exchange the GitHub OIDC JWT for a short-lived crates.io publish token.
+      # Set up at: https://crates.io/crates/reactor-webrtc-sys/settings/trusted-publishing
+      #            https://crates.io/crates/reactor-webrtc/settings/trusted-publishing
+      # Publisher: reactor-team/reactor-webrtc, workflow: publish.yml, environment: crates-io
+      - name: Authenticate to crates.io
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
 
       # Publish sys first (webrtc depends on it), then webrtc.
       # Each step queries crates.io first and skips if the version is already
@@ -75,7 +88,7 @@ jobs:
             cargo publish -p reactor-webrtc --no-verify
           fi
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
       - name: Dry-run summary (crates)
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
