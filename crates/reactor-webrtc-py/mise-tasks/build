@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+#MISE description="[Build] Build the reactor-webrtc wheel (release; embeds libwebrtc)"
+#MISE sources=["src/**/*.rs", "Cargo.toml", "pyproject.toml", "../reactor-webrtc/**/*.rs", "../reactor-webrtc-sys/**/*.rs", "../../Cargo.lock"]
+#MISE outputs=["../../target/wheels/reactor_webrtc-*.whl"]
+set -euo pipefail
+# Requires a native libwebrtc: REACTOR_WEBRTC_LIB_DIR (staged build) or
+# REACTOR_WEBRTC_PREBUILT_URL/_SHA256 (published prebuilt). See repo README.
+maturin build --release --manifest-path "$REPO_ROOT/crates/reactor-webrtc-py/Cargo.toml"

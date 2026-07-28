@@ -95,6 +95,7 @@ case "$OS" in
     for name in libc++.a libc++abi.a libunwind.a; do
       f="$(find "$OUT/obj" -name "$name" 2>/dev/null | head -1)"
       [ -n "$f" ] || continue
+      # shellcheck disable=SC2046  # `ar t` prints member names; word-splitting is intended (each becomes an arg to `ar qcs`).
       ( cd "$OUT" && ar qcs "$STAGE/lib/$name" $(ar t "$f") )
       FOUND="$FOUND $name($(du -h "$STAGE/lib/$name" | cut -f1))"
     done
@@ -116,6 +117,7 @@ echo "==> archiving $ARCHIVE"
 tar --use-compress-program "zstd -19 -T0" \
     -cf "$ARCHIVE" -C "$STAGE" lib include
 
+# shellcheck disable=SC2015  # intentional: prefer shasum, fall back to sha256sum when absent.
 SHA="$( (command -v shasum >/dev/null && shasum -a 256 "$ARCHIVE" || sha256sum "$ARCHIVE") | awk '{print $1}')"
 echo "$SHA  $NAME.tar.zst" > "$ARCHIVE.sha256"
 echo "✅ $ARCHIVE"

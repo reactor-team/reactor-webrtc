@@ -1,0 +1,3 @@
+# Module: reactor-webrtc-py (PyO3/Maturin wheel). Tasks addressed
+# //crates/reactor-webrtc-py:verb. NO [tools] table - tools are declared only in
+# the repo-root mise.toml (enforced by //:lint:mise-tools-root).
