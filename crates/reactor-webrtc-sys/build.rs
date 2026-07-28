@@ -523,14 +523,33 @@ fn run(cmd: &mut std::process::Command, what: &str) {
     }
 }
 
-/// Compute a file's sha256 via `sha256sum` (Linux), `shasum -a 256` (macOS), or
-/// PowerShell's `Get-FileHash` (Windows).
+/// Extract a lowercase 64-char hex digest from a hashing tool's stdout.
 ///
-/// On Windows neither `sha256sum` nor `shasum` is guaranteed to resolve: they
-/// ship with Git-for-Windows' `usr/bin`, which is a bash-only PATH entry, and
-/// `shasum` is a Perl script that `Command`'s `.exe`-only PATH lookup cannot
-/// launch anyway. `Get-FileHash` is what webrtc-build/build.ps1 uses for the
-/// same reason, so mirror it here rather than panicking on a valid platform.
+/// GNU coreutils switches to an escaped output form when the file name contains
+/// a backslash or newline: the line is prefixed with `\` and the backslashes in
+/// the name are doubled. Every Windows path trips this (`D:\a\…`), so
+/// `sha256sum` there reports `\<digest> *<name>` — hence the `\` strip. Returns
+/// `None` if the output is not a well-formed digest, so callers fall through to
+/// the next tool instead of comparing against garbage.
+fn parse_digest(stdout: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(stdout);
+    let hex = text
+        .split_whitespace()
+        .next()?
+        .trim_start_matches('\\')
+        .to_lowercase();
+    (hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit())).then_some(hex)
+}
+
+/// Compute a file's sha256 via `sha256sum` (Linux, and Windows via
+/// Git-for-Windows' `usr/bin`), `shasum -a 256` (macOS), or PowerShell's
+/// `Get-FileHash`.
+///
+/// The PowerShell path is a genuine fallback rather than the Windows path: on
+/// GitHub's `windows-latest` `sha256sum` does resolve and wins. It covers hosts
+/// where neither coreutils tool is on PATH — `shasum` in particular is a Perl
+/// script there, which `Command`'s `.exe`-only PATH lookup cannot launch — and
+/// mirrors what webrtc-build/build.ps1 uses.
 fn sha256_file(path: &Path) -> String {
     for (bin, args) in [("sha256sum", &[][..]), ("shasum", &["-a", "256"][..])] {
         if let Ok(out) = std::process::Command::new(bin)
@@ -539,11 +558,8 @@ fn sha256_file(path: &Path) -> String {
             .output()
         {
             if out.status.success() {
-                if let Some(hex) = String::from_utf8_lossy(&out.stdout)
-                    .split_whitespace()
-                    .next()
-                {
-                    return hex.to_lowercase();
+                if let Some(hex) = parse_digest(&out.stdout) {
+                    return hex;
                 }
             }
         }
@@ -559,11 +575,8 @@ fn sha256_file(path: &Path) -> String {
             .output()
         {
             if out.status.success() {
-                if let Some(hex) = String::from_utf8_lossy(&out.stdout)
-                    .split_whitespace()
-                    .next()
-                {
-                    return hex.to_lowercase();
+                if let Some(hex) = parse_digest(&out.stdout) {
+                    return hex;
                 }
             }
         }
