@@ -74,7 +74,7 @@ run = "cargo fmt --all -- --check"
 [tasks.check]
 # build.rs auto-detects: with nothing set it downloads the libwebrtc prebuilt
 # (headers + lib) for the sys crate's C++ glue, so the first run needs network
-# (and REACTOR_WEBRTC_PREBUILT_TOKEN while the release repo is private).
+# (the release assets are public — no credentials required).
 description = "[Build] cargo check the workspace (auto-fetches the libwebrtc prebuilt)"
 run = "cargo check --workspace"
 

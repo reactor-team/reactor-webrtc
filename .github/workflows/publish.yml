@@ -133,8 +133,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Derive the libwebrtc release tag from WEBRTC_VERSION and look up the
-      # matching prebuilt asset URLs (archive + sha256 sidecar) via the GitHub API.
+      # Derive the libwebrtc release tag from WEBRTC_VERSION and build the
+      # matching prebuilt asset URL. The repo is public, so the release download
+      # URLs are fetchable anonymously — no token anywhere in the build.
+      # Fetching the .sha256 sidecar here doubles as an existence check: curl -f
+      # fails the step if the release or the asset is missing.
       - name: Resolve libwebrtc prebuilt URL
         id: prebuilt
         shell: bash
@@ -144,19 +147,15 @@ jobs:
           COMMIT_SHORT=${WEBRTC_COMMIT:0:8}
           TAG="webrtc-${MILESTONE}-${COMMIT_SHORT}-p${REACTOR_PATCH_LEVEL}"
           ASSET="reactor-webrtc-${{ matrix.platform }}-release.tar.zst"
-          SHA_ASSET="${ASSET}.sha256"
-          echo "Looking up assets in release '${TAG}'..."
-          RELEASE=$(gh api "repos/${{ github.repository }}/releases/tags/${TAG}")
-          URL=$(echo "$RELEASE" | jq -r ".assets[] | select(.name == \"${ASSET}\") | .url")
-          SHA_URL=$(echo "$RELEASE" | jq -r ".assets[] | select(.name == \"${SHA_ASSET}\") | .url")
-          if [ -z "$URL" ]; then
-            echo "::error::Asset '${ASSET}' not found in release '${TAG}'"
+          BASE="https://github.com/${{ github.repository }}/releases/download/${TAG}"
+          echo "Resolving '${ASSET}' in release '${TAG}'..."
+          SHA256=$(curl -fsSL --retry 3 "${BASE}/${ASSET}.sha256" | awk '{print $1}')
+          if [ -z "$SHA256" ]; then
+            echo "::error::Empty sha256 sidecar for '${ASSET}' in release '${TAG}'"
             exit 1
           fi
-          echo "url=${URL}" >> "$GITHUB_OUTPUT"
-          echo "sha_url=${SHA_URL}" >> "$GITHUB_OUTPUT"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          echo "url=${BASE}/${ASSET}" >> "$GITHUB_OUTPUT"
+          echo "sha256=${SHA256}" >> "$GITHUB_OUTPUT"
 
       - uses: PyO3/maturin-action@v1
         with:
@@ -168,10 +167,10 @@ jobs:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
           # For Linux manylinux builds, maturin runs inside a Docker container
-          # and step-level env vars are not forwarded. Set PREBUILT_URL and
-          # PREBUILT_TOKEN via before-script-linux so build.rs downloads and
-          # extracts the prebuilt directly inside the container (avoiding any
-          # host→container path-mapping issues with the 697MB extracted tree).
+          # and step-level env vars are not forwarded. Set PREBUILT_URL/SHA256
+          # via before-script-linux so build.rs downloads and extracts the
+          # prebuilt directly inside the container (avoiding any host→container
+          # path-mapping issues with the 697MB extracted tree).
           before-script-linux: |
             dnf install -y clang lld zstd
             export CXX=clang++
@@ -186,12 +185,12 @@ jobs:
             fi
             export RUSTFLAGS="-C link-arg=-fuse-ld=lld"
             export REACTOR_WEBRTC_PREBUILT_URL="${{ steps.prebuilt.outputs.url }}"
-            export REACTOR_WEBRTC_PREBUILT_TOKEN="${{ secrets.GITHUB_TOKEN }}"
+            export REACTOR_WEBRTC_PREBUILT_SHA256="${{ steps.prebuilt.outputs.sha256 }}"
         env:
           # mac/windows: maturin runs natively and inherits step-level env vars.
-          # linux: PREBUILT_URL/TOKEN are set in before-script-linux above instead.
+          # linux: PREBUILT_URL/SHA256 are set in before-script-linux above instead.
           REACTOR_WEBRTC_PREBUILT_URL: ${{ steps.prebuilt.outputs.url }}
-          REACTOR_WEBRTC_PREBUILT_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REACTOR_WEBRTC_PREBUILT_SHA256: ${{ steps.prebuilt.outputs.sha256 }}
           # win-x64 only: libwebrtc.lib uses /MT; Rust must match (see matrix.rustflags).
           # Linux overrides RUSTFLAGS inside before-script-linux; mac has no RUSTFLAGS.
           RUSTFLAGS: ${{ matrix.rustflags }}

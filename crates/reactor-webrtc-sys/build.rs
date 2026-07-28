@@ -28,7 +28,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 // ── Prebuilt location ─────────────────────────────────────────────────────────
-const PREBUILT_REPO: &str = "reactor-team/reactor-webrtc";
+// The repo is public, so release assets download anonymously — no token needed.
 const PREBUILT_BASE: &str = "https://github.com/reactor-team/reactor-webrtc/releases/download";
 
 // Fallback tag used when WEBRTC_VERSION is not accessible (e.g. builds from a
@@ -58,28 +58,13 @@ fn main() {
 
     // Mode 3: auto-detect the correct prebuilt from WEBRTC_VERSION (or the
     // baked-in fallback tag) and the current Cargo target triple.
-    //
-    // Private repos: github.com/releases/download/... rejects Bearer auth;
-    // must use the GitHub API asset URL instead. When a token is present we
-    // resolve the API URL first; without a token we fall back to the direct
-    // URL (works once the repo is public).
     if let Some(platform) = prebuilt_platform() {
         let tag = prebuilt_tag();
         let asset = format!("reactor-webrtc-{platform}-release.tar.zst");
         let sha_asset = format!("{asset}.sha256");
 
-        let (url, sha_url) = if let Ok(token) = env::var("REACTOR_WEBRTC_PREBUILT_TOKEN") {
-            let u = resolve_github_asset_url(&tag, &asset, &token)
-                .unwrap_or_else(|| format!("{PREBUILT_BASE}/{tag}/{asset}"));
-            let su = resolve_github_asset_url(&tag, &sha_asset, &token)
-                .unwrap_or_else(|| format!("{PREBUILT_BASE}/{tag}/{sha_asset}"));
-            (u, su)
-        } else {
-            (
-                format!("{PREBUILT_BASE}/{tag}/{asset}"),
-                format!("{PREBUILT_BASE}/{tag}/{sha_asset}"),
-            )
-        };
+        let url = format!("{PREBUILT_BASE}/{tag}/{asset}");
+        let sha_url = format!("{PREBUILT_BASE}/{tag}/{sha_asset}");
 
         let sha256 = fetch_sha256(&sha_url);
         let dir = download_prebuilt(&url, sha256.as_deref());
@@ -443,59 +428,17 @@ fn prebuilt_platform() -> Option<&'static str> {
     }
 }
 
-/// Query the GitHub Releases API to obtain the API asset URL for `asset_name`
-/// in the given `tag`. Returns None on any failure (network, 404, parse).
-///
-/// The direct download URL (github.com/releases/download/…) drops Bearer auth
-/// on the cross-host redirect to S3, so private repos always return 404 that
-/// way. The API URL (api.github.com/repos/…/releases/assets/<id>) with
-/// `Accept: application/octet-stream` issues a pre-signed redirect that works.
-fn resolve_github_asset_url(tag: &str, asset_name: &str, token: &str) -> Option<String> {
-    let api_url = format!("https://api.github.com/repos/{PREBUILT_REPO}/releases/tags/{tag}");
-    let tmp = PathBuf::from(env::var("OUT_DIR").unwrap()).join("release_meta.json");
-    let ok = std::process::Command::new("curl")
-        .args(["-fsSL", "--retry", "3", "-o"])
-        .arg(&tmp)
-        .arg(&api_url)
-        .arg("-H")
-        .arg(format!("Authorization: Bearer {token}"))
-        .arg("-H")
-        .arg("Accept: application/vnd.github.v3+json")
-        .arg("-H")
-        .arg("User-Agent: reactor-webrtc-build-rs/1.0")
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !ok {
-        return None;
-    }
-    let json = std::fs::read_to_string(&tmp).ok()?;
-    // GitHub asset JSON has "url" before "name" in each asset object.
-    // Search backward from the "name" match to find the matching "url".
-    let name_pat = format!("\"name\":\"{}\"", asset_name);
-    let pos = json.find(&name_pat)?;
-    let before = &json[..pos];
-    let url_key = "\"url\":\"";
-    let url_start = before.rfind(url_key)? + url_key.len();
-    let url_end = before[url_start..].find('"')? + url_start;
-    Some(before[url_start..url_end].to_string())
-}
-
 /// Download and parse the `.sha256` sidecar file for a prebuilt asset.
 /// Returns the hex digest on success, or `None` if the download fails.
 fn fetch_sha256(sha_url: &str) -> Option<String> {
     let tmp = PathBuf::from(env::var("OUT_DIR").unwrap()).join("prebuilt.sha256");
-    let mut cmd = std::process::Command::new("curl");
-    cmd.args(["-fsSL", "--retry", "3", "-o"])
+    let ok = std::process::Command::new("curl")
+        .args(["-fsSL", "--retry", "3", "-o"])
         .arg(&tmp)
-        .arg(sha_url);
-    if let Ok(token) = env::var("REACTOR_WEBRTC_PREBUILT_TOKEN") {
-        cmd.arg("-H")
-            .arg(format!("Authorization: Bearer {token}"))
-            .arg("-H")
-            .arg("Accept: application/octet-stream");
-    }
-    let ok = cmd.status().map(|s| s.success()).unwrap_or(false);
+        .arg(sha_url)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
     if !ok {
         return None;
     }
@@ -508,9 +451,8 @@ fn fetch_sha256(sha_url: &str) -> Option<String> {
 /// it into `OUT_DIR`. Returns the extracted root (packaged layout) for `link`.
 ///
 /// Shells out to `curl` + `tar`/`zstd` (no extra Rust build-deps, so dev-mode
-/// `cargo check` stays fast). For a private-repo release asset, set
-/// `REACTOR_WEBRTC_PREBUILT_TOKEN` (a `repo`-scoped token) — `curl` follows the
-/// GitHub redirect and drops the auth header on the cross-host hop.
+/// `cargo check` stays fast). Release assets are public, so the download needs
+/// no credentials.
 fn download_prebuilt(url: &str, sha256: Option<&str>) -> PathBuf {
     let out_root = PathBuf::from(env::var("OUT_DIR").unwrap());
     let out = out_root.join("libwebrtc");
@@ -526,16 +468,6 @@ fn download_prebuilt(url: &str, sha256: Option<&str>) -> PathBuf {
     curl.args(["-fSL", "--retry", "3", "--retry-delay", "2", "-o"])
         .arg(&archive)
         .arg(url);
-    if let Ok(token) = env::var("REACTOR_WEBRTC_PREBUILT_TOKEN") {
-        // For a private GitHub release asset, point the URL at the API asset
-        // endpoint (…/releases/assets/<id>); `Accept: application/octet-stream`
-        // makes it 302 to the signed download (auth dropped on the cross-host
-        // hop). Harmless for plain CDN URLs.
-        curl.arg("-H")
-            .arg(format!("Authorization: Bearer {token}"))
-            .arg("-H")
-            .arg("Accept: application/octet-stream");
-    }
     run(&mut curl, "download prebuilt (curl)");
 
     // ── verify sha256 ─────────────────────────────────────────────────────
@@ -591,7 +523,27 @@ fn run(cmd: &mut std::process::Command, what: &str) {
     }
 }
 
-/// Compute a file's sha256 via `sha256sum` (Linux) or `shasum -a 256` (macOS).
+/// Extract a lowercase 64-char hex digest from a hashing tool's stdout.
+///
+/// GNU coreutils switches to an escaped output form when the file name contains
+/// a backslash or newline: the line is prefixed with `\` and the backslashes in
+/// the name are doubled. Every Windows path trips this (`D:\a\…`), so
+/// `sha256sum` there reports `\<digest> *<name>` — hence the `\` strip. Returns
+/// `None` if the output is not a well-formed digest, so callers fall through to
+/// the next tool instead of comparing against garbage.
+fn parse_digest(stdout: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(stdout);
+    let hex = text
+        .split_whitespace()
+        .next()?
+        .trim_start_matches('\\')
+        .to_lowercase();
+    (hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit())).then_some(hex)
+}
+
+/// Compute a file's sha256 via `sha256sum` (Linux, and Windows — it ships in
+/// Git-for-Windows' `usr/bin`, which is on the PATH of GitHub's `windows-latest`
+/// runners, where our Windows wheels are built) or `shasum -a 256` (macOS).
 fn sha256_file(path: &Path) -> String {
     for (bin, args) in [("sha256sum", &[][..]), ("shasum", &["-a", "256"][..])] {
         if let Ok(out) = std::process::Command::new(bin)
@@ -600,11 +552,8 @@ fn sha256_file(path: &Path) -> String {
             .output()
         {
             if out.status.success() {
-                if let Some(hex) = String::from_utf8_lossy(&out.stdout)
-                    .split_whitespace()
-                    .next()
-                {
-                    return hex.to_lowercase();
+                if let Some(hex) = parse_digest(&out.stdout) {
+                    return hex;
                 }
             }
         }

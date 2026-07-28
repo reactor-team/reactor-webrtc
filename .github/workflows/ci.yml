@@ -25,8 +25,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       # check/clippy compile the sys crate's C++ glue, which build.rs auto-detects
-      # + downloads the prebuilt headers for; needs a token + a recent clang.
-      REACTOR_WEBRTC_PREBUILT_TOKEN: ${{ secrets.REACTOR_WEBRTC_PREBUILT_TOKEN }}
+      # + downloads the prebuilt headers for (public release assets, no auth);
+      # needs a recent clang.
       CXX: clang++-21
     steps:
       - uses: actions/checkout@v4
@@ -59,9 +59,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       # Release: webrtc-7907-a5ddff60-p1 - reactor-webrtc-linux-x64-release.tar.zst
-      REACTOR_WEBRTC_PREBUILT_URL: https://api.github.com/repos/reactor-team/reactor-webrtc/releases/assets/475845307
+      REACTOR_WEBRTC_PREBUILT_URL: https://github.com/reactor-team/reactor-webrtc/releases/download/webrtc-7907-a5ddff60-p1/reactor-webrtc-linux-x64-release.tar.zst
       REACTOR_WEBRTC_PREBUILT_SHA256: 4b8b99f45859ab78c3b236c90e8907830a418cb2f2729a56eccaaccda6d3c832
-      REACTOR_WEBRTC_PREBUILT_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       CXX: clang++-21
     steps:
       - uses: actions/checkout@v4
@@ -83,9 +82,8 @@ jobs:
     name: build reactor-webrtc wheel
     runs-on: ubuntu-latest
     env:
-      REACTOR_WEBRTC_PREBUILT_URL: https://api.github.com/repos/reactor-team/reactor-webrtc/releases/assets/475845307
+      REACTOR_WEBRTC_PREBUILT_URL: https://github.com/reactor-team/reactor-webrtc/releases/download/webrtc-7907-a5ddff60-p1/reactor-webrtc-linux-x64-release.tar.zst
       REACTOR_WEBRTC_PREBUILT_SHA256: 4b8b99f45859ab78c3b236c90e8907830a418cb2f2729a56eccaaccda6d3c832
-      REACTOR_WEBRTC_PREBUILT_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       CXX: clang++-21
     steps:
       - uses: actions/checkout@v4
