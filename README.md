@@ -56,15 +56,15 @@ With [mise](https://mise.jdx.dev) (recommended - pins the whole toolchain):
 
 ```bash
 mise install                 # rust (via rust-toolchain.toml) + uv/ruff/maturin/nextest/shellcheck
-make ci                      # fmt-check + clippy + repo lints (auto-fetches the prebuilt)
+mise run ci                  # fmt-check + clippy + repo lints (auto-fetches the prebuilt)
 
 export REACTOR_WEBRTC_LIB_DIR=/path/to/libwebrtc   # a prebuilt is required to link/test
-make test                                          # cargo nextest run + doctests
+mise run test                                      # cargo nextest run + doctests
 mise run //crates/reactor-webrtc-py:build          # build the wheel
 mise run //crates/reactor-webrtc-py:test           # pytest the wheel
 ```
 
-`make help` works at the repo root and in each module directory (`crates/reactor-webrtc-py/`, `webrtc-build/`).
+These are the same tasks CI runs. `mise tasks ls` lists everything; a `make` shim (`make ci`, `make test`, `make help`) also works at the repo root and in each module directory (`crates/reactor-webrtc-py/`, `webrtc-build/`).
 
 Or drive the tools directly:
 
