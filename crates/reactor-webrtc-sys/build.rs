@@ -523,7 +523,14 @@ fn run(cmd: &mut std::process::Command, what: &str) {
     }
 }
 
-/// Compute a file's sha256 via `sha256sum` (Linux) or `shasum -a 256` (macOS).
+/// Compute a file's sha256 via `sha256sum` (Linux), `shasum -a 256` (macOS), or
+/// PowerShell's `Get-FileHash` (Windows).
+///
+/// On Windows neither `sha256sum` nor `shasum` is guaranteed to resolve: they
+/// ship with Git-for-Windows' `usr/bin`, which is a bash-only PATH entry, and
+/// `shasum` is a Perl script that `Command`'s `.exe`-only PATH lookup cannot
+/// launch anyway. `Get-FileHash` is what webrtc-build/build.ps1 uses for the
+/// same reason, so mirror it here rather than panicking on a valid platform.
 fn sha256_file(path: &Path) -> String {
     for (bin, args) in [("sha256sum", &[][..]), ("shasum", &["-a", "256"][..])] {
         if let Ok(out) = std::process::Command::new(bin)
@@ -541,7 +548,31 @@ fn sha256_file(path: &Path) -> String {
             }
         }
     }
-    panic!("reactor-webrtc-sys: need `sha256sum` or `shasum` to verify the prebuilt");
+
+    // Prints the digest as a bare uppercase hex string; single quotes inside the
+    // path are escaped by doubling them (PowerShell literal-string rules).
+    let ps_path = path.display().to_string().replace('\'', "''");
+    let script = format!("(Get-FileHash -LiteralPath '{ps_path}' -Algorithm SHA256).Hash");
+    for bin in ["powershell", "pwsh"] {
+        if let Ok(out) = std::process::Command::new(bin)
+            .args(["-NoProfile", "-Command", &script])
+            .output()
+        {
+            if out.status.success() {
+                if let Some(hex) = String::from_utf8_lossy(&out.stdout)
+                    .split_whitespace()
+                    .next()
+                {
+                    return hex.to_lowercase();
+                }
+            }
+        }
+    }
+
+    panic!(
+        "reactor-webrtc-sys: need `sha256sum`, `shasum` or PowerShell \
+         `Get-FileHash` to verify the prebuilt"
+    );
 }
 
 /// Minimal single-quote shell escaping for a path passed to `sh -c`.
