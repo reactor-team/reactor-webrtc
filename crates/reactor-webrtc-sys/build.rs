@@ -541,15 +541,9 @@ fn parse_digest(stdout: &[u8]) -> Option<String> {
     (hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit())).then_some(hex)
 }
 
-/// Compute a file's sha256 via `sha256sum` (Linux, and Windows via
-/// Git-for-Windows' `usr/bin`), `shasum -a 256` (macOS), or PowerShell's
-/// `Get-FileHash`.
-///
-/// The PowerShell path is a genuine fallback rather than the Windows path: on
-/// GitHub's `windows-latest` `sha256sum` does resolve and wins. It covers hosts
-/// where neither coreutils tool is on PATH — `shasum` in particular is a Perl
-/// script there, which `Command`'s `.exe`-only PATH lookup cannot launch — and
-/// mirrors what webrtc-build/build.ps1 uses.
+/// Compute a file's sha256 via `sha256sum` (Linux, and Windows — it ships in
+/// Git-for-Windows' `usr/bin`, which is on the PATH of GitHub's `windows-latest`
+/// runners, where our Windows wheels are built) or `shasum -a 256` (macOS).
 fn sha256_file(path: &Path) -> String {
     for (bin, args) in [("sha256sum", &[][..]), ("shasum", &["-a", "256"][..])] {
         if let Ok(out) = std::process::Command::new(bin)
@@ -564,28 +558,7 @@ fn sha256_file(path: &Path) -> String {
             }
         }
     }
-
-    // Prints the digest as a bare uppercase hex string; single quotes inside the
-    // path are escaped by doubling them (PowerShell literal-string rules).
-    let ps_path = path.display().to_string().replace('\'', "''");
-    let script = format!("(Get-FileHash -LiteralPath '{ps_path}' -Algorithm SHA256).Hash");
-    for bin in ["powershell", "pwsh"] {
-        if let Ok(out) = std::process::Command::new(bin)
-            .args(["-NoProfile", "-Command", &script])
-            .output()
-        {
-            if out.status.success() {
-                if let Some(hex) = parse_digest(&out.stdout) {
-                    return hex;
-                }
-            }
-        }
-    }
-
-    panic!(
-        "reactor-webrtc-sys: need `sha256sum`, `shasum` or PowerShell \
-         `Get-FileHash` to verify the prebuilt"
-    );
+    panic!("reactor-webrtc-sys: need `sha256sum` or `shasum` to verify the prebuilt");
 }
 
 /// Minimal single-quote shell escaping for a path passed to `sh -c`.
