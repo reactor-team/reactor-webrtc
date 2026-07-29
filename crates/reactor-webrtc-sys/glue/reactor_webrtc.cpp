@@ -221,33 +221,57 @@ class FrameAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
     const uint32_t rate = 48000;
     const size_t channels = 2;
     const size_t frames = rate / 100;  // 10ms
+    const auto period = std::chrono::milliseconds(10);
     std::vector<int16_t> scratch(frames * channels);
     uint64_t pulls = 0, produced = 0;
+
+    // This pump is the clock for the whole receive path: libwebrtc feeds the
+    // sinks of remote audio tracks from the render pull, so its rate is the
+    // rate at which received audio reaches the application. It therefore runs
+    // on absolute deadlines. Sleeping for a fixed period *after* the pull would
+    // add the cost of every pull to every period, and the arrears compound into
+    // a permanently slow clock, starving every consumer downstream.
+    auto next = std::chrono::steady_clock::now();
+
     while (playing_.load()) {
+      size_t out = 0;
+      bool pulled = false;
       {
         std::lock_guard<std::mutex> lock(mutex_);
         if (transport_) {
-          size_t out = 0;
           int64_t elapsed = 0, ntp = 0;
           transport_->NeedMorePlayData(frames, sizeof(int16_t) * channels,
                                        channels, rate, scratch.data(), out,
                                        &elapsed, &ntp);
-          // out is just the requested frame count echoed back; measure the
-          // mixed peak to tell real incoming audio from silence.
-          int16_t peak = 0;
-          for (size_t i = 0; i < out * channels && i < scratch.size(); ++i) {
-            int16_t v = scratch[i] < 0 ? -scratch[i] : scratch[i];
-            if (v > peak) peak = v;
-          }
-          if (peak > 0) ++produced;
-          if (audio_debug() && ++pulls % 200 == 1)
-            fprintf(stderr,
-                    "[reactor-webrtc] ADM playout pump: %llu pulls, %llu non-silent, "
-                    "last peak=%d (out=%zu)\n",
-                    (unsigned long long)pulls, (unsigned long long)produced, peak, out);
+          pulled = true;
         }
       }
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+      // scratch belongs to this thread, so the peak scan stays outside the lock
+      // and cannot delay a concurrent push into the device.
+      if (pulled) {
+        // out is just the requested frame count echoed back; measure the
+        // mixed peak to tell real incoming audio from silence.
+        int16_t peak = 0;
+        for (size_t i = 0; i < out * channels && i < scratch.size(); ++i) {
+          int16_t v = scratch[i] < 0 ? -scratch[i] : scratch[i];
+          if (v > peak) peak = v;
+        }
+        if (peak > 0) ++produced;
+        if (audio_debug() && ++pulls % 200 == 1)
+          fprintf(stderr,
+                  "[reactor-webrtc] ADM playout pump: %llu pulls, %llu non-silent, "
+                  "last peak=%d (out=%zu)\n",
+                  (unsigned long long)pulls, (unsigned long long)produced, peak, out);
+      }
+
+      next += period;
+      const auto now = std::chrono::steady_clock::now();
+      // A long stall (host suspend, scheduler starvation) is dropped rather
+      // than repaid as a burst of back-to-back pulls, which would flood the
+      // receive path with a spike of catch-up audio.
+      if (next < now) next = now;
+      std::this_thread::sleep_until(next);
     }
   }
 
