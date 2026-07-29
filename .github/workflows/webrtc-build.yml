@@ -140,6 +140,21 @@ jobs:
           xcodebuild -version
           echo "SDK: $(xcrun --sdk macosx --show-sdk-version) at $(xcrun --show-sdk-path)"
 
+      # On aarch64 Linux hosts the bundled Chromium clang binary is x86_64-only.
+      # Install system clang-21 and redirect gcc/g++ to it so that gn's
+      # is_clang=false toolchain path invokes clang instead of GCC.
+      - name: Install host compiler (linux-arm64)
+        if: matrix.os == 'linux' && matrix.arch == 'arm64'
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends wget lsb-release software-properties-common gnupg
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh && chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh 21
+          sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/clang-21 100
+          sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/clang++-21 100
+          echo "Host compiler: $(gcc --version | head -1)  target=$(gcc -dumpmachine)"
+
       # POSIX targets: bash build.sh + package.sh.
       - name: Build libwebrtc
         if: matrix.os != 'win'

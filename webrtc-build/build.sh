@@ -109,24 +109,28 @@ gn_args() {
       )
       ;;
     linux)
-      # Always use WebRTC's *bundled* clang + bundled libc++:
-      #   • the bundled clang is a Chromium fork with flags no stock clang has
-      #     (-fno-lifetime-dse, --crel, …), so a host clang can't compile this;
-      #   • the pinned debian sysroot's libstdc++ is too old for WebRTC's C++20
-      #     (std::make_unique_for_overwrite; ssl_stream_adapter.h's nullptr_t),
-      #     so use the bundled (modern) libc++.
-      # Self-contained via the sysroot. Chromium publishes bundled clang binaries
-      # for both linux-x64 and linux-aarch64 hosts; arm64 builds natively on an
-      # ubuntu-24.04-arm runner (no cross-compilation). The sysroot fetch below
-      # only runs when the host and target arches differ, so it is a no-op for
-      # native builds. NOTE: linking a consumer's glue against this lib requires
-      # compiling that glue with libc++ too (follow-up).
-      # No screen/desktop capture in a calling SDK: disable both linux backends
-      # (X11 + PipeWire) so the lib carries no libX11 dependency.
+      # use_custom_libcxx=true: the debian sysroot's libstdc++ is too old for
+      # WebRTC's C++20 (std::make_unique_for_overwrite, nullptr_t in ssl_stream_adapter).
+      # The bundled libc++ is compiled from source and linked explicitly.
+      # use_sysroot=true: the pinned Debian Bullseye sysroot for a stable ABI.
+      # No screen/desktop capture: disable X11 + PipeWire (no libX11 dep).
+      #
+      # is_clang selection:
+      #   x86_64 host → bundled Chromium clang (Linux_x64 binary from GCS).
+      #   aarch64 host → Chromium publishes only Linux_x64 host binaries; update.py
+      #     hardcodes "Linux_x64" for all Linux hosts and there is no Linux_arm64
+      #     variant.  Use is_clang=false so gn skips the bundled binary and invokes
+      #     whatever "gcc"/"g++" resolves to in PATH.  The CI workflow redirects
+      #     those names to system clang-21 via update-alternatives, which compiles
+      #     the bundled libc++ correctly and produces native aarch64-linux-gnu objects.
+      local IS_CLANG=true
+      if [ "$(uname -m)" = "aarch64" ]; then
+        IS_CLANG=false
+      fi
       args+=(
         "rtc_use_x11=false"
         "rtc_use_pipewire=false"
-        "is_clang=true"
+        "is_clang=${IS_CLANG}"
         "use_sysroot=true"
         "use_custom_libcxx=true"
         "symbol_level=1"
@@ -190,16 +194,6 @@ for p in "$HERE"/patches/*.patch; do
   git apply --3way "$p" 2>/dev/null || patch -p1 < "$p"
 done
 shopt -u nullglob
-
-# The WebRTC DEPS cipd packages section downloads the bundled clang for
-# linux-amd64 unconditionally (the package path is not ${platform}-templated
-# for this version).  On an arm64 host the x86_64 binary lands in
-# third_party/llvm-build; running update.py explicitly forces it to re-fetch
-# the linux-arm64 toolchain instead.
-if [ "$GN_OS" = linux ] && [ "$(uname -m)" = "aarch64" ]; then
-  echo "==> re-fetching bundled clang for linux-arm64 host"
-  python3 tools/clang/scripts/update.py
-fi
 
 # Cross-compiling linux/arm64 from an x86_64 host needs the arm64 sysroot, which
 # the default sync (host arch only) does not fetch.
