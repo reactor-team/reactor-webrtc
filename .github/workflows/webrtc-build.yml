@@ -151,8 +151,11 @@ jobs:
           sudo apt-get install -y --no-install-recommends wget lsb-release software-properties-common gnupg
           wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh && chmod +x /tmp/llvm.sh
           sudo /tmp/llvm.sh 21
-          sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/clang-21 100
-          sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/clang++-21 100
+          # update-alternatives priority may be lower than the pre-installed GCC on
+          # the runner. Use direct symlinks in /usr/local/bin (comes before /usr/bin
+          # in PATH) so gn's is_clang=false toolchain picks up clang-21 as gcc/g++.
+          sudo ln -sf /usr/bin/clang-21 /usr/local/bin/gcc
+          sudo ln -sf /usr/bin/clang++-21 /usr/local/bin/g++
           echo "Host compiler: $(gcc --version | head -1)  target=$(gcc -dumpmachine)"
 
       # POSIX targets: bash build.sh + package.sh.

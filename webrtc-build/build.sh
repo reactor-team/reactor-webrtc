@@ -120,9 +120,11 @@ gn_args() {
       #   aarch64 host → Chromium publishes only Linux_x64 host binaries; update.py
       #     hardcodes "Linux_x64" for all Linux hosts and there is no Linux_arm64
       #     variant.  Use is_clang=false so gn skips the bundled binary and invokes
-      #     whatever "gcc"/"g++" resolves to in PATH.  The CI workflow redirects
-      #     those names to system clang-21 via update-alternatives, which compiles
-      #     the bundled libc++ correctly and produces native aarch64-linux-gnu objects.
+      #     whatever "gcc"/"g++" resolves to in PATH.  The CI workflow creates
+      #     /usr/local/bin/{gcc,g++} symlinks pointing to clang-21 (which comes
+      #     before /usr/bin in PATH, overriding the pre-installed GCC 13 regardless
+      #     of update-alternatives priority).  clang-21 compiles the bundled libc++
+      #     correctly and produces native aarch64 objects.
       local IS_CLANG=true
       if [ "$(uname -m)" = "aarch64" ]; then
         IS_CLANG=false
