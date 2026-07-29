@@ -39,7 +39,7 @@ use reactor_webrtc_sys::{
     reactor_webrtc_peer_connection_set_remote_description, reactor_webrtc_selftest,
     reactor_webrtc_video_track_add_sink, reactor_webrtc_video_track_create,
     reactor_webrtc_video_track_push_frame, MediaStreamTrack, PeerConnection,
-    PeerConnectionCallbacks, PeerConnectionFactory,
+    PeerConnectionCallbacks, PeerConnectionFactory, ReactorRtcConfig,
 };
 
 // PeerConnectionState::kConnected (enum order in peer_connection_interface.h).
@@ -164,6 +164,26 @@ fn observer_for(ctx: &PcCtx) -> PeerConnectionCallbacks {
     }
 }
 
+/// Create a PeerConnection, returning the glue's failure reason on error.
+unsafe fn create_pc(
+    factory: *mut PeerConnectionFactory,
+    config: *const ReactorRtcConfig,
+    callbacks: *const PeerConnectionCallbacks,
+) -> Result<*mut PeerConnection, String> {
+    let mut err = [0 as c_char; 256];
+    let pc = reactor_webrtc_peer_connection_create(
+        factory,
+        config,
+        callbacks,
+        err.as_mut_ptr(),
+        err.len() as c_int,
+    );
+    if pc.is_null() {
+        return Err(CStr::from_ptr(err.as_ptr()).to_string_lossy().into_owned());
+    }
+    Ok(pc)
+}
+
 /// Drain `src`'s gathered candidates into `dst`. Returns how many were added.
 fn forward_candidates(src: &PcCtx, dst: *mut PeerConnection) -> usize {
     let mut n = 0;
@@ -192,7 +212,7 @@ fn links_and_runs_libwebrtc() {
     // SAFETY: every symbol is implemented by the C++ glue compiled in build.rs
     // and resolved against our libwebrtc.a.
     unsafe {
-        assert_eq!(reactor_webrtc_abi_version(), 1, "ABI version mismatch");
+        assert_eq!(reactor_webrtc_abi_version(), 2, "ABI version mismatch");
 
         // Codec factories.
         let mut buf = [0u8; 1024];
@@ -207,8 +227,7 @@ fn links_and_runs_libwebrtc() {
         // PeerConnectionFactory + a PeerConnection we just create/destroy.
         let factory = reactor_webrtc_factory_create();
         assert!(!factory.is_null(), "PeerConnectionFactory creation failed");
-        let pc = reactor_webrtc_peer_connection_create(factory, ptr::null(), ptr::null());
-        assert!(!pc.is_null(), "PeerConnection creation failed");
+        let pc = create_pc(factory, ptr::null(), ptr::null()).expect("PeerConnection creation");
         reactor_webrtc_peer_connection_destroy(pc);
         reactor_webrtc_factory_destroy(factory);
         println!("factory + peer connection lifecycle OK");
@@ -227,11 +246,8 @@ fn platform_adm_factory_lifecycle() {
         assert!(!factory.is_null(), "platform-ADM factory creation failed");
         // set_adm_playout_enabled is a no-op for the platform ADM but must not crash.
         reactor_webrtc_factory_set_adm_playout_enabled(factory, 0);
-        let pc = reactor_webrtc_peer_connection_create(factory, ptr::null(), ptr::null());
-        assert!(
-            !pc.is_null(),
-            "peer connection creation failed (platform ADM)"
-        );
+        let pc = create_pc(factory, ptr::null(), ptr::null())
+            .expect("peer connection creation (platform ADM)");
         reactor_webrtc_peer_connection_destroy(pc);
         reactor_webrtc_factory_destroy(factory);
         println!("platform-ADM factory lifecycle OK");
@@ -251,12 +267,8 @@ fn loopback_two_peers_exchange_media() {
         let cb1 = observer_for(&ctx1);
         let cb2 = observer_for(&ctx2);
 
-        let pc1 = reactor_webrtc_peer_connection_create(factory, ptr::null(), &cb1);
-        let pc2 = reactor_webrtc_peer_connection_create(factory, ptr::null(), &cb2);
-        assert!(
-            !pc1.is_null() && !pc2.is_null(),
-            "peer connection creation failed"
-        );
+        let pc1 = create_pc(factory, ptr::null(), &cb1).expect("pc1 creation");
+        let pc2 = create_pc(factory, ptr::null(), &cb2).expect("pc2 creation");
 
         // pc1 gets a data channel + a video track + an audio track to negotiate.
         let dc_label = CString::new("reactor").unwrap();

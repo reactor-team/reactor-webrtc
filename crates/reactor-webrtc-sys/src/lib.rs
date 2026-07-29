@@ -184,6 +184,56 @@ pub struct PeerConnectionCallbacks {
     pub on_track: Option<extern "C" fn(userdata: *mut c_void, track: *mut MediaStreamTrack)>,
 }
 
+/// A single ICE (STUN/TURN) server.
+///
+/// `urls` points to an array of `urls_len` NUL-terminated C strings that share
+/// the credentials in this entry. `username` and `password` may be null, which
+/// the glue reads as an empty credential. libwebrtc rejects a `turn:`/`turns:`
+/// URL whose username or password is empty.
+///
+/// Every pointer is borrowed for the duration of the
+/// [`reactor_webrtc_peer_connection_create`] call. The glue copies what it
+/// needs, so the caller may free the strings once the call returns.
+/// Layout must match `ReactorIceServer` in the glue.
+#[repr(C)]
+pub struct ReactorIceServer {
+    pub urls: *const *const c_char,
+    pub urls_len: usize,
+    pub username: *const c_char,
+    pub password: *const c_char,
+}
+
+/// Peer-connection configuration.
+///
+/// `servers` points to an array of `servers_len` entries. Each entry keeps its
+/// own credentials, so several TURN servers with different credentials stay
+/// distinct.
+///
+/// Both policy fields use an explicit integer encoding that neither side
+/// derives from an enum declaration order:
+///
+/// | `ice_transport_type` | allowed candidates |
+/// |----------------------|--------------------|
+/// | `0`                  | all types          |
+/// | `1`                  | relay only         |
+/// | `2`                  | everything but host |
+/// | `3`                  | none               |
+///
+/// | `continual_gathering_policy` | behaviour |
+/// |------------------------------|-----------|
+/// | `0`                          | gather once |
+/// | `1`                          | gather continually |
+///
+/// An unknown value falls back to `0`. Layout must match `ReactorRtcConfig`
+/// in the glue.
+#[repr(C)]
+pub struct ReactorRtcConfig {
+    pub servers: *const ReactorIceServer,
+    pub servers_len: usize,
+    pub ice_transport_type: c_int,
+    pub continual_gathering_policy: c_int,
+}
+
 extern "C" {
     /// ABI version of this native build. The safe crate asserts compatibility.
     pub fn reactor_webrtc_abi_version() -> u32;
@@ -230,12 +280,16 @@ extern "C" {
         apm_flags: c_int,
     ) -> *mut PeerConnectionFactory;
 
-    /// Create a peer connection. `config_json` carries ICE servers / policies
-    /// (may be null). `callbacks` may be null. Returns null on failure.
+    /// Create a peer connection. `config` carries the ICE servers and policies
+    /// (may be null for the defaults). `callbacks` may be null. Returns null on
+    /// failure, and then writes libwebrtc's reason into `err` as a
+    /// NUL-terminated string truncated to `err_cap` bytes. `err` may be null.
     pub fn reactor_webrtc_peer_connection_create(
         factory: *mut PeerConnectionFactory,
-        config_json: *const c_char,
+        config: *const ReactorRtcConfig,
         callbacks: *const PeerConnectionCallbacks,
+        err: *mut c_char,
+        err_cap: c_int,
     ) -> *mut PeerConnection;
     pub fn reactor_webrtc_peer_connection_destroy(pc: *mut PeerConnection);
 

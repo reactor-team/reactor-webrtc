@@ -276,19 +276,28 @@ impl PeerConnectionFactory {
     ) -> Result<PeerConnection> {
         let state = observer.into_state();
         let callbacks = state.callbacks();
-        let json = CString::new(config.to_json())
-            .map_err(|_| Error::Webrtc("config contains a NUL byte".into()))?;
+        let native = config.to_native()?;
+        // libwebrtc reports why it rejected the configuration (an empty TURN
+        // credential, for example); the glue copies that reason in here.
+        let mut err = [0 as std::os::raw::c_char; 256];
         let raw = unsafe {
             reactor_webrtc_sys::reactor_webrtc_peer_connection_create(
                 self.raw,
-                json.as_ptr(),
+                &native.config(),
                 &callbacks,
+                err.as_mut_ptr(),
+                err.len() as c_int,
             )
         };
         if raw.is_null() {
-            return Err(Error::Webrtc(
-                "peer connection creation returned null".into(),
-            ));
+            let reason = unsafe { std::ffi::CStr::from_ptr(err.as_ptr()) }
+                .to_string_lossy()
+                .into_owned();
+            return Err(Error::Webrtc(if reason.is_empty() {
+                "peer connection creation returned null".into()
+            } else {
+                format!("peer connection creation failed: {reason}")
+            }));
         }
         Ok(PeerConnection::new(raw, state))
     }
