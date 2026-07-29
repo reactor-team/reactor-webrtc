@@ -72,8 +72,8 @@ jobs:
           ios_dev='{"os":"ios","arch":"arm64","runner":"macos-15","ios_env":"device"}'
           ios_sim='{"os":"ios","arch":"arm64","runner":"macos-15","ios_env":"simulator"}'
           linux_x64='{"os":"linux","arch":"x64","runner":"ubuntu-latest"}'
-          # linux/arm64 is cross-compiled from x86_64 (no linux-arm64 bundled clang).
-          linux_arm='{"os":"linux","arch":"arm64","runner":"ubuntu-latest"}'
+          # linux/arm64 builds natively on an arm64 runner; no cross-compilation.
+          linux_arm='{"os":"linux","arch":"arm64","runner":"ubuntu-24.04-arm"}'
           android='{"os":"android","arch":"arm64","runner":"ubuntu-latest"}'
           win='{"os":"win","arch":"x64","runner":"windows-latest"}'
           # CI (push / pull_request) → full target matrix, debug profile.
@@ -166,7 +166,7 @@ jobs:
       # linux glue compiles against the bundled libc++ (ABI namespace __Cr) whose
       # headers need a recent clang (stock clang-18 is too old); install it.
       - name: Test deps (linux)
-        if: matrix.os == 'linux' && matrix.arch == 'x64'
+        if: matrix.os == 'linux'
         run: |
           set -euo pipefail
           sudo apt-get update && sudo apt-get install -y --no-install-recommends wget lsb-release software-properties-common gnupg
@@ -176,10 +176,10 @@ jobs:
           echo "CXX=clang++-$ver" >> "$GITHUB_ENV"; echo "CC=clang-$ver" >> "$GITHUB_ENV"
 
       # Run the lib-linked FFI/integration tests where the target runs natively:
-      # macOS arm64 and linux x64. (iOS/android/windows are cross or non-native;
-      # linux/arm64 is cross-built on x86_64.)
+      # macOS arm64 and both linux targets (x64 + arm64 now native on ubuntu-24.04-arm).
+      # iOS/android/windows are non-native and skipped.
       - name: Test (native targets)
-        if: (matrix.os == 'mac' && matrix.arch == 'arm64') || (matrix.os == 'linux' && matrix.arch == 'x64')
+        if: (matrix.os == 'mac' && matrix.arch == 'arm64') || matrix.os == 'linux'
         run: |
           SLUG="${{ matrix.os }}-${{ matrix.arch }}-${PROFILE}"
           export REACTOR_WEBRTC_LIB_DIR="$PWD/webrtc-build/out/$SLUG/dist"

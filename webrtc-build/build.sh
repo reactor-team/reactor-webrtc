@@ -115,10 +115,12 @@ gn_args() {
       #   • the pinned debian sysroot's libstdc++ is too old for WebRTC's C++20
       #     (std::make_unique_for_overwrite; ssl_stream_adapter.h's nullptr_t),
       #     so use the bundled (modern) libc++.
-      # Self-contained via the sysroot. The bundled clang is published for x86_64
-      # hosts only, so arm64 is cross-compiled from x86_64 (see the sysroot fetch
-      # above + the CI runner mapping). NOTE: linking a consumer's glue against
-      # this lib requires compiling that glue with libc++ too (follow-up).
+      # Self-contained via the sysroot. Chromium publishes bundled clang binaries
+      # for both linux-x64 and linux-aarch64 hosts; arm64 builds natively on an
+      # ubuntu-24.04-arm runner (no cross-compilation). The sysroot fetch below
+      # only runs when the host and target arches differ, so it is a no-op for
+      # native builds. NOTE: linking a consumer's glue against this lib requires
+      # compiling that glue with libc++ too (follow-up).
       # No screen/desktop capture in a calling SDK: disable both linux backends
       # (X11 + PipeWire) so the lib carries no libX11 dependency.
       args+=(
