@@ -115,6 +115,14 @@ jobs:
           sudo apt-get install -y --no-install-recommends clang-21
           echo "CXX=clang++-21" >> "$GITHUB_ENV"
 
+      # setup-rust-toolchain adds cargo to the Windows PATH via core.addPath(),
+      # but mise's bash task runner (Git Bash) doesn't inherit that PATH entry.
+      # Add it explicitly so `cargo` is visible inside mise bash tasks.
+      - name: Add cargo/bin to PATH for mise bash tasks (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Add-Content $env:GITHUB_PATH "$env:USERPROFILE\.cargo\bin"
+
       - uses: jdx/mise-action@v2
         with:
           version: ${{ env.MISE_VERSION }}
@@ -179,6 +187,11 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends clang-21
           echo "CXX=clang++-21" >> "$GITHUB_ENV"
+
+      - name: Add cargo/bin to PATH for mise bash tasks (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Add-Content $env:GITHUB_PATH "$env:USERPROFILE\.cargo\bin"
 
       - uses: jdx/mise-action@v2
         with:
