@@ -115,13 +115,13 @@ jobs:
           sudo apt-get install -y --no-install-recommends clang-21
           echo "CXX=clang++-21" >> "$GITHUB_ENV"
 
-      # setup-rust-toolchain adds cargo to the Windows PATH via core.addPath(),
-      # but mise's bash task runner (Git Bash) doesn't inherit that PATH entry.
-      # Add it explicitly so `cargo` is visible inside mise bash tasks.
-      - name: Add cargo/bin to PATH for mise bash tasks (Windows)
+      # mise's bash task runner (Git Bash) does not inherit the PATH additions
+      # from setup-rust-toolchain. Export CARGO as an absolute path; maturin and
+      # cargo-nextest both respect this env var and skip the PATH lookup entirely.
+      - name: Export CARGO path for mise bash tasks (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: Add-Content $env:GITHUB_PATH "$env:USERPROFILE\.cargo\bin"
+        run: Add-Content $env:GITHUB_ENV "CARGO=$(rustup which cargo)"
 
       - uses: jdx/mise-action@v2
         with:
@@ -188,10 +188,10 @@ jobs:
           sudo apt-get install -y --no-install-recommends clang-21
           echo "CXX=clang++-21" >> "$GITHUB_ENV"
 
-      - name: Add cargo/bin to PATH for mise bash tasks (Windows)
+      - name: Export CARGO path for mise bash tasks (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: Add-Content $env:GITHUB_PATH "$env:USERPROFILE\.cargo\bin"
+        run: Add-Content $env:GITHUB_ENV "CARGO=$(rustup which cargo)"
 
       - uses: jdx/mise-action@v2
         with:
