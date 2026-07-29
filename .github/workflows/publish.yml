@@ -195,6 +195,17 @@ jobs:
           # Linux overrides RUSTFLAGS inside before-script-linux; mac has no RUSTFLAGS.
           RUSTFLAGS: ${{ matrix.rustflags }}
 
+      # Import the just-built wheel natively on the target runner.  Running this
+      # before upload catches broken binaries (missing symbols, wrong libc++
+      # linkage) before they reach PyPI — the exact failure mode of REA-4690,
+      # where the linux-aarch64 wheel silently shipped with an unresolved __Cr
+      # symbol that was never executed in CI.
+      - name: Smoke-test wheel import
+        shell: bash
+        run: |
+          pip install --no-index --find-links dist/ reactor_webrtc
+          python -c "import reactor_webrtc; print('reactor_webrtc imported ok')"
+
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-${{ matrix.platform }}
