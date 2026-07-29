@@ -151,12 +151,17 @@ jobs:
           sudo apt-get install -y --no-install-recommends wget lsb-release software-properties-common gnupg
           wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh && chmod +x /tmp/llvm.sh
           sudo /tmp/llvm.sh 21
-          # update-alternatives priority may be lower than the pre-installed GCC on
-          # the runner. Use direct symlinks in /usr/local/bin (comes before /usr/bin
-          # in PATH) so gn's is_clang=false toolchain picks up clang-21 as gcc/g++.
-          sudo ln -sf /usr/bin/clang-21 /usr/local/bin/gcc
+          # gn's is_clang=false toolchain on linux/arm64 invokes the compiler as
+          # "aarch64-linux-gnu-g++" (the Debian triple-prefixed form), not plain
+          # "g++".  update-alternatives priority may also lose to the pre-installed
+          # GCC, so use direct symlinks in /usr/local/bin (comes before /usr/bin in
+          # PATH) for all four names gn may invoke.
+          sudo ln -sf /usr/bin/clang-21   /usr/local/bin/gcc
           sudo ln -sf /usr/bin/clang++-21 /usr/local/bin/g++
-          echo "Host compiler: $(gcc --version | head -1)  target=$(gcc -dumpmachine)"
+          sudo ln -sf /usr/bin/clang-21   /usr/local/bin/aarch64-linux-gnu-gcc
+          sudo ln -sf /usr/bin/clang++-21 /usr/local/bin/aarch64-linux-gnu-g++
+          echo "CXX: $(aarch64-linux-gnu-g++ --version | head -1)"
+          echo "target: $(aarch64-linux-gnu-g++ -dumpmachine)"
 
       # POSIX targets: bash build.sh + package.sh.
       - name: Build libwebrtc
