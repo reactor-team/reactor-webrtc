@@ -114,25 +114,12 @@ gn_args() {
       # The bundled libc++ is compiled from source and linked explicitly.
       # use_sysroot=true: the pinned Debian Bullseye sysroot for a stable ABI.
       # No screen/desktop capture: disable X11 + PipeWire (no libX11 dep).
-      #
-      # is_clang selection:
-      #   x86_64 host → bundled Chromium clang (Linux_x64 binary from GCS).
-      #   aarch64 host → Chromium publishes only Linux_x64 host binaries; update.py
-      #     hardcodes "Linux_x64" for all Linux hosts and there is no Linux_arm64
-      #     variant.  Use is_clang=false so gn skips the bundled binary and invokes
-      #     whatever "gcc"/"g++" resolves to in PATH.  The CI workflow creates
-      #     /usr/local/bin/{gcc,g++} symlinks pointing to clang-21 (which comes
-      #     before /usr/bin in PATH, overriding the pre-installed GCC 13 regardless
-      #     of update-alternatives priority).  clang-21 compiles the bundled libc++
-      #     correctly and produces native aarch64 objects.
-      local IS_CLANG=true
-      if [ "$(uname -m)" = "aarch64" ]; then
-        IS_CLANG=false
-      fi
+      # is_clang=true on all Linux hosts: on aarch64 the x86_64 bundled clang
+      # binary is replaced with system clang-21 symlinks before gn gen (see below).
       args+=(
         "rtc_use_x11=false"
         "rtc_use_pipewire=false"
-        "is_clang=${IS_CLANG}"
+        "is_clang=true"
         "use_sysroot=true"
         "use_custom_libcxx=true"
         "symbol_level=1"
@@ -203,6 +190,27 @@ if [ "$GN_OS" = linux ] && [ "$CPU" != "$(uname -m | sed 's/x86_64/x64/;s/aarch6
   echo "==> installing linux sysroot for $CPU (cross)"
   python3 build/linux/sysroot_scripts/install-sysroot.py --arch="$CPU" \
     || python3 build/linux/sysroot_scripts/install_sysroot.py --arch="$CPU"
+fi
+
+# On aarch64 Linux the bundled clang binary (downloaded by update.py) is a
+# Linux_x64 ELF — it won't execute on arm64.  Replace it with system clang-21
+# symlinks so is_clang=true keeps working (preserving lld + Clang-specific flags).
+# Must run AFTER gclient sync (update.py deposits the x86_64 binary).
+if [ "$(uname -m)" = "aarch64" ] && [ "$GN_OS" = linux ]; then
+  CLANG_BIN="third_party/llvm-build/Release+Asserts/bin"
+  if [ -d "$CLANG_BIN" ]; then
+    echo "==> aarch64: patching $CLANG_BIN with system clang-21 symlinks"
+    ln -sf /usr/bin/clang-21   "$CLANG_BIN/clang"
+    ln -sf /usr/bin/clang++-21 "$CLANG_BIN/clang++"
+    for tool in ar nm objcopy objdump ranlib readelf strip dwp; do
+      [ -e "/usr/bin/llvm-${tool}-21" ] && ln -sf "/usr/bin/llvm-${tool}-21" "$CLANG_BIN/llvm-${tool}" || true
+    done
+    # ld.lld: try several install paths from lld-21/llvm-21 packages
+    for lld in /usr/lib/llvm-21/bin/ld.lld /usr/bin/ld.lld-21 /usr/bin/lld-21; do
+      if [ -e "$lld" ]; then ln -sf "$lld" "$CLANG_BIN/ld.lld"; break; fi
+    done
+    echo "    clang: $("$CLANG_BIN/clang" --version | head -1)"
+  fi
 fi
 
 # ── 4. gn gen ─────────────────────────────────────────────────────────────────

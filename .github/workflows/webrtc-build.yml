@@ -151,17 +151,12 @@ jobs:
           sudo apt-get install -y --no-install-recommends wget lsb-release software-properties-common gnupg
           wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh && chmod +x /tmp/llvm.sh
           sudo /tmp/llvm.sh 21
-          # gn's is_clang=false toolchain on linux/arm64 invokes the compiler as
-          # "aarch64-linux-gnu-g++" (the Debian triple-prefixed form), not plain
-          # "g++".  update-alternatives priority may also lose to the pre-installed
-          # GCC, so use direct symlinks in /usr/local/bin (comes before /usr/bin in
-          # PATH) for all four names gn may invoke.
-          sudo ln -sf /usr/bin/clang-21   /usr/local/bin/gcc
-          sudo ln -sf /usr/bin/clang++-21 /usr/local/bin/g++
-          sudo ln -sf /usr/bin/clang-21   /usr/local/bin/aarch64-linux-gnu-gcc
-          sudo ln -sf /usr/bin/clang++-21 /usr/local/bin/aarch64-linux-gnu-g++
-          echo "CXX: $(aarch64-linux-gnu-g++ --version | head -1)"
-          echo "target: $(aarch64-linux-gnu-g++ -dumpmachine)"
+          # lld-21: the linker Chromium uses with is_clang=true.
+          # llvm-21: provides llvm-ar, llvm-nm, llvm-objcopy, etc. used by ninja.
+          # build.sh patches the bundled clang dir with symlinks to these after
+          # gclient sync (the bundled binary is Linux_x64 and won't run on arm64).
+          sudo apt-get install -y --no-install-recommends lld-21 llvm-21
+          echo "clang-21: $(clang-21 --version | head -1)"
 
       # POSIX targets: bash build.sh + package.sh.
       - name: Build libwebrtc
