@@ -198,7 +198,7 @@ shopt -u nullglob
 # the linux-arm64 toolchain instead.
 if [ "$GN_OS" = linux ] && [ "$(uname -m)" = "aarch64" ]; then
   echo "==> re-fetching bundled clang for linux-arm64 host"
-  python3 tools/clang/scripts/update.py --without-android
+  python3 tools/clang/scripts/update.py
 fi
 
 # Cross-compiling linux/arm64 from an x86_64 host needs the arm64 sysroot, which
