@@ -191,6 +191,16 @@ for p in "$HERE"/patches/*.patch; do
 done
 shopt -u nullglob
 
+# The WebRTC DEPS cipd packages section downloads the bundled clang for
+# linux-amd64 unconditionally (the package path is not ${platform}-templated
+# for this version).  On an arm64 host the x86_64 binary lands in
+# third_party/llvm-build; running update.py explicitly forces it to re-fetch
+# the linux-arm64 toolchain instead.
+if [ "$GN_OS" = linux ] && [ "$(uname -m)" = "aarch64" ]; then
+  echo "==> re-fetching bundled clang for linux-arm64 host"
+  python3 src/tools/clang/scripts/update.py --without-android
+fi
+
 # Cross-compiling linux/arm64 from an x86_64 host needs the arm64 sysroot, which
 # the default sync (host arch only) does not fetch.
 if [ "$GN_OS" = linux ] && [ "$CPU" != "$(uname -m | sed 's/x86_64/x64/;s/aarch64/arm64/')" ]; then

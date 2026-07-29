@@ -76,24 +76,26 @@ jobs:
           linux_arm='{"os":"linux","arch":"arm64","runner":"ubuntu-24.04-arm"}'
           android='{"os":"android","arch":"arm64","runner":"ubuntu-latest"}'
           win='{"os":"win","arch":"x64","runner":"windows-latest"}'
-          # CI (push / pull_request) → full target matrix, debug profile.
+          # CI (push / pull_request) → linux-arm64 only while debugging native build.
+          # TODO: restore to full once linux-arm64 native build is confirmed working.
           # workflow_dispatch → use the selected inputs.
           t="${{ github.event.inputs.targets }}"
           prof="${{ github.event.inputs.profile }}"
           if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
-            t=full
+            t=linux-arm64
             prof=debug
           fi
           t="${t:-mac}"
           case "$t" in
-            mac)      inc="$mac_arm" ;;
-            apple)    inc="$mac_arm,$mac_x64,$ios_dev,$ios_sim" ;;
-            linux)    inc="$linux_x64,$linux_arm" ;;
-            android)  inc="$android" ;;
-            win)      inc="$win" ;;
-            full)     inc="$mac_arm,$mac_x64,$ios_dev,$ios_sim,$linux_x64,$linux_arm,$android,$win" ;;
+            mac)       inc="$mac_arm" ;;
+            apple)     inc="$mac_arm,$mac_x64,$ios_dev,$ios_sim" ;;
+            linux)     inc="$linux_x64,$linux_arm" ;;
+            android)   inc="$android" ;;
+            win)       inc="$win" ;;
+            full)      inc="$mac_arm,$mac_x64,$ios_dev,$ios_sim,$linux_x64,$linux_arm,$android,$win" ;;
             linux-x64) inc="$linux_x64" ;;
-            *)        inc="$mac_arm" ;;
+            linux-arm64) inc="$linux_arm" ;;
+            *)         inc="$mac_arm" ;;
           esac
           echo "matrix={\"include\":[$inc]}" >> "$GITHUB_OUTPUT"
           echo "profile=${prof:-release}" >> "$GITHUB_OUTPUT"
