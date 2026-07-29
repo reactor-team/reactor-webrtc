@@ -115,24 +115,11 @@ jobs:
           sudo apt-get install -y --no-install-recommends clang-21
           echo "CXX=clang++-21" >> "$GITHUB_ENV"
 
-      # mise has lockfile entries for linux-x64, linux-arm64, and macos-arm64.
-      # Windows is excluded from the lockfile (its builds use maturin-action);
-      # run cargo test directly there instead.
       - uses: jdx/mise-action@v2
-        if: runner.os != 'Windows'
         with:
           version: ${{ env.MISE_VERSION }}
 
-      - name: Test (Linux / macOS)
-        if: runner.os != 'Windows'
-        run: mise run test
-        env:
-          REACTOR_WEBRTC_PREBUILT_URL: ${{ steps.prebuilt.outputs.url }}
-          REACTOR_WEBRTC_PREBUILT_SHA256: ${{ steps.prebuilt.outputs.sha256 }}
-
-      - name: Test (Windows)
-        if: runner.os == 'Windows'
-        run: cargo test --workspace --exclude reactor-webrtc-py
+      - run: mise run test
         env:
           REACTOR_WEBRTC_PREBUILT_URL: ${{ steps.prebuilt.outputs.url }}
           REACTOR_WEBRTC_PREBUILT_SHA256: ${{ steps.prebuilt.outputs.sha256 }}
@@ -155,7 +142,6 @@ jobs:
 
           - platform: win-x64
             os: windows-latest
-            # libwebrtc.lib uses /MT (static CRT); Rust must match to avoid LNK2038.
             rustflags: "-C target-feature=+crt-static"
 
     runs-on: ${{ matrix.os }}
@@ -194,47 +180,16 @@ jobs:
           sudo apt-get install -y --no-install-recommends clang-21
           echo "CXX=clang++-21" >> "$GITHUB_ENV"
 
-      # Linux and macOS: mise has lockfile entries for these platforms.
-      # Windows is excluded from mise's lockfile_platforms (its builds use
-      # maturin-action directly, like publish.yml does).
       - uses: jdx/mise-action@v2
-        if: runner.os != 'Windows'
         with:
           version: ${{ env.MISE_VERSION }}
 
-      - name: Build wheel (Linux / macOS)
-        if: runner.os != 'Windows'
+      - name: Build wheel
         run: mise run //crates/reactor-webrtc-py:build
         env:
           REACTOR_WEBRTC_PREBUILT_URL: ${{ steps.prebuilt.outputs.url }}
           REACTOR_WEBRTC_PREBUILT_SHA256: ${{ steps.prebuilt.outputs.sha256 }}
-
-      # Windows: use maturin-action directly (same as publish.yml).
-      # maturin-action handles installing maturin; output lands in dist/.
-      - name: Build wheel (Windows)
-        if: runner.os == 'Windows'
-        uses: PyO3/maturin-action@v1
-        with:
-          command: build
-          args: >-
-            --release
-            --manifest-path crates/reactor-webrtc-py/Cargo.toml
-            --out dist
-          manylinux: "off"
-        env:
-          REACTOR_WEBRTC_PREBUILT_URL: ${{ steps.prebuilt.outputs.url }}
-          REACTOR_WEBRTC_PREBUILT_SHA256: ${{ steps.prebuilt.outputs.sha256 }}
           RUSTFLAGS: ${{ matrix.rustflags }}
-
-      # Normalise artifact path: mise build lands in target/wheels/, maturin-action
-      # in dist/. Copy dist/ → target/wheels/ on Windows so the upload and
-      # test-py steps use the same path unconditionally.
-      - name: Normalise wheel path (Windows)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          mkdir -p target/wheels
-          cp dist/*.whl target/wheels/
 
       - uses: actions/upload-artifact@v4
         with:
@@ -265,25 +220,10 @@ jobs:
           name: wheel-${{ matrix.platform }}
           path: target/wheels
       - uses: jdx/mise-action@v2
-        if: runner.os != 'Windows'
         with:
           version: ${{ env.MISE_VERSION }}
-      - name: Run Python tests (Linux / macOS)
-        if: runner.os != 'Windows'
+      - name: Run Python tests against the built wheel
         run: mise run //crates/reactor-webrtc-py:test
-      # Windows: replicate the test task without mise/bash. uv is available on
-      # GitHub Actions Windows runners via the pre-installed Python ecosystem.
-      - name: Run Python tests (Windows)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          WHEEL=$(ls target/wheels/reactor_webrtc-*.whl | head -1)
-          VENV="target/py-test-venv"
-          python -m venv "$VENV"
-          "$VENV/Scripts/pip" install pytest "$WHEEL"
-          for f in crates/reactor-webrtc-py/tests/test_*.py; do
-            "$VENV/Scripts/pytest" "$f" -v
-          done
 
   ci-complete:
     name: CI Complete

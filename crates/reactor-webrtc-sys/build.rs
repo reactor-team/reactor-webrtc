@@ -511,7 +511,83 @@ fn download_prebuilt(url: &str, sha256: Option<&str>) -> PathBuf {
              lib/libwebrtc.lib (bad archive layout?)"
         );
     }
+    verify_prebuilt_arch(&out.join("lib"));
     out
+}
+
+/// Verify that `libwebrtc.a` was built for the current target architecture by
+/// inspecting the ELF `e_machine` field of the first object in the archive.
+/// Panics with a clear message when the prebuilt was built for the wrong arch
+/// (e.g. an x86_64 archive delivered as the linux-arm64 prebuilt), avoiding
+/// the cryptic "unknown architecture of input file" error from the linker.
+/// Only active on Linux; macOS/Windows use Mach-O/PE where the linker already
+/// rejects mismatches at load time with a descriptive error.
+fn verify_prebuilt_arch(lib_dir: &Path) {
+    if env::var("CARGO_CFG_TARGET_OS").unwrap_or_default() != "linux" {
+        return;
+    }
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let expected_machine: u16 = match target_arch.as_str() {
+        "x86_64" => 0x3E,  // EM_X86_64
+        "aarch64" => 0xB7, // EM_AARCH64
+        _ => return,
+    };
+
+    let lib = lib_dir.join("libwebrtc.a");
+    let data = match std::fs::read(&lib) {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+
+    // ar archive: 8-byte magic "!<arch>\n", then 60-byte member headers + content.
+    const AR_MAGIC: &[u8] = b"!<arch>\n";
+    if !data.starts_with(AR_MAGIC) {
+        return;
+    }
+
+    let mut pos = AR_MAGIC.len();
+    while pos + 60 <= data.len() {
+        let member_size: usize = std::str::from_utf8(&data[pos + 48..pos + 58])
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+        let content_start = pos + 60;
+        let content_end = data.len().min(content_start + member_size);
+        let content = &data[content_start..content_end];
+
+        // ELF: 4-byte magic + 12 bytes ident fields + 2-byte type + 2-byte machine.
+        if content.len() >= 20 && content.starts_with(b"\x7fELF") {
+            let machine = u16::from_le_bytes([content[18], content[19]]);
+            if machine != expected_machine {
+                let got = match machine {
+                    0x3E => "x86_64",
+                    0xB7 => "aarch64",
+                    0x28 => "arm",
+                    _ => "unknown",
+                };
+                panic!(
+                    "reactor-webrtc-sys: prebuilt architecture mismatch!\n  \
+                     Target:   {} (e_machine={:#06x})\n  \
+                     Prebuilt: {} (e_machine={:#06x})\n\n  \
+                     The archive at\n    {}\n  \
+                     was built for a different architecture than the current target.\n  \
+                     Rebuild the prebuilt for {} or update REACTOR_WEBRTC_PREBUILT_URL.",
+                    target_arch,
+                    expected_machine,
+                    got,
+                    machine,
+                    lib.display(),
+                    target_arch,
+                )
+            }
+            return; // arch matches
+        }
+
+        pos = content_start + member_size;
+        if !member_size.is_multiple_of(2) {
+            pos += 1;
+        }
+    }
 }
 
 /// Run a command, panicking with context on failure.
