@@ -16,6 +16,7 @@
 // Android bootstrap (reactor_webrtc_android_init / _init_context): located at
 // the bottom of this file, guarded by #ifdef WEBRTC_ANDROID.
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -128,6 +129,31 @@ struct ReactorPcCallbacks {
   // A remote track was added; `track` is an owned MediaStreamTrack handle the
   // receiver must free with reactor_webrtc_media_stream_track_destroy.
   void (*on_track)(void* userdata, void* track);
+};
+
+// A single ICE (STUN/TURN) server. `urls` holds `urls_len` NUL-terminated
+// strings that share the credentials in this entry. `username` and `password`
+// may be null, which reads as an empty credential. Every pointer is borrowed
+// for the duration of reactor_webrtc_peer_connection_create.
+struct ReactorIceServer {
+  const char* const* urls;
+  size_t             urls_len;
+  const char*        username;
+  const char*        password;
+};
+
+// Peer-connection configuration. Each entry of `servers` keeps its own
+// credentials, so several TURN servers with different credentials stay
+// distinct. The policy fields use an explicit integer encoding, independent of
+// the webrtc:: enum order:
+//   ice_transport_type:         0=all 1=relay 2=no-host 3=none
+//   continual_gathering_policy: 0=gather-once 1=gather-continually
+// An unknown value falls back to 0.
+struct ReactorRtcConfig {
+  const ReactorIceServer* servers;
+  size_t                  servers_len;
+  int                     ice_transport_type;
+  int                     continual_gathering_policy;
 };
 }  // extern "C"
 
@@ -520,26 +546,53 @@ class SetRemoteDescObserver
   void (*on_complete_)(void*, const char*);
 };
 
-// Lenient ICE-server extraction: pull quoted stun:/turn[s]: URLs out of the
-// config JSON without a JSON dependency. TODO(M1): replace with the structured
-// config the safe crate will build.
-void parse_ice_servers(const char* config_json,
-                       webrtc::PeerConnectionInterface::RTCConfiguration& cfg) {
-  if (!config_json) return;
-  const std::string s(config_json);
-  size_t start = 0;
-  while ((start = s.find('"', start)) != std::string::npos) {
-    const size_t end = s.find('"', start + 1);
-    if (end == std::string::npos) break;
-    const std::string tok = s.substr(start + 1, end - start - 1);
-    if (tok.rfind("stun:", 0) == 0 || tok.rfind("stuns:", 0) == 0 ||
-        tok.rfind("turn:", 0) == 0 || tok.rfind("turns:", 0) == 0) {
-      webrtc::PeerConnectionInterface::IceServer srv;
-      srv.urls.push_back(tok);
-      cfg.servers.push_back(std::move(srv));
+// Copy a borrowed C string, mapping null to empty.
+std::string str_or_empty(const char* s) { return s ? std::string(s) : std::string(); }
+
+// Apply the caller's configuration to a libwebrtc RTCConfiguration. A null
+// `in` keeps the libwebrtc defaults. Credentials travel per server entry, so a
+// turn:/turns: URL reaches ice_server_parsing.cc with its username and
+// password attached.
+void apply_rtc_config(const ReactorRtcConfig* in,
+                      webrtc::PeerConnectionInterface::RTCConfiguration& cfg) {
+  if (!in) return;
+
+  for (size_t i = 0; i < in->servers_len; ++i) {
+    const ReactorIceServer& src = in->servers[i];
+    webrtc::PeerConnectionInterface::IceServer srv;
+    for (size_t u = 0; u < src.urls_len; ++u) {
+      if (src.urls && src.urls[u]) srv.urls.push_back(src.urls[u]);
     }
-    start = end + 1;
+    if (srv.urls.empty()) continue;
+    srv.username = str_or_empty(src.username);
+    srv.password = str_or_empty(src.password);
+    cfg.servers.push_back(std::move(srv));
   }
+
+  switch (in->ice_transport_type) {
+    case 1:  cfg.type = webrtc::PeerConnectionInterface::kRelay;  break;
+    case 2:  cfg.type = webrtc::PeerConnectionInterface::kNoHost; break;
+    case 3:  cfg.type = webrtc::PeerConnectionInterface::kNone;   break;
+    default: cfg.type = webrtc::PeerConnectionInterface::kAll;    break;
+  }
+
+  cfg.continual_gathering_policy =
+      in->continual_gathering_policy == 1
+          ? webrtc::PeerConnectionInterface::GATHER_CONTINUALLY
+          : webrtc::PeerConnectionInterface::GATHER_ONCE;
+}
+
+// Write a NUL-terminated copy of `msg` into `out`, truncated to `cap` bytes.
+// Does nothing when `out` is null or `cap` is not positive. Templated on the
+// message type: RTCError::message() returns const char* on some milestones and
+// a string_view on others, and both convert to std::string.
+template <typename S>
+static void write_error(char* out, int cap, const S& msg) {
+  if (!out || cap <= 0) return;
+  const std::string s(msg);
+  const size_t n = std::min(s.size(), static_cast<size_t>(cap) - 1);
+  std::memcpy(out, s.data(), n);
+  out[n] = '\0';
 }
 
 // Safely dereference any optional-like field (absl::optional<T>, std::optional<T>,
@@ -649,7 +702,7 @@ static webrtc::scoped_refptr<webrtc::AudioProcessing> build_apm(int apm_flags) {
 extern "C" {
 
 // ABI version of this native build. The safe crate asserts compatibility.
-unsigned int reactor_webrtc_abi_version() { return 1; }
+unsigned int reactor_webrtc_abi_version() { return 2; }
 
 // Link/run self-test: build the builtin audio + video encoder factories and
 // enumerate the codecs they support. Writes a comma-separated, NUL-terminated
@@ -745,28 +798,36 @@ void reactor_webrtc_factory_destroy(void* factory) {
   delete reinterpret_cast<ReactorFactory*>(factory);
 }
 
-// Create a PeerConnection on `factory`. `config_json` may be null/empty;
-// recognized ICE-server URLs are applied. `callbacks` may be null. Returns an
-// opaque ReactorPeerConnection* (the `PeerConnection` handle), or nullptr.
+// Create a PeerConnection on `factory`. `config` may be null (libwebrtc
+// defaults). `callbacks` may be null. Returns an opaque ReactorPeerConnection*
+// (the `PeerConnection` handle), or nullptr. On failure the reason from
+// libwebrtc goes into `err` (NUL-terminated, truncated to `err_cap`).
 void* reactor_webrtc_peer_connection_create(void* factory,
-                                            const char* config_json,
-                                            const ReactorPcCallbacks* callbacks) {
+                                            const ReactorRtcConfig* config,
+                                            const ReactorPcCallbacks* callbacks,
+                                            char* err, int err_cap) {
   auto* rf = reinterpret_cast<ReactorFactory*>(factory);
-  if (!rf || !rf->factory) return nullptr;
+  if (!rf || !rf->factory) {
+    write_error(err, err_cap, "invalid peer connection factory");
+    return nullptr;
+  }
 
   auto rpc = std::make_unique<ReactorPeerConnection>();
   ReactorPcCallbacks cb{};
   if (callbacks) cb = *callbacks;
   rpc->observer = std::make_unique<ReactorPcObserver>(cb);
 
-  webrtc::PeerConnectionInterface::RTCConfiguration config;
-  config.sdp_semantics = webrtc::SdpSemantics::kUnifiedPlan;
-  parse_ice_servers(config_json, config);
+  webrtc::PeerConnectionInterface::RTCConfiguration rtc_config;
+  rtc_config.sdp_semantics = webrtc::SdpSemantics::kUnifiedPlan;
+  apply_rtc_config(config, rtc_config);
 
   webrtc::PeerConnectionDependencies deps(rpc->observer.get());
   auto result =
-      rf->factory->CreatePeerConnectionOrError(config, std::move(deps));
-  if (!result.ok()) return nullptr;
+      rf->factory->CreatePeerConnectionOrError(rtc_config, std::move(deps));
+  if (!result.ok()) {
+    write_error(err, err_cap, result.error().message());
+    return nullptr;
+  }
   rpc->pc = result.MoveValue();
   return rpc.release();
 }

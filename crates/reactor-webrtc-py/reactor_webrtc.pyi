@@ -19,7 +19,14 @@ class IceServer:
 
 class RtcConfiguration:
     ice_servers: list[IceServer]
-    def __init__(self, ice_servers: list[IceServer] = ...) -> None: ...
+    ice_transport_type: str  # "all" | "relay" | "no_host" | "none"
+    continual_gathering_policy: str  # "once" | "continually"
+    def __init__(
+        self,
+        ice_servers: list[IceServer] = ...,
+        ice_transport_type: str = "all",
+        continual_gathering_policy: str = "once",
+    ) -> None: ...
 
 # ── Signaling types ───────────────────────────────────────────────────────────
 

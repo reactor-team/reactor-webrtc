@@ -24,7 +24,10 @@ obs.on_ice_candidate = lambda c: relay_to_peer(c)
 obs.on_connection_state_change = lambda s: print("state:", s)
 
 config = rw.RtcConfiguration(ice_servers=[
-    rw.IceServer(urls=["stun:stun.l.google.com:19302"])
+    rw.IceServer(urls=["stun:stun.l.google.com:19302"]),
+    # A turn:/turns: entry needs both credentials, or libwebrtc rejects the
+    # whole configuration.
+    rw.IceServer(urls=["turn:turn.example.com:3478"], username="alice", password="secret"),
 ])
 pc = factory.create_peer_connection(config, obs)
 
@@ -97,7 +100,7 @@ for pair in report.candidate_pairs:
 | `PeerConnectionFactory` | Entry point; creates peer connections and tracks |
 | `PeerConnection` | SDP offer/answer, ICE, tracks, data channels, stats |
 | `PeerConnectionObserver` | Callbacks: state, ICE candidate, track, data channel |
-| `RtcConfiguration` | ICE servers + transport policy |
+| `RtcConfiguration` | ICE servers, ICE transport type, gathering policy |
 | `IceServer` | A STUN or TURN server entry |
 | `IceCandidate` | A trickled ICE candidate |
 | `SessionDescription` | SDP offer or answer (`kind`, `sdp`) |
@@ -115,6 +118,11 @@ for pair in report.candidate_pairs:
 | `MediaKind` | `Audio`, `Video` |
 | `DataChannelState` | `Connecting`, `Open`, `Closing`, `Closed` |
 | `IceCandidatePairState` | `Waiting`, `InProgress`, `Failed`, `Succeeded`, `Cancelled` |
+
+| String-valued field | Values |
+|---------------------|--------|
+| `RtcConfiguration.ice_transport_type` | `all` (default), `relay`, `no_host`, `none` |
+| `RtcConfiguration.continual_gathering_policy` | `once` (default), `continually` |
 
 ## Thread safety
 

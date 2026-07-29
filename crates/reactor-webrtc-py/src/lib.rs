@@ -19,7 +19,7 @@
 // function named `reactor_webrtc` that this file also defines.
 use ::reactor_webrtc as rw;
 
-use pyo3::exceptions::{PyRuntimeError, PyTypeError};
+use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::mem::ManuallyDrop;
@@ -68,9 +68,54 @@ fn parse_sdp_type(s: &str) -> Option<rw::SdpType> {
     }
 }
 
+const ICE_TRANSPORT_TYPES: &str = "all, relay, no_host, none";
+const GATHERING_POLICIES: &str = "once, continually";
+
+fn ice_transport_type_to_str(t: rw::IceTransportsType) -> &'static str {
+    match t {
+        rw::IceTransportsType::All => "all",
+        rw::IceTransportsType::Relay => "relay",
+        rw::IceTransportsType::NoHost => "no_host",
+        rw::IceTransportsType::None => "none",
+    }
+}
+
+fn parse_ice_transport_type(s: &str) -> PyResult<rw::IceTransportsType> {
+    match s {
+        "all" => Ok(rw::IceTransportsType::All),
+        "relay" => Ok(rw::IceTransportsType::Relay),
+        "no_host" => Ok(rw::IceTransportsType::NoHost),
+        "none" => Ok(rw::IceTransportsType::None),
+        other => Err(PyValueError::new_err(format!(
+            "unknown ice_transport_type {other:?}; use one of: {ICE_TRANSPORT_TYPES}"
+        ))),
+    }
+}
+
+fn gathering_policy_to_str(p: rw::ContinualGatheringPolicy) -> &'static str {
+    match p {
+        rw::ContinualGatheringPolicy::GatherOnce => "once",
+        rw::ContinualGatheringPolicy::GatherContinually => "continually",
+    }
+}
+
+fn parse_gathering_policy(s: &str) -> PyResult<rw::ContinualGatheringPolicy> {
+    match s {
+        "once" => Ok(rw::ContinualGatheringPolicy::GatherOnce),
+        "continually" => Ok(rw::ContinualGatheringPolicy::GatherContinually),
+        other => Err(PyValueError::new_err(format!(
+            "unknown continual_gathering_policy {other:?}; use one of: {GATHERING_POLICIES}"
+        ))),
+    }
+}
+
 // ── Config ────────────────────────────────────────────────────────────────────
 
 /// A single STUN/TURN server entry.
+///
+/// All URLs in one entry share `username` and `password`. A `turn:` or `turns:`
+/// URL needs both credentials: libwebrtc rejects the whole configuration when
+/// either one is empty.
 #[pyclass(get_all, set_all)]
 #[derive(Clone, Default)]
 pub struct IceServer {
@@ -106,18 +151,32 @@ impl From<&IceServer> for rw::IceServer {
 }
 
 /// Peer-connection ICE + transport configuration.
+///
+/// `ice_transport_type` restricts which candidate types ICE may use
+/// (`all`, `relay`, `no_host`, `none`). `continual_gathering_policy` selects
+/// whether ICE gathers once or keeps gathering (`once`, `continually`).
 #[pyclass]
 #[derive(Clone)]
 pub struct RtcConfiguration {
     pub ice_servers: Vec<IceServer>,
+    ice_transport_type: rw::IceTransportsType,
+    continual_gathering_policy: rw::ContinualGatheringPolicy,
 }
 
 #[pymethods]
 impl RtcConfiguration {
     #[new]
-    #[pyo3(signature = (ice_servers=vec![]))]
-    fn new(ice_servers: Vec<IceServer>) -> Self {
-        Self { ice_servers }
+    #[pyo3(signature = (ice_servers=vec![], ice_transport_type="all", continual_gathering_policy="once"))]
+    fn new(
+        ice_servers: Vec<IceServer>,
+        ice_transport_type: &str,
+        continual_gathering_policy: &str,
+    ) -> PyResult<Self> {
+        Ok(Self {
+            ice_servers,
+            ice_transport_type: parse_ice_transport_type(ice_transport_type)?,
+            continual_gathering_policy: parse_gathering_policy(continual_gathering_policy)?,
+        })
     }
     #[getter]
     fn ice_servers(&self) -> Vec<IceServer> {
@@ -127,13 +186,32 @@ impl RtcConfiguration {
     fn set_ice_servers(&mut self, servers: Vec<IceServer>) {
         self.ice_servers = servers;
     }
+    #[getter]
+    fn ice_transport_type(&self) -> &'static str {
+        ice_transport_type_to_str(self.ice_transport_type)
+    }
+    #[setter]
+    fn set_ice_transport_type(&mut self, value: &str) -> PyResult<()> {
+        self.ice_transport_type = parse_ice_transport_type(value)?;
+        Ok(())
+    }
+    #[getter]
+    fn continual_gathering_policy(&self) -> &'static str {
+        gathering_policy_to_str(self.continual_gathering_policy)
+    }
+    #[setter]
+    fn set_continual_gathering_policy(&mut self, value: &str) -> PyResult<()> {
+        self.continual_gathering_policy = parse_gathering_policy(value)?;
+        Ok(())
+    }
 }
 
 impl From<&RtcConfiguration> for rw::RtcConfiguration {
     fn from(c: &RtcConfiguration) -> Self {
         rw::RtcConfiguration {
             ice_servers: c.ice_servers.iter().map(Into::into).collect(),
-            ..Default::default()
+            ice_transport_type: c.ice_transport_type,
+            continual_gathering_policy: c.continual_gathering_policy,
         }
     }
 }
