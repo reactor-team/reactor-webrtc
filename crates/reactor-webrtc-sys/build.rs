@@ -299,9 +299,12 @@ fn link_system_deps(lib_dir: &Path) {
         "android" => {
             // WebRTC for Android links the bundled libc++ (ABI namespace __Cr)
             // and the same NDK system libraries as a normal WebRTC Android build.
-            println!("cargo:rustc-link-lib=static=c++");
+            // +whole-archive forces GNU ld to load all archive members (the
+            // bundled libc++.a has internal circular deps that a single-pass
+            // scan misses); --gc-sections trims the unused code afterward.
+            println!("cargo:rustc-link-lib=static:+whole-archive=c++");
             if lib_dir.join("libc++abi.a").is_file() {
-                println!("cargo:rustc-link-lib=static=c++abi");
+                println!("cargo:rustc-link-lib=static:+whole-archive=c++abi");
             }
             if lib_dir.join("libunwind.a").is_file() {
                 println!("cargo:rustc-link-lib=static=unwind");
@@ -327,15 +330,33 @@ fn link_system_deps(lib_dir: &Path) {
             // (shipped by package.sh). Link them after webrtc so its symbols
             // resolve, and do NOT link the system stdc++. Fall back to the system
             // stdc++ only for an older/bare layout without the bundled archives.
-            if lib_dir.join("libc++.a").is_file() {
-                println!("cargo:rustc-link-lib=static=c++");
+            //
+            // +whole-archive forces GNU ld to load all archive members. The
+            // bundled libc++.a is a fat archive whose member ORDER differs from
+            // the x64 side-effect archive: circular refs (e.g. ostream.o →
+            // ios.o → ostream.o) break GNU ld's single-pass scan, leaving
+            // std::__Cr::* symbols undefined. +whole-archive bypasses that
+            // ordering issue; --gc-sections (already in the rustc link flags)
+            // then strips unused code so binary size stays reasonable.
+            let has_cxx = lib_dir.join("libc++.a").is_file();
+            println!(
+                "cargo:warning=reactor-webrtc-sys: libc++.a at {} → {}",
+                lib_dir.join("libc++.a").display(),
+                if has_cxx { "found" } else { "absent" }
+            );
+            if has_cxx {
+                println!("cargo:rustc-link-lib=static:+whole-archive=c++");
                 if lib_dir.join("libc++abi.a").is_file() {
-                    println!("cargo:rustc-link-lib=static=c++abi");
+                    println!("cargo:rustc-link-lib=static:+whole-archive=c++abi");
                 }
                 if lib_dir.join("libunwind.a").is_file() {
                     println!("cargo:rustc-link-lib=static=unwind");
                 }
             } else {
+                println!(
+                    "cargo:warning=reactor-webrtc-sys: bundled libc++.a absent — \
+                     falling back to system stdc++ (std::__Cr::* symbols will be unresolved)"
+                );
                 println!("cargo:rustc-link-lib=dylib=stdc++");
             }
             // Desktop capture (and its libX11 dep) is disabled in the build

@@ -82,7 +82,9 @@ jobs:
           t="${{ github.event.inputs.targets }}"
           prof="${{ github.event.inputs.profile }}"
           if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
-            t=full
+            # Temporarily restricted to linux-arm64 while diagnosing REA-4690.
+            # Restore to t=full once cargo test (linux-arm64) is green.
+            t=linux-arm
             prof=debug
           fi
           t="${t:-mac}"
@@ -94,6 +96,7 @@ jobs:
             win)      inc="$win" ;;
             full)     inc="$mac_arm,$mac_x64,$ios_dev,$ios_sim,$linux_x64,$linux_arm,$android,$win" ;;
             linux-x64) inc="$linux_x64" ;;
+            linux-arm) inc="$linux_arm" ;;
             *)        inc="$mac_arm" ;;
           esac
           echo "matrix={\"include\":[$inc]}" >> "$GITHUB_OUTPUT"
@@ -194,19 +197,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: linux
-            arch: x64
-            runner: ubuntu-latest
+          # Temporarily restricted to linux-arm64 (REA-4690 diagnosis).
           - os: linux
             arch: arm64
             runner: ubuntu-24.04-arm
-          - os: mac
-            arch: arm64
-            runner: macos-15
-          - os: win
-            arch: x64
-            runner: windows-latest
-            rustflags: "-C target-feature=+crt-static"
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
@@ -230,6 +224,18 @@ jobs:
           mkdir -p prebuilt
           zstd -dc dl/*.tar.zst | tar -x -C prebuilt
           echo "REACTOR_WEBRTC_LIB_DIR=$GITHUB_WORKSPACE/prebuilt" >> "$GITHUB_ENV"
+
+      - name: Diagnose prebuilt contents (REA-4690)
+        run: |
+          echo "=== prebuilt/lib ==="
+          ls -lh prebuilt/lib/ || echo "(no lib dir)"
+          echo "=== libc++ symbols check ==="
+          if [ -f prebuilt/lib/libc++.a ]; then
+            nm -A prebuilt/lib/libc++.a 2>/dev/null | grep -c "T _ZNSt4__Cr" || true
+            nm -A prebuilt/lib/libc++.a 2>/dev/null | grep "T _ZNSt4__Cr8ios_base5clearE" | head -5 || echo "(ios_base::clear not found)"
+          else
+            echo "libc++.a MISSING"
+          fi
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -265,19 +271,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: linux
-            arch: x64
-            runner: ubuntu-latest
+          # Temporarily restricted to linux-arm64 (REA-4690 diagnosis).
           - os: linux
             arch: arm64
             runner: ubuntu-24.04-arm
-          - os: mac
-            arch: arm64
-            runner: macos-15
-          - os: win
-            arch: x64
-            runner: windows-latest
-            rustflags: "-C target-feature=+crt-static"
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
@@ -343,18 +340,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: linux
-            arch: x64
-            runner: ubuntu-latest
+          # Temporarily restricted to linux-arm64 (REA-4690 diagnosis).
           - os: linux
             arch: arm64
             runner: ubuntu-24.04-arm
-          - os: mac
-            arch: arm64
-            runner: macos-15
-          - os: win
-            arch: x64
-            runner: windows-latest
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
