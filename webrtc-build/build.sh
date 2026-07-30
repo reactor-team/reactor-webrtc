@@ -131,12 +131,25 @@ gn_args() {
         "use_custom_libcxx=true"
         "symbol_level=1"
       )
-      # System clang-21 (used via the filter wrapper on arm64) does not ship
-      # Chromium's clang plugins (find-bad-constructs, raw-ptr-plugin,
-      # unsafe-buffers).  Disable them so the build system emits no
-      # -Xclang -add-plugin / -plugin-arg-* flags for this host.
       if [ "$(uname -m)" = "aarch64" ]; then
-        args+=("clang_use_chrome_plugins=false")
+        # clang_use_chrome_plugins=false: system clang-21 (used via the filter
+        # wrapper) does not ship Chromium's clang plugins (find-bad-constructs,
+        # raw-ptr-plugin, unsafe-buffers).  Disable so the build system emits
+        # no -Xclang -add-plugin / -plugin-arg-* flags for this host.
+        #
+        # libyuv_use_sme=false: ARM64 SME (Scalable Matrix Extension) in libyuv
+        # is not universally available on all arm64 microarchs and causes
+        # compilation issues with system clang-21.  LiveKit disables this too.
+        #
+        # use_crel=false / cflags filter: Chromium enables experimental CREL
+        # (compact ELF relocations) via -Wa,--crel on Linux arm64.  This causes
+        # runtime segfaults on arm64 Linux (crbug.com/376278218).  LiveKit
+        # applies disable_crel.patch; we suppress it in the filter wrapper and
+        # guard with this gn arg if Chromium exposes one.
+        args+=(
+          "clang_use_chrome_plugins=false"
+          "libyuv_use_sme=false"
+        )
       fi
       ;;
     win)
@@ -245,7 +258,9 @@ filtered=()
 for arg in "\$@"; do
   case "\$arg" in
     -fno-lifetime-dse|-fdiagnostics-show-inlining-chain|-fsanitize-ignore-for-ubsan-feature=*)
-      ;; # discard
+      ;; # discard: Chromium-patched flags not in standard clang-21
+    -Wa,--crel,--allow-experimental-crel)
+      ;; # discard: experimental CREL relocations cause runtime segfaults on arm64 Linux (crbug.com/376278218)
     *)
       filtered+=("\$arg")
       ;;
