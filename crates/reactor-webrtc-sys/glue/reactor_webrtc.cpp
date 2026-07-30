@@ -607,8 +607,10 @@ void apply_rtc_config(const ReactorRtcConfig* in,
           ? webrtc::PeerConnectionInterface::GATHER_CONTINUALLY
           : webrtc::PeerConnectionInterface::GATHER_ONCE;
 
-  if (in->min_port > 0) cfg.set_min_port(in->min_port);
-  if (in->max_port > 0) cfg.set_max_port(in->max_port);
+  if (in->min_port > 0 && in->max_port > 0) {
+    cfg.set_min_port(in->min_port);
+    cfg.set_max_port(in->max_port);
+  }
 }
 
 // Write a NUL-terminated copy of `msg` into `out`, truncated to `cap` bytes.
