@@ -45,6 +45,16 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(have_libwebrtc)");
 
     if let Ok(dir) = env::var("REACTOR_WEBRTC_LIB_DIR") {
+        // Watch the key prebuilt files so a restored Rust build cache does not
+        // silently keep stale link directives when the prebuilt layout changes
+        // (e.g. libc++.a appears for the first time after a p4 rebuild).
+        // Cargo only reruns build scripts on env-var changes; watching the files
+        // directly handles the case where REACTOR_WEBRTC_LIB_DIR stays the same
+        // but its contents are updated.
+        let lib = Path::new(&dir).join("lib");
+        for name in &["libwebrtc.a", "libc++.a", "libc++abi.a", "build_profile"] {
+            println!("cargo:rerun-if-changed={}", lib.join(name).display());
+        }
         link(Path::new(&dir));
         return;
     }
@@ -66,10 +76,23 @@ fn main() {
         let url = format!("{PREBUILT_BASE}/{tag}/{asset}");
         let sha_url = format!("{PREBUILT_BASE}/{tag}/{sha_asset}");
 
+        // Treat the SHA file as an availability probe: if it doesn't resolve
+        // (404 = release not yet published, network error, etc.) don't attempt
+        // the download. This allows `cargo clippy` / `cargo fmt` to run in
+        // API/check-only mode on PRs that bump REACTOR_PATCH_LEVEL before the
+        // new prebuilt has been published. Explicit downloads via
+        // REACTOR_WEBRTC_PREBUILT_URL bypass this check.
         let sha256 = fetch_sha256(&sha_url);
-        let dir = download_prebuilt(&url, sha256.as_deref());
-        link(&dir);
-        return;
+        if let Some(sha) = sha256 {
+            let dir = download_prebuilt(&url, Some(&sha));
+            link(&dir);
+            return;
+        }
+        println!(
+            "cargo:warning=reactor-webrtc-sys: checksum for {tag}/{sha_asset} not \
+             reachable (release not yet published?). \
+             API/check only — set REACTOR_WEBRTC_LIB_DIR to link a local build."
+        );
     }
 
     println!(
