@@ -317,6 +317,44 @@ mod tests {
     }
 
     #[test]
+    fn passes_port_range_to_native() {
+        let default = RtcConfiguration::default().to_native().expect("marshal");
+        assert_eq!(default.config().min_port, 0);
+        assert_eq!(default.config().max_port, 0);
+
+        let ranged = RtcConfiguration {
+            min_port: Some(10000),
+            max_port: Some(10100),
+            ..Default::default()
+        }
+        .to_native()
+        .expect("marshal");
+        assert_eq!(ranged.config().min_port, 10000);
+        assert_eq!(ranged.config().max_port, 10100);
+
+        // Only min_port set — max stays 0.
+        let min_only = RtcConfiguration {
+            min_port: Some(49152),
+            ..Default::default()
+        }
+        .to_native()
+        .expect("marshal");
+        assert_eq!(min_only.config().min_port, 49152);
+        assert_eq!(min_only.config().max_port, 0);
+
+        // u16::MAX round-trips without truncation.
+        let max_u16 = RtcConfiguration {
+            min_port: Some(u16::MAX),
+            max_port: Some(u16::MAX),
+            ..Default::default()
+        }
+        .to_native()
+        .expect("marshal");
+        assert_eq!(max_u16.config().min_port, u16::MAX as c_int);
+        assert_eq!(max_u16.config().max_port, u16::MAX as c_int);
+    }
+
+    #[test]
     fn rejects_a_nul_byte() {
         for server in [
             IceServer {
