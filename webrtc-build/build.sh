@@ -226,7 +226,18 @@ if [ "$GN_OS" = linux ] && [ "$(uname -m)" = "aarch64" ]; then
   CLANG_BIN="$SRC/src/third_party/llvm-build/Release+Asserts/bin"
   mkdir -p "$CLANG_BIN"
   for _bin in clang clang++; do
-    _real="/usr/bin/${_bin}-21"
+    # Use the binary in /usr/lib/llvm-21/bin/ rather than /usr/bin/clang{++}-21.
+    # On Ubuntu arm64, /usr/bin/clang-21 may be a shell wrapper or alternatives
+    # pointer that re-execs clang++-21 regardless of the invocation name; when
+    # exec replaces the process, argv[0] becomes clang++-21 → C++ driver mode →
+    # "error: invalid argument '-std=c11' not allowed with 'C++'" for C files.
+    # /usr/lib/llvm-21/bin/clang is the real ELF; argv[0] basename = "clang" →
+    # C driver mode, as the Chromium toolchain expects.
+    _real=""
+    for _p in "/usr/lib/llvm-21/bin/${_bin}" "/usr/bin/${_bin}-21"; do
+      [ -x "$_p" ] && _real="$_p" && break
+    done
+    [ -z "$_real" ] && _real="/usr/bin/${_bin}-21"
     cat > "$CLANG_BIN/$_bin" << CLANG_WRAPPER_EOF
 #!/bin/bash
 # Filter Chromium-patched-only flags not present in standard clang-21.
