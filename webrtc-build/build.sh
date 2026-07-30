@@ -131,6 +131,13 @@ gn_args() {
         "use_custom_libcxx=true"
         "symbol_level=1"
       )
+      # System clang-21 (used via the filter wrapper on arm64) does not ship
+      # Chromium's clang plugins (find-bad-constructs, raw-ptr-plugin,
+      # unsafe-buffers).  Disable them so the build system emits no
+      # -Xclang -add-plugin / -plugin-arg-* flags for this host.
+      if [ "$(uname -m)" = "aarch64" ]; then
+        args+=("clang_use_chrome_plugins=false")
+      fi
       ;;
     win)
       args+=("use_custom_libcxx=false" "symbol_level=1")
