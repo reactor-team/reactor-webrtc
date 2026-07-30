@@ -209,6 +209,23 @@ gn gen "$OUT" --args="$ARGS"
 echo "==> ninja -C $OUT ${NINJA_TARGET:-webrtc}"
 ninja -C "$OUT" "${NINJA_TARGET:-webrtc}"
 
+# For linux/arm64 cross-compile: explicitly build the arm64 libc++ / libc++abi
+# static libs.  Chromium's GN only adds common_deps (which contains libc++) as
+# an implicit dep of executable/shared_library targets — not static_library
+# targets.  In a cross-compile the arm64 default toolchain only builds the
+# webrtc static library (no arm64 executables), so libc++.a is never scheduled
+# for the arm64 toolchain.  For a native x64 build the host tools (executables)
+# share the default toolchain, which is why x64 libc++.a appears in obj/ as a
+# side-effect.  Build them explicitly here so package.sh can find and repack
+# them into the self-contained prebuilt.
+if [ "$GN_OS" = "linux" ] && \
+   [ "$CPU" != "$(uname -m | sed 's/x86_64/x64/;s/aarch64/arm64/')" ]; then
+  echo "==> building arm64 bundled libc++/libc++abi (cross-compile: not built automatically)"
+  ninja -C "$OUT" \
+    "obj/buildtools/third_party/libc++/libc++.a" \
+    "obj/buildtools/third_party/libc++abi/libc++abi.a"
+fi
+
 # ── 6. assemble: copy the static lib next to the build dir ────────────────────
 LIB="$OUT/obj/libwebrtc.a"
 [ -f "$LIB" ] || { echo "build.sh: expected $LIB not found" >&2; exit 1; }
