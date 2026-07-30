@@ -141,8 +141,8 @@ jobs:
           echo "SDK: $(xcrun --sdk macosx --show-sdk-version) at $(xcrun --show-sdk-path)"
 
       # On aarch64 Linux hosts the bundled Chromium clang binary is x86_64-only.
-      # Install system clang-21 and redirect gcc/g++ to it so that gn's
-      # is_clang=false toolchain path invokes clang instead of GCC.
+      # Install system clang-21 + lld-21 so build.sh can wire them into the
+      # expected bundled-clang path via a filter wrapper (see build.sh step 3b).
       - name: Install host compiler (linux-arm64)
         if: matrix.os == 'linux' && matrix.arch == 'arm64'
         run: |
@@ -152,22 +152,14 @@ jobs:
           wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh && chmod +x /tmp/llvm.sh
           sudo /tmp/llvm.sh 21
           sudo apt-get install -y --no-install-recommends lld-21
-          # gn's is_clang=false toolchain invokes aarch64-linux-gnu-{gcc,g++}.
-          # Wrapper scripts redirect to clang-21 and inject -fuse-ld=lld so that:
-          #   • clang-21 compiles the bundled libc++ (has __has_feature etc.)
-          #   • lld links against the Bullseye sysroot (ld.bfd on Ubuntu 24.04
-          #     fails with GLIBC_PRIVATE ABI references in the sysroot's glibc).
-          printf '#!/bin/sh\nexec /usr/bin/clang-21 -fuse-ld=lld "$@"\n'   | sudo tee /usr/local/bin/aarch64-linux-gnu-gcc > /dev/null
-          printf '#!/bin/sh\nexec /usr/bin/clang++-21 -fuse-ld=lld "$@"\n' | sudo tee /usr/local/bin/aarch64-linux-gnu-g++ > /dev/null
-          sudo chmod +x /usr/local/bin/aarch64-linux-gnu-gcc /usr/local/bin/aarch64-linux-gnu-g++
-          # Expose ld.lld in PATH so clang-21's -fuse-ld=lld can find it.
+          # Expose ld.lld in PATH so clang-21's -fuse-ld=lld can find the linker.
           LLD=""
           for p in /usr/lib/llvm-21/bin/ld.lld /usr/bin/ld.lld-21 /usr/bin/lld-21; do
             [ -e "$p" ] && LLD="$p" && break
           done
           [ -n "$LLD" ] && sudo ln -sf "$LLD" /usr/local/bin/ld.lld
-          echo "aarch64-linux-gnu-g++: $(aarch64-linux-gnu-g++ --version | head -1)"
-          echo "ld.lld: $(ld.lld --version 2>/dev/null | head -1 || echo not found at /usr/local/bin/ld.lld)"
+          echo "clang-21: $(/usr/bin/clang-21 --version | head -1)"
+          echo "ld.lld: $(ld.lld --version 2>/dev/null | head -1 || echo 'not found at /usr/local/bin/ld.lld')"
 
       # POSIX targets: bash build.sh + package.sh.
       - name: Build libwebrtc

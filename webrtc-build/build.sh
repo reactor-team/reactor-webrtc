@@ -115,26 +115,18 @@ gn_args() {
       # use_sysroot=true: the pinned Debian Bullseye sysroot for a stable ABI.
       # No screen/desktop capture: disable X11 + PipeWire (no libX11 dep).
       #
-      # Compiler on aarch64 host (is_clang=false):
+      # is_clang=true on all Linux hosts, including aarch64:
       #   Chromium only publishes a Linux_x64 bundled clang binary; there is no
-      #   Linux_arm64 variant.  is_clang=false tells gn to use gcc/g++ from PATH,
-      #   which the CI workflow points at clang-21 wrapper scripts that also inject
-      #   -fuse-ld=lld.  This avoids two failure modes:
-      #   (a) is_clang=true + clang-21: Chromium-patched-only flags such as
-      #       -fno-lifetime-dse and -fdiagnostics-show-inlining-chain are emitted
-      #       and rejected by standard clang-21.
-      #   (b) is_clang=false + ld.bfd: Ubuntu 24.04's BFD linker fails on the
-      #       pinned Debian Bullseye sysroot (GLIBC_PRIVATE ABI references).
-      #   With clang-21 + lld (via -fuse-ld=lld in the wrapper), both issues
-      #   are avoided: no Chromium-patched flags and lld handles the sysroot.
-      local IS_CLANG=true
-      if [ "$(uname -m)" = "aarch64" ]; then
-        IS_CLANG=false
-      fi
+      #   Linux_arm64 variant.  On aarch64 the build installs a filter wrapper at
+      #   the expected bundled-clang path so gn's is_clang=true toolchain invokes
+      #   system clang-21 + lld (see step 3b below).  is_clang=false is NOT used
+      #   because Chromium does not support is_clang=false + use_custom_libcxx=true:
+      #   that combination builds libc++ without the __Cr ABI namespace, leaving
+      #   libwebrtc.a with unresolvable std::__Cr::* references at link time.
       args+=(
         "rtc_use_x11=false"
         "rtc_use_pipewire=false"
-        "is_clang=${IS_CLANG}"
+        "is_clang=true"
         "use_sysroot=true"
         "use_custom_libcxx=true"
         "symbol_level=1"
@@ -205,6 +197,58 @@ if [ "$GN_OS" = linux ] && [ "$CPU" != "$(uname -m | sed 's/x86_64/x64/;s/aarch6
   echo "==> installing linux sysroot for $CPU (cross)"
   python3 build/linux/sysroot_scripts/install-sysroot.py --arch="$CPU" \
     || python3 build/linux/sysroot_scripts/install_sysroot.py --arch="$CPU"
+fi
+
+# ── 3b. arm64: install clang-21 filter wrapper ───────────────────────────────
+# Chromium ships only a Linux_x64 bundled clang (DEPS GCS dep); gclient sync
+# downloads the x86_64 package even on arm64 hosts, leaving non-executable
+# x86_64 ELF binaries in the bundled-clang dir.  Overwrite clang/clang++ and
+# the LLVM helper tools with native arm64 versions so gn's is_clang=true
+# toolchain can invoke them.
+#
+# The wrapper drops three Chromium-patched-only flags that standard clang-21
+# does not recognise:
+#   -fno-lifetime-dse              (LLVM lifetime-DSE opt control)
+#   -fdiagnostics-show-inlining-chain  (Chromium diagnostics extension)
+#   -fsanitize-ignore-for-ubsan-feature=*  (Chromium UBSan extension)
+# All other flags, including --sysroot and the target triple, pass through.
+# -fuse-ld=lld is injected so lld (not ld.bfd) links against the Bullseye
+# sysroot — ld.bfd fails on GLIBC_PRIVATE ABI references in that sysroot.
+if [ "$GN_OS" = linux ] && [ "$(uname -m)" = "aarch64" ]; then
+  echo "==> installing clang-21 filter wrapper in bundled-clang dir (arm64 host)"
+  CLANG_BIN="$SRC/src/third_party/llvm-build/Release+Asserts/bin"
+  mkdir -p "$CLANG_BIN"
+  for _bin in clang clang++; do
+    _real="/usr/bin/${_bin}-21"
+    cat > "$CLANG_BIN/$_bin" << CLANG_WRAPPER_EOF
+#!/bin/bash
+# Filter Chromium-patched-only flags not present in standard clang-21.
+filtered=()
+for arg in "\$@"; do
+  case "\$arg" in
+    -fno-lifetime-dse|-fdiagnostics-show-inlining-chain|-fsanitize-ignore-for-ubsan-feature=*)
+      ;; # discard
+    *)
+      filtered+=("\$arg")
+      ;;
+  esac
+done
+exec $_real -fuse-ld=lld "\${filtered[@]}"
+CLANG_WRAPPER_EOF
+    chmod +x "$CLANG_BIN/$_bin"
+  done
+  # llvm-ar: Chromium's is_clang=true toolchain uses it for thin archives.
+  for _ar in /usr/lib/llvm-21/bin/llvm-ar /usr/bin/llvm-ar-21 /usr/bin/llvm-ar; do
+    [ -e "$_ar" ] && { ln -sf "$_ar" "$CLANG_BIN/llvm-ar"; break; }
+  done
+  # Other LLVM tools gn may reference from the bundled dir.
+  for _tool in llvm-nm llvm-readelf llvm-readobj llvm-objcopy llvm-objdump llvm-strip; do
+    for _p in "/usr/lib/llvm-21/bin/$_tool" "/usr/bin/${_tool}-21" "/usr/bin/$_tool"; do
+      [ -e "$_p" ] && { ln -sf "$_p" "$CLANG_BIN/$_tool" && break; }
+    done
+  done
+  echo "   wrapper: $(head -2 "$CLANG_BIN/clang" | tail -1)"
+  echo "   llvm-ar: $(readlink -f "$CLANG_BIN/llvm-ar" 2>/dev/null || echo 'not found')"
 fi
 
 # ── 4. gn gen ─────────────────────────────────────────────────────────────────
