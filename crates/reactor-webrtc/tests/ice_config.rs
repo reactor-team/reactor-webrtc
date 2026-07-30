@@ -84,6 +84,7 @@ mod tests {
                     ice_servers: vec![credentialed("turn:turn.example.com:3478")],
                     ice_transport_type: IceTransportsType::Relay,
                     continual_gathering_policy: ContinualGatheringPolicy::GatherContinually,
+                    ..Default::default()
                 },
             ),
         ];
