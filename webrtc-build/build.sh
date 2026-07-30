@@ -177,8 +177,9 @@ echo "==> resolved WebRTC commit: $RESOLVED  (lock this in WEBRTC_VERSION:WEBRTC
 # ── 3. apply our patch series ─────────────────────────────────────────────────
 cd "$SRC/src"
 git reset --hard "$RESOLVED" >/dev/null
-# Also reset third_party sub-repos that our patches touch (gclient sync already
-# pinned them; reset makes repeated builds idempotent).
+# Also reset sub-repos that our patches touch (gclient sync already pinned
+# them; reset makes repeated builds idempotent).
+[ -d build/.git ]              && git -C build              reset --hard >/dev/null 2>&1 || true
 [ -d third_party/jni_zero/.git ] && git -C third_party/jni_zero reset --hard >/dev/null 2>&1 || true
 shopt -s nullglob
 for p in "$HERE"/patches/*.patch; do

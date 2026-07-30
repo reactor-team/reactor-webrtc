@@ -12,8 +12,8 @@
 #   • macos-15 (Apple Silicon + Xcode 16) → mac arm64, mac x64, iOS device + sim.
 #       macos-15 ships MacOSX15.sdk; protobuf's `constinit fixed_address_empty_string`
 #       needs libc++'s constexpr allocator, absent from the MacOSX14.5.sdk on macos-14.
-#   • ubuntu-latest                    → linux x64, android (NDK via gclient).
-#   • ubuntu-24.04-arm                 → linux arm64 (native, runs tests).
+#   • ubuntu-latest / ubuntu-24.04     → linux x64, android (NDK via gclient).
+#   • ubuntu-24.04 (explicit x86_64)   → linux arm64 cross-compile.
 #   • windows-latest                   → win x64.
 name: webrtc-build
 
@@ -73,7 +73,8 @@ jobs:
           ios_sim='{"os":"ios","arch":"arm64","runner":"macos-15","ios_env":"simulator"}'
           linux_x64='{"os":"linux","arch":"x64","runner":"ubuntu-latest"}'
           # linux/arm64 is cross-compiled from x86_64 (no linux-arm64 bundled clang).
-          linux_arm='{"os":"linux","arch":"arm64","runner":"ubuntu-latest"}'
+          # ubuntu-24.04 is explicit x86_64; ubuntu-latest maps to arm64 in this org.
+          linux_arm='{"os":"linux","arch":"arm64","runner":"ubuntu-24.04"}'
           android='{"os":"android","arch":"arm64","runner":"ubuntu-latest"}'
           win='{"os":"win","arch":"x64","runner":"windows-latest"}'
           # CI (push / pull_request) → full target matrix, debug profile.
