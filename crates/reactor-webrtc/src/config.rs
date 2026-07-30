@@ -65,6 +65,12 @@ pub struct RtcConfiguration {
     pub ice_servers: Vec<IceServer>,
     pub continual_gathering_policy: ContinualGatheringPolicy,
     pub ice_transport_type: IceTransportsType,
+    /// Lower bound of the UDP port range ICE may use. `None` leaves the
+    /// libwebrtc default (OS-assigned ephemeral ports).
+    pub min_port: Option<u16>,
+    /// Upper bound of the UDP port range ICE may use. `None` leaves the
+    /// libwebrtc default (OS-assigned ephemeral ports).
+    pub max_port: Option<u16>,
 }
 
 impl Default for RtcConfiguration {
@@ -78,6 +84,8 @@ impl Default for RtcConfiguration {
             // Complete, so it must be an explicit choice.
             continual_gathering_policy: ContinualGatheringPolicy::GatherOnce,
             ice_transport_type: IceTransportsType::All,
+            min_port: None,
+            max_port: None,
         }
     }
 }
@@ -107,6 +115,8 @@ pub(crate) struct NativeConfig {
     servers: Vec<ReactorIceServer>,
     ice_transport_type: c_int,
     continual_gathering_policy: c_int,
+    min_port: c_int,
+    max_port: c_int,
 }
 
 impl NativeConfig {
@@ -150,6 +160,8 @@ impl NativeConfig {
             servers,
             ice_transport_type: config.ice_transport_type.to_wire(),
             continual_gathering_policy: config.continual_gathering_policy.to_wire(),
+            min_port: config.min_port.map(|p| p as c_int).unwrap_or(0),
+            max_port: config.max_port.map(|p| p as c_int).unwrap_or(0),
         })
     }
 
@@ -160,6 +172,8 @@ impl NativeConfig {
             servers_len: self.servers.len(),
             ice_transport_type: self.ice_transport_type,
             continual_gathering_policy: self.continual_gathering_policy,
+            min_port: self.min_port,
+            max_port: self.max_port,
         }
     }
 }
