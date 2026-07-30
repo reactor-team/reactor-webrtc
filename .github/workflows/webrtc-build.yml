@@ -72,30 +72,28 @@ jobs:
           ios_dev='{"os":"ios","arch":"arm64","runner":"macos-15","ios_env":"device"}'
           ios_sim='{"os":"ios","arch":"arm64","runner":"macos-15","ios_env":"simulator"}'
           linux_x64='{"os":"linux","arch":"x64","runner":"ubuntu-latest"}'
-          # linux/arm64 builds natively on an arm64 runner; no cross-compilation.
-          linux_arm='{"os":"linux","arch":"arm64","runner":"ubuntu-24.04-arm"}'
+          # linux/arm64 is cross-compiled from x86_64 (no linux-arm64 bundled clang).
+          linux_arm='{"os":"linux","arch":"arm64","runner":"ubuntu-latest"}'
           android='{"os":"android","arch":"arm64","runner":"ubuntu-latest"}'
           win='{"os":"win","arch":"x64","runner":"windows-latest"}'
-          # CI (push / pull_request) → linux-arm64 only while debugging native build.
-          # TODO: restore to full once linux-arm64 native build is confirmed working.
+          # CI (push / pull_request) → full target matrix, debug profile.
           # workflow_dispatch → use the selected inputs.
           t="${{ github.event.inputs.targets }}"
           prof="${{ github.event.inputs.profile }}"
           if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
-            t=linux-arm64
+            t=full
             prof=debug
           fi
           t="${t:-mac}"
           case "$t" in
-            mac)       inc="$mac_arm" ;;
-            apple)     inc="$mac_arm,$mac_x64,$ios_dev,$ios_sim" ;;
-            linux)     inc="$linux_x64,$linux_arm" ;;
-            android)   inc="$android" ;;
-            win)       inc="$win" ;;
-            full)      inc="$mac_arm,$mac_x64,$ios_dev,$ios_sim,$linux_x64,$linux_arm,$android,$win" ;;
+            mac)      inc="$mac_arm" ;;
+            apple)    inc="$mac_arm,$mac_x64,$ios_dev,$ios_sim" ;;
+            linux)    inc="$linux_x64,$linux_arm" ;;
+            android)  inc="$android" ;;
+            win)      inc="$win" ;;
+            full)     inc="$mac_arm,$mac_x64,$ios_dev,$ios_sim,$linux_x64,$linux_arm,$android,$win" ;;
             linux-x64) inc="$linux_x64" ;;
-            linux-arm64) inc="$linux_arm" ;;
-            *)         inc="$mac_arm" ;;
+            *)        inc="$mac_arm" ;;
           esac
           echo "matrix={\"include\":[$inc]}" >> "$GITHUB_OUTPUT"
           echo "profile=${prof:-release}" >> "$GITHUB_OUTPUT"
@@ -140,27 +138,6 @@ jobs:
           xcodebuild -version
           echo "SDK: $(xcrun --sdk macosx --show-sdk-version) at $(xcrun --show-sdk-path)"
 
-      # On aarch64 Linux hosts the bundled Chromium clang binary is x86_64-only.
-      # Install system clang-21 + lld-21 so build.sh can wire them into the
-      # expected bundled-clang path via a filter wrapper (see build.sh step 3b).
-      - name: Install host compiler (linux-arm64)
-        if: matrix.os == 'linux' && matrix.arch == 'arm64'
-        run: |
-          set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends wget lsb-release software-properties-common gnupg
-          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh && chmod +x /tmp/llvm.sh
-          sudo /tmp/llvm.sh 21
-          sudo apt-get install -y --no-install-recommends lld-21
-          # Expose ld.lld in PATH so clang-21's -fuse-ld=lld can find the linker.
-          LLD=""
-          for p in /usr/lib/llvm-21/bin/ld.lld /usr/bin/ld.lld-21 /usr/bin/lld-21; do
-            [ -e "$p" ] && LLD="$p" && break
-          done
-          [ -n "$LLD" ] && sudo ln -sf "$LLD" /usr/local/bin/ld.lld
-          echo "clang-21: $(/usr/bin/clang-21 --version | head -1)"
-          echo "ld.lld: $(ld.lld --version 2>/dev/null | head -1 || echo 'not found at /usr/local/bin/ld.lld')"
-
       # POSIX targets: bash build.sh + package.sh.
       - name: Build libwebrtc
         if: matrix.os != 'win'
@@ -189,7 +166,7 @@ jobs:
       # linux glue compiles against the bundled libc++ (ABI namespace __Cr) whose
       # headers need a recent clang (stock clang-18 is too old); install it.
       - name: Test deps (linux)
-        if: matrix.os == 'linux'
+        if: matrix.os == 'linux' && matrix.arch == 'x64'
         run: |
           set -euo pipefail
           sudo apt-get update && sudo apt-get install -y --no-install-recommends wget lsb-release software-properties-common gnupg
@@ -199,10 +176,10 @@ jobs:
           echo "CXX=clang++-$ver" >> "$GITHUB_ENV"; echo "CC=clang-$ver" >> "$GITHUB_ENV"
 
       # Run the lib-linked FFI/integration tests where the target runs natively:
-      # macOS arm64 and both linux targets (x64 + arm64 now native on ubuntu-24.04-arm).
-      # iOS/android/windows are non-native and skipped.
+      # macOS arm64 and linux x64. (iOS/android/windows are cross or non-native;
+      # linux/arm64 is cross-built on x86_64.)
       - name: Test (native targets)
-        if: (matrix.os == 'mac' && matrix.arch == 'arm64') || matrix.os == 'linux'
+        if: (matrix.os == 'mac' && matrix.arch == 'arm64') || (matrix.os == 'linux' && matrix.arch == 'x64')
         run: |
           SLUG="${{ matrix.os }}-${{ matrix.arch }}-${PROFILE}"
           export REACTOR_WEBRTC_LIB_DIR="$PWD/webrtc-build/out/$SLUG/dist"
