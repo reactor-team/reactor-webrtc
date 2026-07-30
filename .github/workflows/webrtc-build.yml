@@ -76,15 +76,17 @@ jobs:
           # ubuntu-24.04 is explicit x86_64; ubuntu-latest maps to arm64 in this org.
           linux_arm='{"os":"linux","arch":"arm64","runner":"ubuntu-24.04"}'
           android='{"os":"android","arch":"arm64","runner":"ubuntu-latest"}'
-          win='{"os":"win","arch":"x64","runner":"windows-latest"}'
+          # Windows must always use release profile: is_debug=true compiles with /MTd
+          # (debug static CRT), which references _calloc_dbg/_free_dbg from libucrtd.
+          # Rust's +crt-static links the release CRT (/MT) which lacks those symbols,
+          # causing LNK2019. Release builds use /MT throughout — no CRT mismatch.
+          win='{"os":"win","arch":"x64","runner":"windows-latest","profile":"release"}'
           # CI (push / pull_request) → full target matrix, debug profile.
           # workflow_dispatch → use the selected inputs.
           t="${{ github.event.inputs.targets }}"
           prof="${{ github.event.inputs.profile }}"
           if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
-            # Temporarily restricted to linux-arm64 while diagnosing REA-4690.
-            # Restore to t=full once cargo test (linux-arm64) is green.
-            t=linux-arm
+            t=full
             prof=debug
           fi
           t="${t:-mac}"
@@ -114,7 +116,8 @@ jobs:
       run:
         shell: bash   # the webrtc-build/*.sh scripts are bash; windows-latest needs Git Bash
     env:
-      PROFILE: ${{ needs.setup.outputs.profile }}
+      # matrix.profile overrides the global profile (e.g. win always uses release).
+      PROFILE: ${{ matrix.profile || needs.setup.outputs.profile }}
       IOS_ENV: ${{ matrix.ios_env }}
     steps:
       - uses: actions/checkout@v4
@@ -197,10 +200,19 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Temporarily restricted to linux-arm64 (REA-4690 diagnosis).
+          - os: linux
+            arch: x64
+            runner: ubuntu-latest
           - os: linux
             arch: arm64
             runner: ubuntu-24.04-arm
+          - os: mac
+            arch: arm64
+            runner: macos-15
+          - os: win
+            arch: x64
+            runner: windows-latest
+            rustflags: "-C target-feature=+crt-static"
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
@@ -225,18 +237,6 @@ jobs:
           zstd -dc dl/*.tar.zst | tar -x -C prebuilt
           echo "REACTOR_WEBRTC_LIB_DIR=$GITHUB_WORKSPACE/prebuilt" >> "$GITHUB_ENV"
 
-      - name: Diagnose prebuilt contents (REA-4690)
-        run: |
-          echo "=== prebuilt/lib ==="
-          ls -lh prebuilt/lib/ || echo "(no lib dir)"
-          echo "=== libc++ symbols check ==="
-          if [ -f prebuilt/lib/libc++.a ]; then
-            nm -A prebuilt/lib/libc++.a 2>/dev/null | grep -c "T _ZNSt4__Cr" || true
-            nm -A prebuilt/lib/libc++.a 2>/dev/null | grep "T _ZNSt4__Cr8ios_base5clearE" | head -5 || echo "(ios_base::clear not found)"
-          else
-            echo "libc++.a MISSING"
-          fi
-
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache-on-failure: true
@@ -253,7 +253,15 @@ jobs:
       - name: Export CARGO path (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: Add-Content $env:GITHUB_ENV "CARGO=$(rustup which cargo)"
+        run: |
+          # Trim to strip the trailing \r that PowerShell $(…) captures from
+          # rustup's output; a \r-suffixed path causes "program not found" when
+          # maturin tries to exec the cargo binary via the CARGO env var.
+          # Also add the bin directory to GITHUB_PATH so cargo is on PATH for
+          # any tool (e.g. maturin) that searches PATH instead of CARGO.
+          $cargo = (rustup which cargo).Trim()
+          Add-Content $env:GITHUB_ENV "CARGO=$cargo"
+          Add-Content $env:GITHUB_PATH (Split-Path $cargo)
 
       - uses: jdx/mise-action@v2
         with:
@@ -271,10 +279,19 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Temporarily restricted to linux-arm64 (REA-4690 diagnosis).
+          - os: linux
+            arch: x64
+            runner: ubuntu-latest
           - os: linux
             arch: arm64
             runner: ubuntu-24.04-arm
+          - os: mac
+            arch: arm64
+            runner: macos-15
+          - os: win
+            arch: x64
+            runner: windows-latest
+            rustflags: "-C target-feature=+crt-static"
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
@@ -315,7 +332,15 @@ jobs:
       - name: Export CARGO path (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: Add-Content $env:GITHUB_ENV "CARGO=$(rustup which cargo)"
+        run: |
+          # Trim to strip the trailing \r that PowerShell $(…) captures from
+          # rustup's output; a \r-suffixed path causes "program not found" when
+          # maturin tries to exec the cargo binary via the CARGO env var.
+          # Also add the bin directory to GITHUB_PATH so cargo is on PATH for
+          # any tool (e.g. maturin) that searches PATH instead of CARGO.
+          $cargo = (rustup which cargo).Trim()
+          Add-Content $env:GITHUB_ENV "CARGO=$cargo"
+          Add-Content $env:GITHUB_PATH (Split-Path $cargo)
 
       - uses: jdx/mise-action@v2
         with:
@@ -340,10 +365,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Temporarily restricted to linux-arm64 (REA-4690 diagnosis).
+          - os: linux
+            arch: x64
+            runner: ubuntu-latest
           - os: linux
             arch: arm64
             runner: ubuntu-24.04-arm
+          - os: mac
+            arch: arm64
+            runner: macos-15
+          - os: win
+            arch: x64
+            runner: windows-latest
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
