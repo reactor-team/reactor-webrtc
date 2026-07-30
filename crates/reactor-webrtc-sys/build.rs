@@ -481,9 +481,29 @@ fn download_prebuilt(url: &str, sha256: Option<&str>) -> PathBuf {
     let out = out_root.join("libwebrtc");
     let archive = out_root.join("prebuilt.tar.zst");
 
-    // Cached from a previous build of this OUT_DIR.
-    if out.join("lib/libwebrtc.a").is_file() || out.join("lib/libwebrtc.lib").is_file() {
-        return out;
+    // Use the cached extraction only when the layout is present AND its SHA
+    // matches a sentinel written after the last successful download.  Without
+    // this check a restored Rust build cache (Swatinem/rust-cache restores the
+    // whole OUT_DIR) containing an older prebuilt (e.g. p3 without libc++.a)
+    // would be silently reused even though the caller supplied a different SHA
+    // (the p4 prebuilt).  The sentinel is written below after a verified
+    // extraction and is a no-op when no SHA is provided (Mode 1 / dev builds).
+    let lib_present =
+        out.join("lib/libwebrtc.a").is_file() || out.join("lib/libwebrtc.lib").is_file();
+    if lib_present {
+        let cache_valid = match sha256 {
+            None => true, // no checksum → trust whatever is there
+            Some(expected) => {
+                let sentinel = out.join(".sha256");
+                std::fs::read_to_string(&sentinel)
+                    .map(|s| s.trim().to_lowercase() == expected.trim().to_lowercase())
+                    .unwrap_or(false)
+            }
+        };
+        if cache_valid {
+            return out;
+        }
+        // SHA mismatch or missing sentinel → stale cache; re-download below.
     }
 
     // ── download ──────────────────────────────────────────────────────────
@@ -535,6 +555,12 @@ fn download_prebuilt(url: &str, sha256: Option<&str>) -> PathBuf {
         );
     }
     verify_prebuilt_arch(&out.join("lib"));
+
+    // Write the SHA sentinel so subsequent runs with the same checksum can
+    // skip the download.  Silently ignore write errors (non-fatal).
+    if let Some(sha) = sha256 {
+        let _ = std::fs::write(out.join(".sha256"), sha.trim());
+    }
     out
 }
 
