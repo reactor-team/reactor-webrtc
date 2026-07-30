@@ -41,12 +41,13 @@ hk = "1.52.0"
 experimental = true
 lockfile = true
 # Host platforms that run `mise install` (CI runners + dev machines), NOT the
-# libwebrtc cross-compile targets. CI runners: linux-x64, linux-arm64,
-# macos-arm64, windows-x64. Deliberately excluded: macos-x64
-# (Apple-Silicon-only, like reactor), linux-x64-musl (glibc manylinux wheel,
-# not an Alpine service). See docs before adding: a platform here forces a
+# libwebrtc cross-compile targets. CI is linux-x64 only; macos-arm64 + linux-arm64
+# cover Apple-Silicon + ARM-Linux/Docker-on-Mac dev. Deliberately excluded:
+# macos-x64 (Apple-Silicon-only, like reactor), windows-x64 (its wheel/lib build
+# uses maturin-action/build.ps1, never mise), linux-x64-musl (glibc manylinux
+# wheel, not an Alpine service). See docs before adding: a platform here forces a
 # locked entry for every tool on that platform.
-lockfile_platforms = ["macos-arm64", "linux-x64", "linux-arm64", "windows-x64"]
+lockfile_platforms = ["macos-arm64", "linux-x64", "linux-arm64"]
 # Rust version comes from rust-toolchain.toml (idiomatic), not a [tools] pin -
 # mirrors reactor's /.go-version pattern.
 idiomatic_version_file_enable_tools = ["rust"]
