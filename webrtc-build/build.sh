@@ -111,14 +111,15 @@ gn_args() {
     linux)
       # Always use WebRTC's *bundled* clang + bundled libc++:
       #   • the bundled clang is a Chromium fork with flags no stock clang has
-      #     (-fno-lifetime-dse, --crel, …), so a host clang can't compile this;
+      #     (-fno-lifetime-dse, …), so a host clang can't compile this;
       #   • the pinned debian sysroot's libstdc++ is too old for WebRTC's C++20
       #     (std::make_unique_for_overwrite; ssl_stream_adapter.h's nullptr_t),
       #     so use the bundled (modern) libc++.
       # Self-contained via the sysroot. The bundled clang is published for x86_64
       # hosts only, so arm64 is cross-compiled from x86_64 (see the sysroot fetch
-      # above + the CI runner mapping). NOTE: linking a consumer's glue against
-      # this lib requires compiling that glue with libc++ too (follow-up).
+      # above + the CI runner mapping). CREL (-Wa,--crel) is disabled for arm64
+      # via patches/0003-disable-crel-for-arm64.patch so the produced libwebrtc.a
+      # is compatible with consumer GNU ld on arm64 hosts.
       # No screen/desktop capture in a calling SDK: disable both linux backends
       # (X11 + PipeWire) so the lib carries no libX11 dependency.
       args+=(
