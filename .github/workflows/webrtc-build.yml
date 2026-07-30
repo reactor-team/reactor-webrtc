@@ -164,29 +164,6 @@ jobs:
           git config --global core.autocrlf false
           ./webrtc-build/build.ps1 -Arch ${{ matrix.arch }} -Profile $env:PROFILE
 
-      # linux glue compiles against the bundled libc++ (ABI namespace __Cr) whose
-      # headers need a recent clang (stock clang-18 is too old); install it.
-      - name: Test deps (linux)
-        if: matrix.os == 'linux' && matrix.arch == 'x64'
-        run: |
-          set -euo pipefail
-          sudo apt-get update && sudo apt-get install -y --no-install-recommends wget lsb-release software-properties-common gnupg
-          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh && chmod +x /tmp/llvm.sh
-          sudo /tmp/llvm.sh 21 || sudo /tmp/llvm.sh 20 || sudo /tmp/llvm.sh
-          ver=21; command -v clang++-21 >/dev/null || ver=20; command -v clang++-$ver >/dev/null || ver=$(ls /usr/bin/clang++-* | grep -oE '[0-9]+' | sort -n | tail -1)
-          echo "CXX=clang++-$ver" >> "$GITHUB_ENV"; echo "CC=clang-$ver" >> "$GITHUB_ENV"
-
-      # Run the lib-linked FFI/integration tests where the target runs natively:
-      # macOS arm64 and linux x64. (iOS/android/windows are cross or non-native;
-      # linux/arm64 is cross-built on x86_64.)
-      - name: Test (native targets)
-        if: (matrix.os == 'mac' && matrix.arch == 'arm64') || (matrix.os == 'linux' && matrix.arch == 'x64')
-        run: |
-          SLUG="${{ matrix.os }}-${{ matrix.arch }}-${PROFILE}"
-          export REACTOR_WEBRTC_LIB_DIR="$PWD/webrtc-build/out/$SLUG/dist"
-          [ "${{ runner.os }}" = "macOS" ] && export MACOSX_DEPLOYMENT_TARGET=13.0
-          cargo test --workspace
-
       - name: Upload prebuilt
         if: success()
         uses: actions/upload-artifact@v4
@@ -200,9 +177,206 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # ── Post-build: cargo test, wheel build, python tests ─────────────────────────
+  # These jobs run on every CI trigger using the artifact uploaded by the build
+  # job above — no download from GitHub Releases required.  Each job downloads
+  # the relevant prebuilt artifact from the current workflow run, extracts it to
+  # `prebuilt/`, and sets REACTOR_WEBRTC_LIB_DIR so build.rs uses it directly.
+  #
+  # linux/arm64 is cross-compiled on ubuntu-24.04 (x86_64) in the build job,
+  # but tests must run on the native ubuntu-24.04-arm runner.
+  # win/x64 tests were previously skipped in the build job; they run here.
+
+  test:
+    name: cargo test (${{ matrix.os }}-${{ matrix.arch }})
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: x64
+            runner: ubuntu-latest
+          - os: linux
+            arch: arm64
+            runner: ubuntu-24.04-arm
+          - os: mac
+            arch: arm64
+            runner: macos-15
+          - os: win
+            arch: x64
+            runner: windows-latest
+            rustflags: "-C target-feature=+crt-static"
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      MISE_VERSION: "2026.6.14"
+      MISE_LOCKED: "1"
+      MISE_DISABLE_TOOLS: "rust,rustup,aqua:rust-lang/rustup"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download prebuilt artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: prebuilt-${{ matrix.os }}-${{ matrix.arch }}
+          path: dl
+
+      - name: Extract prebuilt
+        run: |
+          command -v zstd >/dev/null 2>&1 || sudo apt-get install -y --no-install-recommends zstd || brew install zstd || true
+          mkdir -p prebuilt
+          zstd -dc dl/*.tar.zst | tar -x -C prebuilt
+          echo "REACTOR_WEBRTC_LIB_DIR=$GITHUB_WORKSPACE/prebuilt" >> "$GITHUB_ENV"
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache-on-failure: true
+
+      - name: Install clang-21 (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/llvm.asc
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang-21
+          echo "CXX=clang++-21" >> "$GITHUB_ENV"
+
+      - name: Export CARGO path (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Add-Content $env:GITHUB_ENV "CARGO=$(rustup which cargo)"
+
+      - uses: jdx/mise-action@v2
+        with:
+          version: ${{ env.MISE_VERSION }}
+
+      - run: mise run test
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+          MACOSX_DEPLOYMENT_TARGET: "13.0"
+
+  build-wheel:
+    name: build wheel (${{ matrix.os }}-${{ matrix.arch }})
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: x64
+            runner: ubuntu-latest
+          - os: linux
+            arch: arm64
+            runner: ubuntu-24.04-arm
+          - os: mac
+            arch: arm64
+            runner: macos-15
+          - os: win
+            arch: x64
+            runner: windows-latest
+            rustflags: "-C target-feature=+crt-static"
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      MISE_VERSION: "2026.6.14"
+      MISE_LOCKED: "1"
+      MISE_DISABLE_TOOLS: "rust,rustup,aqua:rust-lang/rustup"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download prebuilt artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: prebuilt-${{ matrix.os }}-${{ matrix.arch }}
+          path: dl
+
+      - name: Extract prebuilt
+        run: |
+          command -v zstd >/dev/null 2>&1 || sudo apt-get install -y --no-install-recommends zstd || brew install zstd || true
+          mkdir -p prebuilt
+          zstd -dc dl/*.tar.zst | tar -x -C prebuilt
+          echo "REACTOR_WEBRTC_LIB_DIR=$GITHUB_WORKSPACE/prebuilt" >> "$GITHUB_ENV"
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache-on-failure: true
+
+      - name: Install clang-21 (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/llvm.asc
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang-21
+          echo "CXX=clang++-21" >> "$GITHUB_ENV"
+
+      - name: Export CARGO path (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Add-Content $env:GITHUB_ENV "CARGO=$(rustup which cargo)"
+
+      - uses: jdx/mise-action@v2
+        with:
+          version: ${{ env.MISE_VERSION }}
+
+      - name: Build wheel
+        run: mise run //crates/reactor-webrtc-py:build
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+          MACOSX_DEPLOYMENT_TARGET: "13.0"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.os }}-${{ matrix.arch }}
+          path: target/wheels/reactor_webrtc-*.whl
+          if-no-files-found: error
+
+  test-py:
+    name: pytest (${{ matrix.os }}-${{ matrix.arch }})
+    needs: build-wheel
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: x64
+            runner: ubuntu-latest
+          - os: linux
+            arch: arm64
+            runner: ubuntu-24.04-arm
+          - os: mac
+            arch: arm64
+            runner: macos-15
+          - os: win
+            arch: x64
+            runner: windows-latest
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      MISE_VERSION: "2026.6.14"
+      MISE_LOCKED: "1"
+      MISE_DISABLE_TOOLS: "rust,rustup,aqua:rust-lang/rustup"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheel-${{ matrix.os }}-${{ matrix.arch }}
+          path: target/wheels
+      - uses: jdx/mise-action@v2
+        with:
+          version: ${{ env.MISE_VERSION }}
+      - run: mise run //crates/reactor-webrtc-py:test
+
   # Publish the per-target prebuilts as a GitHub Release (opt-in via dispatch).
   publish:
-    needs: build
+    needs: [build, test, build-wheel, test-py]
     if: github.event_name == 'workflow_dispatch' && inputs.publish
     runs-on: ubuntu-latest
     # Cutting a release ships prebuilt native binaries that downstream packages
