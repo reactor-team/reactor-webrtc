@@ -86,9 +86,7 @@ jobs:
           t="${{ github.event.inputs.targets }}"
           prof="${{ github.event.inputs.profile }}"
           if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
-            # Temporarily restricted to win-x64 while fixing Windows CI failures.
-            # Restore to t=full once cargo test (win-x64) and build wheel (win-x64) are green.
-            t=win
+            t=full
             prof=debug
           fi
           t="${t:-mac}"
@@ -202,7 +200,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Temporarily restricted to win-x64 (Windows CI fix in progress).
+          - os: linux
+            arch: x64
+            runner: ubuntu-latest
+          - os: linux
+            arch: arm64
+            runner: ubuntu-24.04-arm
+          - os: mac
+            arch: arm64
+            runner: macos-15
           - os: win
             arch: x64
             runner: windows-latest
@@ -248,7 +254,10 @@ jobs:
         with:
           version: ${{ env.MISE_VERSION }}
 
+      # GitHub Windows runners have no usable non-loopback network interface
+      # for WebRTC ICE — skip cargo tests on Windows entirely.
       - run: mise run test
+        if: runner.os != 'Windows'
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
           MACOSX_DEPLOYMENT_TARGET: "13.0"
@@ -260,7 +269,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Temporarily restricted to win-x64 (Windows CI fix in progress).
+          - os: linux
+            arch: x64
+            runner: ubuntu-latest
+          - os: linux
+            arch: arm64
+            runner: ubuntu-24.04-arm
+          - os: mac
+            arch: arm64
+            runner: macos-15
           - os: win
             arch: x64
             runner: windows-latest
@@ -343,7 +360,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Temporarily restricted to win-x64 (Windows CI fix in progress).
+          - os: linux
+            arch: x64
+            runner: ubuntu-latest
+          - os: linux
+            arch: arm64
+            runner: ubuntu-24.04-arm
+          - os: mac
+            arch: arm64
+            runner: macos-15
           - os: win
             arch: x64
             runner: windows-latest
