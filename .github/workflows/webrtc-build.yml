@@ -244,20 +244,6 @@ jobs:
           sudo apt-get install -y --no-install-recommends clang-21
           echo "CXX=clang++-21" >> "$GITHUB_ENV"
 
-      - name: Export CARGO path (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          # Point CARGO at the rustup shim (~/.cargo/bin/cargo.exe) rather than
-          # the toolchain-specific binary returned by `rustup which cargo`.
-          # The toolchain binary fails with "program not found" when maturin
-          # tries to exec it via CreateProcess, while the shim is what bash
-          # finds via PATH and works reliably. Also add the bin dir to
-          # GITHUB_PATH for tools that search PATH instead of CARGO.
-          $binDir = "$env:USERPROFILE\.cargo\bin"
-          Add-Content $env:GITHUB_ENV "CARGO=$binDir\cargo.exe"
-          Add-Content $env:GITHUB_PATH $binDir
-
       - uses: jdx/mise-action@v2
         with:
           version: ${{ env.MISE_VERSION }}
@@ -327,26 +313,30 @@ jobs:
           sudo apt-get install -y --no-install-recommends clang-21
           echo "CXX=clang++-21" >> "$GITHUB_ENV"
 
-      - name: Export CARGO path (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          # Point CARGO at the rustup shim (~/.cargo/bin/cargo.exe) rather than
-          # the toolchain-specific binary returned by `rustup which cargo`.
-          # The toolchain binary fails with "program not found" when maturin
-          # tries to exec it via CreateProcess, while the shim is what bash
-          # finds via PATH and works reliably. Also add the bin dir to
-          # GITHUB_PATH for tools that search PATH instead of CARGO.
-          $binDir = "$env:USERPROFILE\.cargo\bin"
-          Add-Content $env:GITHUB_ENV "CARGO=$binDir\cargo.exe"
-          Add-Content $env:GITHUB_PATH $binDir
-
       - uses: jdx/mise-action@v2
         with:
           version: ${{ env.MISE_VERSION }}
 
-      - name: Build wheel
+      - name: Build wheel (non-Windows)
+        if: runner.os != 'Windows'
         run: mise run //crates/reactor-webrtc-py:build
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+          MACOSX_DEPLOYMENT_TARGET: "13.0"
+
+      - name: Build wheel (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # maturin is a native Windows binary: it must spawn cargo via
+          # CreateProcess, which uses the Windows PATH — not MSYS2/bash PATH.
+          # Setting CARGO in the same PowerShell process guarantees maturin
+          # inherits a Windows-native path that CreateProcess can actually use.
+          $cargo = (Get-Command cargo -ErrorAction Stop).Source
+          Write-Host "cargo: $cargo"
+          $env:CARGO = $cargo
+          maturin build --release `
+            --manifest-path "$env:GITHUB_WORKSPACE\crates\reactor-webrtc-py\Cargo.toml"
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
           MACOSX_DEPLOYMENT_TARGET: "13.0"
