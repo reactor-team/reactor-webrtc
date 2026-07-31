@@ -169,7 +169,9 @@ fn encoded_frames_flow_both_directions() {
             forward_ice(&s1, &pc2);
             forward_ice(&s2, &pc1);
             let enough = sent.load(Ordering::SeqCst) > 0 && recvd.load(Ordering::SeqCst) > 0;
-            if enough || start.elapsed() > Duration::from_secs(20) {
+            // Windows CI runners need more headroom for ICE establishment.
+            let timeout = if cfg!(target_os = "windows") { 60 } else { 20 };
+            if enough || start.elapsed() > Duration::from_secs(timeout) {
                 break;
             }
             thread::sleep(Duration::from_millis(50));

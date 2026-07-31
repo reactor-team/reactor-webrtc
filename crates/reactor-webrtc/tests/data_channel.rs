@@ -87,7 +87,10 @@ mod tests {
         pc2: &PeerConnection,
         done: impl Fn() -> bool,
     ) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        // Windows CI runners are slower to establish ICE (firewall teardown,
+        // network stack differences), so give them more headroom.
+        let secs = if cfg!(target_os = "windows") { 60 } else { 20 };
+        let deadline = Instant::now() + Duration::from_secs(secs);
         loop {
             trickle(s1, pc2);
             trickle(s2, pc1);
