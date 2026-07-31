@@ -45,6 +45,16 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(have_libwebrtc)");
 
     if let Ok(dir) = env::var("REACTOR_WEBRTC_LIB_DIR") {
+        // Watch the key prebuilt files so a restored Rust build cache does not
+        // silently keep stale link directives when the prebuilt layout changes
+        // (e.g. libc++.a appears for the first time after a p4 rebuild).
+        // Cargo only reruns build scripts on env-var changes; watching the files
+        // directly handles the case where REACTOR_WEBRTC_LIB_DIR stays the same
+        // but its contents are updated.
+        let lib = Path::new(&dir).join("lib");
+        for name in &["libwebrtc.a", "libc++.a", "libc++abi.a", "build_profile"] {
+            println!("cargo:rerun-if-changed={}", lib.join(name).display());
+        }
         link(Path::new(&dir));
         return;
     }
@@ -66,10 +76,23 @@ fn main() {
         let url = format!("{PREBUILT_BASE}/{tag}/{asset}");
         let sha_url = format!("{PREBUILT_BASE}/{tag}/{sha_asset}");
 
+        // Treat the SHA file as an availability probe: if it doesn't resolve
+        // (404 = release not yet published, network error, etc.) don't attempt
+        // the download. This allows `cargo clippy` / `cargo fmt` to run in
+        // API/check-only mode on PRs that bump REACTOR_PATCH_LEVEL before the
+        // new prebuilt has been published. Explicit downloads via
+        // REACTOR_WEBRTC_PREBUILT_URL bypass this check.
         let sha256 = fetch_sha256(&sha_url);
-        let dir = download_prebuilt(&url, sha256.as_deref());
-        link(&dir);
-        return;
+        if let Some(sha) = sha256 {
+            let dir = download_prebuilt(&url, Some(&sha));
+            link(&dir);
+            return;
+        }
+        println!(
+            "cargo:warning=reactor-webrtc-sys: checksum for {tag}/{sha_asset} not \
+             reachable (release not yet published?). \
+             API/check only — set REACTOR_WEBRTC_LIB_DIR to link a local build."
+        );
     }
 
     println!(
@@ -276,9 +299,12 @@ fn link_system_deps(lib_dir: &Path) {
         "android" => {
             // WebRTC for Android links the bundled libc++ (ABI namespace __Cr)
             // and the same NDK system libraries as a normal WebRTC Android build.
-            println!("cargo:rustc-link-lib=static=c++");
+            // +whole-archive forces GNU ld to load all archive members (the
+            // bundled libc++.a has internal circular deps that a single-pass
+            // scan misses); --gc-sections trims the unused code afterward.
+            println!("cargo:rustc-link-lib=static:+whole-archive=c++");
             if lib_dir.join("libc++abi.a").is_file() {
-                println!("cargo:rustc-link-lib=static=c++abi");
+                println!("cargo:rustc-link-lib=static:+whole-archive=c++abi");
             }
             if lib_dir.join("libunwind.a").is_file() {
                 println!("cargo:rustc-link-lib=static=unwind");
@@ -304,15 +330,33 @@ fn link_system_deps(lib_dir: &Path) {
             // (shipped by package.sh). Link them after webrtc so its symbols
             // resolve, and do NOT link the system stdc++. Fall back to the system
             // stdc++ only for an older/bare layout without the bundled archives.
-            if lib_dir.join("libc++.a").is_file() {
-                println!("cargo:rustc-link-lib=static=c++");
+            //
+            // +whole-archive forces GNU ld to load all archive members. The
+            // bundled libc++.a is a fat archive whose member ORDER differs from
+            // the x64 side-effect archive: circular refs (e.g. ostream.o →
+            // ios.o → ostream.o) break GNU ld's single-pass scan, leaving
+            // std::__Cr::* symbols undefined. +whole-archive bypasses that
+            // ordering issue; --gc-sections (already in the rustc link flags)
+            // then strips unused code so binary size stays reasonable.
+            let has_cxx = lib_dir.join("libc++.a").is_file();
+            println!(
+                "cargo:warning=reactor-webrtc-sys: libc++.a at {} → {}",
+                lib_dir.join("libc++.a").display(),
+                if has_cxx { "found" } else { "absent" }
+            );
+            if has_cxx {
+                println!("cargo:rustc-link-lib=static:+whole-archive=c++");
                 if lib_dir.join("libc++abi.a").is_file() {
-                    println!("cargo:rustc-link-lib=static=c++abi");
+                    println!("cargo:rustc-link-lib=static:+whole-archive=c++abi");
                 }
                 if lib_dir.join("libunwind.a").is_file() {
                     println!("cargo:rustc-link-lib=static=unwind");
                 }
             } else {
+                println!(
+                    "cargo:warning=reactor-webrtc-sys: bundled libc++.a absent — \
+                     falling back to system stdc++ (std::__Cr::* symbols will be unresolved)"
+                );
                 println!("cargo:rustc-link-lib=dylib=stdc++");
             }
             // Desktop capture (and its libX11 dep) is disabled in the build
@@ -458,9 +502,29 @@ fn download_prebuilt(url: &str, sha256: Option<&str>) -> PathBuf {
     let out = out_root.join("libwebrtc");
     let archive = out_root.join("prebuilt.tar.zst");
 
-    // Cached from a previous build of this OUT_DIR.
-    if out.join("lib/libwebrtc.a").is_file() || out.join("lib/libwebrtc.lib").is_file() {
-        return out;
+    // Use the cached extraction only when the layout is present AND its SHA
+    // matches a sentinel written after the last successful download.  Without
+    // this check a restored Rust build cache (Swatinem/rust-cache restores the
+    // whole OUT_DIR) containing an older prebuilt (e.g. p3 without libc++.a)
+    // would be silently reused even though the caller supplied a different SHA
+    // (the p4 prebuilt).  The sentinel is written below after a verified
+    // extraction and is a no-op when no SHA is provided (Mode 1 / dev builds).
+    let lib_present =
+        out.join("lib/libwebrtc.a").is_file() || out.join("lib/libwebrtc.lib").is_file();
+    if lib_present {
+        let cache_valid = match sha256 {
+            None => true, // no checksum → trust whatever is there
+            Some(expected) => {
+                let sentinel = out.join(".sha256");
+                std::fs::read_to_string(&sentinel)
+                    .map(|s| s.trim().to_lowercase() == expected.trim().to_lowercase())
+                    .unwrap_or(false)
+            }
+        };
+        if cache_valid {
+            return out;
+        }
+        // SHA mismatch or missing sentinel → stale cache; re-download below.
     }
 
     // ── download ──────────────────────────────────────────────────────────
@@ -512,6 +576,12 @@ fn download_prebuilt(url: &str, sha256: Option<&str>) -> PathBuf {
         );
     }
     verify_prebuilt_arch(&out.join("lib"));
+
+    // Write the SHA sentinel so subsequent runs with the same checksum can
+    // skip the download.  Silently ignore write errors (non-fatal).
+    if let Some(sha) = sha256 {
+        let _ = std::fs::write(out.join(".sha256"), sha.trim());
+    }
     out
 }
 

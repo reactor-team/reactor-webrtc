@@ -54,8 +54,38 @@ jobs:
       - name: mise.lock drift (vs merge-base)
         run: mise run lint:mise-lock
 
+  # Check whether the prebuilt for the current WEBRTC_VERSION has already been
+  # published to GitHub Releases.  When REACTOR_PATCH_LEVEL is bumped on a
+  # webrtc-build PR the new prebuilt doesn't exist yet — test/build-wheel skip
+  # here (they run in webrtc-build.yml using the CI-built artifact instead).
+  # Once the patch is published, test/build-wheel run normally on every CI push.
+  prebuilt-check:
+    name: Check prebuilt availability
+    runs-on: ubuntu-latest
+    outputs:
+      available: ${{ steps.check.outputs.available }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        shell: bash
+        run: |
+          source WEBRTC_VERSION
+          MILESTONE=${WEBRTC_BRANCH#branch-heads/}
+          TAG="webrtc-${MILESTONE}-${WEBRTC_COMMIT:0:8}-p${REACTOR_PATCH_LEVEL}"
+          URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/reactor-webrtc-linux-x64-release.tar.zst.sha256"
+          echo "Probing release '${TAG}'..."
+          if curl -fsSL --retry 3 --max-time 20 "$URL" > /dev/null 2>&1; then
+            echo "available=true"  >> "$GITHUB_OUTPUT"
+            echo "Release '${TAG}' is published — test/build-wheel will run."
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Release '${TAG}' not yet published — test/build-wheel skip here; webrtc-build.yml covers this PR."
+          fi
+
   test:
     name: cargo test (${{ matrix.platform }})
+    needs: [prebuilt-check]
+    if: needs.prebuilt-check.outputs.available == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -135,6 +165,8 @@ jobs:
 
   build-wheel:
     name: build reactor-webrtc wheel (${{ matrix.platform }})
+    needs: [prebuilt-check]
+    if: needs.prebuilt-check.outputs.available == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -240,7 +272,7 @@ jobs:
 
   ci-complete:
     name: CI Complete
-    needs: [lint, test, build-wheel, test-py]
+    needs: [lint, prebuilt-check, test, build-wheel, test-py]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -248,6 +280,7 @@ jobs:
         run: |
           for r in \
             "${{ needs.lint.result }}" \
+            "${{ needs.prebuilt-check.result }}" \
             "${{ needs.test.result }}" \
             "${{ needs.build-wheel.result }}" \
             "${{ needs.test-py.result }}"; do
