@@ -7,7 +7,7 @@ Safe, idiomatic Rust API over an owned build of Google's WebRTC engine
 
 ```toml
 [dependencies]
-reactor-webrtc = "0.1"
+reactor-webrtc = "0.2"
 ```
 
 The build script automatically downloads the correct `libwebrtc` prebuilt for
