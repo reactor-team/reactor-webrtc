@@ -1361,8 +1361,51 @@ impl PeerConnection {
 
 /// Entry point — creates peer connections and media tracks.
 ///
-/// Uses the **synthetic** (push-based) ADM by default (no audio hardware).
-/// Pass `platform_adm=True` for real mic/speaker on desktop.
+/// **Audio device (`platform_adm`)**
+///
+/// By default the factory uses the *synthetic* audio device: the app pushes
+/// microphone PCM with `push_audio_frame` and receives decoded audio through
+/// `Track.on_audio_frame`. This is right for servers, bots, and any app that
+/// manages its own audio I/O.
+///
+/// Pass `platform_adm=True` to use the real hardware device (CoreAudio,
+/// WASAPI, ALSA/PulseAudio) for mic capture and speaker playout — appropriate
+/// for desktop calling apps.
+///
+/// **Audio processing (`echo_canceller`, `noise_suppression`, `agc`,
+/// `high_pass_filter`)**
+///
+/// All audio processing is **disabled by default**. This is correct for the
+/// synthetic ADM and for any use-case where the app applies its own DSP.
+///
+/// For real hardware capture (`platform_adm=True`) you typically want the
+/// full chain so captured audio is clean before encoding:
+///
+/// ```python
+/// factory = PeerConnectionFactory(
+///     platform_adm=True,
+///     echo_canceller=True,    # AEC3: removes loudspeaker echo from mic
+///     noise_suppression=True, # NS kHigh: suppresses background noise
+///     agc=True,               # AGC1: normalises mic volume across devices
+///     high_pass_filter=True,  # removes DC offset / low-frequency rumble
+/// )
+/// ```
+///
+/// You can mix and match flags freely. For example, use the platform ADM with
+/// no processing at all (your app does its own DSP):
+///
+/// ```python
+/// factory = PeerConnectionFactory(platform_adm=True)
+/// ```
+///
+/// Or enable only noise suppression on a synthetic factory that feeds
+/// pre-gained PCM but still benefits from NS:
+///
+/// ```python
+/// factory = PeerConnectionFactory(noise_suppression=True)
+/// ```
+///
+/// **Singleton**
 ///
 /// Only one `PeerConnectionFactory` may exist per process at a time.
 /// Creating a second one while the first is alive raises `RuntimeError`.
