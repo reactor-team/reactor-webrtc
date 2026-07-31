@@ -248,17 +248,6 @@ jobs:
         with:
           version: ${{ env.MISE_VERSION }}
 
-      - name: Allow WebRTC ICE UDP (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          # WebRTC ICE connectivity checks send STUN Binding Requests over UDP
-          # to the machine's LAN IP (WebRTC filters loopback 127.0.0.1 candidates).
-          # Windows Defender Firewall blocks inbound UDP by default, preventing the
-          # STUN checks from completing and causing all peer-connection tests to
-          # time out. Disable the firewall for this ephemeral CI runner.
-          netsh advfirewall set allprofiles state off
-
       - run: mise run test
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
