@@ -155,27 +155,35 @@ impl From<&IceServer> for rw::IceServer {
 /// `ice_transport_type` restricts which candidate types ICE may use
 /// (`all`, `relay`, `no_host`, `none`). `continual_gathering_policy` selects
 /// whether ICE gathers once or keeps gathering (`once`, `continually`).
+/// `min_port` and `max_port` bound the UDP port range ICE may allocate;
+/// `0` (the default) leaves the OS-assigned ephemeral range unchanged.
 #[pyclass]
 #[derive(Clone)]
 pub struct RtcConfiguration {
     pub ice_servers: Vec<IceServer>,
     ice_transport_type: rw::IceTransportsType,
     continual_gathering_policy: rw::ContinualGatheringPolicy,
+    pub min_port: u16,
+    pub max_port: u16,
 }
 
 #[pymethods]
 impl RtcConfiguration {
     #[new]
-    #[pyo3(signature = (ice_servers=vec![], ice_transport_type="all", continual_gathering_policy="once"))]
+    #[pyo3(signature = (ice_servers=vec![], ice_transport_type="all", continual_gathering_policy="once", min_port=0, max_port=0))]
     fn new(
         ice_servers: Vec<IceServer>,
         ice_transport_type: &str,
         continual_gathering_policy: &str,
+        min_port: u16,
+        max_port: u16,
     ) -> PyResult<Self> {
         Ok(Self {
             ice_servers,
             ice_transport_type: parse_ice_transport_type(ice_transport_type)?,
             continual_gathering_policy: parse_gathering_policy(continual_gathering_policy)?,
+            min_port,
+            max_port,
         })
     }
     #[getter]
@@ -204,6 +212,22 @@ impl RtcConfiguration {
         self.continual_gathering_policy = parse_gathering_policy(value)?;
         Ok(())
     }
+    #[getter]
+    fn min_port(&self) -> u16 {
+        self.min_port
+    }
+    #[setter]
+    fn set_min_port(&mut self, value: u16) {
+        self.min_port = value;
+    }
+    #[getter]
+    fn max_port(&self) -> u16 {
+        self.max_port
+    }
+    #[setter]
+    fn set_max_port(&mut self, value: u16) {
+        self.max_port = value;
+    }
 }
 
 impl From<&RtcConfiguration> for rw::RtcConfiguration {
@@ -212,6 +236,16 @@ impl From<&RtcConfiguration> for rw::RtcConfiguration {
             ice_servers: c.ice_servers.iter().map(Into::into).collect(),
             ice_transport_type: c.ice_transport_type,
             continual_gathering_policy: c.continual_gathering_policy,
+            min_port: if c.min_port > 0 {
+                Some(c.min_port)
+            } else {
+                None
+            },
+            max_port: if c.max_port > 0 {
+                Some(c.max_port)
+            } else {
+                None
+            },
         }
     }
 }

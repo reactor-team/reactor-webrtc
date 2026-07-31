@@ -65,6 +65,12 @@ pub struct RtcConfiguration {
     pub ice_servers: Vec<IceServer>,
     pub continual_gathering_policy: ContinualGatheringPolicy,
     pub ice_transport_type: IceTransportsType,
+    /// Lower bound of the UDP port range ICE may use. `None` leaves the
+    /// libwebrtc default (OS-assigned ephemeral ports).
+    pub min_port: Option<u16>,
+    /// Upper bound of the UDP port range ICE may use. `None` leaves the
+    /// libwebrtc default (OS-assigned ephemeral ports).
+    pub max_port: Option<u16>,
 }
 
 impl Default for RtcConfiguration {
@@ -78,6 +84,8 @@ impl Default for RtcConfiguration {
             // Complete, so it must be an explicit choice.
             continual_gathering_policy: ContinualGatheringPolicy::GatherOnce,
             ice_transport_type: IceTransportsType::All,
+            min_port: None,
+            max_port: None,
         }
     }
 }
@@ -107,6 +115,8 @@ pub(crate) struct NativeConfig {
     servers: Vec<ReactorIceServer>,
     ice_transport_type: c_int,
     continual_gathering_policy: c_int,
+    min_port: c_int,
+    max_port: c_int,
 }
 
 impl NativeConfig {
@@ -143,6 +153,21 @@ impl NativeConfig {
             })
             .collect();
 
+        let (min_port, max_port) = match (config.min_port, config.max_port) {
+            (None, None) => (0, 0),
+            (Some(lo), Some(hi)) if lo <= hi => (lo as c_int, hi as c_int),
+            (Some(lo), Some(hi)) => {
+                return Err(Error::Webrtc(format!(
+                    "min_port ({lo}) must be <= max_port ({hi})"
+                )));
+            }
+            _ => {
+                return Err(Error::Webrtc(
+                    "port range requires both min_port and max_port".into(),
+                ));
+            }
+        };
+
         Ok(Self {
             _urls: urls,
             _credentials: credentials,
@@ -150,6 +175,8 @@ impl NativeConfig {
             servers,
             ice_transport_type: config.ice_transport_type.to_wire(),
             continual_gathering_policy: config.continual_gathering_policy.to_wire(),
+            min_port,
+            max_port,
         })
     }
 
@@ -160,6 +187,8 @@ impl NativeConfig {
             servers_len: self.servers.len(),
             ice_transport_type: self.ice_transport_type,
             continual_gathering_policy: self.continual_gathering_policy,
+            min_port: self.min_port,
+            max_port: self.max_port,
         }
     }
 }
@@ -300,6 +329,74 @@ mod tests {
         .to_native()
         .expect("marshal");
         assert_eq!(none.config().ice_transport_type, 3);
+    }
+
+    #[test]
+    fn passes_port_range_to_native() {
+        let default = RtcConfiguration::default().to_native().expect("marshal");
+        assert_eq!(default.config().min_port, 0);
+        assert_eq!(default.config().max_port, 0);
+
+        let ranged = RtcConfiguration {
+            min_port: Some(10000),
+            max_port: Some(10100),
+            ..Default::default()
+        }
+        .to_native()
+        .expect("marshal");
+        assert_eq!(ranged.config().min_port, 10000);
+        assert_eq!(ranged.config().max_port, 10100);
+
+        // u16::MAX round-trips without truncation.
+        let max_u16 = RtcConfiguration {
+            min_port: Some(u16::MAX),
+            max_port: Some(u16::MAX),
+            ..Default::default()
+        }
+        .to_native()
+        .expect("marshal");
+        assert_eq!(max_u16.config().min_port, u16::MAX as c_int);
+        assert_eq!(max_u16.config().max_port, u16::MAX as c_int);
+    }
+
+    #[test]
+    fn rejects_half_specified_or_inverted_port_range() {
+        let min_only = RtcConfiguration {
+            min_port: Some(49152),
+            ..Default::default()
+        };
+        let err = min_only
+            .to_native()
+            .err()
+            .expect("min_only must be rejected")
+            .to_string();
+        assert!(err.contains("both min_port and max_port"), "got: {err}");
+
+        let max_only = RtcConfiguration {
+            max_port: Some(49152),
+            ..Default::default()
+        };
+        let err = max_only
+            .to_native()
+            .err()
+            .expect("max_only must be rejected")
+            .to_string();
+        assert!(err.contains("both min_port and max_port"), "got: {err}");
+
+        let inverted = RtcConfiguration {
+            min_port: Some(20000),
+            max_port: Some(10000),
+            ..Default::default()
+        };
+        let err = inverted
+            .to_native()
+            .err()
+            .expect("inverted range must be rejected")
+            .to_string();
+        assert!(
+            err.contains("min_port") && err.contains("max_port"),
+            "got: {err}"
+        );
     }
 
     #[test]

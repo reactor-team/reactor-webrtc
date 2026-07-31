@@ -84,6 +84,15 @@ mod tests {
                     ice_servers: vec![credentialed("turn:turn.example.com:3478")],
                     ice_transport_type: IceTransportsType::Relay,
                     continual_gathering_policy: ContinualGatheringPolicy::GatherContinually,
+                    ..Default::default()
+                },
+            ),
+            (
+                "explicit port range",
+                RtcConfiguration {
+                    min_port: Some(10000),
+                    max_port: Some(10100),
+                    ..Default::default()
                 },
             ),
         ];
@@ -116,5 +125,39 @@ mod tests {
             "expected the empty-credential reason, got: {message}"
         );
         println!("turn without credentials rejected ✅ — {message}");
+    }
+
+    #[test]
+    fn rejects_half_specified_and_inverted_port_range() {
+        for (label, config) in [
+            (
+                "min_port only",
+                RtcConfiguration {
+                    min_port: Some(10000),
+                    ..Default::default()
+                },
+            ),
+            (
+                "max_port only",
+                RtcConfiguration {
+                    max_port: Some(10100),
+                    ..Default::default()
+                },
+            ),
+            (
+                "inverted range",
+                RtcConfiguration {
+                    min_port: Some(10100),
+                    max_port: Some(10000),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let result = PeerConnectionFactory::new()
+                .expect("factory")
+                .create_peer_connection(&config, PeerConnectionObserver::new());
+            assert!(result.is_err(), "{label}: expected error but got Ok");
+            println!("{label} correctly rejected ✅ — {}", result.err().unwrap());
+        }
     }
 }

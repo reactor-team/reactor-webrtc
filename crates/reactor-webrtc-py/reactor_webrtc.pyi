@@ -21,11 +21,15 @@ class RtcConfiguration:
     ice_servers: list[IceServer]
     ice_transport_type: str  # "all" | "relay" | "no_host" | "none"
     continual_gathering_policy: str  # "once" | "continually"
+    min_port: int  # 0 = use OS default
+    max_port: int  # 0 = use OS default
     def __init__(
         self,
         ice_servers: list[IceServer] = ...,
         ice_transport_type: str = "all",
         continual_gathering_policy: str = "once",
+        min_port: int = 0,
+        max_port: int = 0,
     ) -> None: ...
 
 # ── Signaling types ───────────────────────────────────────────────────────────

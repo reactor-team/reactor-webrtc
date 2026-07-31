@@ -121,3 +121,24 @@ class TestPolicies:
             continual_gathering_policy="once",
         )
         assert factory.create_peer_connection(config, rw.PeerConnectionObserver())
+
+
+class TestPortRange:
+    def test_explicit_range_accepted(self, factory):
+        config = rw.RtcConfiguration(min_port=10000, max_port=10100)
+        assert factory.create_peer_connection(config, rw.PeerConnectionObserver())
+
+    def test_min_only_rejected(self, factory):
+        config = rw.RtcConfiguration(min_port=10000)
+        with pytest.raises(RuntimeError, match="both min_port and max_port"):
+            factory.create_peer_connection(config, rw.PeerConnectionObserver())
+
+    def test_max_only_rejected(self, factory):
+        config = rw.RtcConfiguration(max_port=10100)
+        with pytest.raises(RuntimeError, match="both min_port and max_port"):
+            factory.create_peer_connection(config, rw.PeerConnectionObserver())
+
+    def test_inverted_range_rejected(self, factory):
+        config = rw.RtcConfiguration(min_port=10100, max_port=10000)
+        with pytest.raises(RuntimeError, match="min_port.*max_port"):
+            factory.create_peer_connection(config, rw.PeerConnectionObserver())

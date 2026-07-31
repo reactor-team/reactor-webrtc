@@ -232,6 +232,10 @@ pub struct ReactorRtcConfig {
     pub servers_len: usize,
     pub ice_transport_type: c_int,
     pub continual_gathering_policy: c_int,
+    /// UDP port range lower bound. `0` means "not specified" (libwebrtc default).
+    pub min_port: c_int,
+    /// UDP port range upper bound. `0` means "not specified" (libwebrtc default).
+    pub max_port: c_int,
 }
 
 extern "C" {
