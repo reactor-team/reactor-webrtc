@@ -86,7 +86,9 @@ jobs:
           t="${{ github.event.inputs.targets }}"
           prof="${{ github.event.inputs.profile }}"
           if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
-            t=full
+            # Temporarily restricted to win-x64 while fixing Windows CI failures.
+            # Restore to t=full once cargo test (win-x64) and build wheel (win-x64) are green.
+            t=win
             prof=debug
           fi
           t="${t:-mac}"
@@ -200,15 +202,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: linux
-            arch: x64
-            runner: ubuntu-latest
-          - os: linux
-            arch: arm64
-            runner: ubuntu-24.04-arm
-          - os: mac
-            arch: arm64
-            runner: macos-15
+          # Temporarily restricted to win-x64 (Windows CI fix in progress).
           - os: win
             arch: x64
             runner: windows-latest
@@ -254,14 +248,15 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          # Trim to strip the trailing \r that PowerShell $(…) captures from
-          # rustup's output; a \r-suffixed path causes "program not found" when
-          # maturin tries to exec the cargo binary via the CARGO env var.
-          # Also add the bin directory to GITHUB_PATH so cargo is on PATH for
-          # any tool (e.g. maturin) that searches PATH instead of CARGO.
-          $cargo = (rustup which cargo).Trim()
-          Add-Content $env:GITHUB_ENV "CARGO=$cargo"
-          Add-Content $env:GITHUB_PATH (Split-Path $cargo)
+          # Point CARGO at the rustup shim (~/.cargo/bin/cargo.exe) rather than
+          # the toolchain-specific binary returned by `rustup which cargo`.
+          # The toolchain binary fails with "program not found" when maturin
+          # tries to exec it via CreateProcess, while the shim is what bash
+          # finds via PATH and works reliably. Also add the bin dir to
+          # GITHUB_PATH for tools that search PATH instead of CARGO.
+          $binDir = "$env:USERPROFILE\.cargo\bin"
+          Add-Content $env:GITHUB_ENV "CARGO=$binDir\cargo.exe"
+          Add-Content $env:GITHUB_PATH $binDir
 
       - uses: jdx/mise-action@v2
         with:
@@ -279,15 +274,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: linux
-            arch: x64
-            runner: ubuntu-latest
-          - os: linux
-            arch: arm64
-            runner: ubuntu-24.04-arm
-          - os: mac
-            arch: arm64
-            runner: macos-15
+          # Temporarily restricted to win-x64 (Windows CI fix in progress).
           - os: win
             arch: x64
             runner: windows-latest
@@ -333,14 +320,15 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          # Trim to strip the trailing \r that PowerShell $(…) captures from
-          # rustup's output; a \r-suffixed path causes "program not found" when
-          # maturin tries to exec the cargo binary via the CARGO env var.
-          # Also add the bin directory to GITHUB_PATH so cargo is on PATH for
-          # any tool (e.g. maturin) that searches PATH instead of CARGO.
-          $cargo = (rustup which cargo).Trim()
-          Add-Content $env:GITHUB_ENV "CARGO=$cargo"
-          Add-Content $env:GITHUB_PATH (Split-Path $cargo)
+          # Point CARGO at the rustup shim (~/.cargo/bin/cargo.exe) rather than
+          # the toolchain-specific binary returned by `rustup which cargo`.
+          # The toolchain binary fails with "program not found" when maturin
+          # tries to exec it via CreateProcess, while the shim is what bash
+          # finds via PATH and works reliably. Also add the bin dir to
+          # GITHUB_PATH for tools that search PATH instead of CARGO.
+          $binDir = "$env:USERPROFILE\.cargo\bin"
+          Add-Content $env:GITHUB_ENV "CARGO=$binDir\cargo.exe"
+          Add-Content $env:GITHUB_PATH $binDir
 
       - uses: jdx/mise-action@v2
         with:
@@ -365,15 +353,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: linux
-            arch: x64
-            runner: ubuntu-latest
-          - os: linux
-            arch: arm64
-            runner: ubuntu-24.04-arm
-          - os: mac
-            arch: arm64
-            runner: macos-15
+          # Temporarily restricted to win-x64 (Windows CI fix in progress).
           - os: win
             arch: x64
             runner: windows-latest
