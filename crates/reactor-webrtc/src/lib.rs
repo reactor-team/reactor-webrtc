@@ -86,21 +86,55 @@ pub enum AdmMode {
 
 /// Audio Processing Module configuration passed to [`PeerConnectionFactory`].
 ///
-/// All fields default to `false` (no processing). Enable selectively:
-/// ```
-/// use reactor_webrtc::ApmConfig;
+/// All fields default to `false` — no processing applied, true audio
+/// passthrough. This is the right choice for server-side apps (bots,
+/// recorders, SFUs) and for any app that does its own DSP upstream.
 ///
-/// let apm = ApmConfig { echo_canceller: true, noise_suppression: true, ..Default::default() };
+/// For real mic/speaker hardware ([`AdmMode::Platform`]) you typically want
+/// the full chain so captured audio is clean before encoding:
+///
+/// ```no_run
+/// use reactor_webrtc::{ApmConfig, AdmMode, PeerConnectionFactory};
+///
+/// // Real hardware capture: enable the full processing chain.
+/// let factory = PeerConnectionFactory::with_adm_apm(
+///     AdmMode::Platform,
+///     ApmConfig {
+///         echo_canceller:    true,
+///         noise_suppression: true,
+///         agc:               true,
+///         high_pass_filter:  true,
+///     },
+/// )?;
+/// # Ok::<_, reactor_webrtc::Error>(())
+/// ```
+///
+/// You can also use the platform ADM with *no* processing — for example when
+/// your app feeds audio through its own DSP pipeline, or when capturing from a
+/// virtual audio source that is already clean:
+///
+/// ```no_run
+/// use reactor_webrtc::{AdmMode, PeerConnectionFactory};
+///
+/// let factory = PeerConnectionFactory::with_adm(AdmMode::Platform)?;
+/// # Ok::<_, reactor_webrtc::Error>(())
 /// ```
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ApmConfig {
-    /// AEC3 acoustic echo cancellation.
+    /// AEC3 acoustic echo cancellation: removes loudspeaker echo from the
+    /// microphone signal. Required when mic and speaker are in the same room;
+    /// unnecessary (and potentially harmful) with headphones or line-in.
     pub echo_canceller: bool,
-    /// Noise suppression (level = kHigh when enabled).
+    /// Noise suppression (WebRTC NS at kHigh level): attenuates stationary
+    /// background noise (fans, HVAC). Safe to leave off if the capture
+    /// environment is quiet or the source is already noise-gated.
     pub noise_suppression: bool,
-    /// Automatic gain control (gain_controller1).
+    /// Automatic gain control (gain_controller1 / AGC1): normalises microphone
+    /// volume across devices. Disable when the calling app manages gain itself
+    /// or when pushing synthetic PCM.
     pub agc: bool,
-    /// High-pass filter.
+    /// High-pass filter: removes DC offset and low-frequency rumble below
+    /// ~80 Hz. Costs almost nothing; usually safe to leave on for real mics.
     pub high_pass_filter: bool,
 }
 
@@ -135,12 +169,20 @@ unsafe impl Send for PeerConnectionFactory {}
 unsafe impl Sync for PeerConnectionFactory {}
 
 impl PeerConnectionFactory {
-    /// Create a factory with the given [`AdmMode`] and no APM processing.
+    /// Create a factory with the given [`AdmMode`] and **no APM processing**
+    /// (true audio passthrough — no echo cancellation, noise suppression, AGC,
+    /// or high-pass filter). Use this when your app does its own DSP, or when
+    /// you are using [`AdmMode::Synthetic`] and pushing pre-processed PCM.
     pub fn with_adm(mode: AdmMode) -> Result<Self> {
         Self::with_adm_apm(mode, ApmConfig::default())
     }
 
-    /// Create a factory with full control over the audio device and APM chain.
+    /// Create a factory with explicit control over both the audio device module
+    /// and the APM (audio processing) chain.
+    ///
+    /// `apm` defaults to all-false (no processing). Set individual flags to
+    /// enable only the processing stages you need. See [`ApmConfig`] for
+    /// guidance on when each stage is appropriate.
     pub fn with_adm_apm(mode: AdmMode, apm: ApmConfig) -> Result<Self> {
         let raw = unsafe {
             reactor_webrtc_sys::reactor_webrtc_factory_create_with_adm_apm(
@@ -161,9 +203,14 @@ impl PeerConnectionFactory {
     }
 
     /// Create a factory using the **platform** audio device module (real
-    /// mic/speaker, e.g. CoreAudio on macOS) with the full AEC3 + noise
-    /// suppression + AGC + high-pass chain enabled — the sensible default for
-    /// real hardware capture.
+    /// mic/speaker — CoreAudio on macOS, WASAPI on Windows, ALSA/PulseAudio on
+    /// Linux) with the full APM chain enabled: AEC3 echo cancellation, noise
+    /// suppression, AGC, and high-pass filter.
+    ///
+    /// This is the recommended starting point for desktop client apps. If you
+    /// need the platform ADM with specific processing stages disabled (e.g. no
+    /// AGC because your app manages gain), use [`PeerConnectionFactory::with_adm_apm`]
+    /// directly.
     pub fn with_platform_adm() -> Result<Self> {
         Self::with_adm_apm(
             AdmMode::Platform,
