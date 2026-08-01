@@ -403,6 +403,24 @@ impl Track {
         self.video_sink = Some(state);
     }
 
+    /// Push interleaved i16 PCM to a local audio track created with
+    /// [`PeerConnectionFactory::create_audio_track_with_local_source`]. Delivers
+    /// audio directly to the sender's encoder, bypassing the shared ADM. No-op
+    /// for tracks backed by the factory ADM or for remote tracks.
+    pub fn push_pcm(&self, pcm: &[i16], sample_rate: u32, channels: u32) {
+        let channels = channels.max(1) as c_int;
+        let samples_per_channel = (pcm.len() / channels as usize) as c_int;
+        unsafe {
+            reactor_webrtc_sys::reactor_webrtc_audio_track_push_pcm(
+                self.raw,
+                pcm.as_ptr(),
+                samples_per_channel,
+                sample_rate as c_int,
+                channels,
+            );
+        }
+    }
+
     /// Subscribe to decoded PCM from a (remote) audio track. Replaces any
     /// previous sink. The closure runs on a WebRTC thread.
     pub fn on_audio_frame(&mut self, cb: impl for<'a> FnMut(AudioFrame<'a>) + Send + 'static) {

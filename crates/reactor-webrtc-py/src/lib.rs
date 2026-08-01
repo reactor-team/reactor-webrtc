@@ -23,27 +23,7 @@ use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::mem::ManuallyDrop;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-
-// Process-wide guard: libwebrtc starts global threads on factory creation and
-// joins them on destruction.  Creating a second factory before the first is
-// fully destroyed races those threads and reliably segfaults.  One factory at
-// a time is the safe contract; enforce it here so callers get a clear error
-// instead of a crash.
-static FACTORY_LIVE: AtomicBool = AtomicBool::new(false);
-
-fn claim_factory() -> PyResult<()> {
-    FACTORY_LIVE
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .map(|_| ())
-        .map_err(|_| {
-            PyRuntimeError::new_err(
-                "a PeerConnectionFactory is already alive in this process; \
-                 drop it before creating another",
-            )
-        })
-}
 
 fn err(e: rw::Error) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
@@ -769,6 +749,22 @@ impl Track {
         });
     }
 
+    /// Push interleaved signed 16-bit little-endian PCM to a local audio track
+    /// created with `factory.create_audio_track_with_local_source()`. `pcm`
+    /// must have even byte length (2 bytes per i16 sample). No-op for ADM-
+    /// backed or remote tracks.
+    fn push_pcm(&self, py: Python, pcm: &[u8], sample_rate: u32, channels: u32) -> PyResult<()> {
+        if !pcm.len().is_multiple_of(2) {
+            return Err(PyRuntimeError::new_err("pcm byte length must be even"));
+        }
+        let samples: Vec<i16> = pcm
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        py.allow_threads(|| self.inner.push_pcm(&samples, sample_rate, channels));
+        Ok(())
+    }
+
     /// Register `callback(pcm: bytes, sample_rate, channels, frames)` for
     /// decoded audio from a remote track. `pcm` is i16 little-endian.
     fn on_audio_frame(&mut self, callback: PyObject) {
@@ -1398,17 +1394,11 @@ impl PeerConnection {
 /// Uses the **synthetic** (push-based) ADM by default (no audio hardware).
 /// Pass `platform_adm=True` for real mic/speaker on desktop.
 ///
-/// Only one `PeerConnectionFactory` may exist per process at a time.
-/// Creating a second one while the first is alive raises `RuntimeError`.
+/// Multiple factories can exist concurrently. Each factory owns its own
+/// libwebrtc thread pool and synthetic ADM.
 #[pyclass]
 pub struct PeerConnectionFactory {
     inner: rw::PeerConnectionFactory,
-}
-
-impl Drop for PeerConnectionFactory {
-    fn drop(&mut self) {
-        FACTORY_LIVE.store(false, Ordering::SeqCst);
-    }
 }
 
 #[pymethods]
@@ -1428,7 +1418,6 @@ impl PeerConnectionFactory {
         agc: bool,
         high_pass_filter: bool,
     ) -> PyResult<Self> {
-        claim_factory()?;
         let adm = if platform_adm {
             rw::AdmMode::Platform
         } else {
@@ -1442,10 +1431,7 @@ impl PeerConnectionFactory {
         };
         rw::PeerConnectionFactory::with_adm_apm(adm, apm)
             .map(|inner| Self { inner })
-            .map_err(|e| {
-                FACTORY_LIVE.store(false, Ordering::SeqCst);
-                err(e)
-            })
+            .map_err(err)
     }
 
     /// Create a `PeerConnection` with `config` and `observer`.
@@ -1481,6 +1467,17 @@ impl PeerConnectionFactory {
             .map_err(err)
     }
 
+    /// Create a local audio track with a per-track audio source.
+    /// Feed samples via `track.push_pcm(pcm_bytes, sample_rate, channels)`.
+    /// Each call returns an independent track — different audio can be pushed
+    /// to different peer connections.
+    fn create_audio_track_with_local_source(&self, id: &str) -> PyResult<Track> {
+        self.inner
+            .create_audio_track_with_local_source(id)
+            .map(Track::from_rust)
+            .map_err(err)
+    }
+
     /// Push interleaved signed 16-bit little-endian PCM to the synthetic ADM.
     /// `pcm` must have even length (2 bytes per i16 sample).
     fn push_audio_frame(
@@ -1512,13 +1509,9 @@ impl PeerConnectionFactory {
         width: u32,
         height: u32,
     ) -> PyResult<(Self, EncodedVideoTrack)> {
-        claim_factory()?;
         rw::PeerConnectionFactory::with_encoded_video_track(track_id, width, height)
             .map(|(f, t)| (Self { inner: f }, EncodedVideoTrack { inner: t }))
-            .map_err(|e| {
-                FACTORY_LIVE.store(false, Ordering::SeqCst);
-                err(e)
-            })
+            .map_err(err)
     }
 
     fn set_adm_playout_enabled(&self, enabled: bool) {
