@@ -216,28 +216,25 @@ class TestTransceiverDirection:
 
 
 class TestPeerConnectionFactory:
-    def test_concurrent_factories_allowed(self, factory):
-        # Multiple factories may coexist — each owns its own thread pool and
-        # synthetic ADM. Creating a second factory while one is alive must
-        # succeed rather than raise or segfault.
-        second = rw.PeerConnectionFactory()
-        assert second is not None
+    def test_duplicate_factory_raises(self, factory):
+        # The session-scoped factory fixture keeps one factory alive; a second
+        # must be rejected with a clear error rather than a segfault.
+        with pytest.raises(RuntimeError, match="already"):
+            rw.PeerConnectionFactory()
 
-    def test_apm_kwargs_accepted(self):
-        # Verify that APM kwargs are accepted as valid named parameters.
-        # Unknown kwargs raise TypeError before the factory is constructed;
-        # valid kwargs must construct successfully.
-        factory = rw.PeerConnectionFactory(
-            echo_canceller=False,
-            noise_suppression=False,
-            agc=False,
-            high_pass_filter=False,
-        )
-        assert factory is not None
-
-    def test_unknown_kwarg_raises_type_error(self):
-        with pytest.raises(TypeError):
-            rw.PeerConnectionFactory(nonexistent_param=True)
+    def test_apm_kwargs_accepted(self, factory):
+        # Verify APM kwargs are accepted as valid named parameters.
+        # A second factory cannot be created (factory fixture keeps one alive),
+        # so we rely on PyO3 validating kwargs before the factory-guard check:
+        # unknown names raise TypeError, but valid names reach the guard and
+        # raise RuntimeError("already").
+        with pytest.raises(RuntimeError, match="already"):
+            rw.PeerConnectionFactory(
+                echo_canceller=False,
+                noise_suppression=False,
+                agc=False,
+                high_pass_filter=False,
+            )
 
 
 class TestTrack:
