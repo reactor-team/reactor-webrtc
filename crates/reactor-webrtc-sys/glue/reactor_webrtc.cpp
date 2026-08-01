@@ -319,6 +319,19 @@ class AudioFrameSink : public webrtc::AudioTrackSinkInterface {
       : userdata_(userdata), on_audio_(on_audio) {}
   void OnData(const void* audio_data, int /*bits_per_sample*/, int sample_rate,
               size_t number_of_channels, size_t number_of_frames) override {
+    // The playout pump fires this sink every 10 ms for every PeerConnection,
+    // even for peers that are not sending audio.  When no RTP has arrived the
+    // jitter buffer outputs all-zero frames (comfort noise / empty buffer).
+    // Forwarding those frames to the model as if they were real audio doubles
+    // (or multiplies) the effective audio input rate in multi-peer sessions,
+    // causing the model to emit audio faster than peers can play it back.
+    const int16_t* pcm = static_cast<const int16_t*>(audio_data);
+    const size_t total = number_of_frames * number_of_channels;
+    bool has_signal = false;
+    for (size_t i = 0; i < total && !has_signal; ++i)
+      if (pcm[i] != 0) has_signal = true;
+    if (!has_signal) return;
+
     if (audio_debug()) {
       static uint64_t n = 0;
       if (++n % 100 == 1)
@@ -326,7 +339,7 @@ class AudioFrameSink : public webrtc::AudioTrackSinkInterface {
                 (unsigned long long)n, sample_rate, number_of_channels, number_of_frames);
     }
     if (on_audio_)
-      on_audio_(userdata_, static_cast<const int16_t*>(audio_data), sample_rate,
+      on_audio_(userdata_, pcm, sample_rate,
                 static_cast<int>(number_of_channels),
                 static_cast<int>(number_of_frames));
   }
@@ -362,11 +375,61 @@ class FrameSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
   std::vector<uint8_t> bgra_;
 };
 
+// A per-track audio source that bypasses the shared ADM.  Each instance
+// maintains the sinks registered by the VoiceEngine send channel for a
+// specific peer connection and delivers PCM to those sinks directly, so
+// different audio can be routed to different peers independently.
+//
+// PushPcm() is called from each peer's dedicated _audio_feed_loop Python
+// thread.  Because each LocalAudioSource is owned by exactly one peer and
+// its _audio_feed_loop is the only caller, the ChannelSend's serialised-call
+// requirement is satisfied by construction — no PostTask to the shared worker
+// thread is needed.  Routing through the worker thread adds latency and
+// contention when multiple peers are active; calling directly keeps each
+// peer's audio path independent and low-latency.
+class LocalAudioSource
+    : public webrtc::Notifier<webrtc::AudioSourceInterface> {
+ public:
+  static webrtc::scoped_refptr<LocalAudioSource> Create() {
+    return webrtc::make_ref_counted<LocalAudioSource>();
+  }
+
+  webrtc::MediaSourceInterface::SourceState state() const override {
+    return kLive;
+  }
+  bool remote() const override { return false; }
+
+  void AddSink(webrtc::AudioTrackSinkInterface* sink) override {
+    std::lock_guard<std::mutex> lock(sinks_mutex_);
+    sinks_.push_back(sink);
+  }
+  void RemoveSink(webrtc::AudioTrackSinkInterface* sink) override {
+    std::lock_guard<std::mutex> lock(sinks_mutex_);
+    sinks_.erase(std::remove(sinks_.begin(), sinks_.end(), sink), sinks_.end());
+  }
+
+  // Deliver PCM directly to the registered sinks on the calling thread.
+  void PushPcm(const int16_t* pcm, int samples_per_channel,
+               int sample_rate, int channels) {
+    std::lock_guard<std::mutex> lock(sinks_mutex_);
+    for (auto* sink : sinks_) {
+      sink->OnData(pcm, /*bits_per_sample=*/16, sample_rate,
+                   static_cast<size_t>(channels),
+                   static_cast<size_t>(samples_per_channel));
+    }
+  }
+
+ private:
+  std::mutex sinks_mutex_;
+  std::vector<webrtc::AudioTrackSinkInterface*> sinks_;
+};
+
 // A track handle (the `MediaStreamTrack` in the Rust API). For a local track
-// `source` is set and frames can be pushed; for a remote track (from OnTrack)
-// `source` is null and `sink` is attached to receive frames.
+// `source` or `audio_source` is set and frames can be pushed; for a remote
+// track (from OnTrack) both sources are null and `sink`/`audio_sink` are used.
 struct ReactorMediaStreamTrack {
-  webrtc::scoped_refptr<FrameSource> source;
+  webrtc::scoped_refptr<FrameSource> source;              // local video
+  webrtc::scoped_refptr<LocalAudioSource> audio_source;  // local audio (per-track)
   webrtc::scoped_refptr<webrtc::MediaStreamTrackInterface> track;
   std::unique_ptr<FrameSink> sink;
   std::unique_ptr<AudioFrameSink> audio_sink;
@@ -1143,6 +1206,34 @@ void* reactor_webrtc_audio_track_create(void* factory, const char* id) {
   handle->track = rf->factory->CreateAudioTrack(id ? id : "", source.get());
   if (!handle->track) return nullptr;
   return handle.release();
+}
+
+// Create a local audio track backed by a per-track LocalAudioSource instead of
+// the factory-level ADM. Each call returns an independent source, so different
+// audio can be pushed to different peer connections. Feed via
+// reactor_webrtc_audio_track_push_pcm.
+void* reactor_webrtc_audio_track_create_with_local_source(void* factory,
+                                                          const char* id) {
+  auto* rf = reinterpret_cast<ReactorFactory*>(factory);
+  if (!rf || !rf->factory) return nullptr;
+  auto source = LocalAudioSource::Create();
+  auto handle = std::make_unique<ReactorMediaStreamTrack>();
+  handle->audio_source = source;
+  handle->track = rf->factory->CreateAudioTrack(id ? id : "", source.get());
+  if (!handle->track) return nullptr;
+  return handle.release();
+}
+
+// Push interleaved int16 PCM directly to a local audio track that was created
+// with reactor_webrtc_audio_track_create_with_local_source. No-op on tracks
+// backed by the factory ADM.
+void reactor_webrtc_audio_track_push_pcm(void* track, const int16_t* pcm,
+                                         int samples_per_channel,
+                                         int sample_rate, int channels) {
+  auto* h = reinterpret_cast<ReactorMediaStreamTrack*>(track);
+  if (!h || !h->audio_source || !pcm || samples_per_channel <= 0 || channels <= 0)
+    return;
+  h->audio_source->PushPcm(pcm, samples_per_channel, sample_rate, channels);
 }
 
 // Deliver interleaved int16 PCM to the factory's ADM (shared by all local audio

@@ -769,6 +769,22 @@ impl Track {
         });
     }
 
+    /// Push interleaved signed 16-bit little-endian PCM to a local audio track
+    /// created with `factory.create_audio_track_with_local_source()`. `pcm`
+    /// must have even byte length (2 bytes per i16 sample). No-op for ADM-
+    /// backed or remote tracks.
+    fn push_pcm(&self, py: Python, pcm: &[u8], sample_rate: u32, channels: u32) -> PyResult<()> {
+        if !pcm.len().is_multiple_of(2) {
+            return Err(PyRuntimeError::new_err("pcm byte length must be even"));
+        }
+        let samples: Vec<i16> = pcm
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        py.allow_threads(|| self.inner.push_pcm(&samples, sample_rate, channels))
+            .map_err(err)
+    }
+
     /// Register `callback(pcm: bytes, sample_rate, channels, frames)` for
     /// decoded audio from a remote track. `pcm` is i16 little-endian.
     fn on_audio_frame(&mut self, callback: PyObject) {
@@ -1477,6 +1493,17 @@ impl PeerConnectionFactory {
     fn create_audio_track(&self, id: &str) -> PyResult<Track> {
         self.inner
             .create_audio_track(id)
+            .map(Track::from_rust)
+            .map_err(err)
+    }
+
+    /// Create a local audio track with a per-track audio source.
+    /// Feed samples via `track.push_pcm(pcm_bytes, sample_rate, channels)`.
+    /// Each call returns an independent track — different audio can be pushed
+    /// to different peer connections.
+    fn create_audio_track_with_local_source(&self, id: &str) -> PyResult<Track> {
+        self.inner
+            .create_audio_track_with_local_source(id)
             .map(Track::from_rust)
             .map_err(err)
     }

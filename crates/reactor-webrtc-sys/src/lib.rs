@@ -527,6 +527,26 @@ extern "C" {
         factory: *mut PeerConnectionFactory,
         id: *const c_char,
     ) -> *mut MediaStreamTrack;
+    /// Create a local audio track with a per-track audio source, independent of
+    /// the factory ADM. Each call returns a track whose audio is fed exclusively
+    /// via [`reactor_webrtc_audio_track_push_pcm`], allowing different audio to
+    /// be delivered to different peer connections. Returns an owned
+    /// [`MediaStreamTrack`] handle or null.
+    pub fn reactor_webrtc_audio_track_create_with_local_source(
+        factory: *mut PeerConnectionFactory,
+        id: *const c_char,
+    ) -> *mut MediaStreamTrack;
+    /// Push interleaved i16 PCM directly to a local audio track that was created
+    /// with [`reactor_webrtc_audio_track_create_with_local_source`]. No-op for
+    /// tracks backed by the factory ADM. `samples_per_channel` is the frame
+    /// count (e.g. 480 for 10ms @ 48kHz).
+    pub fn reactor_webrtc_audio_track_push_pcm(
+        track: *mut MediaStreamTrack,
+        pcm: *const i16,
+        samples_per_channel: c_int,
+        sample_rate: c_int,
+        channels: c_int,
+    );
     /// Deliver interleaved i16 PCM to the factory's ADM (shared by all local
     /// audio tracks). `samples_per_channel` is the frame count (e.g. 480 for
     /// 10ms @ 48kHz).

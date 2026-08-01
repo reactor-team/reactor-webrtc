@@ -8,6 +8,7 @@
 //! a frame sink attached. Audio send is via the factory ADM
 //! ([`crate::PeerConnectionFactory::push_audio_frame`]).
 
+use crate::{Error, Result};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::os::raw::c_int;
@@ -401,6 +402,39 @@ impl Track {
             reactor_webrtc_sys::reactor_webrtc_video_track_add_sink(self.raw, ud, video_sink_tramp);
         }
         self.video_sink = Some(state);
+    }
+
+    /// Push interleaved i16 PCM to a local audio track created with
+    /// [`PeerConnectionFactory::create_audio_track_with_local_source`]. Delivers
+    /// audio directly to the sender's encoder, bypassing the shared ADM. No-op
+    /// for tracks backed by the factory ADM or for remote tracks.
+    ///
+    /// `pcm.len()` must be a multiple of `channels`; a partial trailing frame
+    /// is an error. Only one thread should call `push_pcm` at a time for a
+    /// given track — concurrent callers produce interleaved, garbage audio.
+    pub fn push_pcm(&self, pcm: &[i16], sample_rate: u32, channels: u32) -> Result<()> {
+        if channels == 0 {
+            return Err(Error::Webrtc("channels must be at least 1".to_owned()));
+        }
+        if !pcm.len().is_multiple_of(channels as usize) {
+            return Err(Error::Webrtc(format!(
+                "pcm length ({}) is not a multiple of channels ({})",
+                pcm.len(),
+                channels
+            )));
+        }
+        let channels = channels as c_int;
+        let samples_per_channel = (pcm.len() / channels as usize) as c_int;
+        unsafe {
+            reactor_webrtc_sys::reactor_webrtc_audio_track_push_pcm(
+                self.raw,
+                pcm.as_ptr(),
+                samples_per_channel,
+                sample_rate as c_int,
+                channels,
+            );
+        }
+        Ok(())
     }
 
     /// Subscribe to decoded PCM from a (remote) audio track. Replaces any

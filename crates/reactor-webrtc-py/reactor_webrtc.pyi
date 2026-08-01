@@ -123,6 +123,12 @@ class StatsReport:
 class Track:
     def kind(self) -> MediaKind: ...
     def push_video_frame(self, bgra: bytes, width: int, height: int) -> None: ...
+    def push_pcm(self, pcm: bytes, sample_rate: int, channels: int) -> None:
+        """Push interleaved signed 16-bit little-endian PCM to a local audio track
+        created with `PeerConnectionFactory.create_audio_track_with_local_source`.
+        `pcm` must have even byte length and `len(pcm) // 2` must be a multiple of
+        `channels`. No-op for ADM-backed or remote tracks."""
+        ...
     def on_video_frame(
         self,
         callback: Callable[[bytes, int, int], None],
@@ -133,7 +139,10 @@ class Track:
         self,
         callback: Callable[[bytes, int, int, int], None],
     ) -> None:
-        """Register `callback(pcm: bytes, sample_rate: int, channels: int, frames: int)`."""
+        """Register `callback(pcm: bytes, sample_rate: int, channels: int, frames: int)`.
+
+        Note: all-zero frames (empty jitter buffer from peers with no incoming RTP)
+        are suppressed and will not trigger this callback."""
         ...
 
 class EncodedVideoTrack:
@@ -212,6 +221,12 @@ class PeerConnectionFactory:
     ) -> PeerConnection: ...
     def create_video_track(self, id: str) -> Track: ...
     def create_audio_track(self, id: str) -> Track: ...
+    def create_audio_track_with_local_source(self, id: str) -> Track:
+        """Create a local audio track with a per-track audio source independent of
+        the factory ADM. Feed samples via `track.push_pcm(pcm, sample_rate, channels)`.
+        Each call returns an independent track, so different audio can be pushed to
+        different peer connections."""
+        ...
     def push_audio_frame(
         self, pcm: bytes, sample_rate: int, channels: int
     ) -> None:

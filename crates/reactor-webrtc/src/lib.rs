@@ -328,6 +328,26 @@ impl PeerConnectionFactory {
         Ok(Track::from_raw(raw, MediaKind::Audio))
     }
 
+    /// Create a local audio track with a per-track audio source, independent of
+    /// the factory ADM. Feed samples with [`Track::push_pcm`]. This allows
+    /// different audio to be delivered to different peer connections, since each
+    /// call returns a track backed by its own source.
+    pub fn create_audio_track_with_local_source(&self, id: &str) -> Result<Track> {
+        let cid = CString::new(id).map_err(|_| Error::Webrtc("id contains a NUL byte".into()))?;
+        let raw = unsafe {
+            reactor_webrtc_sys::reactor_webrtc_audio_track_create_with_local_source(
+                self.raw,
+                cid.as_ptr(),
+            )
+        };
+        if raw.is_null() {
+            return Err(Error::Webrtc(
+                "audio track with local source creation returned null".into(),
+            ));
+        }
+        Ok(Track::from_raw(raw, MediaKind::Audio))
+    }
+
     /// Feed interleaved i16 PCM to the (synthetic) ADM, shared by all local
     /// audio tracks. Typically called with ~10ms blocks (e.g. 480 frames @
     /// 48kHz). No-op with the platform ADM.
