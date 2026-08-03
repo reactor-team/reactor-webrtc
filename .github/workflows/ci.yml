@@ -99,6 +99,9 @@ jobs:
           - platform: mac-arm64
             os: macos-latest
 
+          - platform: mac-x64
+            os: macos-13
+
           - platform: win-x64
             os: windows-latest
             # libwebrtc.lib uses /MT (static CRT); Rust must match to avoid LNK2038.
@@ -182,6 +185,9 @@ jobs:
 
           - platform: mac-arm64
             os: macos-latest
+
+          - platform: mac-x64
+            os: macos-13
 
           - platform: win-x64
             os: windows-latest
@@ -273,6 +279,8 @@ jobs:
             os: ubuntu-24.04-arm
           - platform: mac-arm64
             os: macos-latest
+          - platform: mac-x64
+            os: macos-13
           - platform: win-x64
             os: windows-latest
     runs-on: ${{ matrix.os }}

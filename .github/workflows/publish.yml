@@ -122,6 +122,11 @@ jobs:
             target: aarch64-apple-darwin
             manylinux: "off"
 
+          - platform: mac-x64
+            os: macos-13
+            target: x86_64-apple-darwin
+            manylinux: "off"
+
           - platform: win-x64
             os: windows-latest
             target: x86_64-pc-windows-msvc
