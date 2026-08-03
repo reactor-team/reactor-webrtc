@@ -314,6 +314,37 @@ impl SessionDescription {
     fn __repr__(&self) -> String {
         format!("SessionDescription(kind={:?})", self.kind)
     }
+
+    /// The `ice-ufrag` values this description carries, in document order.
+    ///
+    /// One per m-section: bundled sections repeat the same value, while a
+    /// non-BUNDLE description has a distinct ufrag per transport.
+    fn ice_ufrags(&self) -> Vec<String> {
+        to_rust_sdp(self)
+            .map(|d| d.ice_ufrags().into_iter().map(str::to_owned).collect())
+            .unwrap_or_default()
+    }
+
+    /// Return a copy with every `ice-ufrag` and `ice-pwd` replaced.
+    ///
+    /// libwebrtc generates ICE credentials itself and exposes no setter, so an
+    /// application that needs to *choose* its ufrag — routing through an edge
+    /// relay that demultiplexes on it, for instance — substitutes them in the
+    /// description instead. That works because the local description is what
+    /// libwebrtc reads the transport's ICE parameters from.
+    ///
+    /// Call it on the result of `create_offer`/`create_answer` and **before**
+    /// `set_local_description`: setting the local description is what creates the
+    /// transport and starts gathering, so substituting afterwards acts on nothing.
+    ///
+    /// Raises if either value is outside RFC 8445's length range (ufrag 4..=256,
+    /// password 22..=256) or contains a character outside `ice-char`.
+    fn with_ice_credentials(&self, ufrag: &str, pwd: &str) -> PyResult<Self> {
+        let out = to_rust_sdp(self)?
+            .with_ice_credentials(ufrag, pwd)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(out.into())
+    }
 }
 
 impl From<rw::SessionDescription> for SessionDescription {
