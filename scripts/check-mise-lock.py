@@ -36,10 +36,15 @@ _NO_PLATFORM_BACKENDS = ("go:", "npm:", "cargo:", "pipx:", "core:")
 
 # Tools that legitimately ship no binary for a lockfile platform, so `mise lock`
 # cannot produce an entry for it. Exempt the specific tool -> platforms pair
-# rather than dropping the platform for every tool. Currently empty: the 3
-# lockfile platforms (macos-arm64, linux-x64, linux-arm64) are all covered by
-# every tool. Keep this tiny and justified -- a stale exemption hides a real gap.
-_PLATFORM_EXEMPTIONS: dict[str, set[str]] = {}
+# rather than dropping the platform for every tool. Keep this tiny and justified
+# -- a stale exemption hides a real gap.
+_PLATFORM_EXEMPTIONS: dict[str, set[str]] = {
+    # jdx/hk only releases aarch64-apple-darwin; no x86_64-apple-darwin asset
+    # exists in any published release. With MISE_LOCKED=1, mise skips tools that
+    # have no lock entry for the current platform, so the macos-x64 CI runners
+    # simply run without hk (which is fine -- hk is only needed for git hooks).
+    "hk": {"macos-x64"},
+}
 
 
 def die(msg: str) -> None:

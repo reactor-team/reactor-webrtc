@@ -99,6 +99,9 @@ jobs:
           - platform: mac-arm64
             os: macos-latest
 
+          - platform: mac-x64
+            os: macos-15-intel
+
           - platform: win-x64
             os: windows-latest
             # libwebrtc.lib uses /MT (static CRT); Rust must match to avoid LNK2038.
@@ -153,6 +156,12 @@ jobs:
         shell: pwsh
         run: Add-Content $env:GITHUB_ENV "CARGO=$(rustup which cargo)"
 
+      # hk ships no x86_64-apple-darwin binary; disable it so mise install
+      # doesn't error under MISE_LOCKED=1 (hk is only needed for git hooks).
+      - name: Disable hk on mac-x64
+        if: matrix.platform == 'mac-x64'
+        run: echo "MISE_DISABLE_TOOLS=${{ env.MISE_DISABLE_TOOLS }},hk" >> "$GITHUB_ENV"
+
       - uses: jdx/mise-action@v2
         with:
           version: ${{ env.MISE_VERSION }}
@@ -182,6 +191,9 @@ jobs:
 
           - platform: mac-arm64
             os: macos-latest
+
+          - platform: mac-x64
+            os: macos-15-intel
 
           - platform: win-x64
             os: windows-latest
@@ -228,9 +240,19 @@ jobs:
         shell: pwsh
         run: Add-Content $env:GITHUB_ENV "CARGO=$(rustup which cargo)"
 
+      # hk ships no x86_64-apple-darwin binary; disable it so mise install
+      # doesn't error under MISE_LOCKED=1 (hk is only needed for git hooks).
+      - name: Disable hk on mac-x64
+        if: matrix.platform == 'mac-x64'
+        run: echo "MISE_DISABLE_TOOLS=${{ env.MISE_DISABLE_TOOLS }},hk" >> "$GITHUB_ENV"
+
       - uses: jdx/mise-action@v2
         with:
           version: ${{ env.MISE_VERSION }}
+
+      - name: Set macOS deployment target (mac-x64)
+        if: matrix.platform == 'mac-x64'
+        run: echo "MACOSX_DEPLOYMENT_TARGET=13.0" >> "$GITHUB_ENV"
 
       - name: Build wheel (non-Windows)
         if: runner.os != 'Windows'
@@ -273,6 +295,8 @@ jobs:
             os: ubuntu-24.04-arm
           - platform: mac-arm64
             os: macos-latest
+          - platform: mac-x64
+            os: macos-15-intel
           - platform: win-x64
             os: windows-latest
     runs-on: ${{ matrix.os }}
@@ -282,6 +306,11 @@ jobs:
         with:
           name: wheel-${{ matrix.platform }}
           path: target/wheels
+      # hk ships no x86_64-apple-darwin binary; disable it so mise install
+      # doesn't error under MISE_LOCKED=1 (hk is only needed for git hooks).
+      - name: Disable hk on mac-x64
+        if: matrix.platform == 'mac-x64'
+        run: echo "MISE_DISABLE_TOOLS=${{ env.MISE_DISABLE_TOOLS }},hk" >> "$GITHUB_ENV"
       - uses: jdx/mise-action@v2
         with:
           version: ${{ env.MISE_VERSION }}
