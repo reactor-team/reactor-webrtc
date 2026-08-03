@@ -123,7 +123,7 @@ jobs:
             manylinux: "off"
 
           - platform: mac-x64
-            os: macos-13
+            os: macos-15-intel
             target: x86_64-apple-darwin
             manylinux: "off"
 
@@ -161,6 +161,10 @@ jobs:
           fi
           echo "url=${BASE}/${ASSET}" >> "$GITHUB_OUTPUT"
           echo "sha256=${SHA256}" >> "$GITHUB_OUTPUT"
+
+      - name: Set macOS deployment target (mac-x64)
+        if: matrix.platform == 'mac-x64'
+        run: echo "MACOSX_DEPLOYMENT_TARGET=13.0" >> "$GITHUB_ENV"
 
       - uses: PyO3/maturin-action@v1
         with:
