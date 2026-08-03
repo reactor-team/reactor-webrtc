@@ -132,6 +132,21 @@ impl SessionDescription {
     /// # Ok(()) }
     /// ```
     ///
+    /// # Renegotiation
+    ///
+    /// Changing `ice-ufrag`/`ice-pwd` between generations *is* an ICE restart
+    /// (RFC 8445 §9): the transport discards its checklist and revalidates. So on a
+    /// renegotiation that is not meant to restart ICE, re-apply the **same** values
+    /// the session already uses. Substituting a fresh pair out of habit — rotating
+    /// a routing token, say — restarts connectivity checks and can interrupt media.
+    ///
+    /// A renegotiation-time description also differs from a first one in carrying
+    /// the candidates gathered so far. Those are left untouched, which is correct
+    /// for this build: it emits `a=candidate` lines without the optional trailing
+    /// `ufrag` token, so no candidate-level value can fall out of step with the
+    /// substituted media-level one. `tests/ice_credentials.rs` pins that, since it
+    /// is an upstream behaviour rather than a guarantee.
+    ///
     /// # Errors
     ///
     /// If either value is outside RFC 8445's length range or contains a character

@@ -320,9 +320,19 @@ impl SessionDescription {
     /// One per m-section: bundled sections repeat the same value, while a
     /// non-BUNDLE description has a distinct ufrag per transport.
     fn ice_ufrags(&self) -> Vec<String> {
-        to_rust_sdp(self)
-            .map(|d| d.ice_ufrags().into_iter().map(str::to_owned).collect())
-            .unwrap_or_default()
+        // Read straight off the SDP rather than through `to_rust_sdp`: parsing
+        // ufrags does not need `kind`, and routing it through the converter would
+        // turn an unrelated "unknown SDP kind" into an empty list — which reads
+        // exactly like a description that carries no credentials. Python can set
+        // `kind` to any string, so that mistake is one typo away.
+        rw::SessionDescription {
+            kind: rw::SdpType::Offer,
+            sdp: self.sdp.clone(),
+        }
+        .ice_ufrags()
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
     }
 
     /// Return a copy with every `ice-ufrag` and `ice-pwd` replaced.
