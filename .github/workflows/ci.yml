@@ -156,6 +156,12 @@ jobs:
         shell: pwsh
         run: Add-Content $env:GITHUB_ENV "CARGO=$(rustup which cargo)"
 
+      # hk ships no x86_64-apple-darwin binary; disable it so mise install
+      # doesn't error under MISE_LOCKED=1 (hk is only needed for git hooks).
+      - name: Disable hk on mac-x64
+        if: matrix.platform == 'mac-x64'
+        run: echo "MISE_DISABLE_TOOLS=${{ env.MISE_DISABLE_TOOLS }},hk" >> "$GITHUB_ENV"
+
       - uses: jdx/mise-action@v2
         with:
           version: ${{ env.MISE_VERSION }}
@@ -234,6 +240,12 @@ jobs:
         shell: pwsh
         run: Add-Content $env:GITHUB_ENV "CARGO=$(rustup which cargo)"
 
+      # hk ships no x86_64-apple-darwin binary; disable it so mise install
+      # doesn't error under MISE_LOCKED=1 (hk is only needed for git hooks).
+      - name: Disable hk on mac-x64
+        if: matrix.platform == 'mac-x64'
+        run: echo "MISE_DISABLE_TOOLS=${{ env.MISE_DISABLE_TOOLS }},hk" >> "$GITHUB_ENV"
+
       - uses: jdx/mise-action@v2
         with:
           version: ${{ env.MISE_VERSION }}
@@ -294,6 +306,11 @@ jobs:
         with:
           name: wheel-${{ matrix.platform }}
           path: target/wheels
+      # hk ships no x86_64-apple-darwin binary; disable it so mise install
+      # doesn't error under MISE_LOCKED=1 (hk is only needed for git hooks).
+      - name: Disable hk on mac-x64
+        if: matrix.platform == 'mac-x64'
+        run: echo "MISE_DISABLE_TOOLS=${{ env.MISE_DISABLE_TOOLS }},hk" >> "$GITHUB_ENV"
       - uses: jdx/mise-action@v2
         with:
           version: ${{ env.MISE_VERSION }}
