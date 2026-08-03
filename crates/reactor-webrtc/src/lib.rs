@@ -8,6 +8,12 @@
 //! video send/receive) and [`DataChannel`]s. RAII throughout: dropping a handle
 //! releases the native object.
 //!
+//! ICE credentials are libwebrtc's to generate, and it exposes no setter. When an
+//! application needs to *choose* its ufrag — so that a fronting layer can route on
+//! it — [`SessionDescription::with_ice_credentials`] substitutes them in the
+//! description before it is set locally, which is where libwebrtc reads the
+//! transport's ICE parameters from.
+//!
 //! Building a real binary or test requires a native `libwebrtc`; set
 //! `REACTOR_WEBRTC_LIB_DIR` or `REACTOR_WEBRTC_PREBUILT_URL`. `cargo check`
 //! works without one.

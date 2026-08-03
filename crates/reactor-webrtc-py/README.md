@@ -103,7 +103,7 @@ for pair in report.candidate_pairs:
 | `RtcConfiguration` | ICE servers, ICE transport type, gathering policy |
 | `IceServer` | A STUN or TURN server entry |
 | `IceCandidate` | A trickled ICE candidate |
-| `SessionDescription` | SDP offer or answer (`kind`, `sdp`) |
+| `SessionDescription` | SDP offer or answer (`kind`, `sdp`, `ice_ufrags`, `with_ice_credentials`) |
 | `Track` | Local (push frames) or remote (attach sink) media track |
 | `EncodedVideoTrack` | Push pre-encoded video (H.264 Annex-B, VP8, VP9, …) |
 | `Transceiver` | RTP m-section: `mid`, `kind`, `set_track`, `set_direction` |
@@ -123,6 +123,36 @@ for pair in report.candidate_pairs:
 |---------------------|--------|
 | `RtcConfiguration.ice_transport_type` | `all` (default), `relay`, `no_host`, `none` |
 | `RtcConfiguration.continual_gathering_policy` | `once` (default), `continually` |
+
+## Choosing your own ICE credentials
+
+libwebrtc generates the ICE ufrag and password itself and offers no setter. If
+something upstream needs to *recognise* a session by its ufrag — an edge relay
+that demultiplexes on it, say — substitute the credentials in the description
+before setting it locally:
+
+```python
+answer = pc.create_answer()
+answer = answer.with_ice_credentials(my_ufrag, my_password)
+pc.set_local_description(answer)
+
+answer.ice_ufrags()  # ["<my_ufrag>", ...] — one per m-section
+```
+
+The local description is what libwebrtc reads the transport's ICE parameters
+from, so the substituted values are the ones that end up on the wire.
+
+Two things to get right:
+
+- **Order.** Setting the local description is what creates the transport and
+  starts gathering, so substituting afterwards acts on nothing.
+- **Renegotiation.** Changing the credentials between generations *is* an ICE
+  restart (RFC 8445 §9). On a renegotiation that is not meant to restart ICE,
+  pass the values the session already uses.
+
+Raises if a value is outside RFC 8445's ranges (ufrag 4–256 characters, password
+22–256) or contains anything outside `ice-char` — which is also what stops a
+newline in a credential from injecting an SDP line.
 
 ## Thread safety
 

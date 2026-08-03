@@ -53,6 +53,147 @@ pub struct SessionDescription {
     pub sdp: String,
 }
 
+/// RFC 8445 §5.3: an ice-ufrag is 4..=256 characters.
+const ICE_UFRAG_LEN: std::ops::RangeInclusive<usize> = 4..=256;
+/// RFC 8445 §5.3: an ice-pwd is 22..=256 characters.
+const ICE_PWD_LEN: std::ops::RangeInclusive<usize> = 22..=256;
+
+/// RFC 8445 `ice-char = ALPHA / DIGIT / "+" / "/"`.
+fn is_ice_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '+' || c == '/'
+}
+
+fn check_ice_value(
+    what: &str,
+    value: &str,
+    len: std::ops::RangeInclusive<usize>,
+) -> crate::Result<()> {
+    if !len.contains(&value.len()) {
+        return Err(crate::Error::Webrtc(format!(
+            "{what} must be {}..={} characters, got {}",
+            len.start(),
+            len.end(),
+            value.len()
+        )));
+    }
+    if let Some(bad) = value.chars().find(|c| !is_ice_char(*c)) {
+        return Err(crate::Error::Webrtc(format!(
+            "{what} contains {bad:?}, which is not an RFC 8445 ice-char"
+        )));
+    }
+    Ok(())
+}
+
+impl SessionDescription {
+    /// The `ice-ufrag` values this description carries, in document order.
+    ///
+    /// One per m-section. Bundled sections repeat the same value; a non-BUNDLE
+    /// description has a distinct ufrag per transport.
+    pub fn ice_ufrags(&self) -> Vec<&str> {
+        self.sdp
+            .lines()
+            .filter_map(|l| l.strip_prefix("a=ice-ufrag:").map(str::trim_end))
+            .collect()
+    }
+
+    /// Return a copy with every `ice-ufrag` and `ice-pwd` replaced.
+    ///
+    /// # Why this exists
+    ///
+    /// libwebrtc generates ICE credentials itself and exposes no setter — the
+    /// `SetIceParameters` entry point lives on `IceTransportInternal`, below the
+    /// public API, and calling it out of band would desync the transport from the
+    /// description that was signalled. An application that needs to *choose* its
+    /// ufrag — routing through an edge relay that demultiplexes on it, for
+    /// instance — has to do it here instead.
+    ///
+    /// It works because the local description is the source of truth:
+    /// `JsepTransport::SetLocalJsepTransportDescription` reads `IceParameters`
+    /// straight out of the description's transport description, and the only guard
+    /// libwebrtc applies to a local description checks that credentials are
+    /// *present*, not that it generated them. `tests/ice_credentials.rs` verifies
+    /// this by observation rather than by reading: a loopback whose offerer has
+    /// substituted credentials connects, which it could not if the transport had
+    /// kept its own.
+    ///
+    /// # Ordering
+    ///
+    /// Call this on the description returned by `create_offer`/`create_answer` and
+    /// before [`PeerConnection::set_local_description`]. Setting the local
+    /// description is what creates the transport and starts gathering, so
+    /// substituting afterwards has nothing to act on.
+    ///
+    /// ```no_run
+    /// # use reactor_webrtc::PeerConnection;
+    /// # fn f(pc: &PeerConnection) -> reactor_webrtc::Result<()> {
+    /// let answer = pc.create_answer()?;
+    /// let answer = answer.with_ice_credentials("MyRelayIssuedUfrag00", "aPasswordOfAtLeast22Chars")?;
+    /// pc.set_local_description(&answer)?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// # Renegotiation
+    ///
+    /// Changing `ice-ufrag`/`ice-pwd` between generations *is* an ICE restart
+    /// (RFC 8445 §9): the transport discards its checklist and revalidates. So on a
+    /// renegotiation that is not meant to restart ICE, re-apply the **same** values
+    /// the session already uses. Substituting a fresh pair out of habit — rotating
+    /// a routing token, say — restarts connectivity checks and can interrupt media.
+    ///
+    /// A renegotiation-time description also differs from a first one in carrying
+    /// the candidates gathered so far. Those are left untouched, which is correct
+    /// for this build: it emits `a=candidate` lines without the optional trailing
+    /// `ufrag` token, so no candidate-level value can fall out of step with the
+    /// substituted media-level one. `tests/ice_credentials.rs` pins that, since it
+    /// is an upstream behaviour rather than a guarantee.
+    ///
+    /// # Errors
+    ///
+    /// If either value is outside RFC 8445's length range or contains a character
+    /// outside `ice-char` (`ALPHA / DIGIT / "+" / "/"`). Rejecting here rather
+    /// than at `set_local_description` keeps the failure attributable: libwebrtc
+    /// reports the same problem as a generic invalid-parameters error much later.
+    ///
+    /// Note that RFC 8839 §5.4 asks a *sender* to keep the ufrag to 32 characters
+    /// even though a receiver must accept 256. That is not enforced here, because
+    /// the range libwebrtc itself accepts is the one that governs interoperation,
+    /// but staying inside 32 is the safer choice.
+    pub fn with_ice_credentials(&self, ufrag: &str, pwd: &str) -> crate::Result<Self> {
+        check_ice_value("ice-ufrag", ufrag, ICE_UFRAG_LEN)?;
+        check_ice_value("ice-pwd", pwd, ICE_PWD_LEN)?;
+
+        if self.ice_ufrags().is_empty() {
+            return Err(crate::Error::Webrtc(
+                "session description carries no ice-ufrag to replace".into(),
+            ));
+        }
+
+        // Every occurrence, not the first: bundled m-sections each carry the
+        // attribute and they must agree, so replacing one would leave an SDP that
+        // is inconsistent rather than substituted.
+        let mut out = String::with_capacity(self.sdp.len() + 64);
+        for line in self.sdp.lines() {
+            if line.starts_with("a=ice-ufrag:") {
+                out.push_str("a=ice-ufrag:");
+                out.push_str(ufrag);
+            } else if line.starts_with("a=ice-pwd:") {
+                out.push_str("a=ice-pwd:");
+                out.push_str(pwd);
+            } else {
+                out.push_str(line);
+            }
+            // SDP lines are CRLF-terminated (RFC 4566 §5); `lines` has already
+            // stripped whatever the input used.
+            out.push_str("\r\n");
+        }
+
+        Ok(Self {
+            kind: self.kind,
+            sdp: out,
+        })
+    }
+}
+
 /// A trickled ICE candidate.
 #[derive(Debug, Clone)]
 pub struct IceCandidate {
@@ -809,5 +950,166 @@ impl Drop for PeerConnection {
     fn drop(&mut self) {
         // Destroy the native PC (stops callbacks) before the observer box drops.
         unsafe { reactor_webrtc_sys::reactor_webrtc_peer_connection_destroy(self.raw) }
+    }
+}
+
+#[cfg(test)]
+mod sdp_ice_credentials_tests {
+    use super::*;
+
+    /// A two-section bundled description, as libwebrtc emits one.
+    fn bundled() -> SessionDescription {
+        SessionDescription {
+            kind: SdpType::Answer,
+            sdp: concat!(
+                "v=0\r\n",
+                "o=- 1 2 IN IP4 127.0.0.1\r\n",
+                "s=-\r\n",
+                "t=0 0\r\n",
+                "a=group:BUNDLE 0 1\r\n",
+                "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n",
+                "a=mid:0\r\n",
+                "a=ice-ufrag:jHFv\r\n",
+                "a=ice-pwd:0123456789012345678901\r\n",
+                "a=fingerprint:sha-256 AA:BB\r\n",
+                "m=video 9 UDP/TLS/RTP/SAVPF 96\r\n",
+                "a=mid:1\r\n",
+                "a=ice-ufrag:jHFv\r\n",
+                "a=ice-pwd:0123456789012345678901\r\n",
+                "a=fingerprint:sha-256 AA:BB\r\n",
+            )
+            .to_string(),
+        }
+    }
+
+    const UFRAG: &str = "CgAHFcpsamqt/IIl8YtGLBP8al/dIA";
+    const PWD: &str = "iMyV3ZlbyUC8SBiy/AeG2OVaSJ5di54s";
+
+    #[test]
+    fn replaces_every_section_not_just_the_first() {
+        // Replacing one and leaving the other would produce an SDP that is
+        // inconsistent rather than substituted, and bundled sections must agree.
+        let out = bundled().with_ice_credentials(UFRAG, PWD).unwrap();
+        assert_eq!(out.ice_ufrags(), vec![UFRAG, UFRAG]);
+        assert_eq!(out.sdp.matches(&format!("a=ice-pwd:{PWD}")).count(), 2);
+        assert!(!out.sdp.contains("jHFv"));
+    }
+
+    #[test]
+    fn leaves_everything_else_byte_for_byte() {
+        let out = bundled().with_ice_credentials(UFRAG, PWD).unwrap();
+        for keep in [
+            "a=group:BUNDLE 0 1",
+            "a=fingerprint:sha-256 AA:BB",
+            "m=video 9 UDP/TLS/RTP/SAVPF 96",
+            "a=mid:1",
+        ] {
+            assert!(out.sdp.contains(keep), "lost {keep:?}");
+        }
+        assert_eq!(out.sdp.lines().count(), bundled().sdp.lines().count());
+        assert_eq!(out.kind, bundled().kind);
+    }
+
+    #[test]
+    fn the_fingerprint_survives_untouched() {
+        // Load-bearing: DTLS is what keeps a relay out of the media, and it is
+        // authenticated by this line. Rewriting it would silently break end-to-end
+        // encryption rather than fail loudly.
+        let before = bundled();
+        let after = before.with_ice_credentials(UFRAG, PWD).unwrap();
+        let fp = |s: &SessionDescription| -> Vec<String> {
+            s.sdp
+                .lines()
+                .filter(|l| l.starts_with("a=fingerprint:"))
+                .map(str::to_string)
+                .collect()
+        };
+        assert_eq!(fp(&before), fp(&after));
+    }
+
+    #[test]
+    fn output_is_crlf_terminated() {
+        let out = bundled().with_ice_credentials(UFRAG, PWD).unwrap();
+        assert!(out.sdp.ends_with("\r\n"));
+        assert_eq!(
+            out.sdp.matches('\n').count(),
+            out.sdp.matches("\r\n").count()
+        );
+    }
+
+    #[test]
+    fn normalises_bare_lf_input_to_crlf() {
+        let lf = SessionDescription {
+            kind: SdpType::Offer,
+            sdp: "v=0\na=ice-ufrag:jHFv\na=ice-pwd:0123456789012345678901\n".into(),
+        };
+        let out = lf.with_ice_credentials(UFRAG, PWD).unwrap();
+        assert_eq!(out.sdp.matches("\r\n").count(), 3);
+    }
+
+    #[test]
+    fn rejects_a_ufrag_that_is_too_short_or_too_long() {
+        let d = bundled();
+        assert!(d.with_ice_credentials("abc", PWD).is_err());
+        assert!(d.with_ice_credentials(&"a".repeat(257), PWD).is_err());
+        assert!(d.with_ice_credentials(&"a".repeat(4), PWD).is_ok());
+        assert!(d.with_ice_credentials(&"a".repeat(256), PWD).is_ok());
+    }
+
+    #[test]
+    fn rejects_a_password_below_the_rfc_minimum() {
+        let d = bundled();
+        assert!(d.with_ice_credentials(UFRAG, &"a".repeat(21)).is_err());
+        assert!(d.with_ice_credentials(UFRAG, &"a".repeat(22)).is_ok());
+    }
+
+    #[test]
+    fn rejects_characters_outside_ice_char() {
+        // Rejecting here keeps the failure attributable. Passed through, these
+        // surface much later as a generic invalid-parameter error from libwebrtc.
+        let d = bundled();
+        for bad in [
+            "has space",
+            "has=equals",
+            "has\r\ninjected:line",
+            "acentuação",
+        ] {
+            assert!(
+                d.with_ice_credentials(bad, PWD).is_err(),
+                "{bad:?} was accepted as a ufrag"
+            );
+        }
+        assert!(d
+            .with_ice_credentials(UFRAG, "short but has spaces!!")
+            .is_err());
+    }
+
+    #[test]
+    fn a_crlf_in_a_credential_cannot_inject_an_sdp_line() {
+        // The alphabet check is what prevents this, and it is worth asserting
+        // directly rather than trusting it as a side effect.
+        let d = bundled();
+        assert!(d
+            .with_ice_credentials("aaaa\r\na=candidate:injected", PWD)
+            .is_err());
+    }
+
+    #[test]
+    fn refuses_a_description_with_no_credentials_to_replace() {
+        let empty = SessionDescription {
+            kind: SdpType::Offer,
+            sdp: "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n".into(),
+        };
+        assert!(empty.with_ice_credentials(UFRAG, PWD).is_err());
+    }
+
+    #[test]
+    fn ice_ufrags_reads_each_section() {
+        assert_eq!(bundled().ice_ufrags(), vec!["jHFv", "jHFv"]);
+        let none = SessionDescription {
+            kind: SdpType::Offer,
+            sdp: "v=0\r\n".into(),
+        };
+        assert!(none.ice_ufrags().is_empty());
     }
 }
