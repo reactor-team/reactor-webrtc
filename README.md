@@ -155,6 +155,8 @@ Per-target toolchain rationale lives at the top of `build.sh` (POSIX) and
 - ✅ Python wheel (`reactor-webrtc-py`): full signaling API, data channels, media tracks,
   stats, and a loopback test suite - built and tested in CI.
 - ✅ crates.io + PyPI publish CI (`publish.yml`), triggered by semver tag.
+- ✅ Caller-chosen ICE credentials (`SessionDescription::with_ice_credentials`), for
+  fronting layers that route on the ufrag.
 
 ## Licensing
 
