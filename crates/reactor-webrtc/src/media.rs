@@ -8,7 +8,7 @@
 //! a frame sink attached. Audio send is via the factory ADM
 //! ([`crate::PeerConnectionFactory::push_audio_frame`]).
 
-use crate::{Error, Result};
+use crate::{Error, FactoryHandle, Result};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::os::raw::c_int;
@@ -134,6 +134,11 @@ pub struct Track {
     // increasing keys in the sender map even when two pushes land in the
     // same millisecond.
     last_send_ms: AtomicI64,
+    // Keeps the factory's signaling/worker/network threads alive for as long
+    // as this track exists — destroying a track dispatches onto them, whether
+    // the track is a local one this factory produced or a remote one the
+    // observer delivered over a connection this factory created.
+    _factory: Arc<FactoryHandle>,
 }
 
 // SAFETY: the native track is internally thread-safe; sink callbacks are
@@ -147,6 +152,7 @@ impl Track {
     pub(crate) fn from_raw(
         raw: *mut reactor_webrtc_sys::MediaStreamTrack,
         kind: MediaKind,
+        factory: Arc<FactoryHandle>,
     ) -> Self {
         Self {
             raw,
@@ -157,6 +163,7 @@ impl Track {
             receiver_meta: None,
             frame_counter: AtomicU64::new(0),
             last_send_ms: AtomicI64::new(0),
+            _factory: factory,
         }
     }
 

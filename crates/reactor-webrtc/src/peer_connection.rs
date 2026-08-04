@@ -3,7 +3,7 @@
 use std::ffi::{c_void, CStr, CString};
 use std::os::raw::{c_char, c_int};
 use std::sync::mpsc::{sync_channel, SyncSender};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use reactor_webrtc_sys::ReactorStatEntry;
@@ -11,7 +11,7 @@ use reactor_webrtc_sys::ReactorStatEntry;
 use crate::encoded::FrameTransform;
 use crate::media::{MediaKind, Track};
 use crate::observer::ObserverState;
-use crate::{Error, Result};
+use crate::{Error, FactoryHandle, Result};
 
 /// How long to wait for an async native op (create offer/answer, set
 /// description, add ICE candidate) to complete before giving up.
@@ -517,6 +517,10 @@ pub struct DataChannel {
     raw: *mut reactor_webrtc_sys::DataChannel,
     // Keeps the callback closures alive while the native observer is registered.
     observer: Option<Box<DcObserverState>>,
+    // Keeps the factory's signaling/network threads alive for as long as this
+    // channel exists — a caller can detach it and outlive both the connection
+    // that created it and the factory that ultimately owns those threads.
+    _factory: Arc<FactoryHandle>,
 }
 
 // SAFETY: the native data channel is internally thread-safe; callbacks are
@@ -526,10 +530,14 @@ unsafe impl Send for DataChannel {}
 unsafe impl Sync for DataChannel {}
 
 impl DataChannel {
-    pub(crate) fn from_raw(raw: *mut reactor_webrtc_sys::DataChannel) -> Self {
+    pub(crate) fn from_raw(
+        raw: *mut reactor_webrtc_sys::DataChannel,
+        factory: Arc<FactoryHandle>,
+    ) -> Self {
         Self {
             raw,
             observer: None,
+            _factory: factory,
         }
     }
 
@@ -769,6 +777,10 @@ pub struct PeerConnection {
     // Keeps the observer closures alive for the connection's lifetime. The
     // native side holds a pointer into this box.
     _observer: Box<ObserverState>,
+    // Keeps the factory's signaling/worker/network threads alive for as long
+    // as this connection exists — destroying it dispatches onto them, so it
+    // must not be destroyed after they are.
+    _factory: Arc<FactoryHandle>,
 }
 
 // SAFETY: the native peer connection is internally thread-safe; observer
@@ -780,10 +792,12 @@ impl PeerConnection {
     pub(crate) fn new(
         raw: *mut reactor_webrtc_sys::PeerConnection,
         observer: Box<ObserverState>,
+        factory: Arc<FactoryHandle>,
     ) -> Self {
         Self {
             raw,
             _observer: observer,
+            _factory: factory,
         }
     }
 
@@ -922,7 +936,7 @@ impl PeerConnection {
         if raw.is_null() {
             Err(Error::Webrtc("create_data_channel returned null".into()))
         } else {
-            Ok(DataChannel::from_raw(raw))
+            Ok(DataChannel::from_raw(raw, Arc::clone(&self._factory)))
         }
     }
 
