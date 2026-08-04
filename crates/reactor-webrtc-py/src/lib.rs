@@ -917,7 +917,7 @@ impl EncodedVideoTrack {
     /// transceiver automatically).
     fn add_to_peer_connection(&self, py: Python, pc: &PeerConnection) -> PyResult<()> {
         let track = self.inner.track();
-        py.allow_threads(|| pc.inner.as_ref().unwrap().add_track(track))
+        py.allow_threads(|| pc.pc().add_track(track))
             .map_err(err)
     }
 
@@ -932,7 +932,7 @@ impl EncodedVideoTrack {
         let track = self.inner.track();
         let t = py
             .allow_threads(|| {
-                pc.inner.as_ref().unwrap().add_transceiver(
+                pc.pc().add_transceiver(
                     rw::MediaKind::Video,
                     rw::TransceiverDirection::from(direction),
                 )
@@ -1384,10 +1384,21 @@ impl Drop for PeerConnection {
     }
 }
 
+impl PeerConnection {
+    /// Borrows the native connection. `inner` is only ever `None` after this
+    /// object's own `Drop` has run — which means it no longer exists to call
+    /// a method on, so every live call through Python sees `Some`.
+    fn pc(&self) -> &Arc<rw::PeerConnection> {
+        self.inner
+            .as_ref()
+            .expect("PeerConnection used after being dropped")
+    }
+}
+
 #[pymethods]
 impl PeerConnection {
     fn create_offer<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let inner = Arc::clone(self.inner.as_ref().unwrap());
+        let inner = Arc::clone(self.pc());
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             tokio::task::spawn_blocking(move || inner.create_offer())
                 .await
@@ -1397,7 +1408,7 @@ impl PeerConnection {
         })
     }
     fn create_answer<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let inner = Arc::clone(self.inner.as_ref().unwrap());
+        let inner = Arc::clone(self.pc());
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             tokio::task::spawn_blocking(move || inner.create_answer())
                 .await
@@ -1411,7 +1422,7 @@ impl PeerConnection {
         py: Python<'py>,
         sdp: &SessionDescription,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let inner = Arc::clone(self.inner.as_ref().unwrap());
+        let inner = Arc::clone(self.pc());
         let rust = to_rust_sdp(sdp)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             tokio::task::spawn_blocking(move || inner.set_local_description(&rust))
@@ -1425,7 +1436,7 @@ impl PeerConnection {
         py: Python<'py>,
         sdp: &SessionDescription,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let inner = Arc::clone(self.inner.as_ref().unwrap());
+        let inner = Arc::clone(self.pc());
         let rust = to_rust_sdp(sdp)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             tokio::task::spawn_blocking(move || inner.set_remote_description(&rust))
@@ -1439,7 +1450,7 @@ impl PeerConnection {
         py: Python<'py>,
         candidate: &IceCandidate,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let inner = Arc::clone(self.inner.as_ref().unwrap());
+        let inner = Arc::clone(self.pc());
         let rust = rw::IceCandidate::from(candidate);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             tokio::task::spawn_blocking(move || inner.add_ice_candidate(&rust))
@@ -1449,7 +1460,7 @@ impl PeerConnection {
         })
     }
     fn add_track(&self, py: Python, track: &Track) -> PyResult<()> {
-        py.allow_threads(|| self.inner.as_ref().unwrap().add_track(&track.inner))
+        py.allow_threads(|| self.pc().add_track(&track.inner))
             .map_err(err)
     }
     fn add_transceiver(
@@ -1473,7 +1484,7 @@ impl PeerConnection {
         .map_err(err)
     }
     fn create_data_channel(&self, py: Python, label: &str) -> PyResult<DataChannel> {
-        py.allow_threads(|| self.inner.as_ref().unwrap().create_data_channel(label))
+        py.allow_threads(|| self.pc().create_data_channel(label))
             .map(|inner| DataChannel {
                 inner: ManuallyDrop::new(inner),
             })
@@ -1485,7 +1496,7 @@ impl PeerConnection {
     /// to attach local tracks to the transceivers auto-created from the remote
     /// offer's recvonly m-sections.
     fn transceivers(&self, py: Python) -> Vec<Transceiver> {
-        py.allow_threads(|| self.inner.as_ref().unwrap().transceivers())
+        py.allow_threads(|| self.pc().transceivers())
             .into_iter()
             .map(|t| Transceiver { inner: t })
             .collect()
@@ -1495,7 +1506,7 @@ impl PeerConnection {
     /// Returns a `StatsReport` with inbound/outbound RTP streams and ICE
     /// candidate-pair metrics.
     fn get_stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let inner = Arc::clone(self.inner.as_ref().unwrap());
+        let inner = Arc::clone(self.pc());
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             tokio::task::spawn_blocking(move || inner.get_stats())
                 .await
