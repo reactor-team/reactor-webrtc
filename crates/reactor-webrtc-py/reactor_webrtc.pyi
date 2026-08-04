@@ -201,15 +201,19 @@ class Track:
         ...
     def on_video_frame(
         self,
-        callback: Callable[[bytes, int, int, Optional[FrameMetadata]], None],
+        callback: Union[
+            Callable[[bytes, int, int, Optional[FrameMetadata]], None],
+            Callable[[bytes, int, int], None],
+        ],
     ) -> None:
-        """Register `callback(bgra: bytes, width: int, height: int, metadata: FrameMetadata | None)`.
+        """Register a callback for decoded video frames from a remote track.
+
+        Preferred signature: `callback(bgra: bytes, width: int, height: int, metadata: FrameMetadata | None)`.
+        Legacy 3-arg signature `callback(bgra, width, height)` is also accepted.
 
         `metadata` is `None` when no receiver transform is attached or when the
-        sender did not include a trailer. For backward compatibility with
-        3-argument callbacks `callback(bgra, width, height)`, the 4-argument
-        call is retried as a 3-argument call on `TypeError` when `metadata` is
-        `None`.
+        sender did not include a trailer. When `metadata` is `None` and the
+        4-arg call raises any exception, it is retried as a 3-arg call.
 
         Note: all-zero frames (empty jitter buffer from peers with no incoming
         RTP) are suppressed and will not trigger this callback."""
