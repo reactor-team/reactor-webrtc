@@ -24,7 +24,7 @@ jobs:
     # exempting commits inline (the inline check can be spoofed via git config).
     if: github.event.pull_request.user.login != 'dependabot[bot]'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 

@@ -29,7 +29,7 @@ jobs:
       # needs a recent clang.
       CXX: clang++-21
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0   # mise.lock drift check diffs against the merge-base
       - uses: actions-rust-lang/setup-rust-toolchain@v1   # reads rust-toolchain.toml
@@ -65,7 +65,7 @@ jobs:
     outputs:
       available: ${{ steps.check.outputs.available }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: check
         shell: bash
         run: |
@@ -109,7 +109,7 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Derive the prebuilt URL+SHA256 from WEBRTC_VERSION so this job always
       # tests the prebuilt that matches the current source tree, and stays in
@@ -201,7 +201,7 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Resolve libwebrtc prebuilt
         id: prebuilt
@@ -276,7 +276,7 @@ jobs:
           REACTOR_WEBRTC_PREBUILT_SHA256: ${{ steps.prebuilt.outputs.sha256 }}
           RUSTFLAGS: ${{ matrix.rustflags }}
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wheel-${{ matrix.platform }}
           path: target/wheels/reactor_webrtc-*.whl
@@ -301,8 +301,8 @@ jobs:
             os: windows-latest
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           name: wheel-${{ matrix.platform }}
           path: target/wheels
