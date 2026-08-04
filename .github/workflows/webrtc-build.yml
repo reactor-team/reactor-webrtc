@@ -250,7 +250,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends clang-21
           echo "CXX=clang++-21" >> "$GITHUB_ENV"
 
-      - uses: jdx/mise-action@v2
+      - uses: jdx/mise-action@v4
         with:
           version: ${{ env.MISE_VERSION }}
 
@@ -319,7 +319,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends clang-21
           echo "CXX=clang++-21" >> "$GITHUB_ENV"
 
-      - uses: jdx/mise-action@v2
+      - uses: jdx/mise-action@v4
         with:
           version: ${{ env.MISE_VERSION }}
 
@@ -386,7 +386,7 @@ jobs:
         with:
           name: wheel-${{ matrix.os }}-${{ matrix.arch }}
           path: target/wheels
-      - uses: jdx/mise-action@v2
+      - uses: jdx/mise-action@v4
         with:
           version: ${{ env.MISE_VERSION }}
       - run: mise run //crates/reactor-webrtc-py:test
