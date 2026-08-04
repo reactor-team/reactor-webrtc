@@ -129,18 +129,47 @@ impl ApmConfig {
     }
 }
 
-/// Entry point: creates peer connections and tracks, and owns the audio device
-/// module (synthetic by default, or the platform device).
-pub struct PeerConnectionFactory {
-    raw: *mut reactor_webrtc_sys::PeerConnectionFactory,
-}
+/// The native factory pointer, refcounted so every object the factory produces
+/// (a [`PeerConnection`], a [`Track`](crate::media::Track)) can hold a clone and
+/// keep the factory's signaling/worker/network threads alive for as long as it
+/// lives — including past the point where the [`PeerConnectionFactory`] value
+/// itself is dropped. Without this, the factory's `Drop` tears those threads
+/// down as soon as its own handle goes out of scope, and any object it produced
+/// that outlives it is left holding a pointer into what those threads used to
+/// back.
+pub(crate) struct FactoryHandle(*mut reactor_webrtc_sys::PeerConnectionFactory);
 
 // SAFETY: the native factory is internally thread-safe (it owns the WebRTC
 // signaling/worker/network threads).
-unsafe impl Send for PeerConnectionFactory {}
-unsafe impl Sync for PeerConnectionFactory {}
+unsafe impl Send for FactoryHandle {}
+unsafe impl Sync for FactoryHandle {}
+
+impl FactoryHandle {
+    pub(crate) fn raw(&self) -> *mut reactor_webrtc_sys::PeerConnectionFactory {
+        self.0
+    }
+}
+
+impl Drop for FactoryHandle {
+    fn drop(&mut self) {
+        unsafe { reactor_webrtc_sys::reactor_webrtc_factory_destroy(self.0) }
+    }
+}
+
+/// Entry point: creates peer connections and tracks, and owns the audio device
+/// module (synthetic by default, or the platform device).
+pub struct PeerConnectionFactory {
+    handle: Arc<FactoryHandle>,
+}
 
 impl PeerConnectionFactory {
+    /// Clone the refcounted native handle, so a [`PeerConnection`] or
+    /// [`Track`] created from this factory can keep its threads alive past
+    /// this value's own lifetime.
+    pub(crate) fn handle(&self) -> Arc<FactoryHandle> {
+        Arc::clone(&self.handle)
+    }
+
     /// Create a factory with the given [`AdmMode`] and no APM processing.
     pub fn with_adm(mode: AdmMode) -> Result<Self> {
         Self::with_adm_apm(mode, ApmConfig::default())
@@ -157,7 +186,9 @@ impl PeerConnectionFactory {
         if raw.is_null() {
             return Err(Error::Webrtc("factory creation returned null".into()));
         }
-        Ok(Self { raw })
+        Ok(Self {
+            handle: Arc::new(FactoryHandle(raw)),
+        })
     }
 
     /// Create a factory using the **synthetic** audio device module — no audio
@@ -216,7 +247,9 @@ impl PeerConnectionFactory {
                 "factory with custom encoder returned null".into(),
             ));
         }
-        Ok(Self { raw })
+        Ok(Self {
+            handle: Arc::new(FactoryHandle(raw)),
+        })
     }
 
     /// Create a builder for a factory that supports **multiple** pre-encoded
@@ -280,7 +313,7 @@ impl PeerConnectionFactory {
         config: &RtcConfiguration,
         observer: PeerConnectionObserver,
     ) -> Result<PeerConnection> {
-        let state = observer.into_state();
+        let state = observer.into_state(self.handle());
         let callbacks = state.callbacks();
         let native = config.to_native()?;
         // libwebrtc reports why it rejected the configuration (an empty TURN
@@ -288,7 +321,7 @@ impl PeerConnectionFactory {
         let mut err = [0 as std::os::raw::c_char; 256];
         let raw = unsafe {
             reactor_webrtc_sys::reactor_webrtc_peer_connection_create(
-                self.raw,
+                self.handle.raw(),
                 &native.config(),
                 &callbacks,
                 err.as_mut_ptr(),
@@ -305,7 +338,7 @@ impl PeerConnectionFactory {
                 format!("peer connection creation failed: {reason}")
             }));
         }
-        Ok(PeerConnection::new(raw, state))
+        Ok(PeerConnection::new(raw, state, self.handle()))
     }
 
     /// Create a local video track backed by a push-able source
@@ -313,12 +346,12 @@ impl PeerConnectionFactory {
     pub fn create_video_track(&self, id: &str) -> Result<Track> {
         let cid = CString::new(id).map_err(|_| Error::Webrtc("id contains a NUL byte".into()))?;
         let raw = unsafe {
-            reactor_webrtc_sys::reactor_webrtc_video_track_create(self.raw, cid.as_ptr())
+            reactor_webrtc_sys::reactor_webrtc_video_track_create(self.handle.raw(), cid.as_ptr())
         };
         if raw.is_null() {
             return Err(Error::Webrtc("video track creation returned null".into()));
         }
-        Ok(Track::from_raw(raw, MediaKind::Video))
+        Ok(Track::from_raw(raw, MediaKind::Video, self.handle()))
     }
 
     /// Create a local audio track. Its samples come from this factory's ADM —
@@ -326,12 +359,12 @@ impl PeerConnectionFactory {
     pub fn create_audio_track(&self, id: &str) -> Result<Track> {
         let cid = CString::new(id).map_err(|_| Error::Webrtc("id contains a NUL byte".into()))?;
         let raw = unsafe {
-            reactor_webrtc_sys::reactor_webrtc_audio_track_create(self.raw, cid.as_ptr())
+            reactor_webrtc_sys::reactor_webrtc_audio_track_create(self.handle.raw(), cid.as_ptr())
         };
         if raw.is_null() {
             return Err(Error::Webrtc("audio track creation returned null".into()));
         }
-        Ok(Track::from_raw(raw, MediaKind::Audio))
+        Ok(Track::from_raw(raw, MediaKind::Audio, self.handle()))
     }
 
     /// Create a local audio track with a per-track audio source, independent of
@@ -342,7 +375,7 @@ impl PeerConnectionFactory {
         let cid = CString::new(id).map_err(|_| Error::Webrtc("id contains a NUL byte".into()))?;
         let raw = unsafe {
             reactor_webrtc_sys::reactor_webrtc_audio_track_create_with_local_source(
-                self.raw,
+                self.handle.raw(),
                 cid.as_ptr(),
             )
         };
@@ -351,7 +384,7 @@ impl PeerConnectionFactory {
                 "audio track with local source creation returned null".into(),
             ));
         }
-        Ok(Track::from_raw(raw, MediaKind::Audio))
+        Ok(Track::from_raw(raw, MediaKind::Audio, self.handle()))
     }
 
     /// Feed interleaved i16 PCM to the (synthetic) ADM, shared by all local
@@ -362,7 +395,7 @@ impl PeerConnectionFactory {
         let samples_per_channel = (pcm.len() / channels as usize) as c_int;
         unsafe {
             reactor_webrtc_sys::reactor_webrtc_factory_push_audio_frame(
-                self.raw,
+                self.handle.raw(),
                 pcm.as_ptr(),
                 samples_per_channel,
                 sample_rate as c_int,
@@ -376,15 +409,9 @@ impl PeerConnectionFactory {
     pub fn set_adm_playout_enabled(&self, enabled: bool) {
         unsafe {
             reactor_webrtc_sys::reactor_webrtc_factory_set_adm_playout_enabled(
-                self.raw,
+                self.handle.raw(),
                 enabled as c_int,
             )
         }
-    }
-}
-
-impl Drop for PeerConnectionFactory {
-    fn drop(&mut self) {
-        unsafe { reactor_webrtc_sys::reactor_webrtc_factory_destroy(self.raw) }
     }
 }

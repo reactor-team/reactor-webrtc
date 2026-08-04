@@ -6,10 +6,11 @@
 
 use std::ffi::{c_void, CStr};
 use std::os::raw::{c_char, c_int};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::media::{MediaKind, Track};
 use crate::peer_connection::{DataChannel, IceCandidate, IceGatheringState, PeerConnectionState};
+use crate::FactoryHandle;
 
 type StateCb = Box<dyn FnMut(PeerConnectionState) + Send>;
 type GatheringCb = Box<dyn FnMut(IceGatheringState) + Send>;
@@ -60,13 +61,14 @@ impl PeerConnectionObserver {
         self
     }
 
-    pub(crate) fn into_state(self) -> Box<ObserverState> {
+    pub(crate) fn into_state(self, factory: Arc<FactoryHandle>) -> Box<ObserverState> {
         Box::new(ObserverState {
             conn: self.on_connection_state_change.map(Mutex::new),
             gathering: self.on_ice_gathering_change.map(Mutex::new),
             ice: self.on_ice_candidate.map(Mutex::new),
             track: self.on_track.map(Mutex::new),
             data_channel: self.on_data_channel.map(Mutex::new),
+            factory,
         })
     }
 }
@@ -79,6 +81,10 @@ pub(crate) struct ObserverState {
     ice: Option<Mutex<IceCb>>,
     track: Option<Mutex<TrackCb>>,
     data_channel: Option<Mutex<DataChannelCb>>,
+    // Cloned into every remote `Track` the `on_track` trampoline hands off, so
+    // a caller that detaches a remote track and drops the peer connection
+    // still keeps the factory's threads alive for as long as that track does.
+    factory: Arc<FactoryHandle>,
 }
 
 impl ObserverState {
@@ -148,7 +154,7 @@ extern "C" fn tramp_track(ud: *mut c_void, track: *mut reactor_webrtc_sys::Media
         reactor_webrtc_sys::reactor_webrtc_media_stream_track_kind(track)
     });
     // Take ownership of the handle; if there's no handler, dropping it frees it.
-    let t = Track::from_raw(track, kind);
+    let t = Track::from_raw(track, kind, Arc::clone(&st.factory));
     if let Some(m) = &st.track {
         if let Ok(mut cb) = m.lock() {
             cb(kind, t);
