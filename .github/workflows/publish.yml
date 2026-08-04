@@ -30,7 +30,7 @@ jobs:
       contents: read   # actions/checkout
       id-token: write  # OIDC trusted publishing — no API token required
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
 
       # Bake the current libwebrtc release tag into build.rs so that the
@@ -136,7 +136,7 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Derive the libwebrtc release tag from WEBRTC_VERSION and build the
       # matching prebuilt asset URL. The repo is public, so the release download
@@ -215,7 +215,7 @@ jobs:
           pip install --no-index --find-links dist/ reactor_webrtc
           python -c "import reactor_webrtc; print('reactor_webrtc imported ok')"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wheel-${{ matrix.platform }}
           path: dist/*.whl
@@ -231,7 +231,7 @@ jobs:
     permissions:
       id-token: write  # OIDC trusted publishing — no API token required
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: wheel-*
           merge-multiple: true

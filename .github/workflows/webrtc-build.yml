@@ -120,7 +120,7 @@ jobs:
       PROFILE: ${{ matrix.profile || needs.setup.outputs.profile }}
       IOS_ENV: ${{ matrix.ios_env }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Free disk space (Linux)
         if: runner.os == 'Linux'
@@ -172,7 +172,7 @@ jobs:
 
       - name: Upload prebuilt
         if: success()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: prebuilt-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ios_env && format('-{0}', matrix.ios_env) || '' }}
           path: |
@@ -222,10 +222,10 @@ jobs:
       MISE_LOCKED: "1"
       MISE_DISABLE_TOOLS: "rust,rustup,aqua:rust-lang/rustup"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Download prebuilt artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: prebuilt-${{ matrix.os }}-${{ matrix.arch }}
           path: dl
@@ -291,10 +291,10 @@ jobs:
       MISE_LOCKED: "1"
       MISE_DISABLE_TOOLS: "rust,rustup,aqua:rust-lang/rustup"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Download prebuilt artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: prebuilt-${{ matrix.os }}-${{ matrix.arch }}
           path: dl
@@ -347,7 +347,7 @@ jobs:
           RUSTFLAGS: ${{ matrix.rustflags }}
           MACOSX_DEPLOYMENT_TARGET: "13.0"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wheel-${{ matrix.os }}-${{ matrix.arch }}
           path: target/wheels/reactor_webrtc-*.whl
@@ -381,8 +381,8 @@ jobs:
       MISE_LOCKED: "1"
       MISE_DISABLE_TOOLS: "rust,rustup,aqua:rust-lang/rustup"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           name: wheel-${{ matrix.os }}-${{ matrix.arch }}
           path: target/wheels
@@ -404,9 +404,9 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Download all prebuilts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: webrtc-build/dist
           merge-multiple: true
