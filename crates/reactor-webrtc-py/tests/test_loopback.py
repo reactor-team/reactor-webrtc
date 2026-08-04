@@ -5,6 +5,7 @@ All tests require the module to be built (`maturin develop`).  Run with:
     pytest crates/reactor-webrtc-py/tests/ -v
 """
 
+import asyncio
 import threading
 import time
 from dataclasses import dataclass, field
@@ -19,12 +20,12 @@ POLL = 0.025
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
-def wait_for(condition, timeout: float = TIMEOUT, poll: float = POLL) -> bool:
+async def wait_for(condition, timeout: float = TIMEOUT, poll: float = POLL) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if condition():
             return True
-        time.sleep(poll)
+        await asyncio.sleep(poll)
     return False
 
 
@@ -65,33 +66,33 @@ def make_peer(
     return peer
 
 
-def negotiate(p1: Peer, p2: Peer) -> None:
-    offer = p1.pc.create_offer()
-    p1.pc.set_local_description(offer)
-    p2.pc.set_remote_description(offer)
-    answer = p2.pc.create_answer()
-    p2.pc.set_local_description(answer)
-    p1.pc.set_remote_description(answer)
+async def negotiate(p1: Peer, p2: Peer) -> None:
+    offer = await p1.pc.create_offer()
+    await p1.pc.set_local_description(offer)
+    await p2.pc.set_remote_description(offer)
+    answer = await p2.pc.create_answer()
+    await p2.pc.set_local_description(answer)
+    await p1.pc.set_remote_description(answer)
 
 
-def trickle(src: Peer, dst: Peer) -> None:
+async def trickle(src: Peer, dst: Peer) -> None:
     for cand in list(src.ice):
-        dst.pc.add_ice_candidate(cand)
+        await dst.pc.add_ice_candidate(cand)
     src.ice.clear()
 
 
-def connect(p1: Peer, p2: Peer, *, open_event: threading.Event | None = None) -> bool:
+async def connect(p1: Peer, p2: Peer, *, open_event: threading.Event | None = None) -> bool:
     """Negotiate and trickle ICE until both peers are connected."""
-    negotiate(p1, p2)
+    await negotiate(p1, p2)
     deadline = time.monotonic() + TIMEOUT
     while time.monotonic() < deadline:
-        trickle(p1, p2)
-        trickle(p2, p1)
+        await trickle(p1, p2)
+        await trickle(p2, p1)
         if open_event is not None and open_event.is_set():
             return True
         if open_event is None and p1.connected.is_set() and p2.connected.is_set():
             return True
-        time.sleep(POLL)
+        await asyncio.sleep(POLL)
     return False
 
 
@@ -121,41 +122,41 @@ class TestFactory:
 
 
 class TestPeerConnection:
-    def test_create_offer_returns_offer_sdp(self, factory):
+    async def test_create_offer_returns_offer_sdp(self, factory):
         p = make_peer(factory)
         dc = p.pc.create_data_channel("probe")  # need an m-section for a non-empty offer
-        offer = p.pc.create_offer()
+        offer = await p.pc.create_offer()
         assert offer.kind == "offer"
         assert "v=0" in offer.sdp
 
-    def test_create_answer_after_remote_offer(self, factory):
+    async def test_create_answer_after_remote_offer(self, factory):
         p1 = make_peer(factory)
         p2 = make_peer(factory)
         p1.pc.create_data_channel("probe")
-        offer = p1.pc.create_offer()
-        p1.pc.set_local_description(offer)
-        p2.pc.set_remote_description(offer)
-        answer = p2.pc.create_answer()
+        offer = await p1.pc.create_offer()
+        await p1.pc.set_local_description(offer)
+        await p2.pc.set_remote_description(offer)
+        answer = await p2.pc.create_answer()
         assert answer.kind == "answer"
         assert "v=0" in answer.sdp
 
-    def test_invalid_sdp_kind_raises(self, factory):
+    async def test_invalid_sdp_kind_raises(self, factory):
         p = make_peer(factory)
         bad_sdp = rw.SessionDescription("bogus", "v=0\r\n")
         with pytest.raises(RuntimeError, match="unknown SDP kind"):
-            p.pc.set_remote_description(bad_sdp)
+            await p.pc.set_remote_description(bad_sdp)
 
     def test_add_transceiver_unknown_kind_raises(self, factory):
         p = make_peer(factory)
         with pytest.raises(RuntimeError, match="Audio or Video"):
             p.pc.add_transceiver(rw.MediaKind.Unknown, rw.TransceiverDirection.SendRecv)
 
-    def test_add_transceiver_mid_set_after_sdp(self, factory):
+    async def test_add_transceiver_mid_set_after_sdp(self, factory):
         p1 = make_peer(factory)
         p2 = make_peer(factory)
         t = p1.pc.add_transceiver(rw.MediaKind.Video, rw.TransceiverDirection.SendOnly)
         assert t.mid() is None  # not yet negotiated
-        negotiate(p1, p2)
+        await negotiate(p1, p2)
         assert t.mid() is not None  # SDP exchange assigns the mid
 
     def test_add_video_track(self, factory):
@@ -163,21 +164,21 @@ class TestPeerConnection:
         track = factory.create_video_track("cam")
         p.pc.add_track(track)  # must not raise
 
-    def test_ice_gathering_change_fires(self, factory):
+    async def test_ice_gathering_change_fires(self, factory):
         p = make_peer(factory)
         p.pc.create_data_channel("probe")
         # ICE gathering starts after set_local_description, not create_offer
-        offer = p.pc.create_offer()
-        p.pc.set_local_description(offer)
-        ok = wait_for(lambda: rw.IceGatheringState.Gathering in p.gathering_states)
+        offer = await p.pc.create_offer()
+        await p.pc.set_local_description(offer)
+        ok = await wait_for(lambda: rw.IceGatheringState.Gathering in p.gathering_states)
         assert ok, "on_ice_gathering_change(Gathering) never fired"
 
-    def test_ice_candidates_collected(self, factory):
+    async def test_ice_candidates_collected(self, factory):
         p = make_peer(factory)
         p.pc.create_data_channel("probe")
-        offer = p.pc.create_offer()
-        p.pc.set_local_description(offer)
-        ok = wait_for(lambda: len(p.ice) > 0)
+        offer = await p.pc.create_offer()
+        await p.pc.set_local_description(offer)
+        ok = await wait_for(lambda: len(p.ice) > 0)
         assert ok, "no ICE candidates gathered within timeout"
         for c in p.ice:
             assert isinstance(c, rw.IceCandidate)
@@ -204,7 +205,7 @@ class TestDataChannel:
         dc = p.pc.create_data_channel("ch")
         assert dc.buffered_amount() == 0
 
-    def test_send_receive_binary(self, factory):
+    async def test_send_receive_binary(self, factory):
         received: list[tuple[bytes, bool]] = []
         dc2_ref: list[rw.DataChannel] = []
 
@@ -219,18 +220,18 @@ class TestDataChannel:
         dc1_open = threading.Event()
         dc1.on_open(dc1_open.set)
 
-        ok = connect(p1, p2, open_event=dc1_open)
+        ok = await connect(p1, p2, open_event=dc1_open)
         assert ok, "data channel did not open within timeout"
 
         dc1.send(b"hello", True)
         dc1.send(b"world", True)
 
-        assert wait_for(lambda: len(received) >= 2), "messages not received"
+        assert await wait_for(lambda: len(received) >= 2), "messages not received"
         payloads = {r[0] for r in received}
         assert payloads == {b"hello", b"world"}
         assert all(binary for _, binary in received)
 
-    def test_send_receive_text(self, factory):
+    async def test_send_receive_text(self, factory):
         received: list[tuple[bytes, bool]] = []
         dc2_ref: list[rw.DataChannel] = []
 
@@ -245,17 +246,17 @@ class TestDataChannel:
         dc1_open = threading.Event()
         dc1.on_open(dc1_open.set)
 
-        ok = connect(p1, p2, open_event=dc1_open)
+        ok = await connect(p1, p2, open_event=dc1_open)
         assert ok, "data channel did not open within timeout"
 
         dc1.send(b"ping", False)  # binary=False → text SCTP message
 
-        assert wait_for(lambda: len(received) >= 1)
+        assert await wait_for(lambda: len(received) >= 1)
         assert received[0][0] == b"ping"
         # text messages arrive with binary=False
         assert received[0][1] is False
 
-    def test_on_state_change_fires_open(self, factory):
+    async def test_on_state_change_fires_open(self, factory):
         states: list[rw.DataChannelState] = []
         dc2_ref: list[rw.DataChannel] = []
 
@@ -270,14 +271,14 @@ class TestDataChannel:
         dc1_open = threading.Event()
         dc1.on_open(dc1_open.set)
 
-        ok = connect(p1, p2, open_event=dc1_open)
+        ok = await connect(p1, p2, open_event=dc1_open)
         assert ok, "data channel did not open within timeout"
 
-        assert wait_for(lambda: rw.DataChannelState.Open in states), (
+        assert await wait_for(lambda: rw.DataChannelState.Open in states), (
             "on_state_change(Open) never fired on the remote data channel"
         )
 
-    def test_multiple_channels(self, factory):
+    async def test_multiple_channels(self, factory):
         received_a: list[bytes] = []
         received_b: list[bytes] = []
         dcs: list[rw.DataChannel] = []
@@ -305,13 +306,15 @@ class TestDataChannel:
         dca.on_open(mark_open)
         dcb.on_open(mark_open)
 
-        ok = connect(p1, p2, open_event=both_open)
+        ok = await connect(p1, p2, open_event=both_open)
         assert ok, "data channels did not open within timeout"
 
         dca.send(b"from-a", True)
         dcb.send(b"from-b", True)
 
-        assert wait_for(lambda: received_a and received_b), "messages not received on both channels"
+        assert await wait_for(lambda: received_a and received_b), (
+            "messages not received on both channels"
+        )
         assert received_a == [b"from-a"]
         assert received_b == [b"from-b"]
 
@@ -320,42 +323,42 @@ class TestDataChannel:
 
 
 class TestStats:
-    def test_get_stats_returns_report(self, factory):
+    async def test_get_stats_returns_report(self, factory):
         """get_stats() always returns a StatsReport, even before connection."""
         p = make_peer(factory)
-        report = p.pc.get_stats()
+        report = await p.pc.get_stats()
         assert isinstance(report, rw.StatsReport)
 
-    def test_stats_empty_before_negotiation(self, factory):
+    async def test_stats_empty_before_negotiation(self, factory):
         """No RTP streams without an offer/answer exchange."""
         p = make_peer(factory)
-        report = p.pc.get_stats()
+        report = await p.pc.get_stats()
         assert report.inbound_rtp == []
         assert report.outbound_rtp == []
 
-    def test_stats_candidate_pairs_after_connection(self, factory):
+    async def test_stats_candidate_pairs_after_connection(self, factory):
         """At least one candidate pair exists once peers are connected."""
         p1 = make_peer(factory)
         p2 = make_peer(factory)
         p1.pc.create_data_channel("probe")
 
-        ok = connect(p1, p2)
+        ok = await connect(p1, p2)
         assert ok, "peers did not connect within timeout"
 
-        report1 = p1.pc.get_stats()
+        report1 = await p1.pc.get_stats()
         assert isinstance(report1, rw.StatsReport)
         assert len(report1.candidate_pairs) > 0, "expected at least one candidate pair"
 
-    def test_candidate_pair_stats_fields(self, factory):
+    async def test_candidate_pair_stats_fields(self, factory):
         """IceCandidatePairStats fields have sane types and values."""
         p1 = make_peer(factory)
         p2 = make_peer(factory)
         p1.pc.create_data_channel("probe")
 
-        ok = connect(p1, p2)
+        ok = await connect(p1, p2)
         assert ok, "peers did not connect within timeout"
 
-        report = p1.pc.get_stats()
+        report = await p1.pc.get_stats()
         pair = next(
             (cp for cp in report.candidate_pairs if cp.state == rw.IceCandidatePairState.Succeeded),
             None,
@@ -376,12 +379,12 @@ class TestStats:
             for j, b in enumerate(variants):
                 assert (a == b) == (i == j)
 
-    def test_stats_report_repr(self, factory):
+    async def test_stats_report_repr(self, factory):
         p = make_peer(factory)
-        r = p.pc.get_stats()
+        r = await p.pc.get_stats()
         assert "StatsReport" in repr(r)
 
-    def test_inbound_rtp_stats_fields_after_receive(self, factory):
+    async def test_inbound_rtp_stats_fields_after_receive(self, factory):
         """After receiving RTP audio, inbound stats are populated."""
         received_audio = threading.Event()
         p1 = make_peer(factory)
@@ -392,18 +395,18 @@ class TestStats:
         audio = factory.create_audio_track("mic")
         p1.pc.add_track(audio)
 
-        ok = connect(p1, p2)
+        ok = await connect(p1, p2)
         assert ok, "peers did not connect within timeout"
 
         # Push enough PCM so at least one RTP packet crosses the loopback
         pcm = b"\x00" * 960  # 10 ms at 48 kHz mono
         for _ in range(20):
             factory.push_audio_frame(pcm, sample_rate=48000, channels=1)
-            time.sleep(0.01)
+            await asyncio.sleep(0.01)
 
-        wait_for(lambda: received_audio.is_set(), timeout=10.0)
+        await wait_for(lambda: received_audio.is_set(), timeout=10.0)
 
-        report = p2.pc.get_stats()
+        report = await p2.pc.get_stats()
         assert len(report.inbound_rtp) > 0, "expected inbound RTP stats after receiving audio"
         s = report.inbound_rtp[0]
         assert s.ssrc > 0
@@ -418,7 +421,7 @@ class TestStats:
 class TestFrameMetadata:
     """End-to-end tests for per-frame metadata embedded via the packet trailer."""
 
-    def test_frame_metadata_roundtrip(self, factory):
+    async def test_frame_metadata_roundtrip(self, factory):
         """Metadata pushed by the sender arrives in on_video_frame as FrameMetadata."""
         recv_track_ref: list = []  # keeps the Track alive — Drop removes the sink
         recv_tf_ref: list = []  # keeps the FrameTransform alive
@@ -442,7 +445,7 @@ class TestFrameMetadata:
         send_tf = video.sender_metadata_transform()  # noqa: F841 — must stay alive
         tx1.set_sender_transform(send_tf)
 
-        ok = connect(p1, p2)
+        ok = await connect(p1, p2)
         assert ok, "peers did not connect within timeout"
 
         # on_track fired during negotiate(); the receiver transform is ready.
@@ -460,9 +463,9 @@ class TestFrameMetadata:
             if received_meta:
                 break
             video.push_video_frame(bgra, 320, 240, user_data=user_data)
-            time.sleep(0.033)
+            await asyncio.sleep(0.033)
 
-        ok = wait_for(lambda: len(received_meta) > 0)
+        ok = await wait_for(lambda: len(received_meta) > 0)
         assert ok, "no metadata received within timeout"
 
         meta = received_meta[0]
@@ -470,7 +473,7 @@ class TestFrameMetadata:
         assert meta.frame_id > 0, "frame_id must be non-zero"
         assert meta.timestamp > 0, "timestamp must be non-zero"
 
-    def test_no_transform_peer_decodes_cleanly(self, factory):
+    async def test_no_transform_peer_decodes_cleanly(self, factory):
         """A receiver without receiver_metadata_transform still decodes frames; metadata is None."""
         recv_track_ref: list = []  # keeps the Track alive — Drop removes the sink
         received_frames: list = []
@@ -491,7 +494,7 @@ class TestFrameMetadata:
         send_tf = video.sender_metadata_transform()  # noqa: F841 — must stay alive
         tx1.set_sender_transform(send_tf)
 
-        ok = connect(p1, p2)
+        ok = await connect(p1, p2)
         assert ok, "peers did not connect within timeout"
 
         bgra = bytes(320 * 240 * 4)
@@ -499,9 +502,9 @@ class TestFrameMetadata:
             if received_frames:
                 break
             video.push_video_frame(bgra, 320, 240, user_data=b"dropped")
-            time.sleep(0.033)
+            await asyncio.sleep(0.033)
 
-        ok = wait_for(lambda: len(received_frames) > 0)
+        ok = await wait_for(lambda: len(received_frames) > 0)
         assert ok, "no decoded frame received within timeout"
 
         _, _, meta = received_frames[0]

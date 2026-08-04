@@ -41,11 +41,11 @@ obs.on_ice_candidate     = lambda c: ...
 obs.on_connection_state_change = lambda s: ...
 
 pc = factory.create_peer_connection(rw.RtcConfiguration(), obs)
-offer = pc.create_offer()
-pc.set_local_description(offer)
+offer = await pc.create_offer()
+await pc.set_local_description(offer)
 
 # Stats (RTCStatsReport)
-report = pc.get_stats()
+report = await pc.get_stats()
 for pair in report.candidate_pairs:
     print(pair.state, pair.current_round_trip_time_s)
 ```

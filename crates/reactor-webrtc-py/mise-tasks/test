@@ -11,7 +11,7 @@ fi
 # venv under target/ (already gitignored), so the test leaves no untracked files.
 VENV="$REPO_ROOT/target/py-test-venv"
 uv venv --python 3.12 "$VENV"
-VIRTUAL_ENV="$VENV" uv pip install pytest "$WHEEL"
+VIRTUAL_ENV="$VENV" uv pip install pytest pytest-asyncio "$WHEEL"
 # One pytest process per test file: PeerConnectionFactory is a process-wide
 # singleton (one factory per process), and test_loopback.py and
 # test_encoded_track.py each create their own session-scoped factory.

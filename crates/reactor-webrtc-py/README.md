@@ -14,29 +14,36 @@ Requires **Python ≥ 3.10**.
 
 ## Quick start
 
+`PeerConnection`'s signaling methods are natively awaitable, so this runs
+inside an `asyncio` event loop:
+
 ```python
+import asyncio
 import reactor_webrtc as rw
 
-factory = rw.PeerConnectionFactory()
+async def main():
+    factory = rw.PeerConnectionFactory()
 
-obs = rw.PeerConnectionObserver()
-obs.on_ice_candidate = lambda c: relay_to_peer(c)
-obs.on_connection_state_change = lambda s: print("state:", s)
+    obs = rw.PeerConnectionObserver()
+    obs.on_ice_candidate = lambda c: relay_to_peer(c)
+    obs.on_connection_state_change = lambda s: print("state:", s)
 
-config = rw.RtcConfiguration(ice_servers=[
-    rw.IceServer(urls=["stun:stun.l.google.com:19302"]),
-    # A turn:/turns: entry needs both credentials, or libwebrtc rejects the
-    # whole configuration.
-    rw.IceServer(urls=["turn:turn.example.com:3478"], username="alice", password="secret"),
-])
-pc = factory.create_peer_connection(config, obs)
+    config = rw.RtcConfiguration(ice_servers=[
+        rw.IceServer(urls=["stun:stun.l.google.com:19302"]),
+        # A turn:/turns: entry needs both credentials, or libwebrtc rejects the
+        # whole configuration.
+        rw.IceServer(urls=["turn:turn.example.com:3478"], username="alice", password="secret"),
+    ])
+    pc = factory.create_peer_connection(config, obs)
 
-offer = pc.create_offer()
-pc.set_local_description(offer)
+    offer = await pc.create_offer()
+    await pc.set_local_description(offer)
 
-# Exchange offer.sdp with the remote peer via your signaling channel, then:
-# pc.set_remote_description(remote_answer)
-# pc.add_ice_candidate(candidate)
+    # Exchange offer.sdp with the remote peer via your signaling channel, then:
+    # await pc.set_remote_description(remote_answer)
+    # await pc.add_ice_candidate(candidate)
+
+asyncio.run(main())
 ```
 
 ## Audio
@@ -88,7 +95,7 @@ obs.on_track = on_track
 ## Stats
 
 ```python
-report = pc.get_stats()
+report = await pc.get_stats()
 for pair in report.candidate_pairs:
     print(pair.state, f"{pair.current_round_trip_time_s * 1000:.1f}ms")
 ```
@@ -132,9 +139,9 @@ that demultiplexes on it, say — substitute the credentials in the description
 before setting it locally:
 
 ```python
-answer = pc.create_answer()
+answer = await pc.create_answer()
 answer = answer.with_ice_credentials(my_ufrag, my_password)
-pc.set_local_description(answer)
+await pc.set_local_description(answer)
 
 answer.ice_ufrags()  # ["<my_ufrag>", ...] — one per m-section
 ```
@@ -156,10 +163,20 @@ newline in a credential from injecting an SDP line.
 
 ## Thread safety
 
-Signaling methods (`create_offer`, `set_local_description`, etc.) block for a
-few milliseconds while the WebRTC engine responds. Wrap in `asyncio.to_thread()`
-when calling from an async context. Callbacks fire on WebRTC internal threads
-with the GIL acquired; keep them fast.
+`PeerConnection`'s signaling methods (`create_offer`, `create_answer`,
+`set_local_description`, `set_remote_description`, `add_ice_candidate`,
+`get_stats`) are natively awaitable — `await` them directly, no
+`asyncio.to_thread()`/executor wrapping needed. They still take a few
+milliseconds to resolve while the WebRTC engine responds, but that wait
+happens off the event loop thread, so it never blocks other coroutines.
+
+Every other method (`add_track`, `add_transceiver`, `transceivers`,
+`create_data_channel`, and everything on `Track`/`Transceiver`/`DataChannel`) is
+a fast synchronous call with no native round-trip, and stays a plain function
+call — no `await`.
+
+Callbacks fire on WebRTC internal threads with the GIL acquired; keep them
+fast.
 
 ## License
 

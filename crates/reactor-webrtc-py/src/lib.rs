@@ -1,8 +1,12 @@
 //! PyO3 bindings for `reactor-webrtc`.
 //!
-//! Imported from Python as `import reactor_webrtc`. All blocking operations
-//! release the GIL (`py.allow_threads`) so callbacks that re-acquire it can
-//! fire without deadlocking.
+//! Imported from Python as `import reactor_webrtc`. `PeerConnection`'s
+//! signaling methods (`create_offer`, `create_answer`, `set_local_description`,
+//! `set_remote_description`, `add_ice_candidate`, `get_stats`) are natively
+//! awaitable, backed by a small tokio runtime (see the `#[pymodule]` init)
+//! that runs the blocking libwebrtc round-trip via `spawn_blocking`. Every
+//! other blocking operation releases the GIL (`py.allow_threads`) so
+//! callbacks that re-acquire it can fire without deadlocking.
 //!
 //! Build with Maturin:
 //!
@@ -47,6 +51,11 @@ fn claim_factory() -> PyResult<()> {
 
 fn err(e: rw::Error) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
+}
+
+/// Maps a `spawn_blocking` `JoinError` (task panic) to a `PyErr`.
+fn join_err(e: tokio::task::JoinError) -> PyErr {
+    PyRuntimeError::new_err(format!("task join: {e}"))
 }
 
 fn sdp_type_to_str(kind: rw::SdpType) -> &'static str {
@@ -908,7 +917,8 @@ impl EncodedVideoTrack {
     /// transceiver automatically).
     fn add_to_peer_connection(&self, py: Python, pc: &PeerConnection) -> PyResult<()> {
         let track = self.inner.track();
-        py.allow_threads(|| pc.inner.add_track(track)).map_err(err)
+        py.allow_threads(|| pc.inner.as_ref().unwrap().add_track(track))
+            .map_err(err)
     }
 
     /// Add a transceiver of the given `direction` for this track. Returns the
@@ -922,7 +932,7 @@ impl EncodedVideoTrack {
         let track = self.inner.track();
         let t = py
             .allow_threads(|| {
-                pc.inner.add_transceiver(
+                pc.inner.as_ref().unwrap().add_transceiver(
                     rw::MediaKind::Video,
                     rw::TransceiverDirection::from(direction),
                 )
@@ -1351,12 +1361,13 @@ impl PeerConnectionObserver {
 
 /// An RTCPeerConnection.
 ///
-/// Signaling methods (`create_offer`, `create_answer`, etc.) block for up to
-/// ~5 ms while the WebRTC engine responds. Wrap in `asyncio.to_thread()` when
-/// calling from an async context.
+/// Signaling methods (`create_offer`, `create_answer`, `set_local_description`,
+/// `set_remote_description`, `add_ice_candidate`, `get_stats`) are natively
+/// awaitable — `await` them directly from an async context, no executor
+/// wrapping needed. Every other method is a fast synchronous call.
 #[pyclass]
 pub struct PeerConnection {
-    inner: ManuallyDrop<rw::PeerConnection>,
+    inner: Option<Arc<rw::PeerConnection>>,
 }
 
 impl Drop for PeerConnection {
@@ -1364,41 +1375,81 @@ impl Drop for PeerConnection {
         // pc->Close() dispatches synchronously to the signaling thread, which fires
         // on_connection_state_change(Closed) and tries Python::with_gil. If the GIL
         // is held by the Python GC thread that invoked this drop, both threads deadlock.
-        // Release the GIL first so those callbacks can complete.
-        let inner = unsafe { ManuallyDrop::take(&mut self.inner) };
+        // Release the GIL first so those callbacks can complete. Harmless when an
+        // in-flight signaling call still holds another Arc clone — this then just
+        // decrements the refcount; the real close happens when that clone drops
+        // later, off the GIL entirely, on a tokio blocking-pool thread.
+        let inner = self.inner.take();
         Python::with_gil(|py| py.allow_threads(|| drop(inner)));
     }
 }
 
 #[pymethods]
 impl PeerConnection {
-    fn create_offer(&self, py: Python) -> PyResult<SessionDescription> {
-        py.allow_threads(|| self.inner.create_offer())
-            .map(SessionDescription::from)
-            .map_err(err)
+    fn create_offer<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(self.inner.as_ref().unwrap());
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            tokio::task::spawn_blocking(move || inner.create_offer())
+                .await
+                .map_err(join_err)?
+                .map(SessionDescription::from)
+                .map_err(err)
+        })
     }
-    fn create_answer(&self, py: Python) -> PyResult<SessionDescription> {
-        py.allow_threads(|| self.inner.create_answer())
-            .map(SessionDescription::from)
-            .map_err(err)
+    fn create_answer<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(self.inner.as_ref().unwrap());
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            tokio::task::spawn_blocking(move || inner.create_answer())
+                .await
+                .map_err(join_err)?
+                .map(SessionDescription::from)
+                .map_err(err)
+        })
     }
-    fn set_local_description(&self, py: Python, sdp: &SessionDescription) -> PyResult<()> {
+    fn set_local_description<'py>(
+        &self,
+        py: Python<'py>,
+        sdp: &SessionDescription,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(self.inner.as_ref().unwrap());
         let rust = to_rust_sdp(sdp)?;
-        py.allow_threads(|| self.inner.set_local_description(&rust))
-            .map_err(err)
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            tokio::task::spawn_blocking(move || inner.set_local_description(&rust))
+                .await
+                .map_err(join_err)?
+                .map_err(err)
+        })
     }
-    fn set_remote_description(&self, py: Python, sdp: &SessionDescription) -> PyResult<()> {
+    fn set_remote_description<'py>(
+        &self,
+        py: Python<'py>,
+        sdp: &SessionDescription,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(self.inner.as_ref().unwrap());
         let rust = to_rust_sdp(sdp)?;
-        py.allow_threads(|| self.inner.set_remote_description(&rust))
-            .map_err(err)
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            tokio::task::spawn_blocking(move || inner.set_remote_description(&rust))
+                .await
+                .map_err(join_err)?
+                .map_err(err)
+        })
     }
-    fn add_ice_candidate(&self, py: Python, candidate: &IceCandidate) -> PyResult<()> {
+    fn add_ice_candidate<'py>(
+        &self,
+        py: Python<'py>,
+        candidate: &IceCandidate,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(self.inner.as_ref().unwrap());
         let rust = rw::IceCandidate::from(candidate);
-        py.allow_threads(|| self.inner.add_ice_candidate(&rust))
-            .map_err(err)
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            tokio::task::spawn_blocking(move || inner.add_ice_candidate(&rust))
+                .await
+                .map_err(join_err)?
+                .map_err(err)
+        })
     }
     fn add_track(&self, py: Python, track: &Track) -> PyResult<()> {
-        py.allow_threads(|| self.inner.add_track(&track.inner))
+        py.allow_threads(|| self.inner.as_ref().unwrap().add_track(&track.inner))
             .map_err(err)
     }
     fn add_transceiver(
@@ -1414,13 +1465,15 @@ impl PeerConnection {
         };
         py.allow_threads(|| {
             self.inner
+                .as_ref()
+                .unwrap()
                 .add_transceiver(rust_kind, rw::TransceiverDirection::from(direction))
         })
         .map(|t| Transceiver { inner: t })
         .map_err(err)
     }
     fn create_data_channel(&self, py: Python, label: &str) -> PyResult<DataChannel> {
-        py.allow_threads(|| self.inner.create_data_channel(label))
+        py.allow_threads(|| self.inner.as_ref().unwrap().create_data_channel(label))
             .map(|inner| DataChannel {
                 inner: ManuallyDrop::new(inner),
             })
@@ -1432,19 +1485,24 @@ impl PeerConnection {
     /// to attach local tracks to the transceivers auto-created from the remote
     /// offer's recvonly m-sections.
     fn transceivers(&self, py: Python) -> Vec<Transceiver> {
-        py.allow_threads(|| self.inner.transceivers())
+        py.allow_threads(|| self.inner.as_ref().unwrap().transceivers())
             .into_iter()
             .map(|t| Transceiver { inner: t })
             .collect()
     }
 
-    /// Collect a stats snapshot from the WebRTC engine. Blocks until the report
-    /// arrives (typically <5 ms). Returns a `StatsReport` with inbound/outbound
-    /// RTP streams and ICE candidate-pair metrics.
-    fn get_stats(&self, py: Python) -> PyResult<StatsReport> {
-        py.allow_threads(|| self.inner.get_stats())
-            .map(StatsReport::from)
-            .map_err(err)
+    /// Collect a stats snapshot from the WebRTC engine. Natively awaitable.
+    /// Returns a `StatsReport` with inbound/outbound RTP streams and ICE
+    /// candidate-pair metrics.
+    fn get_stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(self.inner.as_ref().unwrap());
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            tokio::task::spawn_blocking(move || inner.get_stats())
+                .await
+                .map_err(join_err)?
+                .map(StatsReport::from)
+                .map_err(err)
+        })
     }
 }
 
@@ -1517,7 +1575,7 @@ impl PeerConnectionFactory {
         self.inner
             .create_peer_connection(&rust_config, rust_obs)
             .map(|inner| PeerConnection {
-                inner: ManuallyDrop::new(inner),
+                inner: Some(Arc::new(inner)),
             })
             .map_err(err)
     }
@@ -1598,6 +1656,14 @@ impl PeerConnectionFactory {
 
 #[pymodule]
 fn reactor_webrtc(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Backs the awaitables PeerConnection's signaling methods return. Must be
+    // multi_thread: nothing in this extension module ever calls block_on, so a
+    // current_thread runtime would never be driven and spawned futures would
+    // hang. One worker is enough — it only polls spawn_blocking join handles.
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.worker_threads(1);
+    pyo3_async_runtimes::tokio::init(builder);
+
     m.add_class::<IceServer>()?;
     m.add_class::<RtcConfiguration>()?;
     m.add_class::<IceCandidate>()?;
