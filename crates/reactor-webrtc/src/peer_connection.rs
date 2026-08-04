@@ -517,6 +517,10 @@ pub struct DataChannel {
     raw: *mut reactor_webrtc_sys::DataChannel,
     // Keeps the callback closures alive while the native observer is registered.
     observer: Option<Box<DcObserverState>>,
+    // Keeps the factory's signaling/network threads alive for as long as this
+    // channel exists — a caller can detach it and outlive both the connection
+    // that created it and the factory that ultimately owns those threads.
+    _factory: Arc<FactoryHandle>,
 }
 
 // SAFETY: the native data channel is internally thread-safe; callbacks are
@@ -526,10 +530,14 @@ unsafe impl Send for DataChannel {}
 unsafe impl Sync for DataChannel {}
 
 impl DataChannel {
-    pub(crate) fn from_raw(raw: *mut reactor_webrtc_sys::DataChannel) -> Self {
+    pub(crate) fn from_raw(
+        raw: *mut reactor_webrtc_sys::DataChannel,
+        factory: Arc<FactoryHandle>,
+    ) -> Self {
         Self {
             raw,
             observer: None,
+            _factory: factory,
         }
     }
 
@@ -928,7 +936,7 @@ impl PeerConnection {
         if raw.is_null() {
             Err(Error::Webrtc("create_data_channel returned null".into()))
         } else {
-            Ok(DataChannel::from_raw(raw))
+            Ok(DataChannel::from_raw(raw, Arc::clone(&self._factory)))
         }
     }
 

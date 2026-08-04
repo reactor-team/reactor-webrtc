@@ -164,7 +164,7 @@ extern "C" fn tramp_track(ud: *mut c_void, track: *mut reactor_webrtc_sys::Media
 
 extern "C" fn tramp_data_channel(ud: *mut c_void, dc: *mut reactor_webrtc_sys::DataChannel) {
     let st = unsafe { &*(ud as *const ObserverState) };
-    let channel = DataChannel::from_raw(dc);
+    let channel = DataChannel::from_raw(dc, Arc::clone(&st.factory));
     if let Some(m) = &st.data_channel {
         if let Ok(mut cb) = m.lock() {
             cb(channel);
