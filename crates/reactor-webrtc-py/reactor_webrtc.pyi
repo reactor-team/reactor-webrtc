@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Callable, Optional
+from typing import Callable, Optional, Union
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -120,22 +120,105 @@ class StatsReport:
     outbound_rtp: list[OutboundRtpStats]
     candidate_pairs: list[IceCandidatePairStats]
 
+# ── Frame metadata ────────────────────────────────────────────────────────────
+
+class FrameMetadata:
+    """Metadata attached to a video frame via the RTP packet trailer.
+
+    All fields are zero / empty when not set by the sender."""
+
+    frame_id: int
+    timestamp: int
+    user_data: bytes
+    def __init__(
+        self,
+        frame_id: int = 0,
+        timestamp: int = 0,
+        user_data: bytes = b"",
+    ) -> None: ...
+
+# ── Encoded-frame transform ───────────────────────────────────────────────────
+
+class FrameAction:
+    """What a FrameTransform callback should do with the frame."""
+
+    Forward: FrameAction
+    Drop: FrameAction
+
+class EncodedFrame:
+    """Snapshot of an encoded frame passed to a FrameTransform callback.
+
+    Call `replace_data(new_bytes)` inside the callback to substitute the
+    payload; the new bytes are forwarded when the callback returns
+    `FrameAction.Forward`."""
+
+    data: bytes
+    is_key_frame: bool
+    ssrc: int
+    timestamp: int
+    capture_time_ms: int
+    def replace_data(self, new_data: bytes) -> None: ...
+
+class FrameTransform:
+    """Encoded-frame transformer attached to a transceiver sender or receiver.
+
+    Create from a Python callable with `FrameTransform(callback)`, or obtain a
+    pre-built metadata transform from
+    `Track.sender_metadata_transform()` / `receiver_metadata_transform()` or
+    `EncodedVideoTrack.sender_metadata_transform()`.
+
+    Callback signature: `callback(frame: EncodedFrame) -> FrameAction`"""
+
+    def __init__(self, callback: Callable[[EncodedFrame], FrameAction]) -> None: ...
+
 # ── Media ─────────────────────────────────────────────────────────────────────
 
 class Track:
     def kind(self) -> MediaKind: ...
-    def push_video_frame(self, bgra: bytes, width: int, height: int) -> None: ...
+    def push_video_frame(
+        self,
+        bgra: bytes,
+        width: int,
+        height: int,
+        user_data: Optional[bytes] = None,
+    ) -> None:
+        """Push a raw BGRA video frame into a local video track.
+
+        Pass `user_data` (bytes) to embed per-frame metadata in the encoded
+        packet trailer. Requires `sender_metadata_transform()` to be attached
+        to the sender transceiver beforehand; otherwise `user_data` is
+        silently ignored."""
+        ...
+    def sender_metadata_transform(self) -> FrameTransform:
+        """Return a FrameTransform that appends a metadata trailer to encoded
+        frames on the send path. Attach to the sender transceiver with
+        `Transceiver.set_sender_transform` before the SDP exchange."""
+        ...
+    def receiver_metadata_transform(self) -> FrameTransform:
+        """Return a FrameTransform that strips the metadata trailer from
+        received encoded frames. After attachment, `on_video_frame` callbacks
+        carry a `FrameMetadata` when the sender included a trailer."""
+        ...
+    def on_video_frame(
+        self,
+        callback: Callable[[bytes, int, int, Optional[FrameMetadata]], None],
+    ) -> None:
+        """Register `callback(bgra: bytes, width: int, height: int, metadata: FrameMetadata | None)`.
+
+        `metadata` is `None` when no receiver transform is attached or when the
+        sender did not include a trailer. For backward compatibility with
+        3-argument callbacks `callback(bgra, width, height)`, the 4-argument
+        call is retried as a 3-argument call on `TypeError` when `metadata` is
+        `None`.
+
+        Note: all-zero frames (empty jitter buffer from peers with no incoming
+        RTP) are suppressed and will not trigger this callback."""
+        ...
     def push_pcm(self, pcm: bytes, sample_rate: int, channels: int) -> None:
         """Push interleaved signed 16-bit little-endian PCM to a local audio track
         created with `PeerConnectionFactory.create_audio_track_with_local_source`.
         `pcm` must have even byte length and `len(pcm) // 2` must be a multiple of
         `channels`. No-op for ADM-backed or remote tracks."""
-        ...
-    def on_video_frame(
-        self,
-        callback: Callable[[bytes, int, int], None],
-    ) -> None:
-        """Register `callback(bgra: bytes, width: int, height: int)`."""
         ...
     def on_audio_frame(
         self,
@@ -155,7 +238,20 @@ class EncodedVideoTrack:
         width: int = 0,
         height: int = 0,
         rtp_timestamp: int = 0,
-    ) -> None: ...
+        user_data: Optional[bytes] = None,
+    ) -> None:
+        """Push a compressed video frame (Annex-B H.264 or VP8/VP9).
+
+        Pass `user_data` (bytes) to embed per-frame metadata in the encoded
+        packet trailer. Requires `sender_metadata_transform()` to be attached
+        to the sender transceiver beforehand; otherwise `user_data` is
+        silently ignored."""
+        ...
+    def sender_metadata_transform(self) -> FrameTransform:
+        """Return a sender FrameTransform that embeds per-frame metadata
+        trailers. Attach to the sender transceiver with
+        `Transceiver.set_sender_transform` before the SDP exchange."""
+        ...
     def add_to_peer_connection(self, pc: PeerConnection) -> None: ...
     def add_transceiver(
         self, pc: PeerConnection, direction: TransceiverDirection
@@ -164,8 +260,16 @@ class EncodedVideoTrack:
 class Transceiver:
     def mid(self) -> Optional[str]: ...
     def kind(self) -> MediaKind: ...
-    def set_track(self, track: Track) -> None: ...
+    def set_track(self, track: Union[Track, EncodedVideoTrack]) -> None: ...
     def set_direction(self, direction: TransceiverDirection) -> None: ...
+    def set_sender_transform(self, transform: FrameTransform) -> None:
+        """Attach a FrameTransform to the sender path of this transceiver.
+        The transform runs after the encoder, before RTP packetization."""
+        ...
+    def set_receiver_transform(self, transform: FrameTransform) -> None:
+        """Attach a FrameTransform to the receiver path of this transceiver.
+        The transform runs after RTP depacketization, before the decoder."""
+        ...
 
 # ── Data channel ──────────────────────────────────────────────────────────────
 
