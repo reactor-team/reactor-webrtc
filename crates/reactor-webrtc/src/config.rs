@@ -26,6 +26,54 @@ pub enum ContinualGatheringPolicy {
     GatherContinually,
 }
 
+/// How m-sections are bundled onto a single transport.
+///
+/// [`MaxBundle`] is the right choice for real-time streaming: all tracks share
+/// one DTLS+SRTP association, which halves the ICE pairs that need to succeed
+/// and reduces per-packet overhead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BundlePolicy {
+    /// Balanced — libwebrtc default.
+    #[default]
+    Balanced,
+    /// All m-sections share one transport (recommended for streaming).
+    MaxBundle,
+    /// One transport per m-section (maximises compatibility with legacy stacks).
+    MaxCompat,
+}
+
+impl BundlePolicy {
+    fn to_wire(self) -> c_int {
+        match self {
+            Self::Balanced => 0,
+            Self::MaxBundle => 1,
+            Self::MaxCompat => 2,
+        }
+    }
+}
+
+/// Whether libwebrtc may gather TCP ICE candidates.
+///
+/// TCP is disabled by default because it adds latency. Enable it only when UDP
+/// is blocked (corporate firewalls, symmetric NATs without TURN).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TcpCandidatePolicy {
+    /// TCP ICE candidates are not gathered (libwebrtc default).
+    #[default]
+    Disabled,
+    /// TCP ICE candidates are gathered alongside UDP.
+    Enabled,
+}
+
+impl TcpCandidatePolicy {
+    fn to_wire(self) -> c_int {
+        match self {
+            Self::Disabled => 0,
+            Self::Enabled => 1,
+        }
+    }
+}
+
 impl ContinualGatheringPolicy {
     /// The wire value understood by the glue. Explicit, so reordering the
     /// variants cannot silently change the meaning on the native side.
@@ -71,6 +119,24 @@ pub struct RtcConfiguration {
     /// Upper bound of the UDP port range ICE may use. `None` leaves the
     /// libwebrtc default (OS-assigned ephemeral ports).
     pub max_port: Option<u16>,
+    /// How m-sections are bundled onto a single transport.
+    /// [`BundlePolicy::MaxBundle`] is recommended for streaming.
+    pub bundle_policy: BundlePolicy,
+    /// How long ICE waits for a response before declaring the path failed.
+    ///
+    /// libwebrtc's default is very conservative (~30 s in practice). For
+    /// real-time streaming, `Some(2000)` to `Some(4000)` detects failures fast
+    /// enough to trigger reconnect before users notice a freeze.
+    pub ice_connection_receiving_timeout_ms: Option<i32>,
+    /// Minimum interval between ICE connectivity checks on a good path (ms).
+    ///
+    /// `None` keeps the libwebrtc default (~500 ms). Lowering this (e.g.
+    /// `Some(250)`) makes keepalives more frequent, trading bandwidth for
+    /// faster detection of path changes.
+    pub ice_check_interval_strong_connectivity_ms: Option<i32>,
+    /// Whether libwebrtc gathers TCP ICE candidates.
+    /// Disabled by default; enable only when UDP is firewalled.
+    pub tcp_candidate_policy: TcpCandidatePolicy,
 }
 
 impl Default for RtcConfiguration {
@@ -86,6 +152,10 @@ impl Default for RtcConfiguration {
             ice_transport_type: IceTransportsType::All,
             min_port: None,
             max_port: None,
+            bundle_policy: BundlePolicy::default(),
+            ice_connection_receiving_timeout_ms: None,
+            ice_check_interval_strong_connectivity_ms: None,
+            tcp_candidate_policy: TcpCandidatePolicy::default(),
         }
     }
 }
@@ -117,6 +187,10 @@ pub(crate) struct NativeConfig {
     continual_gathering_policy: c_int,
     min_port: c_int,
     max_port: c_int,
+    bundle_policy: c_int,
+    ice_connection_receiving_timeout_ms: c_int,
+    ice_check_interval_strong_connectivity_ms: c_int,
+    tcp_candidate_policy: c_int,
 }
 
 impl NativeConfig {
@@ -177,6 +251,14 @@ impl NativeConfig {
             continual_gathering_policy: config.continual_gathering_policy.to_wire(),
             min_port,
             max_port,
+            bundle_policy: config.bundle_policy.to_wire(),
+            ice_connection_receiving_timeout_ms: config
+                .ice_connection_receiving_timeout_ms
+                .unwrap_or(-1),
+            ice_check_interval_strong_connectivity_ms: config
+                .ice_check_interval_strong_connectivity_ms
+                .unwrap_or(-1),
+            tcp_candidate_policy: config.tcp_candidate_policy.to_wire(),
         })
     }
 
@@ -189,6 +271,11 @@ impl NativeConfig {
             continual_gathering_policy: self.continual_gathering_policy,
             min_port: self.min_port,
             max_port: self.max_port,
+            bundle_policy: self.bundle_policy,
+            ice_connection_receiving_timeout_ms: self.ice_connection_receiving_timeout_ms,
+            ice_check_interval_strong_connectivity_ms: self
+                .ice_check_interval_strong_connectivity_ms,
+            tcp_candidate_policy: self.tcp_candidate_policy,
         }
     }
 }

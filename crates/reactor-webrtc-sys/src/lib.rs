@@ -226,6 +226,17 @@ pub struct ReactorIceServer {
 ///
 /// An unknown value falls back to `0`. Layout must match `ReactorRtcConfig`
 /// in the glue.
+///
+/// | `bundle_policy` | behaviour |
+/// |-----------------|-----------|
+/// | `0`             | balanced (default) |
+/// | `1`             | max-bundle — all m-sections share one transport |
+/// | `2`             | max-compat |
+///
+/// | `tcp_candidate_policy` | behaviour |
+/// |------------------------|-----------|
+/// | `0`                    | TCP ICE candidates disabled (default) |
+/// | `1`                    | TCP ICE candidates enabled |
 #[repr(C)]
 pub struct ReactorRtcConfig {
     pub servers: *const ReactorIceServer,
@@ -236,6 +247,14 @@ pub struct ReactorRtcConfig {
     pub min_port: c_int,
     /// UDP port range upper bound. `0` means "not specified" (libwebrtc default).
     pub max_port: c_int,
+    /// Bundle policy. 0 = balanced, 1 = max-bundle, 2 = max-compat.
+    pub bundle_policy: c_int,
+    /// ICE connection-receiving timeout in ms. `<=0` keeps the libwebrtc default.
+    pub ice_connection_receiving_timeout_ms: c_int,
+    /// ICE check interval on well-connected paths in ms. `<=0` keeps the default.
+    pub ice_check_interval_strong_connectivity_ms: c_int,
+    /// TCP candidate policy. 0 = disabled (default), 1 = enabled.
+    pub tcp_candidate_policy: c_int,
 }
 
 extern "C" {
@@ -296,6 +315,18 @@ extern "C" {
         err_cap: c_int,
     ) -> *mut PeerConnection;
     pub fn reactor_webrtc_peer_connection_destroy(pc: *mut PeerConnection);
+
+    /// Set aggregate bitrate limits. Pass `-1` for any field to keep the
+    /// libwebrtc default. All values are bits per second.
+    /// Returns 0 on success, -1 on error (reason written into `err`/`err_cap`).
+    pub fn reactor_webrtc_peer_connection_set_bitrate(
+        pc: *mut PeerConnection,
+        min_bps: c_int,
+        start_bps: c_int,
+        max_bps: c_int,
+        err: *mut c_char,
+        err_cap: c_int,
+    ) -> c_int;
 
     /// Create an SDP offer. Exactly one callback fires asynchronously on the
     /// signaling thread: `on_success(userdata, type, sdp)` or

@@ -958,6 +958,54 @@ impl PeerConnection {
             reactor_webrtc_sys::reactor_webrtc_peer_connection_get_stats(self.raw, ud, stats_cb)
         })
     }
+
+    /// Set aggregate bitrate limits on the peer connection.
+    ///
+    /// Each parameter is optional; pass `None` to keep the libwebrtc default
+    /// for that field. All values are in bits per second.
+    ///
+    /// # Parameters
+    ///
+    /// - `min_bps` — floor handed to the congestion controller; it will not
+    ///   drop below this even when the network estimate is very low.
+    /// - `start_bps` — initial encoder target. libwebrtc's built-in default
+    ///   is ~300 kbps, which causes a visible quality ramp-up on new
+    ///   connections. Set this close to your expected steady-state bitrate
+    ///   (e.g. `Some(4_000_000)` for a 4 Mbps stream) to reach quality
+    ///   quickly.
+    /// - `max_bps` — ceiling; the GCC algorithm will not allocate above this.
+    ///
+    /// Can be called at any time after the peer connection is created,
+    /// including after negotiation.
+    pub fn set_bitrate(
+        &self,
+        min_bps: Option<i32>,
+        start_bps: Option<i32>,
+        max_bps: Option<i32>,
+    ) -> crate::Result<()> {
+        let mut err = [0 as std::os::raw::c_char; 256];
+        let rc = unsafe {
+            reactor_webrtc_sys::reactor_webrtc_peer_connection_set_bitrate(
+                self.raw,
+                min_bps.unwrap_or(-1),
+                start_bps.unwrap_or(-1),
+                max_bps.unwrap_or(-1),
+                err.as_mut_ptr(),
+                err.len() as std::os::raw::c_int,
+            )
+        };
+        if rc != 0 {
+            let reason = unsafe { std::ffi::CStr::from_ptr(err.as_ptr()) }
+                .to_string_lossy()
+                .into_owned();
+            return Err(crate::Error::Webrtc(if reason.is_empty() {
+                "set_bitrate failed".into()
+            } else {
+                reason
+            }));
+        }
+        Ok(())
+    }
 }
 
 impl Drop for PeerConnection {

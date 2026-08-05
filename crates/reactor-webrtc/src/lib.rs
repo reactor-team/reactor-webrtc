@@ -33,7 +33,10 @@ use std::os::raw::c_int;
 use std::sync::{Arc, Mutex};
 
 pub use builder::{EncodedVideoBuilder, MixedVideoTrack};
-pub use config::{ContinualGatheringPolicy, IceServer, IceTransportsType, RtcConfiguration};
+pub use config::{
+    BundlePolicy, ContinualGatheringPolicy, IceServer, IceTransportsType, RtcConfiguration,
+    TcpCandidatePolicy,
+};
 pub use encoded::{
     CustomVideoEncoder, EncodedFrame, EncodedVideoFrame, EncodedVideoTrack, FrameAction,
     FrameDirection, FrameTransform, RawVideoFrame, VideoCodec,

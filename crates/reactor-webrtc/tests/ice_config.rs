@@ -11,8 +11,8 @@
 #[cfg(have_libwebrtc)]
 mod tests {
     use reactor_webrtc::{
-        ContinualGatheringPolicy, IceServer, IceTransportsType, PeerConnectionFactory,
-        PeerConnectionObserver, RtcConfiguration,
+        BundlePolicy, ContinualGatheringPolicy, IceServer, IceTransportsType,
+        PeerConnectionFactory, PeerConnectionObserver, RtcConfiguration, TcpCandidatePolicy,
     };
 
     fn stun() -> IceServer {
@@ -92,6 +92,41 @@ mod tests {
                 RtcConfiguration {
                     min_port: Some(10000),
                     max_port: Some(10100),
+                    ..Default::default()
+                },
+            ),
+            (
+                "bundle policy max-bundle",
+                RtcConfiguration {
+                    bundle_policy: BundlePolicy::MaxBundle,
+                    ..Default::default()
+                },
+            ),
+            (
+                "bundle policy max-compat",
+                RtcConfiguration {
+                    bundle_policy: BundlePolicy::MaxCompat,
+                    ..Default::default()
+                },
+            ),
+            (
+                "tcp candidate policy enabled",
+                RtcConfiguration {
+                    tcp_candidate_policy: TcpCandidatePolicy::Enabled,
+                    ..Default::default()
+                },
+            ),
+            (
+                "ice connection receiving timeout",
+                RtcConfiguration {
+                    ice_connection_receiving_timeout_ms: Some(3000),
+                    ..Default::default()
+                },
+            ),
+            (
+                "ice check interval strong connectivity",
+                RtcConfiguration {
+                    ice_check_interval_strong_connectivity_ms: Some(2000),
                     ..Default::default()
                 },
             ),

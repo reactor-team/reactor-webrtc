@@ -174,18 +174,37 @@ pub struct RtcConfiguration {
     continual_gathering_policy: rw::ContinualGatheringPolicy,
     pub min_port: u16,
     pub max_port: u16,
+    bundle_policy: rw::BundlePolicy,
+    pub ice_connection_receiving_timeout_ms: i32,
+    pub ice_check_interval_strong_connectivity_ms: i32,
+    tcp_candidate_policy: rw::TcpCandidatePolicy,
 }
 
 #[pymethods]
 impl RtcConfiguration {
     #[new]
-    #[pyo3(signature = (ice_servers=vec![], ice_transport_type="all", continual_gathering_policy="once", min_port=0, max_port=0))]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        ice_servers=vec![],
+        ice_transport_type="all",
+        continual_gathering_policy="once",
+        min_port=0,
+        max_port=0,
+        bundle_policy=BundlePolicy::Balanced,
+        ice_connection_receiving_timeout_ms=0,
+        ice_check_interval_strong_connectivity_ms=0,
+        tcp_candidate_policy=TcpCandidatePolicy::Disabled,
+    ))]
     fn new(
         ice_servers: Vec<IceServer>,
         ice_transport_type: &str,
         continual_gathering_policy: &str,
         min_port: u16,
         max_port: u16,
+        bundle_policy: BundlePolicy,
+        ice_connection_receiving_timeout_ms: i32,
+        ice_check_interval_strong_connectivity_ms: i32,
+        tcp_candidate_policy: TcpCandidatePolicy,
     ) -> PyResult<Self> {
         Ok(Self {
             ice_servers,
@@ -193,6 +212,10 @@ impl RtcConfiguration {
             continual_gathering_policy: parse_gathering_policy(continual_gathering_policy)?,
             min_port,
             max_port,
+            bundle_policy: rw::BundlePolicy::from(bundle_policy),
+            ice_connection_receiving_timeout_ms,
+            ice_check_interval_strong_connectivity_ms,
+            tcp_candidate_policy: rw::TcpCandidatePolicy::from(tcp_candidate_policy),
         })
     }
     #[getter]
@@ -237,6 +260,42 @@ impl RtcConfiguration {
     fn set_max_port(&mut self, value: u16) {
         self.max_port = value;
     }
+
+    #[getter]
+    fn bundle_policy(&self) -> BundlePolicy {
+        BundlePolicy::from(self.bundle_policy)
+    }
+    #[setter]
+    fn set_bundle_policy(&mut self, value: BundlePolicy) {
+        self.bundle_policy = rw::BundlePolicy::from(value);
+    }
+
+    #[getter]
+    fn ice_connection_receiving_timeout_ms(&self) -> i32 {
+        self.ice_connection_receiving_timeout_ms
+    }
+    #[setter]
+    fn set_ice_connection_receiving_timeout_ms(&mut self, value: i32) {
+        self.ice_connection_receiving_timeout_ms = value;
+    }
+
+    #[getter]
+    fn ice_check_interval_strong_connectivity_ms(&self) -> i32 {
+        self.ice_check_interval_strong_connectivity_ms
+    }
+    #[setter]
+    fn set_ice_check_interval_strong_connectivity_ms(&mut self, value: i32) {
+        self.ice_check_interval_strong_connectivity_ms = value;
+    }
+
+    #[getter]
+    fn tcp_candidate_policy(&self) -> TcpCandidatePolicy {
+        TcpCandidatePolicy::from(self.tcp_candidate_policy)
+    }
+    #[setter]
+    fn set_tcp_candidate_policy(&mut self, value: TcpCandidatePolicy) {
+        self.tcp_candidate_policy = rw::TcpCandidatePolicy::from(value);
+    }
 }
 
 impl From<&RtcConfiguration> for rw::RtcConfiguration {
@@ -255,6 +314,21 @@ impl From<&RtcConfiguration> for rw::RtcConfiguration {
             } else {
                 None
             },
+            bundle_policy: c.bundle_policy,
+            ice_connection_receiving_timeout_ms: if c.ice_connection_receiving_timeout_ms > 0 {
+                Some(c.ice_connection_receiving_timeout_ms)
+            } else {
+                None
+            },
+            ice_check_interval_strong_connectivity_ms: if c
+                .ice_check_interval_strong_connectivity_ms
+                > 0
+            {
+                Some(c.ice_check_interval_strong_connectivity_ms)
+            } else {
+                None
+            },
+            tcp_candidate_policy: c.tcp_candidate_policy,
         }
     }
 }
@@ -446,6 +520,66 @@ impl From<rw::DataChannelState> for DataChannelState {
             rw::DataChannelState::Open => Self::Open,
             rw::DataChannelState::Closing => Self::Closing,
             rw::DataChannelState::Closed => Self::Closed,
+        }
+    }
+}
+
+/// How m-sections are bundled onto a single transport.
+#[pyclass(eq, eq_int)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum BundlePolicy {
+    /// One transport per m-section that needs one (libwebrtc default).
+    Balanced = 0,
+    /// All m-sections share one transport — recommended for streaming.
+    MaxBundle = 1,
+    /// One transport per m-section (maximises legacy stack compatibility).
+    MaxCompat = 2,
+}
+
+impl From<BundlePolicy> for rw::BundlePolicy {
+    fn from(p: BundlePolicy) -> Self {
+        match p {
+            BundlePolicy::Balanced => rw::BundlePolicy::Balanced,
+            BundlePolicy::MaxBundle => rw::BundlePolicy::MaxBundle,
+            BundlePolicy::MaxCompat => rw::BundlePolicy::MaxCompat,
+        }
+    }
+}
+
+impl From<rw::BundlePolicy> for BundlePolicy {
+    fn from(p: rw::BundlePolicy) -> Self {
+        match p {
+            rw::BundlePolicy::Balanced => BundlePolicy::Balanced,
+            rw::BundlePolicy::MaxBundle => BundlePolicy::MaxBundle,
+            rw::BundlePolicy::MaxCompat => BundlePolicy::MaxCompat,
+        }
+    }
+}
+
+/// Whether libwebrtc gathers TCP ICE candidates.
+#[pyclass(eq, eq_int)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TcpCandidatePolicy {
+    /// TCP candidates are not gathered (libwebrtc default).
+    Disabled = 0,
+    /// TCP candidates are gathered alongside UDP.
+    Enabled = 1,
+}
+
+impl From<TcpCandidatePolicy> for rw::TcpCandidatePolicy {
+    fn from(p: TcpCandidatePolicy) -> Self {
+        match p {
+            TcpCandidatePolicy::Disabled => rw::TcpCandidatePolicy::Disabled,
+            TcpCandidatePolicy::Enabled => rw::TcpCandidatePolicy::Enabled,
+        }
+    }
+}
+
+impl From<rw::TcpCandidatePolicy> for TcpCandidatePolicy {
+    fn from(p: rw::TcpCandidatePolicy) -> Self {
+        match p {
+            rw::TcpCandidatePolicy::Disabled => TcpCandidatePolicy::Disabled,
+            rw::TcpCandidatePolicy::Enabled => TcpCandidatePolicy::Enabled,
         }
     }
 }
@@ -1514,6 +1648,22 @@ impl PeerConnection {
                 .map_err(err)
         })
     }
+
+    /// Adjust the bandwidth estimate limits and starting point.
+    ///
+    /// Pass `None` to leave a value at its libwebrtc default. A value of 0 is
+    /// treated as `None` (unset). Units are bits-per-second.
+    #[pyo3(signature = (min_bps=None, start_bps=None, max_bps=None))]
+    fn set_bitrate(
+        &self,
+        py: Python,
+        min_bps: Option<i32>,
+        start_bps: Option<i32>,
+        max_bps: Option<i32>,
+    ) -> PyResult<()> {
+        py.allow_threads(|| self.pc().set_bitrate(min_bps, start_bps, max_bps))
+            .map_err(err)
+    }
 }
 
 // ── PeerConnectionFactory ─────────────────────────────────────────────────────
@@ -1675,6 +1825,8 @@ fn reactor_webrtc(m: &Bound<'_, PyModule>) -> PyResult<()> {
     pyo3_async_runtimes::tokio::init(builder);
 
     m.add_class::<IceServer>()?;
+    m.add_class::<BundlePolicy>()?;
+    m.add_class::<TcpCandidatePolicy>()?;
     m.add_class::<RtcConfiguration>()?;
     m.add_class::<IceCandidate>()?;
     m.add_class::<SessionDescription>()?;
