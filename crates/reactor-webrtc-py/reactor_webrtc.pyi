@@ -17,12 +17,36 @@ class IceServer:
         password: str = ...,
     ) -> None: ...
 
+class BundlePolicy:
+    """Controls how media tracks are bundled onto ICE transports.
+
+    `Balanced` (default): one BUNDLE group per media type.
+    `MaxBundle`: all tracks share a single transport — recommended for streaming.
+    `MaxCompat`: one transport per track; maximum compatibility with legacy endpoints."""
+
+    Balanced: BundlePolicy
+    MaxBundle: BundlePolicy
+    MaxCompat: BundlePolicy
+
+class TcpCandidatePolicy:
+    """Whether TCP ICE candidates are gathered.
+
+    `Disabled` (default): UDP only.
+    `Enabled`: also collect TCP candidates (useful when UDP is blocked)."""
+
+    Disabled: TcpCandidatePolicy
+    Enabled: TcpCandidatePolicy
+
 class RtcConfiguration:
     ice_servers: list[IceServer]
     ice_transport_type: str  # "all" | "relay" | "no_host" | "none"
     continual_gathering_policy: str  # "once" | "continually"
     min_port: int  # 0 = use OS default
     max_port: int  # 0 = use OS default
+    bundle_policy: BundlePolicy
+    ice_connection_receiving_timeout_ms: int  # 0 = libwebrtc default (~30 000 ms)
+    ice_check_min_interval_ms: int  # 0 = libwebrtc default
+    tcp_candidate_policy: TcpCandidatePolicy
     def __init__(
         self,
         ice_servers: list[IceServer] = ...,
@@ -30,6 +54,10 @@ class RtcConfiguration:
         continual_gathering_policy: str = "once",
         min_port: int = 0,
         max_port: int = 0,
+        bundle_policy: BundlePolicy = ...,
+        ice_connection_receiving_timeout_ms: int = 0,
+        ice_check_min_interval_ms: int = 0,
+        tcp_candidate_policy: TcpCandidatePolicy = ...,
     ) -> None: ...
 
 # ── Signaling types ───────────────────────────────────────────────────────────
@@ -312,6 +340,19 @@ class PeerConnection:
     def transceivers(self) -> list[Transceiver]: ...
     def create_data_channel(self, label: str) -> DataChannel: ...
     async def get_stats(self) -> StatsReport: ...
+    def set_bitrate(
+        self,
+        min_bps: Optional[int] = None,
+        start_bps: Optional[int] = None,
+        max_bps: Optional[int] = None,
+    ) -> None:  # raises RuntimeError if libwebrtc rejects the settings
+        """Adjust the bandwidth estimate limits and starting point.
+
+        All arguments are optional; pass `None` to leave a value at its
+        libwebrtc default. Units are bits-per-second.
+
+        Typical streaming values: `min_bps=200_000, start_bps=500_000, max_bps=2_000_000`."""
+        ...
 
 # ── Factory ───────────────────────────────────────────────────────────────────
 

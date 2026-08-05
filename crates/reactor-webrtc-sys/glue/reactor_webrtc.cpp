@@ -148,6 +148,8 @@ struct ReactorIceServer {
 // the webrtc:: enum order:
 //   ice_transport_type:         0=all 1=relay 2=no-host 3=none
 //   continual_gathering_policy: 0=gather-once 1=gather-continually
+//   bundle_policy:              0=balanced 1=max-bundle 2=max-compat
+//   tcp_candidate_policy:       0=disabled 1=enabled
 // An unknown value falls back to 0.
 struct ReactorRtcConfig {
   const ReactorIceServer* servers;
@@ -156,6 +158,12 @@ struct ReactorRtcConfig {
   int                     continual_gathering_policy;
   int                     min_port;  // 0 = not specified
   int                     max_port;  // 0 = not specified
+  int                     bundle_policy;
+  // Milliseconds. <=0 keeps the libwebrtc default (~30 s in practice).
+  int                     ice_connection_receiving_timeout_ms;
+  // ICE check interval on a well-connected path in ms. <=0 = libwebrtc default.
+  int                     ice_check_min_interval_ms;
+  int                     tcp_candidate_policy;
 };
 }  // extern "C"
 
@@ -674,6 +682,29 @@ void apply_rtc_config(const ReactorRtcConfig* in,
     cfg.set_min_port(in->min_port);
     cfg.set_max_port(in->max_port);
   }
+
+  switch (in->bundle_policy) {
+    case 1: cfg.bundle_policy =
+                webrtc::PeerConnectionInterface::kBundlePolicyMaxBundle; break;
+    case 2: cfg.bundle_policy =
+                webrtc::PeerConnectionInterface::kBundlePolicyMaxCompat; break;
+    default: break;  // 0 = balanced (libwebrtc default)
+  }
+
+  if (in->ice_connection_receiving_timeout_ms > 0)
+    cfg.ice_connection_receiving_timeout =
+        in->ice_connection_receiving_timeout_ms;
+
+  if (in->ice_check_min_interval_ms > 0)
+    cfg.ice_check_interval_strong_connectivity =
+        absl::optional<int>(in->ice_check_min_interval_ms);
+
+  switch (in->tcp_candidate_policy) {
+    case 1: cfg.tcp_candidate_policy =
+                webrtc::PeerConnectionInterface::kTcpCandidatePolicyEnabled;
+            break;
+    default: break;  // 0 = disabled (libwebrtc default)
+  }
 }
 
 // Write a NUL-terminated copy of `msg` into `out`, truncated to `cap` bytes.
@@ -931,6 +962,30 @@ void reactor_webrtc_peer_connection_destroy(void* pc) {
   auto* rpc = reinterpret_cast<ReactorPeerConnection*>(pc);
   if (rpc && rpc->pc) rpc->pc->Close();
   delete rpc;
+}
+
+// Set aggregate bitrate limits on the peer connection. Use -1 for any field
+// that should keep the libwebrtc default.
+//
+//   min_bps   — floor handed to the congestion controller; it will not drop
+//               below this even when the network estimate is very low.
+//   start_bps — initial encoder target; libwebrtc defaults to ~300 kbps,
+//               which causes a slow ramp-up; set to your expected steady-state
+//               for streaming (e.g. 4 000 000 for 4 Mbps targets).
+//   max_bps   — ceiling; the GCC algorithm will not allocate above this.
+//
+// All values are in bits per second. The call is a no-op when `pc` is null.
+void reactor_webrtc_peer_connection_set_bitrate(void* pc,
+                                                int min_bps,
+                                                int start_bps,
+                                                int max_bps) {
+  auto* rpc = reinterpret_cast<ReactorPeerConnection*>(pc);
+  if (!rpc || !rpc->pc) return;
+  webrtc::BitrateSettings s;
+  if (min_bps   > 0) s.min_bitrate_bps   = min_bps;
+  if (start_bps > 0) s.start_bitrate_bps = start_bps;
+  if (max_bps   > 0) s.max_bitrate_bps   = max_bps;
+  rpc->pc->SetBitrate(s);
 }
 
 // Create an offer. The result is delivered asynchronously on the signaling
