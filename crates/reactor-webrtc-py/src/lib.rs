@@ -176,7 +176,7 @@ pub struct RtcConfiguration {
     pub max_port: u16,
     bundle_policy: rw::BundlePolicy,
     pub ice_connection_receiving_timeout_ms: i32,
-    pub ice_check_min_interval_ms: i32,
+    pub ice_check_interval_strong_connectivity_ms: i32,
     tcp_candidate_policy: rw::TcpCandidatePolicy,
 }
 
@@ -192,7 +192,7 @@ impl RtcConfiguration {
         max_port=0,
         bundle_policy=BundlePolicy::Balanced,
         ice_connection_receiving_timeout_ms=0,
-        ice_check_min_interval_ms=0,
+        ice_check_interval_strong_connectivity_ms=0,
         tcp_candidate_policy=TcpCandidatePolicy::Disabled,
     ))]
     fn new(
@@ -203,7 +203,7 @@ impl RtcConfiguration {
         max_port: u16,
         bundle_policy: BundlePolicy,
         ice_connection_receiving_timeout_ms: i32,
-        ice_check_min_interval_ms: i32,
+        ice_check_interval_strong_connectivity_ms: i32,
         tcp_candidate_policy: TcpCandidatePolicy,
     ) -> PyResult<Self> {
         Ok(Self {
@@ -214,7 +214,7 @@ impl RtcConfiguration {
             max_port,
             bundle_policy: rw::BundlePolicy::from(bundle_policy),
             ice_connection_receiving_timeout_ms,
-            ice_check_min_interval_ms,
+            ice_check_interval_strong_connectivity_ms,
             tcp_candidate_policy: rw::TcpCandidatePolicy::from(tcp_candidate_policy),
         })
     }
@@ -280,12 +280,12 @@ impl RtcConfiguration {
     }
 
     #[getter]
-    fn ice_check_min_interval_ms(&self) -> i32 {
-        self.ice_check_min_interval_ms
+    fn ice_check_interval_strong_connectivity_ms(&self) -> i32 {
+        self.ice_check_interval_strong_connectivity_ms
     }
     #[setter]
-    fn set_ice_check_min_interval_ms(&mut self, value: i32) {
-        self.ice_check_min_interval_ms = value;
+    fn set_ice_check_interval_strong_connectivity_ms(&mut self, value: i32) {
+        self.ice_check_interval_strong_connectivity_ms = value;
     }
 
     #[getter]
@@ -320,8 +320,11 @@ impl From<&RtcConfiguration> for rw::RtcConfiguration {
             } else {
                 None
             },
-            ice_check_min_interval_ms: if c.ice_check_min_interval_ms > 0 {
-                Some(c.ice_check_min_interval_ms)
+            ice_check_interval_strong_connectivity_ms: if c
+                .ice_check_interval_strong_connectivity_ms
+                > 0
+            {
+                Some(c.ice_check_interval_strong_connectivity_ms)
             } else {
                 None
             },
@@ -1651,8 +1654,15 @@ impl PeerConnection {
     /// Pass `None` to leave a value at its libwebrtc default. A value of 0 is
     /// treated as `None` (unset). Units are bits-per-second.
     #[pyo3(signature = (min_bps=None, start_bps=None, max_bps=None))]
-    fn set_bitrate(&self, min_bps: Option<i32>, start_bps: Option<i32>, max_bps: Option<i32>) {
-        self.inner.set_bitrate(min_bps, start_bps, max_bps);
+    fn set_bitrate(
+        &self,
+        py: Python,
+        min_bps: Option<i32>,
+        start_bps: Option<i32>,
+        max_bps: Option<i32>,
+    ) -> PyResult<()> {
+        py.allow_threads(|| self.pc().set_bitrate(min_bps, start_bps, max_bps))
+            .map_err(err)
     }
 }
 

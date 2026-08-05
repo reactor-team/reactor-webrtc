@@ -162,7 +162,7 @@ struct ReactorRtcConfig {
   // Milliseconds. <=0 keeps the libwebrtc default (~30 s in practice).
   int                     ice_connection_receiving_timeout_ms;
   // ICE check interval on a well-connected path in ms. <=0 = libwebrtc default.
-  int                     ice_check_min_interval_ms;
+  int                     ice_check_interval_strong_connectivity_ms;
   int                     tcp_candidate_policy;
 };
 }  // extern "C"
@@ -695,9 +695,9 @@ void apply_rtc_config(const ReactorRtcConfig* in,
     cfg.ice_connection_receiving_timeout =
         in->ice_connection_receiving_timeout_ms;
 
-  if (in->ice_check_min_interval_ms > 0)
+  if (in->ice_check_interval_strong_connectivity_ms > 0)
     cfg.ice_check_interval_strong_connectivity =
-        absl::optional<int>(in->ice_check_min_interval_ms);
+        in->ice_check_interval_strong_connectivity_ms;
 
   switch (in->tcp_candidate_policy) {
     case 1: cfg.tcp_candidate_policy =
@@ -974,18 +974,29 @@ void reactor_webrtc_peer_connection_destroy(void* pc) {
 //               for streaming (e.g. 4 000 000 for 4 Mbps targets).
 //   max_bps   — ceiling; the GCC algorithm will not allocate above this.
 //
-// All values are in bits per second. The call is a no-op when `pc` is null.
-void reactor_webrtc_peer_connection_set_bitrate(void* pc,
-                                                int min_bps,
-                                                int start_bps,
-                                                int max_bps) {
+// All values are in bits per second.
+// Returns 0 on success, -1 on error (message written to err/err_cap).
+int reactor_webrtc_peer_connection_set_bitrate(void* pc,
+                                               int min_bps,
+                                               int start_bps,
+                                               int max_bps,
+                                               char* err,
+                                               int err_cap) {
   auto* rpc = reinterpret_cast<ReactorPeerConnection*>(pc);
-  if (!rpc || !rpc->pc) return;
+  if (!rpc || !rpc->pc) {
+    write_error(err, err_cap, "no peer connection");
+    return -1;
+  }
   webrtc::BitrateSettings s;
   if (min_bps   > 0) s.min_bitrate_bps   = min_bps;
   if (start_bps > 0) s.start_bitrate_bps = start_bps;
   if (max_bps   > 0) s.max_bitrate_bps   = max_bps;
-  rpc->pc->SetBitrate(s);
+  auto result = rpc->pc->SetBitrate(s);
+  if (!result.ok()) {
+    write_error(err, err_cap, result.message());
+    return -1;
+  }
+  return 0;
 }
 
 // Create an offer. The result is delivered asynchronously on the signaling

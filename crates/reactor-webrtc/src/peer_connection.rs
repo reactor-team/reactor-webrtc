@@ -977,15 +977,34 @@ impl PeerConnection {
     ///
     /// Can be called at any time after the peer connection is created,
     /// including after negotiation.
-    pub fn set_bitrate(&self, min_bps: Option<i32>, start_bps: Option<i32>, max_bps: Option<i32>) {
-        unsafe {
+    pub fn set_bitrate(
+        &self,
+        min_bps: Option<i32>,
+        start_bps: Option<i32>,
+        max_bps: Option<i32>,
+    ) -> crate::Result<()> {
+        let mut err = [0 as std::os::raw::c_char; 256];
+        let rc = unsafe {
             reactor_webrtc_sys::reactor_webrtc_peer_connection_set_bitrate(
                 self.raw,
                 min_bps.unwrap_or(-1),
                 start_bps.unwrap_or(-1),
                 max_bps.unwrap_or(-1),
-            );
+                err.as_mut_ptr(),
+                err.len() as std::os::raw::c_int,
+            )
+        };
+        if rc != 0 {
+            let reason = unsafe { std::ffi::CStr::from_ptr(err.as_ptr()) }
+                .to_string_lossy()
+                .into_owned();
+            return Err(crate::Error::Webrtc(if reason.is_empty() {
+                "set_bitrate failed".into()
+            } else {
+                reason
+            }));
         }
+        Ok(())
     }
 }
 

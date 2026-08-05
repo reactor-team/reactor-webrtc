@@ -133,7 +133,7 @@ pub struct RtcConfiguration {
     /// `None` keeps the libwebrtc default (~500 ms). Lowering this (e.g.
     /// `Some(250)`) makes keepalives more frequent, trading bandwidth for
     /// faster detection of path changes.
-    pub ice_check_min_interval_ms: Option<i32>,
+    pub ice_check_interval_strong_connectivity_ms: Option<i32>,
     /// Whether libwebrtc gathers TCP ICE candidates.
     /// Disabled by default; enable only when UDP is firewalled.
     pub tcp_candidate_policy: TcpCandidatePolicy,
@@ -154,7 +154,7 @@ impl Default for RtcConfiguration {
             max_port: None,
             bundle_policy: BundlePolicy::default(),
             ice_connection_receiving_timeout_ms: None,
-            ice_check_min_interval_ms: None,
+            ice_check_interval_strong_connectivity_ms: None,
             tcp_candidate_policy: TcpCandidatePolicy::default(),
         }
     }
@@ -189,7 +189,7 @@ pub(crate) struct NativeConfig {
     max_port: c_int,
     bundle_policy: c_int,
     ice_connection_receiving_timeout_ms: c_int,
-    ice_check_min_interval_ms: c_int,
+    ice_check_interval_strong_connectivity_ms: c_int,
     tcp_candidate_policy: c_int,
 }
 
@@ -255,7 +255,9 @@ impl NativeConfig {
             ice_connection_receiving_timeout_ms: config
                 .ice_connection_receiving_timeout_ms
                 .unwrap_or(-1),
-            ice_check_min_interval_ms: config.ice_check_min_interval_ms.unwrap_or(-1),
+            ice_check_interval_strong_connectivity_ms: config
+                .ice_check_interval_strong_connectivity_ms
+                .unwrap_or(-1),
             tcp_candidate_policy: config.tcp_candidate_policy.to_wire(),
         })
     }
@@ -271,7 +273,8 @@ impl NativeConfig {
             max_port: self.max_port,
             bundle_policy: self.bundle_policy,
             ice_connection_receiving_timeout_ms: self.ice_connection_receiving_timeout_ms,
-            ice_check_min_interval_ms: self.ice_check_min_interval_ms,
+            ice_check_interval_strong_connectivity_ms: self
+                .ice_check_interval_strong_connectivity_ms,
             tcp_candidate_policy: self.tcp_candidate_policy,
         }
     }

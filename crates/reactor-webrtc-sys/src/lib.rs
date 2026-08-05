@@ -252,7 +252,7 @@ pub struct ReactorRtcConfig {
     /// ICE connection-receiving timeout in ms. `<=0` keeps the libwebrtc default.
     pub ice_connection_receiving_timeout_ms: c_int,
     /// ICE check interval on well-connected paths in ms. `<=0` keeps the default.
-    pub ice_check_min_interval_ms: c_int,
+    pub ice_check_interval_strong_connectivity_ms: c_int,
     /// TCP candidate policy. 0 = disabled (default), 1 = enabled.
     pub tcp_candidate_policy: c_int,
 }
@@ -318,12 +318,15 @@ extern "C" {
 
     /// Set aggregate bitrate limits. Pass `-1` for any field to keep the
     /// libwebrtc default. All values are bits per second.
+    /// Returns 0 on success, -1 on error (reason written into `err`/`err_cap`).
     pub fn reactor_webrtc_peer_connection_set_bitrate(
         pc: *mut PeerConnection,
         min_bps: c_int,
         start_bps: c_int,
         max_bps: c_int,
-    );
+        err: *mut c_char,
+        err_cap: c_int,
+    ) -> c_int;
 
     /// Create an SDP offer. Exactly one callback fires asynchronously on the
     /// signaling thread: `on_success(userdata, type, sdp)` or

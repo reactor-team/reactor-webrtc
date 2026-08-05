@@ -45,7 +45,7 @@ class RtcConfiguration:
     max_port: int  # 0 = use OS default
     bundle_policy: BundlePolicy
     ice_connection_receiving_timeout_ms: int  # 0 = libwebrtc default (~30 000 ms)
-    ice_check_min_interval_ms: int  # 0 = libwebrtc default
+    ice_check_interval_strong_connectivity_ms: int  # 0 = libwebrtc default
     tcp_candidate_policy: TcpCandidatePolicy
     def __init__(
         self,
@@ -56,7 +56,7 @@ class RtcConfiguration:
         max_port: int = 0,
         bundle_policy: BundlePolicy = ...,
         ice_connection_receiving_timeout_ms: int = 0,
-        ice_check_min_interval_ms: int = 0,
+        ice_check_interval_strong_connectivity_ms: int = 0,
         tcp_candidate_policy: TcpCandidatePolicy = ...,
     ) -> None: ...
 
