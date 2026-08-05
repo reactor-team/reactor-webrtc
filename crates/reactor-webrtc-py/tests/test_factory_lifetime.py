@@ -35,10 +35,16 @@ def test_peer_connection_survives_process_exit():
     referenced, the exact shape of REA-4766's and REA-4875's reports.
     """
     result = _run(
+        "import asyncio\n"
         "import reactor_webrtc as rw\n"
         "factory = rw.PeerConnectionFactory()\n"
         "pc = factory.create_peer_connection(rw.RtcConfiguration(), rw.PeerConnectionObserver())\n"
-        "pc.create_offer()\n"
+        # pc.create_offer() must be called from inside a running loop — its
+        # coroutine body only executes once asyncio.run() drives it, unlike a
+        # plain call passed directly as asyncio.run()'s argument.
+        "async def go():\n"
+        "    await pc.create_offer()\n"
+        "asyncio.run(go())\n"
     )
     assert result.returncode == 0, result.stderr.decode()
 

@@ -8,6 +8,7 @@ alive simultaneously.
     pytest crates/reactor-webrtc-py/tests/test_encoded_track.py -v
 """
 
+import asyncio
 import threading
 import time
 
@@ -21,12 +22,12 @@ POLL = 0.025
 # ── Helpers (mirrors test_loopback.py) ────────────────────────────────────────
 
 
-def wait_for(condition, timeout: float = TIMEOUT, poll: float = POLL) -> bool:
+async def wait_for(condition, timeout: float = TIMEOUT, poll: float = POLL) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if condition():
             return True
-        time.sleep(poll)
+        await asyncio.sleep(poll)
     return False
 
 
@@ -53,24 +54,24 @@ def make_peer(factory: rw.PeerConnectionFactory, *, on_track=None):
     return peer
 
 
-def connect(p1, p2) -> bool:
-    offer = p1.pc.create_offer()
-    p1.pc.set_local_description(offer)
-    p2.pc.set_remote_description(offer)
-    answer = p2.pc.create_answer()
-    p2.pc.set_local_description(answer)
-    p1.pc.set_remote_description(answer)
+async def connect(p1, p2) -> bool:
+    offer = await p1.pc.create_offer()
+    await p1.pc.set_local_description(offer)
+    await p2.pc.set_remote_description(offer)
+    answer = await p2.pc.create_answer()
+    await p2.pc.set_local_description(answer)
+    await p1.pc.set_remote_description(answer)
     deadline = time.monotonic() + TIMEOUT
     while time.monotonic() < deadline:
         for c in list(p1.ice):
-            p2.pc.add_ice_candidate(c)
+            await p2.pc.add_ice_candidate(c)
         p1.ice.clear()
         for c in list(p2.ice):
-            p1.pc.add_ice_candidate(c)
+            await p1.pc.add_ice_candidate(c)
         p2.ice.clear()
         if p1.connected.is_set() and p2.connected.is_set():
             return True
-        time.sleep(POLL)
+        await asyncio.sleep(POLL)
     return False
 
 
@@ -95,7 +96,7 @@ def enc_factory_and_track():
 class TestEncodedFrameMetadata:
     """E2E tests for push_encoded_frame with per-frame metadata."""
 
-    def test_encoded_frame_metadata_sender_embeds_trailer(self, enc_factory_and_track):
+    async def test_encoded_frame_metadata_sender_embeds_trailer(self, enc_factory_and_track):
         """push_encoded_frame(user_data=...) correctly embeds the RXMT metadata trailer.
 
         Uses a raw receiver FrameTransform to inspect the encoded bytes before
@@ -129,7 +130,7 @@ class TestEncodedFrameMetadata:
         send_tf = enc_track.sender_metadata_transform()  # noqa: F841 — must stay alive
         tx1.set_sender_transform(send_tf)
 
-        ok = connect(p1, p2)
+        ok = await connect(p1, p2)
         assert ok, "peers did not connect within timeout"
 
         assert recv_track_ref, "on_track was not called during SDP negotiation"
@@ -149,16 +150,16 @@ class TestEncodedFrameMetadata:
             if trailer_seen:
                 break
             enc_track.push_encoded_frame(dummy_frame, is_key_frame=True, user_data=user_data)
-            time.sleep(0.033)
+            await asyncio.sleep(0.033)
 
-        ok = wait_for(lambda: bool(trailer_seen))
+        ok = await wait_for(lambda: bool(trailer_seen))
         assert ok, (
             "RXMT trailer not seen in receiver FrameTransform within timeout — "
             "sender_metadata_transform may not be correctly appending the trailer "
             "for pre-encoded frames"
         )
 
-    def test_encoded_frame_metadata_roundtrip(self, enc_factory_and_track):
+    async def test_encoded_frame_metadata_roundtrip(self, enc_factory_and_track):
         """Full E2E: push_encoded_frame metadata survives the send→receive pipeline.
 
         Pushes dummy encoded bytes tagged with user_data; on the receiver uses
@@ -197,7 +198,7 @@ class TestEncodedFrameMetadata:
         send_tf2 = enc_track.sender_metadata_transform()  # noqa: F841
         tx3.set_sender_transform(send_tf2)
 
-        ok = connect(p3, p4)
+        ok = await connect(p3, p4)
         assert ok, "peers did not connect within timeout"
 
         assert recv_tf_ref, "on_track was not called"
@@ -212,7 +213,7 @@ class TestEncodedFrameMetadata:
 
         for _ in range(120):
             enc_track.push_encoded_frame(dummy_frame, is_key_frame=True, user_data=user_data)
-            time.sleep(0.033)
+            await asyncio.sleep(0.033)
 
         # Dummy bytes may not decode — only assert if any metadata actually arrived.
         if received_meta:
