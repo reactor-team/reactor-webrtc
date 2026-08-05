@@ -917,8 +917,7 @@ impl EncodedVideoTrack {
     /// transceiver automatically).
     fn add_to_peer_connection(&self, py: Python, pc: &PeerConnection) -> PyResult<()> {
         let track = self.inner.track();
-        py.allow_threads(|| pc.pc().add_track(track))
-            .map_err(err)
+        py.allow_threads(|| pc.pc().add_track(track)).map_err(err)
     }
 
     /// Add a transceiver of the given `direction` for this track. Returns the
