@@ -1608,9 +1608,7 @@ impl PeerConnection {
             MediaKind::Unknown => return Err(PyRuntimeError::new_err("need Audio or Video")),
         };
         py.allow_threads(|| {
-            self.inner
-                .as_ref()
-                .unwrap()
+            self.pc()
                 .add_transceiver(rust_kind, rw::TransceiverDirection::from(direction))
         })
         .map(|t| Transceiver { inner: t })

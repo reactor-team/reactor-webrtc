@@ -32,22 +32,26 @@ reactor-webrtc/
 `libwebrtc` statically - no separate native dependency at runtime.
 
 ```python
+import asyncio
 import reactor_webrtc as rw
 
-factory = rw.PeerConnectionFactory()
+async def main():
+    factory = rw.PeerConnectionFactory()
 
-obs = rw.PeerConnectionObserver()
-obs.on_ice_candidate     = lambda c: ...
-obs.on_connection_state_change = lambda s: ...
+    obs = rw.PeerConnectionObserver()
+    obs.on_ice_candidate     = lambda c: ...
+    obs.on_connection_state_change = lambda s: ...
 
-pc = factory.create_peer_connection(rw.RtcConfiguration(), obs)
-offer = await pc.create_offer()
-await pc.set_local_description(offer)
+    pc = factory.create_peer_connection(rw.RtcConfiguration(), obs)
+    offer = await pc.create_offer()
+    await pc.set_local_description(offer)
 
-# Stats (RTCStatsReport)
-report = await pc.get_stats()
-for pair in report.candidate_pairs:
-    print(pair.state, pair.current_round_trip_time_s)
+    # Stats (RTCStatsReport)
+    report = await pc.get_stats()
+    for pair in report.candidate_pairs:
+        print(pair.state, pair.current_round_trip_time_s)
+
+asyncio.run(main())
 ```
 
 **Building locally** (requires a prebuilt `libwebrtc`):
