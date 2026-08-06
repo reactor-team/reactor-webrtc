@@ -630,20 +630,40 @@ impl EncodedVideoTrack {
     /// fires the sender transform exactly once per encoded frame in push order,
     /// so a simple queue pop is sufficient and avoids the timestamp-clamping
     /// issue where `VideoStreamEncoder::OnFrame` discards future timestamps.
-    pub fn sender_metadata_transform(&mut self) -> crate::FrameTransform {
+    ///
+    /// # The gate
+    ///
+    /// `gate` is what makes attaching this unconditionally safe. Take it from
+    /// [`PeerConnection::frame_metadata_gate`](crate::PeerConnection::frame_metadata_gate);
+    /// while the remote has not declared support, frames are forwarded untouched
+    /// even when
+    /// [`push_encoded_frame_with_metadata`](Self::push_encoded_frame_with_metadata)
+    /// supplied `user_data`, because appending a trailer the peer will not strip
+    /// hands the extra bytes to its decoder.
+    pub fn sender_metadata_transform(
+        &mut self,
+        gate: &crate::metadata::FrameMetadataGate,
+    ) -> crate::FrameTransform {
         let fifo: Arc<Mutex<VecDeque<crate::metadata::FrameMetadata>>> =
             Arc::new(Mutex::new(VecDeque::new()));
         self.sender_meta_fifo = Some(fifo.clone());
+        let gate = gate.clone();
         crate::encoded::FrameTransform::new(move |frame| {
             if frame.direction != FrameDirection::Send {
                 return FrameAction::Forward;
             }
+            // Pop even when the gate is closed. push_encoded_frame_with_metadata
+            // enqueues without consulting the gate, so skipping the pop would let
+            // the queue grow for as long as the peer declines the capability, and
+            // would then start emitting stale metadata if it ever accepted it.
             let meta = fifo.lock().ok().and_then(|mut g| g.pop_front());
-            if let Some(ref m) = meta {
-                let trailer = crate::metadata::encode_trailer(m);
-                let mut new_data = frame.data.to_vec();
-                new_data.extend_from_slice(&trailer);
-                frame.replace_data(&new_data);
+            if gate.is_open() {
+                if let Some(ref m) = meta {
+                    let trailer = crate::metadata::encode_trailer(m);
+                    let mut new_data = frame.data.to_vec();
+                    new_data.extend_from_slice(&trailer);
+                    frame.replace_data(&new_data);
+                }
             }
             FrameAction::Forward
         })

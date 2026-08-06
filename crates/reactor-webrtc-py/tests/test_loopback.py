@@ -67,10 +67,40 @@ def make_peer(
 
 
 async def negotiate(p1: Peer, p2: Peer) -> None:
+    """Run the offer/answer exchange.
+
+    Nothing here mentions frame metadata: create_offer advertises it and
+    create_answer mirrors it.
+    """
     offer = await p1.pc.create_offer()
     await p1.pc.set_local_description(offer)
     await p2.pc.set_remote_description(offer)
     answer = await p2.pc.create_answer()
+    await p2.pc.set_local_description(answer)
+    await p1.pc.set_remote_description(answer)
+
+
+def strip_frame_metadata(sdp: rw.SessionDescription) -> rw.SessionDescription:
+    """Drop every a=extmap line carrying our URI.
+
+    Turns a reactor-webrtc description into what a peer built before the
+    capability existed would have produced.
+    """
+    kept = "".join(
+        f"{line}\r\n"
+        for line in sdp.sdp.splitlines()
+        if rw.FRAME_METADATA_URI not in line
+    )
+    return rw.SessionDescription(sdp.kind, kept)
+
+
+async def negotiate_with_legacy_peer(p1: Peer, p2: Peer) -> None:
+    """Negotiate against a peer that does not understand frame metadata."""
+    offer = await p1.pc.create_offer()
+    await p1.pc.set_local_description(offer)
+    await p2.pc.set_remote_description(strip_frame_metadata(offer))
+    answer = await p2.pc.create_answer()
+    assert not answer.declares_frame_metadata()
     await p2.pc.set_local_description(answer)
     await p1.pc.set_remote_description(answer)
 
@@ -81,9 +111,18 @@ async def trickle(src: Peer, dst: Peer) -> None:
     src.ice.clear()
 
 
-async def connect(p1: Peer, p2: Peer, *, open_event: threading.Event | None = None) -> bool:
+async def connect(
+    p1: Peer,
+    p2: Peer,
+    *,
+    open_event: threading.Event | None = None,
+    legacy_peer: bool = False,
+) -> bool:
     """Negotiate and trickle ICE until both peers are connected."""
-    await negotiate(p1, p2)
+    if legacy_peer:
+        await negotiate_with_legacy_peer(p1, p2)
+    else:
+        await negotiate(p1, p2)
     deadline = time.monotonic() + TIMEOUT
     while time.monotonic() < deadline:
         await trickle(p1, p2)
@@ -451,7 +490,9 @@ class TestFrameMetadata:
         video = factory.create_video_track("meta-video")
         tx1 = p1.pc.add_transceiver(rw.MediaKind.Video, rw.TransceiverDirection.SendOnly)
         tx1.set_track(video)
-        send_tf = video.sender_metadata_transform()  # noqa: F841 — must stay alive
+        send_tf = video.sender_metadata_transform(  # noqa: F841 — must stay alive
+            p1.pc.frame_metadata_gate()
+        )
         tx1.set_sender_transform(send_tf)
 
         ok = await connect(p1, p2)
@@ -483,7 +524,14 @@ class TestFrameMetadata:
         assert meta.timestamp > 0, "timestamp must be non-zero"
 
     async def test_no_transform_peer_decodes_cleanly(self, factory):
-        """A receiver without receiver_metadata_transform still decodes frames; metadata is None."""
+        """A receiver without receiver_metadata_transform still decodes frames; metadata is None.
+
+        Negotiation makes this pairing unreachable in practice — a peer that
+        declares the capability attaches the transform — so this exercises a
+        receiver that declares support (as every answer does) and then fails to
+        honour it, to pin the property that matters on its own: trailing bytes
+        do not break the decoder.
+        """
         recv_track_ref: list = []  # keeps the Track alive — Drop removes the sink
         received_frames: list = []
 
@@ -500,7 +548,9 @@ class TestFrameMetadata:
         video = factory.create_video_track("notf-video")
         tx1 = p1.pc.add_transceiver(rw.MediaKind.Video, rw.TransceiverDirection.SendOnly)
         tx1.set_track(video)
-        send_tf = video.sender_metadata_transform()  # noqa: F841 — must stay alive
+        send_tf = video.sender_metadata_transform(  # noqa: F841 — must stay alive
+            p1.pc.frame_metadata_gate()
+        )
         tx1.set_sender_transform(send_tf)
 
         ok = await connect(p1, p2)
@@ -518,3 +568,151 @@ class TestFrameMetadata:
 
         _, _, meta = received_frames[0]
         assert meta is None, "expected metadata=None without receiver_metadata_transform"
+
+    async def test_closed_gate_suppresses_the_trailer(self, factory):
+        """Without a declared capability, user_data never reaches the wire.
+
+        The push site cannot see the negotiated state, so the library has to be
+        the one that declines. The receiver here *does* attach a strip
+        transform, which makes the assertion sharp: it would surface a trailer
+        if one were appended.
+        """
+        recv_track_ref: list = []  # keeps the Track alive — Drop removes the sink
+        recv_tf_ref: list = []
+        received_frames: list = []
+
+        def on_track(kind, track):
+            if kind == rw.MediaKind.Video:
+                recv_track_ref.append(track)
+                recv_tf = track.receiver_metadata_transform()
+                recv_tf_ref.append(recv_tf)
+                track.on_video_frame(
+                    lambda bgra, w, h, meta: received_frames.append(meta)
+                )
+
+        p1 = make_peer(factory)
+        p2 = make_peer(factory, on_track=on_track)
+
+        video = factory.create_video_track("gated-video")
+        tx1 = p1.pc.add_transceiver(rw.MediaKind.Video, rw.TransceiverDirection.SendOnly)
+        tx1.set_track(video)
+        gate = p1.pc.frame_metadata_gate()
+        assert not gate.is_open(), "gate must start closed"
+        send_tf = video.sender_metadata_transform(gate)  # noqa: F841 — must stay alive
+        tx1.set_sender_transform(send_tf)
+
+        # A peer that never declares the capability.
+        ok = await connect(p1, p2, legacy_peer=True)
+        assert ok, "peers did not connect within timeout"
+        assert not gate.is_open(), "gate must stay closed when the answer is silent"
+
+        assert recv_tf_ref, "on_track was not called during SDP negotiation"
+        for t in p2.pc.transceivers():
+            if t.kind() == rw.MediaKind.Video:
+                t.set_receiver_transform(recv_tf_ref[0])
+                break
+
+        bgra = bytes(320 * 240 * 4)
+        for _ in range(90):
+            if len(received_frames) >= 3:
+                break
+            video.push_video_frame(bgra, 320, 240, user_data=b"must-not-ship")
+            await asyncio.sleep(0.033)
+
+        ok = await wait_for(lambda: len(received_frames) > 0)
+        assert ok, "no decoded frame received within timeout"
+        tagged = [m for m in received_frames if m is not None]
+        assert not tagged, (
+            f"{len(tagged)} of {len(received_frames)} frames carried a trailer "
+            "with the gate closed"
+        )
+
+
+# ── SDP capability negotiation ────────────────────────────────────────────────
+
+
+class TestFrameMetadataNegotiation:
+    """Declaring and reading the a=extmap capability, without any media."""
+
+    async def test_every_offer_advertises_the_capability(self, factory):
+        p = make_peer(factory)
+        p.pc.add_transceiver(rw.MediaKind.Video, rw.TransceiverDirection.SendOnly)
+
+        offer = await p.pc.create_offer()
+        extmap_id = offer.frame_metadata_id()
+        assert extmap_id is not None, "create_offer must advertise the capability"
+        assert offer.declares_frame_metadata()
+        assert f"a=extmap:{extmap_id} {rw.FRAME_METADATA_URI}" in offer.sdp
+
+        # libwebrtc accepts the injected line in a *local* description: an unknown
+        # extmap URI parses, then goes unmapped rather than erroring.
+        await p.pc.set_local_description(offer)
+
+    async def test_answer_mirrors_the_offer(self, factory):
+        p1 = make_peer(factory)
+        p2 = make_peer(factory)
+        p1.pc.add_transceiver(rw.MediaKind.Video, rw.TransceiverDirection.SendOnly)
+
+        offer = await p1.pc.create_offer()
+        await p1.pc.set_local_description(offer)
+        await p2.pc.set_remote_description(offer)
+        answer = await p2.pc.create_answer()
+        assert (
+            answer.frame_metadata_id() == offer.frame_metadata_id()
+        ), "the answer must echo the offer's extmap id"
+
+    async def test_answer_stays_silent_for_a_legacy_offer(self, factory):
+        p1 = make_peer(factory)
+        p2 = make_peer(factory)
+        p1.pc.add_transceiver(rw.MediaKind.Video, rw.TransceiverDirection.SendOnly)
+
+        offer = await p1.pc.create_offer()
+        await p1.pc.set_local_description(offer)
+        # Introducing the capability in an answer that was not offered it is not
+        # something offer/answer can express.
+        await p2.pc.set_remote_description(strip_frame_metadata(offer))
+        answer = await p2.pc.create_answer()
+        assert not answer.declares_frame_metadata()
+        assert not p2.pc.frame_metadata_gate().is_open()
+
+    async def test_gate_tracks_the_remote_declaration(self, factory):
+        p1 = make_peer(factory)
+        p2 = make_peer(factory)
+        p1.pc.add_transceiver(rw.MediaKind.Video, rw.TransceiverDirection.SendOnly)
+        gate = p1.pc.frame_metadata_gate()
+
+        assert not gate.is_open()
+        assert gate.extmap_id() is None
+        await negotiate(p1, p2)
+        assert gate.is_open(), "an answer declaring support must open the gate"
+        assert gate.extmap_id() is not None
+
+    async def test_gate_stays_closed_against_a_legacy_peer(self, factory):
+        p1 = make_peer(factory)
+        p2 = make_peer(factory)
+        p1.pc.add_transceiver(rw.MediaKind.Video, rw.TransceiverDirection.SendOnly)
+        gate = p1.pc.frame_metadata_gate()
+
+        await negotiate_with_legacy_peer(p1, p2)
+        assert not gate.is_open()
+
+    async def test_audio_only_offer_advertises_nothing(self, factory):
+        # No video m-section to declare on. That must not fail the offer — the
+        # capability just goes unadvertised.
+        p = make_peer(factory)
+        p.pc.add_transceiver(rw.MediaKind.Audio, rw.TransceiverDirection.SendOnly)
+        offer = await p.pc.create_offer()
+        assert not offer.declares_frame_metadata()
+        await p.pc.set_local_description(offer)
+
+    async def test_manual_helpers_are_idempotent_and_validate(self, factory):
+        # create_offer already declared, so with_frame_metadata is a no-op here.
+        p = make_peer(factory)
+        p.pc.add_transceiver(rw.MediaKind.Video, rw.TransceiverDirection.SendOnly)
+        offer = await p.pc.create_offer()
+        assert offer.with_frame_metadata().sdp == offer.sdp
+
+        with pytest.raises(RuntimeError):
+            offer.with_frame_metadata_id(0)
+        with pytest.raises(RuntimeError):
+            offer.with_frame_metadata_id(256)

@@ -110,7 +110,9 @@ for pair in report.candidate_pairs:
 | `RtcConfiguration` | ICE servers, ICE transport type, gathering policy |
 | `IceServer` | A STUN or TURN server entry |
 | `IceCandidate` | A trickled ICE candidate |
-| `SessionDescription` | SDP offer or answer (`kind`, `sdp`, `ice_ufrags`, `with_ice_credentials`) |
+| `SessionDescription` | SDP offer or answer (`kind`, `sdp`, `ice_ufrags`, `with_ice_credentials`, `frame_metadata_id`) |
+| `FrameMetadata` | Per-frame `frame_id`, `timestamp`, `user_data` |
+| `FrameMetadataGate` | What the remote declared about per-frame metadata |
 | `Track` | Local (push frames) or remote (attach sink) media track |
 | `EncodedVideoTrack` | Push pre-encoded video (H.264 Annex-B, VP8, VP9, …) |
 | `Transceiver` | RTP m-section: `mid`, `kind`, `set_track`, `set_direction` |
@@ -130,6 +132,39 @@ for pair in report.candidate_pairs:
 |---------------------|--------|
 | `RtcConfiguration.ice_transport_type` | `all` (default), `relay`, `no_host`, `none` |
 | `RtcConfiguration.continual_gathering_policy` | `once` (default), `continually` |
+
+## Per-frame metadata
+
+Arbitrary bytes can ride alongside each encoded video frame, in a protobuf
+trailer appended to the payload:
+
+```python
+video.push_video_frame(bgra, 320, 240, user_data=b"anything you like")
+
+def on_frame(bgra, w, h, meta):
+    if meta is not None:
+        print(meta.frame_id, meta.timestamp, meta.user_data)
+
+track.on_video_frame(on_frame)
+```
+
+That only works if the far end strips the trailer before its decoder sees it, so
+support is negotiated in the SDP and **you do not have to do anything for it**:
+
+- `create_offer` advertises the capability on every video m-section as
+  `a=extmap:<id> http://reactor.inc/rtp-hdrext/frame-metadata`
+  (`rw.FRAME_METADATA_URI`).
+- `create_answer` mirrors an offer that asked for it, reusing the offer's id.
+- `set_remote_description` arms `pc.frame_metadata_gate()`, and the sender
+  transform appends nothing while it is closed.
+
+A peer that has never heard of the URI ignores the line, the gate stays closed,
+and `user_data` is silently dropped rather than corrupting that peer's decode.
+Read `pc.frame_metadata_gate().is_open()` if you want to know whether the peer
+agreed.
+
+No RTP bytes are emitted for the extmap itself — libwebrtc declines to map a URI
+it does not know, so the line is a capability flag and nothing more.
 
 ## Choosing your own ICE credentials
 

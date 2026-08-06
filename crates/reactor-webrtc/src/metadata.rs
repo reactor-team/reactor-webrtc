@@ -10,10 +10,85 @@
 //! `proto_len`, decodes the protobuf slice, and calls `replace_data` with the
 //! original payload (minus the trailer) before forwarding to the decoder.
 
+use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::Arc;
+
 use prost::Message;
 
 const MAGIC: &[u8; 4] = b"RXMT";
 const FRAMING: usize = 4 /* proto_len: u32 */ + 4 /* magic */;
+
+/// The SDP `a=extmap` URI a peer declares to say it understands the trailer
+/// this module defines.
+///
+/// The URI *is* the wire version: an incompatible change to the trailer format
+/// mints a new one (`…/frame-metadata-2`) rather than adding a version field, so
+/// that a peer speaking the old format and one speaking the new never negotiate
+/// a match. See [`SessionDescription::with_frame_metadata`][swfm].
+///
+/// No header-extension bytes are ever emitted for it. libwebrtc's
+/// `RtpHeaderExtensionMap::RegisterByUri` refuses to map a URI it does not know,
+/// so the declaration lives in the SDP and the RTP stream is untouched — which
+/// is the whole point: this is a capability flag, not a transport.
+///
+/// [swfm]: crate::SessionDescription::with_frame_metadata
+pub const FRAME_METADATA_URI: &str = "http://reactor.inc/rtp-hdrext/frame-metadata";
+
+/// What the remote peer declared about frame-metadata support, as negotiated.
+///
+/// A connection's gate is available from
+/// [`PeerConnection::frame_metadata_gate`][gate]. It starts **closed** and is
+/// armed by [`PeerConnection::set_remote_description`][srd] from whether that
+/// description carries [`FRAME_METADATA_URI`]. Every renegotiation re-arms it, so
+/// a peer that drops support closes it again.
+///
+/// It drives two things, both inside the library:
+///
+/// * [`create_answer`][ca] mirrors the offer — it declares the capability, under
+///   the offer's own extmap id, only when the offer declared it.
+/// * The sender metadata transform consults it per frame and appends nothing
+///   while it is closed, because handing a trailer to a peer that will not strip
+///   it hands the extra bytes to that peer's decoder.
+///
+/// Callers do not have to consult it: pass `user_data` whenever it is meaningful
+/// and let the negotiated state decide whether it reaches the wire. Reading it is
+/// still useful for diagnostics — "did this peer agree?" is otherwise invisible.
+///
+/// [gate]: crate::PeerConnection::frame_metadata_gate
+/// [srd]: crate::PeerConnection::set_remote_description
+/// [ca]: crate::PeerConnection::create_answer
+#[derive(Clone, Debug, Default)]
+pub struct FrameMetadataGate(Arc<AtomicU16>);
+
+impl FrameMetadataGate {
+    /// A closed gate, not attached to any peer connection. Useful in tests.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether trailers may be appended.
+    pub fn is_open(&self) -> bool {
+        self.extmap_id().is_some()
+    }
+
+    /// The `a=extmap` id the remote declared the capability under.
+    ///
+    /// `create_answer` echoes this rather than allocating its own, matching what
+    /// libwebrtc does for the extensions it knows.
+    pub fn extmap_id(&self) -> Option<u16> {
+        // 0 is not a valid extmap id (RFC 8285 ids start at 1), so it doubles as
+        // "closed" and the whole gate stays one lock-free word.
+        match self.0.load(Ordering::Relaxed) {
+            0 => None,
+            id => Some(id),
+        }
+    }
+
+    /// Arm from a remote description's declaration. `None` closes the gate.
+    pub(crate) fn set(&self, extmap_id: Option<u16>) {
+        self.0.store(extmap_id.unwrap_or(0), Ordering::Relaxed);
+    }
+}
 
 /// Per-frame metadata carried alongside an encoded video frame.
 ///

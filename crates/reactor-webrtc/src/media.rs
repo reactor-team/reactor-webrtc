@@ -308,11 +308,33 @@ impl Track {
     ///
     /// If `push_video_frame` is called (no metadata), the transform forwards
     /// the frame unchanged.
-    pub fn sender_metadata_transform(&mut self) -> crate::encoded::FrameTransform {
+    ///
+    /// # The gate
+    ///
+    /// `gate` is what makes attaching this unconditionally safe. Take it from
+    /// [`PeerConnection::frame_metadata_gate`](crate::PeerConnection::frame_metadata_gate)
+    /// and attach the transform before the SDP exchange as usual; while the
+    /// remote has not declared support, every frame is forwarded untouched,
+    /// whether or not the caller passed `user_data`. Appending a trailer for a
+    /// peer that does not strip it would hand the extra bytes to that peer's
+    /// decoder, and the caller is in no position to know — the negotiated state
+    /// is not visible from the push site.
+    pub fn sender_metadata_transform(
+        &mut self,
+        gate: &crate::metadata::FrameMetadataGate,
+    ) -> crate::encoded::FrameTransform {
         let map: SenderMetaMap = Arc::new(Mutex::new((HashMap::new(), VecDeque::new())));
         self.sender_meta = Some(map.clone());
+        let gate = gate.clone();
         crate::encoded::FrameTransform::new(move |frame| {
             if frame.direction != crate::encoded::FrameDirection::Send {
+                return crate::encoded::FrameAction::Forward;
+            }
+            // Returning before the lookup is safe here (unlike the FIFO in
+            // EncodedVideoTrack): the sender map is capacity-bounded and evicts
+            // in insertion order, so entries left behind by a closed gate are
+            // reclaimed rather than accumulated.
+            if !gate.is_open() {
                 return crate::encoded::FrameAction::Forward;
             }
             // Look up by the frame's capture timestamp (ms precision). No-erase

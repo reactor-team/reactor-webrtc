@@ -52,7 +52,8 @@ pc.set_local_description(&offer)?;
 | `EncodedVideoTrack` | Push pre-encoded video frames (H.264, VP8, VP9, …) |
 | `Transceiver` | RTP send/recv direction + MID |
 | `StatsReport` | `inbound_rtp`, `outbound_rtp`, `candidate_pairs` |
-| `SessionDescription` | SDP offer or answer; `ice_ufrags`, `with_ice_credentials` |
+| `SessionDescription` | SDP offer or answer; `ice_ufrags`, `with_ice_credentials`, `frame_metadata_id` |
+| `FrameMetadataGate` | What the remote declared about per-frame metadata |
 | `IceCandidate` | Trickled ICE candidate |
 | `RtcConfiguration` | ICE servers + transport policy |
 | `AdmMode` | `Synthetic` (push PCM) or `Platform` (real mic/speaker) |
@@ -94,6 +95,53 @@ Returns an error if a value falls outside RFC 8445's ranges (ufrag 4–256
 characters, password 22–256) or contains anything outside `ice-char`
 (`ALPHA / DIGIT / "+" / "/"`). That last check is also what stops a newline in a
 credential from injecting an SDP line.
+
+## Per-frame metadata
+
+Arbitrary bytes can ride alongside each encoded video frame, in a protobuf trailer
+appended to the payload:
+
+```text
+[ encoded payload ][ proto bytes ][ u32 LE: proto_len ][ b"RXMT" ]
+```
+
+Push it with the frame; read it off the decoded one:
+
+```rust
+track.push_video_frame_with_metadata(&bgra, w, h, b"anything you like");
+
+track.on_video_frame(|frame| {
+    if let Some(meta) = frame.metadata {
+        // meta.user_data, meta.frame_id, meta.timestamp
+    }
+});
+```
+
+That only works if the far end strips the trailer before its decoder sees it, so
+support is negotiated in the SDP and **you do not have to do anything for it**:
+
+- `create_offer` advertises the capability on every video m-section as
+  `a=extmap:<id> http://reactor.inc/rtp-hdrext/frame-metadata`.
+- `create_answer` mirrors an offer that asked for it, reusing the offer's id.
+- `set_remote_description` arms the connection's `FrameMetadataGate` from what the
+  remote declared, and the sender transform appends nothing while it is closed.
+
+A peer that has never heard of the URI ignores the line — RFC 8866 requires
+unrecognised attributes to be ignored — and the gate stays closed, so `user_data`
+is silently dropped rather than corrupting that peer's decode. Check
+`pc.frame_metadata_gate().is_open()` if you want to know whether the peer agreed.
+
+Three details worth knowing:
+
+- **No bytes on the wire for the extmap.** libwebrtc's `RegisterByUri` declines a
+  URI it does not know, so the extension is never mapped and never packetised.
+  The `a=extmap` line is a capability flag, nothing more.
+- **The id is searched bundle-wide.** RFC 8843 requires one id to mean one URI
+  across every bundled m-section, and the *peer* enforces it when it applies what
+  we signalled. Ids stay inside 1–14 so the result never depends on
+  `a=extmap-allow-mixed`.
+- **The URI is the version.** An incompatible change to the trailer format mints a
+  new URI rather than adding a version field, so old and new never match.
 
 ## Audio modes
 

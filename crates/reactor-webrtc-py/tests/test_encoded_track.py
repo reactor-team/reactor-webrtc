@@ -55,6 +55,11 @@ def make_peer(factory: rw.PeerConnectionFactory, *, on_track=None):
 
 
 async def connect(p1, p2) -> bool:
+    """Negotiate and trickle ICE until both peers are connected.
+
+    create_offer advertises frame-metadata support and create_answer mirrors it,
+    so nothing here has to.
+    """
     offer = await p1.pc.create_offer()
     await p1.pc.set_local_description(offer)
     await p2.pc.set_remote_description(offer)
@@ -127,7 +132,9 @@ class TestEncodedFrameMetadata:
         tx1 = p1.pc.add_transceiver(rw.MediaKind.Video, rw.TransceiverDirection.SendOnly)
         tx1.set_track(enc_track)
 
-        send_tf = enc_track.sender_metadata_transform()  # noqa: F841 — must stay alive
+        send_tf = enc_track.sender_metadata_transform(  # noqa: F841 — must stay alive
+            p1.pc.frame_metadata_gate()
+        )
         tx1.set_sender_transform(send_tf)
 
         ok = await connect(p1, p2)
@@ -195,7 +202,9 @@ class TestEncodedFrameMetadata:
         tx3 = p3.pc.add_transceiver(rw.MediaKind.Video, rw.TransceiverDirection.SendOnly)
         tx3.set_track(enc_track)
 
-        send_tf2 = enc_track.sender_metadata_transform()  # noqa: F841
+        send_tf2 = enc_track.sender_metadata_transform(  # noqa: F841
+            p3.pc.frame_metadata_gate()
+        )
         tx3.set_sender_transform(send_tf2)
 
         ok = await connect(p3, p4)

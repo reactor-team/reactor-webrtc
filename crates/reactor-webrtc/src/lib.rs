@@ -14,6 +14,15 @@
 //! description before it is set locally, which is where libwebrtc reads the
 //! transport's ICE parameters from.
 //!
+//! Per-frame metadata ([`metadata`]) rides in a trailer appended to the encoded
+//! payload, which only works if the peer strips it again. That is negotiated for
+//! you: every [`PeerConnection::create_offer`] advertises the capability as an
+//! `a=extmap`, [`PeerConnection::create_answer`] mirrors an offer that asked for
+//! it, and [`PeerConnection::set_remote_description`] arms a
+//! [`FrameMetadataGate`] from what the remote declared. Callers pass `user_data`
+//! when it is meaningful and never have to ask what the far end supports — a
+//! trailer reaches the wire only when the peer said it strips them.
+//!
 //! Building a real binary or test requires a native `libwebrtc`; set
 //! `REACTOR_WEBRTC_LIB_DIR` or `REACTOR_WEBRTC_PREBUILT_URL`. `cargo check`
 //! works without one.
@@ -42,7 +51,7 @@ pub use encoded::{
     FrameDirection, FrameTransform, RawVideoFrame, VideoCodec,
 };
 pub use media::{AudioFrame, MediaKind, Track, VideoFrame};
-pub use metadata::FrameMetadata;
+pub use metadata::{FrameMetadata, FrameMetadataGate, FRAME_METADATA_URI};
 pub use observer::PeerConnectionObserver;
 pub use peer_connection::{
     DataChannel, DataChannelState, IceCandidate, IceCandidatePairState, IceCandidatePairStats,
