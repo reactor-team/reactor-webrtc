@@ -15,7 +15,7 @@
 //! — the opposite of what is wanted.
 //!
 //! What the two *do* share is the native track they wrap. So tracks register
-//! their metadata source in [`REGISTRY`] under that native identity
+//! their metadata source under that native identity
 //! (`reactor_webrtc_rtp_transceiver_sender_track_id`), and the install step looks
 //! it up. Entries are weak and tracks deregister on drop, so a registered track
 //! going away leaves nothing behind and cannot resurrect a stale queue.

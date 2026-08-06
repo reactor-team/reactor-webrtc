@@ -81,15 +81,16 @@ async def negotiate(p1: Peer, p2: Peer) -> None:
 
 
 def strip_frame_metadata(sdp: rw.SessionDescription) -> rw.SessionDescription:
-    """Drop every a=extmap line carrying our URI.
+    """Drop the frame-metadata declaration.
 
     Turns a reactor-webrtc description into what a peer built before the
     capability existed would have produced.
     """
+    prefix = f"a={rw.FRAME_METADATA_ATTRIBUTE}:"
     kept = "".join(
         f"{line}\r\n"
         for line in sdp.sdp.splitlines()
-        if rw.FRAME_METADATA_URI not in line
+        if not line.startswith(prefix)
     )
     return rw.SessionDescription(sdp.kind, kept)
 
@@ -605,20 +606,24 @@ class TestFrameMetadata:
 
 
 class TestFrameMetadataNegotiation:
-    """Declaring and reading the a=extmap capability, without any media."""
+    """Declaring and reading the SDP capability, without any media."""
 
     async def test_every_offer_advertises_the_capability(self, factory):
         p = make_peer(factory)
         p.pc.add_transceiver(rw.MediaKind.Video, rw.TransceiverDirection.SendOnly)
 
         offer = await p.pc.create_offer()
-        extmap_id = offer.frame_metadata_id()
-        assert extmap_id is not None, "create_offer must advertise the capability"
-        assert offer.declares_frame_metadata()
-        assert f"a=extmap:{extmap_id} {rw.FRAME_METADATA_URI}" in offer.sdp
+        assert offer.declares_frame_metadata(), (
+            "create_offer must advertise the capability"
+        )
+        declaration = (
+            f"a={rw.FRAME_METADATA_ATTRIBUTE}:{rw.FRAME_METADATA_VERSION}"
+        )
+        assert declaration in offer.sdp
+        assert offer.sdp.count(declaration) == 1, "session level, so exactly once"
 
-        # libwebrtc accepts the injected line in a *local* description: an unknown
-        # extmap URI parses, then goes unmapped rather than erroring.
+        # libwebrtc tolerates the injected line in a *local* description: it drops
+        # attributes it does not recognise rather than erroring.
         await p.pc.set_local_description(offer)
 
     async def test_answer_mirrors_the_offer(self, factory):
@@ -630,9 +635,9 @@ class TestFrameMetadataNegotiation:
         await p1.pc.set_local_description(offer)
         await p2.pc.set_remote_description(offer)
         answer = await p2.pc.create_answer()
-        assert (
-            answer.frame_metadata_id() == offer.frame_metadata_id()
-        ), "the answer must echo the offer's extmap id"
+        assert answer.declares_frame_metadata(), (
+            "the answer must mirror the offer's declaration"
+        )
 
     async def test_answer_stays_silent_for_a_legacy_offer(self, factory):
         p1 = make_peer(factory)
@@ -655,10 +660,8 @@ class TestFrameMetadataNegotiation:
         gate = p1.pc.frame_metadata_gate()
 
         assert not gate.is_open()
-        assert gate.extmap_id() is None
         await negotiate(p1, p2)
         assert gate.is_open(), "an answer declaring support must open the gate"
-        assert gate.extmap_id() is not None
 
     async def test_gate_stays_closed_against_a_legacy_peer(self, factory):
         p1 = make_peer(factory)
@@ -669,26 +672,23 @@ class TestFrameMetadataNegotiation:
         await negotiate_with_legacy_peer(p1, p2)
         assert not gate.is_open()
 
-    async def test_audio_only_offer_advertises_nothing(self, factory):
-        # No video m-section to declare on. That must not fail the offer — the
-        # capability just goes unadvertised.
+    async def test_audio_only_offer_still_advertises(self, factory):
+        # The declaration is session level, so there is nothing about video to
+        # condition it on — and a renegotiation that adds video must not have to
+        # introduce the capability mid-session.
         p = make_peer(factory)
         p.pc.add_transceiver(rw.MediaKind.Audio, rw.TransceiverDirection.SendOnly)
         offer = await p.pc.create_offer()
-        assert not offer.declares_frame_metadata()
+        assert offer.declares_frame_metadata()
         await p.pc.set_local_description(offer)
 
-    async def test_manual_helpers_are_idempotent_and_validate(self, factory):
+    async def test_manual_helper_is_idempotent(self, factory):
         # create_offer already declared, so with_frame_metadata is a no-op here.
         p = make_peer(factory)
         p.pc.add_transceiver(rw.MediaKind.Video, rw.TransceiverDirection.SendOnly)
         offer = await p.pc.create_offer()
         assert offer.with_frame_metadata().sdp == offer.sdp
-
-        with pytest.raises(RuntimeError):
-            offer.with_frame_metadata_id(0)
-        with pytest.raises(RuntimeError):
-            offer.with_frame_metadata_id(256)
+        assert offer.with_frame_metadata().kind == offer.kind
 
     async def test_disabled_frame_metadata_never_negotiates(self, factory):
         """frame_metadata=False keeps the capability out of the SDP entirely."""

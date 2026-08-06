@@ -10,7 +10,7 @@
 //! `proto_len`, decodes the protobuf slice, and calls `replace_data` with the
 //! original payload (minus the trailer) before forwarding to the decoder.
 
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use prost::Message;
@@ -18,34 +18,42 @@ use prost::Message;
 const MAGIC: &[u8; 4] = b"RXMT";
 const FRAMING: usize = 4 /* proto_len: u32 */ + 4 /* magic */;
 
-/// The SDP `a=extmap` URI a peer declares to say it understands the trailer
-/// this module defines.
+/// The SDP attribute name a peer declares to say it understands the trailer this
+/// module defines. Emitted at **session level** as `a=x-reactor-frame-metadata:<version>`.
 ///
-/// The URI *is* the wire version: an incompatible change to the trailer format
-/// mints a new one (`…/frame-metadata-2`) rather than adding a version field, so
-/// that a peer speaking the old format and one speaking the new never negotiate
-/// a match. See [`SessionDescription::with_frame_metadata`][swfm].
+/// A session-level line rather than a per-m-section one because support is a
+/// property of a peer's code, not of one of its tracks — no peer understands the
+/// trailer on one video track and not another.
 ///
-/// No header-extension bytes are ever emitted for it. libwebrtc's
-/// `RtpHeaderExtensionMap::RegisterByUri` refuses to map a URI it does not know,
-/// so the declaration lives in the SDP and the RTP stream is untouched — which
-/// is the whole point: this is a capability flag, not a transport.
+/// Unregistered, hence the `x-` prefix. RFC 8866 §6 requires a receiver to ignore
+/// an attribute it does not recognise, which is what makes the declaration safe to
+/// send unconditionally: a peer that has never heard of it is unaffected.
 ///
-/// [swfm]: crate::SessionDescription::with_frame_metadata
-pub const FRAME_METADATA_URI: &str = "http://reactor.inc/rtp-hdrext/frame-metadata";
+/// Note that libwebrtc drops unrecognised `a=` lines when it parses a description,
+/// so this is readable from the SDP **string** and not from anything libwebrtc
+/// hands back. Everything here reads
+/// [`SessionDescription::sdp`](crate::SessionDescription::sdp) directly for that
+/// reason.
+pub const FRAME_METADATA_ATTRIBUTE: &str = "x-reactor-frame-metadata";
+
+/// Wire version of the trailer format in this module.
+///
+/// A peer declaring a different version reads as *unsupported*: an incompatible
+/// change to the trailer bumps this, and old and new then never agree.
+pub const FRAME_METADATA_VERSION: u32 = 1;
 
 /// What the remote peer declared about frame-metadata support, as negotiated.
 ///
 /// A connection's gate is available from
 /// [`PeerConnection::frame_metadata_gate`][gate]. It starts **closed** and is
 /// armed by [`PeerConnection::set_remote_description`][srd] from whether that
-/// description carries [`FRAME_METADATA_URI`]. Every renegotiation re-arms it, so
+/// description carries [`FRAME_METADATA_ATTRIBUTE`]. Every renegotiation re-arms it, so
 /// a peer that drops support closes it again.
 ///
 /// It drives two things, both inside the library:
 ///
-/// * [`create_answer`][ca] mirrors the offer — it declares the capability, under
-///   the offer's own extmap id, only when the offer declared it.
+/// * [`create_answer`][ca] mirrors the offer — it declares the capability only when
+///   the offer declared it.
 /// * The sender metadata transform consults it per frame and appends nothing
 ///   while it is closed, because handing a trailer to a peer that will not strip
 ///   it hands the extra bytes to that peer's decoder.
@@ -58,7 +66,7 @@ pub const FRAME_METADATA_URI: &str = "http://reactor.inc/rtp-hdrext/frame-metada
 /// [srd]: crate::PeerConnection::set_remote_description
 /// [ca]: crate::PeerConnection::create_answer
 #[derive(Clone, Debug, Default)]
-pub struct FrameMetadataGate(Arc<AtomicU16>);
+pub struct FrameMetadataGate(Arc<AtomicBool>);
 
 impl FrameMetadataGate {
     /// A closed gate, not attached to any peer connection. Useful in tests.
@@ -68,25 +76,12 @@ impl FrameMetadataGate {
 
     /// Whether trailers may be appended.
     pub fn is_open(&self) -> bool {
-        self.extmap_id().is_some()
+        self.0.load(Ordering::Relaxed)
     }
 
-    /// The `a=extmap` id the remote declared the capability under.
-    ///
-    /// `create_answer` echoes this rather than allocating its own, matching what
-    /// libwebrtc does for the extensions it knows.
-    pub fn extmap_id(&self) -> Option<u16> {
-        // 0 is not a valid extmap id (RFC 8285 ids start at 1), so it doubles as
-        // "closed" and the whole gate stays one lock-free word.
-        match self.0.load(Ordering::Relaxed) {
-            0 => None,
-            id => Some(id),
-        }
-    }
-
-    /// Arm from a remote description's declaration. `None` closes the gate.
-    pub(crate) fn set(&self, extmap_id: Option<u16>) {
-        self.0.store(extmap_id.unwrap_or(0), Ordering::Relaxed);
+    /// Arm from whether a remote description declared support.
+    pub(crate) fn set(&self, declared: bool) {
+        self.0.store(declared, Ordering::Relaxed);
     }
 }
 

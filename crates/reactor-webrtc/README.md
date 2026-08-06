@@ -121,9 +121,9 @@ That only works if the far end strips the trailer before its decoder sees it, so
 support is negotiated in the SDP and **you do not have to do anything for it** —
 there are no transforms to build or attach:
 
-- `create_offer` advertises the capability on every video m-section as
-  `a=extmap:<id> http://reactor.inc/rtp-hdrext/frame-metadata`.
-- `create_answer` mirrors an offer that asked for it, reusing the offer's id.
+- `create_offer` advertises the capability as one session-level
+  `a=x-reactor-frame-metadata:1`, inserted before the first media section.
+- `create_answer` mirrors an offer that asked for it.
 - `set_remote_description` arms the connection's `FrameMetadataGate` and, when it
   is open, installs the embed and strip transforms on the video transceivers. The
   remote track exists by then: libwebrtc creates it while applying the
@@ -131,22 +131,31 @@ there are no transforms to build or attach:
 - The sender transform still consults the gate per frame, so a renegotiation in
   which the peer drops support stops the trailers without detaching anything.
 
-A peer that has never heard of the URI ignores the line — RFC 8866 requires
+A peer that has never heard of the attribute ignores it — RFC 8866 §6 requires
 unrecognised attributes to be ignored — and the gate stays closed, so `user_data`
 is silently dropped rather than corrupting that peer's decode. Check
 `pc.frame_metadata_gate().is_open()` if you want to know whether the peer agreed.
 
 Three details worth knowing:
 
-- **No bytes on the wire for the extmap.** libwebrtc's `RegisterByUri` declines a
-  URI it does not know, so the extension is never mapped and never packetised.
-  The `a=extmap` line is a capability flag, nothing more.
-- **The id is searched bundle-wide.** RFC 8843 requires one id to mean one URI
-  across every bundled m-section, and the *peer* enforces it when it applies what
-  we signalled. Ids stay inside 1–14 so the result never depends on
-  `a=extmap-allow-mixed`.
-- **The URI is the version.** An incompatible change to the trailer format mints a
-  new URI rather than adding a version field, so old and new never match.
+- **Session level, not per m-section.** Understanding the trailer is a property of
+  a peer's code, not of one of its tracks, so one line covers the session — audio-only
+  descriptions included, which keeps a renegotiation that adds video from having to
+  introduce the capability mid-session.
+- **Read it from the SDP string.** libwebrtc discards `a=` lines it does not
+  recognise while parsing, so the declaration is only ever visible in the signalled
+  text — not in anything the stack hands back. Nothing in this crate depends on the
+  parsed form. Browsers behave the same way, so a browser peer must read the raw
+  signalled SDP too.
+- **The version is the compatibility token.** An incompatible change to the trailer
+  format bumps `FRAME_METADATA_VERSION`, and old and new then never agree.
+
+An `a=extmap` would have been the recognisable spelling, and was the first thing
+tried, but it means "I will send this RTP header extension" — which is not true, no
+header extension is ever emitted — and it drags in a shared id namespace that the
+*peer* validates (RFC 8843: one id, one URI, across a BUNDLE group), so a collision
+would surface as the far side's `set_remote_description` failing. An unregistered
+`x-` attribute claims nothing false and has no id to collide.
 - **Your own `FrameTransform` composes with it.** libwebrtc holds one transformer
   per sender and per receiver, so the crate owns those slots and runs both things
   that want them. Your callback goes first in both directions, so it sees exactly

@@ -447,19 +447,11 @@ impl SessionDescription {
         Ok(out.into())
     }
 
-    /// The `a=extmap` id this description declares `FRAME_METADATA_URI` with, or
-    /// `None`.
+    /// Whether this description declares frame-metadata support.
     ///
-    /// Read it on an offer to echo the same id back in the answer.
-    fn frame_metadata_id(&self) -> Option<u16> {
-        // Read straight off the SDP, like `ice_ufrags`: the answer does not
-        // depend on `kind`, and routing it through `to_rust_sdp` would turn an
-        // unrelated "unknown SDP kind" into `None` — indistinguishable from a
-        // description that simply does not declare support.
-        self.as_rust_for_reading().frame_metadata_id()
-    }
-
-    /// Whether this description declares support for frame-metadata trailers.
+    /// True when it carries a session-level `a=x-reactor-frame-metadata:<version>`
+    /// at a version this build understands. A peer speaking a different trailer
+    /// format therefore reads as unsupported rather than as a partial match.
     ///
     /// `set_remote_description` arms the connection's `FrameMetadataGate` from
     /// exactly this.
@@ -467,45 +459,19 @@ impl SessionDescription {
         self.as_rust_for_reading().declares_frame_metadata()
     }
 
-    /// Return a copy declaring frame-metadata support on every video m-section,
-    /// allocating the lowest free one-byte `a=extmap` id.
+    /// Return a copy declaring frame-metadata support, as a session-level attribute.
     ///
-    /// Declare on the description you **signal** and set the unmodified one
-    /// locally — unlike `with_ice_credentials`, this line is pure signalling and
-    /// libwebrtc has no use for it:
-    ///
-    /// ```python
-    /// offer = await pc.create_offer()
-    /// await pc.set_local_description(offer)
-    /// signal(offer.with_frame_metadata().sdp)
-    /// ```
-    ///
-    /// Idempotent. Raises if there is no video m-section with an `a=mid:`, or if
-    /// every id in 1..=14 is already in use.
-    fn with_frame_metadata(&self) -> PyResult<Self> {
-        let out = to_rust_sdp(self)?
-            .with_frame_metadata()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(out.into())
-    }
-
-    /// Return a copy declaring frame-metadata support with a specific
-    /// `a=extmap` id. Use it on an answer, echoing the offer's id:
-    ///
-    /// ```python
-    /// offer_id = offer.frame_metadata_id()
-    /// if offer_id is not None:
-    ///     answer = answer.with_frame_metadata_id(offer_id)
-    /// ```
-    ///
-    /// Raises if `id` is outside 1..=255, if it is already bound to a different
-    /// URI in this description, if there is no video m-section with an `a=mid:`,
-    /// or if the description already declares support under another id.
-    fn with_frame_metadata_id(&self, id: u16) -> PyResult<Self> {
-        let out = to_rust_sdp(self)?
-            .with_frame_metadata_id(id)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(out.into())
+    /// `create_offer` already applies this to every offer and `create_answer`
+    /// mirrors the offer, so callers using this library's signalling path never need
+    /// it. Public for callers that assemble or rewrite SDP themselves. Idempotent.
+    fn with_frame_metadata(&self) -> Self {
+        // Preserves `kind` verbatim instead of validating it: declaring the
+        // capability does not depend on the SDP type, so an unfamiliar `kind` is not
+        // a reason to raise here. Same reasoning as `as_rust_for_reading`.
+        Self {
+            kind: self.kind.clone(),
+            sdp: self.as_rust_for_reading().with_frame_metadata().sdp,
+        }
     }
 }
 
@@ -899,18 +865,15 @@ impl FrameMetadataGate {
         self.inner.is_open()
     }
 
-    /// The `a=extmap` id the remote declared the capability under, or `None`.
-    ///
-    /// `create_answer` echoes this rather than allocating its own.
-    fn extmap_id(&self) -> Option<u16> {
-        self.inner.extmap_id()
-    }
-
     fn __repr__(&self) -> String {
-        match self.inner.extmap_id() {
-            Some(id) => format!("FrameMetadataGate(open, extmap_id={id})"),
-            None => "FrameMetadataGate(closed)".to_string(),
-        }
+        format!(
+            "FrameMetadataGate({})",
+            if self.inner.is_open() {
+                "open"
+            } else {
+                "closed"
+            }
+        )
     }
 }
 
@@ -1980,9 +1943,10 @@ fn reactor_webrtc(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PeerConnection>()?;
     m.add_class::<PeerConnectionFactory>()?;
 
-    // The SDP a=extmap URI peers declare frame-metadata support with. Exposed so
-    // that a caller inspecting or building SDP by hand does not have to hardcode
-    // it — and so that the version baked into this wheel is the one they see.
-    m.add("FRAME_METADATA_URI", rw::FRAME_METADATA_URI)?;
+    // The SDP attribute peers declare frame-metadata support with, and the trailer
+    // version this wheel speaks. Exposed so that a caller inspecting or building SDP
+    // by hand does not have to hardcode either.
+    m.add("FRAME_METADATA_ATTRIBUTE", rw::FRAME_METADATA_ATTRIBUTE)?;
+    m.add("FRAME_METADATA_VERSION", rw::FRAME_METADATA_VERSION)?;
     Ok(())
 }

@@ -58,47 +58,6 @@ const ICE_UFRAG_LEN: std::ops::RangeInclusive<usize> = 4..=256;
 /// RFC 8445 §5.3: an ice-pwd is 22..=256 characters.
 const ICE_PWD_LEN: std::ops::RangeInclusive<usize> = 22..=256;
 
-/// Highest `a=extmap` id expressible in RFC 8285's one-byte header form.
-/// `RtpHeaderExtensionId::kOneByteHeaderExtensionMaxId` upstream.
-const EXTMAP_ONE_BYTE_MAX_ID: u16 = 14;
-/// Highest `a=extmap` id libwebrtc accepts at all (two-byte form).
-/// `RtpHeaderExtensionId::kMaxId` upstream.
-const EXTMAP_MAX_ID: u16 = 255;
-
-/// Split an `a=extmap` line into its id and URI.
-///
-/// `a=extmap:<value>["/"<direction>] <URI> <extensionattributes>` (RFC 8285 §6).
-/// Ids outside 1..=255 are rejected rather than returned: RFC 8285 has no such
-/// id, libwebrtc's `VerifyExtensionIds` refuses one, and callers here use the
-/// result to index a table.
-fn parse_extmap(line: &str) -> Option<(u16, &str)> {
-    let (id_direction, rest) = line.strip_prefix("a=extmap:")?.split_once(' ')?;
-    let id = id_direction.split('/').next()?.parse::<u16>().ok()?;
-    if !(1..=EXTMAP_MAX_ID).contains(&id) {
-        return None;
-    }
-    Some((id, rest.split_whitespace().next()?))
-}
-
-/// The lowest one-byte `a=extmap` id unused anywhere in `sdp`.
-///
-/// Scans the whole description rather than one m-section, because RFC 8843
-/// requires an id to identify the same extension across every bundled
-/// m-section — audio included — and it is the *peer* that enforces this
-/// (`ValidateBundledRtpHeaderExtensions`) when it applies what we signalled. A
-/// per-section search could pick an id that is free there and taken next door.
-///
-/// Restricted to the one-byte range so the result never depends on
-/// `a=extmap-allow-mixed` having been negotiated. Since the frame-metadata
-/// declaration emits no header bytes, the id's only job is not to collide.
-fn free_extmap_id(sdp: &str) -> Option<u16> {
-    let mut used = [false; EXTMAP_MAX_ID as usize + 1];
-    for (id, _) in sdp.lines().filter_map(parse_extmap) {
-        used[id as usize] = true;
-    }
-    (1..=EXTMAP_ONE_BYTE_MAX_ID).find(|&id| !used[id as usize])
-}
-
 /// RFC 8445 `ice-char = ALPHA / DIGIT / "+" / "/"`.
 fn is_ice_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '+' || c == '/'
@@ -234,165 +193,86 @@ impl SessionDescription {
         })
     }
 
-    /// The `a=extmap` id this description declares
-    /// [`FRAME_METADATA_URI`](crate::metadata::FRAME_METADATA_URI) with, if any.
+    /// Whether this description declares frame-metadata support.
     ///
-    /// Read it on an offer to echo the same id back in the answer, the way
-    /// libwebrtc does for the extensions it knows.
-    pub fn frame_metadata_id(&self) -> Option<u16> {
-        self.sdp
-            .lines()
-            .filter_map(parse_extmap)
-            .find(|&(_, uri)| uri == crate::metadata::FRAME_METADATA_URI)
-            .map(|(id, _)| id)
-    }
-
-    /// Whether this description declares support for frame-metadata trailers.
+    /// True when it carries a session-level
+    /// `a=x-reactor-frame-metadata:<version>` whose version this build understands
+    /// ([`FRAME_METADATA_VERSION`](crate::metadata::FRAME_METADATA_VERSION)). A peer
+    /// speaking a different trailer format therefore reads as unsupported rather
+    /// than as a partial match.
     ///
-    /// This is what [`PeerConnection::set_remote_description`] arms the
-    /// connection's [`FrameMetadataGate`](crate::FrameMetadataGate) from.
+    /// Read off the SDP string, not from libwebrtc: it drops `a=` lines it does not
+    /// recognise when parsing, so the parsed description never carries this.
+    ///
+    /// This is what [`PeerConnection::set_remote_description`] arms the connection's
+    /// [`FrameMetadataGate`](crate::FrameMetadataGate) from.
     pub fn declares_frame_metadata(&self) -> bool {
-        self.frame_metadata_id().is_some()
+        let prefix = format!("a={}:", crate::metadata::FRAME_METADATA_ATTRIBUTE);
+        self.sdp.lines().any(|line| {
+            line.strip_prefix(prefix.as_str())
+                .and_then(|v| v.trim_end().parse::<u32>().ok())
+                .is_some_and(|v| v == crate::metadata::FRAME_METADATA_VERSION)
+        })
     }
 
-    /// Return a copy declaring frame-metadata support on every video m-section,
-    /// allocating the lowest free one-byte `a=extmap` id.
+    /// Return a copy declaring frame-metadata support, as a session-level attribute.
     ///
-    /// [`create_offer`](PeerConnection::create_offer) already applies this to
-    /// every offer, and [`create_answer`](PeerConnection::create_answer) mirrors
-    /// the offer — so a caller using this crate's signalling path never needs to
-    /// call it. It is public for callers that assemble or rewrite descriptions
-    /// themselves.
+    /// [`create_offer`](PeerConnection::create_offer) already applies this to every
+    /// offer, and [`create_answer`](PeerConnection::create_answer) mirrors the offer
+    /// — so a caller using this crate's signalling path never needs it. It is public
+    /// for callers that assemble or rewrite descriptions themselves.
     ///
-    /// # Why an extmap
+    /// Idempotent: a description that already declares the capability comes back
+    /// unchanged, as does one with no lines at all.
     ///
-    /// The capability has to survive the trip. libwebrtc drops `a=` attributes it
-    /// does not recognise when it parses a description, so a bespoke attribute
-    /// would arrive as nothing; an `a=extmap` arrives as a first-class
-    /// `RtpExtension` because `ParseExtmap` applies no URI whitelist. It also
-    /// costs nothing on the wire:
-    /// `RtpHeaderExtensionMap::RegisterByUri` refuses to map an unknown URI, so
-    /// no header extension is ever written to a packet.
+    /// # Why a bespoke attribute
     ///
-    /// What it does *not* buy is automatic negotiation.
-    /// `NegotiateRtpHeaderExtensions` builds an answer by walking the extensions
-    /// the local engine supports and looking each up in the offer, so a URI it
-    /// has never heard of is never echoed. Both peers inject the line themselves
-    /// — the answerer with
-    /// [`with_frame_metadata_id`](Self::with_frame_metadata_id), reusing the
-    /// offer's id.
+    /// The declaration says only "this peer understands the trailer". An
+    /// `a=extmap` would have been the recognisable spelling, but it means "I will
+    /// send this RTP header extension", which is not true — no header extension is
+    /// ever emitted — and it would drag in a shared id namespace that the *peer*
+    /// validates (RFC 8843 requires one id to mean one URI across a BUNDLE group),
+    /// so a collision would surface as the far side's `set_remote_description`
+    /// failing. An unregistered `x-` attribute claims nothing false and has no id
+    /// to collide.
     ///
-    /// # The description this produces is set locally too
+    /// The cost is that libwebrtc discards it while parsing, so it is only ever
+    /// readable from the SDP string. Nothing here depends on the parsed form.
     ///
-    /// `create_offer` returns an already-declared description, so the same bytes
-    /// go to `set_local_description` and to the peer. libwebrtc therefore parses
-    /// our unknown URI on both sides, which is fine — `RegisterByUri` declines it
-    /// with a log line rather than an error — but it does mean the id has to
-    /// satisfy `VerifyExtensionIds` and the RFC 8843 bundle rule locally as well
-    /// as remotely. That is what the bundle-wide id search is for.
+    /// # Placement
     ///
-    /// # Errors
-    ///
-    /// If the description has no video m-section carrying an `a=mid:`, or if
-    /// every id in 1..=14 is already spoken for.
-    ///
-    /// Already declaring the capability is not an error — the description comes
-    /// back unchanged.
-    pub fn with_frame_metadata(&self) -> crate::Result<Self> {
-        // Route the already-declared case through the id path so idempotence is
-        // decided in exactly one place.
-        let id = match self.frame_metadata_id() {
-            Some(id) => id,
-            None => free_extmap_id(&self.sdp).ok_or_else(|| {
-                crate::Error::Webrtc(format!(
-                    "every extmap id in 1..={EXTMAP_ONE_BYTE_MAX_ID} is taken, \
-                     so frame-metadata support cannot be declared"
-                ))
-            })?,
-        };
-        self.with_frame_metadata_id(id)
-    }
-
-    /// Return a copy declaring frame-metadata support with a specific
-    /// `a=extmap` id.
-    ///
-    /// This is what [`create_answer`](PeerConnection::create_answer) uses to echo
-    /// the offer's id, and it is public for the same reason
-    /// [`with_frame_metadata`](Self::with_frame_metadata) is.
-    ///
-    /// A divergent id would in fact be harmless — both ends ignore the URI, so
-    /// nothing reads the number — but matching costs nothing and keeps the
-    /// description something a strict middlebox has no opinion about.
-    ///
-    /// # Errors
-    ///
-    /// If `id` is outside 1..=255, if it is already bound to a *different* URI in
-    /// this description (which would fail the peer's `VerifyExtensionIds`), if
-    /// there is no video m-section with an `a=mid:`, or if the description
-    /// already declares the capability under some other id.
-    pub fn with_frame_metadata_id(&self, id: u16) -> crate::Result<Self> {
-        if !(1..=EXTMAP_MAX_ID).contains(&id) {
-            return Err(crate::Error::Webrtc(format!(
-                "extmap id must be 1..={EXTMAP_MAX_ID}, got {id}"
-            )));
+    /// Inserted immediately before the first `m=` line, which is the end of the
+    /// session section: RFC 8866 §5 puts session-level attributes after `t=`/`z=`/`k=`
+    /// and before the first media description, and everything preceding the first
+    /// `m=` is by definition session level.
+    pub fn with_frame_metadata(&self) -> Self {
+        if self.declares_frame_metadata() || self.sdp.lines().next().is_none() {
+            return self.clone();
         }
-        match self.frame_metadata_id() {
-            Some(existing) if existing == id => return Ok(self.clone()),
-            Some(existing) => {
-                return Err(crate::Error::Webrtc(format!(
-                    "description already declares frame-metadata support with id \
-                     {existing}, refusing to add a second declaration as {id}"
-                )))
-            }
-            None => {}
-        }
-        // Rejecting here keeps the failure ours. Signalling a colliding id would
-        // instead surface as the *peer's* set_remote_description failing, which
-        // is a much harder thing to attribute.
-        if let Some(uri) = self
-            .sdp
-            .lines()
-            .filter_map(parse_extmap)
-            .find(|&(n, _)| n == id)
-            .map(|(_, uri)| uri)
-        {
-            return Err(crate::Error::Webrtc(format!(
-                "extmap id {id} is already bound to {uri} in this description"
-            )));
-        }
-
-        let mut out = String::with_capacity(self.sdp.len() + 96);
-        let mut in_video = false;
-        let mut declared = 0usize;
+        let declaration = format!(
+            "a={}:{}\r\n",
+            crate::metadata::FRAME_METADATA_ATTRIBUTE,
+            crate::metadata::FRAME_METADATA_VERSION
+        );
+        let mut out = String::with_capacity(self.sdp.len() + declaration.len());
+        let mut inserted = false;
         for line in self.sdp.lines() {
+            if !inserted && line.starts_with("m=") {
+                out.push_str(&declaration);
+                inserted = true;
+            }
             out.push_str(line);
             out.push_str("\r\n");
-            if let Some(rest) = line.strip_prefix("m=") {
-                in_video = rest.starts_with("video");
-            } else if in_video && line.starts_with("a=mid:") {
-                // Anchored on a=mid: rather than on the m= line, because RFC 8866
-                // §5 puts the attribute block after c= and b=. Inserting straight
-                // after m= would emit an a= line ahead of them.
-                out.push_str("a=extmap:");
-                out.push_str(&id.to_string());
-                out.push(' ');
-                out.push_str(crate::metadata::FRAME_METADATA_URI);
-                out.push_str("\r\n");
-                declared += 1;
-            }
         }
-        if declared == 0 {
-            return Err(crate::Error::Webrtc(
-                "no video m-section with an a=mid: to declare frame-metadata \
-                 support on"
-                    .into(),
-            ));
+        // A description with no media section at all: session level is still session
+        // level, so it goes at the end.
+        if !inserted {
+            out.push_str(&declaration);
         }
-
-        Ok(Self {
+        Self {
             kind: self.kind,
             sdp: out,
-        })
+        }
     }
 }
 
@@ -1094,12 +974,10 @@ impl PeerConnection {
 
     /// Create an offer.
     ///
-    /// Every offer advertises frame-metadata support
-    /// ([`FRAME_METADATA_URI`](crate::metadata::FRAME_METADATA_URI)) on each video
-    /// m-section, because this crate does support it. A peer that does not
-    /// understand the URI ignores the line — RFC 8866 requires unrecognised
-    /// attributes to be ignored — and libwebrtc in particular parses it, declines
-    /// to map it to any header extension, and emits no bytes for it.
+    /// Every offer advertises frame-metadata support as a session-level
+    /// `a=x-reactor-frame-metadata:<version>`, because this crate does support it. A
+    /// peer that does not understand the attribute ignores it — RFC 8866 §6 requires
+    /// unrecognised attributes to be ignored.
     ///
     /// The declaration is what lets the answerer tell us it strips trailers, which
     /// is what opens this connection's
@@ -1113,78 +991,71 @@ impl PeerConnection {
         if !self.frame_metadata_enabled {
             return Ok(offer);
         }
-        Ok(Self::advertise_frame_metadata(offer, None))
+        Ok(offer.with_frame_metadata())
     }
 
     /// Create an answer.
     ///
-    /// Mirrors the offer on frame metadata: the capability is declared, under the
-    /// offer's own extmap id, only when the offer declared it. Introducing it in
-    /// an answer that was not offered it is not something offer/answer can
-    /// express, so a silent offer produces a silent answer and the gate stays
-    /// closed in both directions.
+    /// Mirrors the offer on frame metadata: the capability is declared only when the
+    /// offer declared it. Introducing it in an answer that was not offered it is not
+    /// something offer/answer can express, so a silent offer produces a silent answer
+    /// and the gate stays closed in both directions.
     ///
-    /// Requires [`set_remote_description`](Self::set_remote_description) to have
-    /// been called with the offer first, which is already the only valid order.
+    /// Requires [`set_remote_description`](Self::set_remote_description) to have been
+    /// called with the offer first, which is already the only valid order.
     pub fn create_answer(&self) -> Result<SessionDescription> {
         let answer = run_sdp(|ud| unsafe {
             reactor_webrtc_sys::reactor_webrtc_peer_connection_create_answer(
                 self.raw, ud, sdp_ok, sdp_err,
             )
         })?;
-        // The gate is only ever armed when the flag is on, so checking it covers
-        // both "the offer did not ask" and "this connection does not take part".
-        match self.frame_metadata_gate.extmap_id() {
-            Some(id) => Ok(Self::advertise_frame_metadata(answer, Some(id))),
-            None => Ok(answer),
+        // The gate is only ever armed when the flag is on, so this covers both "the
+        // offer did not ask" and "this connection does not take part".
+        if self.frame_metadata_gate.is_open() {
+            return Ok(answer.with_frame_metadata());
         }
+        Ok(answer)
     }
 
-    /// Declare frame-metadata support on `sdp`, or return it untouched.
-    ///
-    /// Failure is never propagated. `with_frame_metadata` errors on a description
-    /// with no video m-section, or one where every one-byte extmap id is already
-    /// spoken for — neither is a reason to fail the caller's offer or answer. The
-    /// capability simply goes unadvertised and the gate stays closed, which is the
-    /// same outcome as talking to a peer that never supported it.
-    fn advertise_frame_metadata(sdp: SessionDescription, id: Option<u16>) -> SessionDescription {
-        let declared = match id {
-            Some(id) => sdp.with_frame_metadata_id(id),
-            None => sdp.with_frame_metadata(),
-        };
-        declared.unwrap_or(sdp)
-    }
     pub fn set_local_description(&self, sdp: &SessionDescription) -> Result<()> {
         self.set_description(sdp, true)
     }
+
     /// Apply the remote description, and arm this connection's
     /// [`FrameMetadataGate`](crate::FrameMetadataGate) from it.
     ///
-    /// The gate opens when `sdp` declares
-    /// [`FRAME_METADATA_URI`](crate::metadata::FRAME_METADATA_URI) and closes
-    /// when it does not, on every call — so a renegotiation in which the peer
-    /// drops support closes it again.
+    /// The gate opens when `sdp` declares the capability and closes when it does
+    /// not, on every call — so a renegotiation in which the peer drops support
+    /// closes it again.
     ///
-    /// On an answerer this runs before [`create_answer`](Self::create_answer),
-    /// which is what lets the answer echo the offer's extmap id.
+    /// On an answerer this runs before [`create_answer`](Self::create_answer), which
+    /// is what lets the answer mirror the offer.
     pub fn set_remote_description(&self, sdp: &SessionDescription) -> Result<()> {
         self.set_description(sdp, false)?;
         // After the native call, not before: a description libwebrtc rejected was
         // never applied, and must not move the gate.
+        //
         // A disabled connection never arms the gate, so it never answers with the
         // capability and never installs a transform.
         self.frame_metadata_gate
-            .set(if self.frame_metadata_enabled {
-                sdp.frame_metadata_id()
-            } else {
-                None
-            });
+            .set(self.frame_metadata_enabled && sdp.declares_frame_metadata());
         self.install_frame_metadata_transforms();
         Ok(())
     }
 
-    /// Attach the frame-metadata transforms to every video transceiver, now that
-    /// the remote has said it strips trailers.
+    /// This connection's frame-metadata gate: what the remote peer declared.
+    ///
+    /// Cloneable and cheap. Reading it is diagnostic — the library already consults
+    /// it when answering, when installing the transforms, and when appending a
+    /// trailer, so a caller does not need to. It stays closed until
+    /// [`set_remote_description`](Self::set_remote_description) sees a remote
+    /// description that declares support.
+    pub fn frame_metadata_gate(&self) -> crate::metadata::FrameMetadataGate {
+        self.frame_metadata_gate.clone()
+    }
+
+    /// Wire the frame-metadata steps into every video transceiver, now that the
+    /// remote has said it strips trailers.
     ///
     /// Runs after the remote description has been applied, which is what makes it
     /// possible at all: libwebrtc creates a receiver's track while applying the
@@ -1198,9 +1069,9 @@ impl PeerConnection {
     /// flow, which is the same as not having negotiated it.
     fn install_frame_metadata_transforms(&self) {
         if !self.frame_metadata_gate.is_open() {
-            // Nothing to install. A transform left over from a previous generation
-            // keeps consulting the gate per frame, so a peer that dropped support
-            // stops getting trailers without anything being detached here.
+            // Nothing to install. A step left over from a previous generation keeps
+            // consulting the gate per frame, so a peer that dropped support stops
+            // getting trailers without anything being detached here.
             return;
         }
         for tc in self.transceivers() {
@@ -1224,17 +1095,6 @@ impl PeerConnection {
                 }
             }
         }
-    }
-
-    /// This connection's frame-metadata gate: what the remote peer declared.
-    ///
-    /// Cloneable and cheap. Reading it is diagnostic — the library already
-    /// consults it when answering and when appending trailers, so a caller does
-    /// not need to. It stays closed until
-    /// [`set_remote_description`](Self::set_remote_description) sees a remote
-    /// description that declares support.
-    pub fn frame_metadata_gate(&self) -> crate::metadata::FrameMetadataGate {
-        self.frame_metadata_gate.clone()
     }
 
     fn set_description(&self, sdp: &SessionDescription, local: bool) -> Result<()> {
@@ -1600,10 +1460,14 @@ mod sdp_ice_credentials_tests {
 #[cfg(test)]
 mod sdp_frame_metadata_tests {
     use super::*;
-    use crate::metadata::FRAME_METADATA_URI;
+    use crate::metadata::{FRAME_METADATA_ATTRIBUTE, FRAME_METADATA_VERSION};
+
+    fn declaration() -> String {
+        format!("a={FRAME_METADATA_ATTRIBUTE}:{FRAME_METADATA_VERSION}")
+    }
 
     /// A bundled audio+video description, as libwebrtc emits one, with `extra`
-    /// spliced into the video section's attribute block.
+    /// spliced in at session level (after `t=`, before the first `m=`).
     fn described(extra: &str) -> SessionDescription {
         SessionDescription {
             kind: SdpType::Offer,
@@ -1613,15 +1477,13 @@ mod sdp_frame_metadata_tests {
                  s=-\r\n\
                  t=0 0\r\n\
                  a=group:BUNDLE 0 1\r\n\
+                 {extra}\
                  m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
                  c=IN IP4 0.0.0.0\r\n\
                  a=mid:0\r\n\
-                 a=extmap:1 urn:ietf:params:rtp-hdrext:ssrc-audio-level\r\n\
                  m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
                  c=IN IP4 0.0.0.0\r\n\
-                 b=AS:2000\r\n\
                  a=mid:1\r\n\
-                 {extra}\
                  a=fingerprint:sha-256 AA:BB\r\n"
             ),
         }
@@ -1631,203 +1493,134 @@ mod sdp_frame_metadata_tests {
         described("")
     }
 
-    /// Every `a=extmap` declaring our URI, as `(id, mid)` pairs in document order.
-    fn declarations(sdp: &str) -> Vec<(u16, String)> {
-        let mut out = Vec::new();
-        let mut mid = String::new();
-        for line in sdp.lines() {
-            if let Some(v) = line.strip_prefix("a=mid:") {
-                mid = v.to_string();
-            } else if let Some((id, uri)) = parse_extmap(line) {
-                if uri == FRAME_METADATA_URI {
-                    out.push((id, mid.clone()));
-                }
-            }
-        }
-        out
-    }
-
     #[test]
-    fn declares_on_the_video_section_only() {
-        let out = bundled().with_frame_metadata().unwrap();
-        assert_eq!(declarations(&out.sdp), vec![(2, "1".to_string())]);
-        assert_eq!(out.frame_metadata_id(), Some(2));
+    fn declares_once_at_session_level() {
+        let out = bundled().with_frame_metadata();
         assert!(out.declares_frame_metadata());
+        assert_eq!(out.sdp.matches(&declaration()).count(), 1);
     }
 
     #[test]
-    fn skips_ids_already_in_use() {
-        // id 1 is taken by ssrc-audio-level in the audio section. Bundle-wide,
-        // not per-section: RFC 8843 makes an id mean one URI across the group, and
-        // the peer rejects a description that breaks it.
-        assert_eq!(
-            bundled().with_frame_metadata().unwrap().frame_metadata_id(),
-            Some(2)
-        );
-
-        let crowded = described(concat!(
-            "a=extmap:2 urn:ietf:params:rtp-hdrext:sdes:mid\r\n",
-            "a=extmap:3 http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time\r\n",
-        ));
-        assert_eq!(
-            crowded.with_frame_metadata().unwrap().frame_metadata_id(),
-            Some(4)
-        );
-    }
-
-    #[test]
-    fn refuses_when_every_one_byte_id_is_taken() {
-        // Never silently reach into the two-byte range: those ids only work when
-        // a=extmap-allow-mixed was negotiated, which we cannot see from here.
-        let taken: String = (1..=EXTMAP_ONE_BYTE_MAX_ID)
-            .map(|id| format!("a=extmap:{id} urn:example:ext:{id}\r\n"))
-            .collect();
-        let err = described(&taken).with_frame_metadata().unwrap_err();
-        assert!(err.to_string().contains("is taken"), "{err}");
-    }
-
-    #[test]
-    fn declares_the_same_id_in_every_video_section() {
-        // One id, one URI, across the whole bundle group — otherwise the peer's
-        // ValidateBundledRtpHeaderExtensions rejects what we signalled.
-        let two_videos = SessionDescription {
-            kind: SdpType::Offer,
-            sdp: concat!(
-                "v=0\r\n",
-                "a=group:BUNDLE 0 1\r\n",
-                "m=video 9 UDP/TLS/RTP/SAVPF 96\r\n",
-                "a=mid:0\r\n",
-                "m=video 9 UDP/TLS/RTP/SAVPF 96\r\n",
-                "a=mid:1\r\n",
-            )
-            .to_string(),
-        };
-        let out = two_videos.with_frame_metadata().unwrap();
-        assert_eq!(
-            declarations(&out.sdp),
-            vec![(1, "0".to_string()), (1, "1".to_string())]
-        );
-    }
-
-    #[test]
-    fn inserted_after_the_mid_never_before_c_or_b() {
-        // RFC 8866 §5 orders an m-section as m=, i=, c=, b=, k=, then a=.
-        let out = bundled().with_frame_metadata().unwrap();
+    fn inserted_before_the_first_media_section() {
+        // RFC 8866 §5 puts session-level attributes after t=/z=/k= and before the
+        // first media description; everything before the first m= is session level.
+        let out = bundled().with_frame_metadata();
         let lines: Vec<&str> = out.sdp.lines().collect();
-        let at = |needle: &str| lines.iter().position(|l| l.contains(needle)).unwrap();
-        assert!(at("c=IN IP4 0.0.0.0") < at(FRAME_METADATA_URI));
-        assert!(at("b=AS:2000") < at(FRAME_METADATA_URI));
-        assert_eq!(at("a=mid:1") + 1, at(FRAME_METADATA_URI));
+        let at = |needle: &str| lines.iter().position(|l| l.starts_with(needle)).unwrap();
+        assert!(at("t=") < at("a=x-reactor-frame-metadata:"));
+        assert!(at("a=x-reactor-frame-metadata:") < at("m="));
     }
 
     #[test]
-    fn answer_echoes_the_offers_id() {
-        let offer = described("a=extmap:7 urn:ietf:params:rtp-hdrext:sdes:mid\r\n")
-            .with_frame_metadata()
-            .unwrap();
-        let id = offer.frame_metadata_id().unwrap();
-        assert_eq!(id, 2); // 1 is ssrc-audio-level and 7 is sdes:mid, so 2 is lowest free
-
-        let answer = bundled().with_frame_metadata_id(id).unwrap();
-        assert_eq!(answer.frame_metadata_id(), Some(id));
+    fn declares_on_an_audio_only_description() {
+        // Session level, so there is nothing about video to condition it on — and a
+        // renegotiation that adds video must not have to introduce the capability.
+        let audio_only = SessionDescription {
+            kind: SdpType::Offer,
+            sdp: "v=0\r\nt=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:0\r\n".into(),
+        };
+        let out = audio_only.with_frame_metadata();
+        assert!(out.declares_frame_metadata());
+        let lines: Vec<&str> = out.sdp.lines().collect();
+        let declared = lines
+            .iter()
+            .position(|l| l.starts_with("a=x-reactor-frame-metadata:"))
+            .expect("declaration");
+        let first_media = lines.iter().position(|l| l.starts_with("m=")).expect("m=");
+        assert!(
+            declared < first_media,
+            "declaration landed inside a media section"
+        );
     }
 
     #[test]
-    fn refuses_an_id_bound_to_another_uri() {
-        // Signalling a collision would surface as the *peer's*
-        // set_remote_description failing, which is far harder to attribute.
-        let err = bundled().with_frame_metadata_id(1).unwrap_err();
-        assert!(err.to_string().contains("already bound to"), "{err}");
-        assert!(err.to_string().contains("ssrc-audio-level"), "{err}");
+    fn declares_on_a_description_with_no_media_section() {
+        let no_media = SessionDescription {
+            kind: SdpType::Offer,
+            sdp: "v=0\r\nt=0 0\r\n".into(),
+        };
+        assert!(no_media.with_frame_metadata().declares_frame_metadata());
     }
 
     #[test]
-    fn rejects_out_of_range_ids() {
-        for bad in [0, EXTMAP_MAX_ID + 1, 1000] {
-            assert!(
-                bundled().with_frame_metadata_id(bad).is_err(),
-                "accepted extmap id {bad}"
-            );
-        }
-        assert!(bundled().with_frame_metadata_id(EXTMAP_MAX_ID).is_ok());
+    fn an_empty_description_is_left_alone() {
+        // Emitting a lone attribute line would be invalid SDP, and there is nothing
+        // useful to declare it on.
+        let empty = SessionDescription {
+            kind: SdpType::Offer,
+            sdp: String::new(),
+        };
+        let out = empty.with_frame_metadata();
+        assert!(out.sdp.is_empty());
+        assert!(!out.declares_frame_metadata());
     }
 
     #[test]
     fn is_idempotent() {
-        let once = bundled().with_frame_metadata().unwrap();
-        let twice = once.with_frame_metadata().unwrap();
+        let once = bundled().with_frame_metadata();
+        let twice = once.with_frame_metadata();
         assert_eq!(once.sdp, twice.sdp);
-        assert_eq!(
-            twice
-                .with_frame_metadata_id(once.frame_metadata_id().unwrap())
-                .unwrap()
-                .sdp,
-            once.sdp
-        );
+        assert_eq!(once.sdp.matches(&declaration()).count(), 1);
     }
 
     #[test]
-    fn refuses_a_second_declaration_under_a_different_id() {
-        let once = bundled().with_frame_metadata().unwrap();
-        let other = once.frame_metadata_id().unwrap() + 1;
-        let err = once.with_frame_metadata_id(other).unwrap_err();
-        assert!(err.to_string().contains("already declares"), "{err}");
-    }
-
-    #[test]
-    fn a_different_uri_version_reads_as_unsupported() {
-        // The URI is the wire version. A peer speaking a future trailer format
-        // must not look like a peer speaking this one.
-        let future = described(&format!("a=extmap:5 {FRAME_METADATA_URI}-2\r\n"));
-        assert_eq!(future.frame_metadata_id(), None);
+    fn a_different_version_reads_as_unsupported() {
+        // The version is the compatibility token: a peer speaking a future trailer
+        // format must not look like a peer speaking this one.
+        let future = described(&format!(
+            "a={FRAME_METADATA_ATTRIBUTE}:{}\r\n",
+            FRAME_METADATA_VERSION + 1
+        ));
         assert!(!future.declares_frame_metadata());
-        // …and declaring ours alongside it works, on a free id.
-        let out = future.with_frame_metadata().unwrap();
-        assert_eq!(out.frame_metadata_id(), Some(2));
+        // …and declaring ours alongside it works.
+        let out = future.with_frame_metadata();
+        assert!(out.declares_frame_metadata());
     }
 
     #[test]
-    fn errors_without_a_video_section() {
-        let audio_only = SessionDescription {
-            kind: SdpType::Offer,
-            sdp: "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:0\r\n".into(),
-        };
-        let err = audio_only.with_frame_metadata().unwrap_err();
-        assert!(err.to_string().contains("no video m-section"), "{err}");
+    fn a_malformed_version_reads_as_unsupported() {
+        for bad in ["", "abc", "1.0", "-1"] {
+            let d = described(&format!("a={FRAME_METADATA_ATTRIBUTE}:{bad}\r\n"));
+            assert!(
+                !d.declares_frame_metadata(),
+                "accepted version {bad:?} as ours"
+            );
+        }
+    }
+
+    #[test]
+    fn a_similar_attribute_name_does_not_match() {
+        let d = described(&format!(
+            "a={FRAME_METADATA_ATTRIBUTE}-2:{FRAME_METADATA_VERSION}\r\n"
+        ));
+        assert!(!d.declares_frame_metadata());
+    }
+
+    #[test]
+    fn leaves_everything_else_intact() {
+        let before = bundled();
+        let after = before.with_frame_metadata();
+        for keep in [
+            "a=group:BUNDLE 0 1",
+            "m=audio 9 UDP/TLS/RTP/SAVPF 111",
+            "m=video 9 UDP/TLS/RTP/SAVPF 96",
+            "a=mid:1",
+            "a=fingerprint:sha-256 AA:BB",
+        ] {
+            assert!(after.sdp.contains(keep), "lost {keep:?}");
+        }
+        assert_eq!(after.sdp.lines().count(), before.sdp.lines().count() + 1);
+        assert_eq!(after.kind, before.kind);
     }
 
     #[test]
     fn output_is_crlf_terminated() {
-        let out = bundled().with_frame_metadata().unwrap();
+        let out = bundled().with_frame_metadata();
         assert!(out.sdp.ends_with("\r\n"));
         assert_eq!(
             out.sdp.matches('\n').count(),
             out.sdp.matches("\r\n").count()
         );
-        assert_eq!(out.kind, bundled().kind);
-    }
-
-    #[test]
-    fn parses_a_direction_qualified_extmap() {
-        // a=extmap:<id>["/"<direction>] <URI> — the direction is optional and we
-        // emit none, but a peer may send one and its id still has to be seen.
-        assert_eq!(
-            parse_extmap("a=extmap:9/sendonly urn:example:ext"),
-            Some((9, "urn:example:ext"))
-        );
-        assert_eq!(
-            parse_extmap("a=extmap:9 urn:example:ext extra=params"),
-            Some((9, "urn:example:ext"))
-        );
-        assert_eq!(parse_extmap("a=extmap:0 urn:example:ext"), None);
-        assert_eq!(parse_extmap("a=extmap:256 urn:example:ext"), None);
-        assert_eq!(parse_extmap("a=mid:0"), None);
-    }
-
-    #[test]
-    fn declarations_are_read_back_from_a_direction_qualified_line() {
-        let manual = described(&format!("a=extmap:4/sendrecv {FRAME_METADATA_URI}\r\n"));
-        assert_eq!(manual.frame_metadata_id(), Some(4));
     }
 }
 
@@ -1837,32 +1630,19 @@ mod frame_metadata_gate_tests {
 
     #[test]
     fn starts_closed() {
-        // Closed-by-default is the safe direction: a sender that has not yet
-        // applied a remote description must not append trailers.
-        let gate = FrameMetadataGate::new();
-        assert!(!gate.is_open());
-        assert_eq!(gate.extmap_id(), None);
-    }
-
-    #[test]
-    fn carries_the_negotiated_id() {
-        // create_answer echoes this id, so losing it would mean answering with a
-        // freshly allocated one that disagrees with the offer.
-        let gate = FrameMetadataGate::new();
-        gate.set(Some(7));
-        assert!(gate.is_open());
-        assert_eq!(gate.extmap_id(), Some(7));
+        // Closed-by-default is the safe direction: a sender that has not yet applied
+        // a remote description must not append trailers.
+        assert!(!FrameMetadataGate::new().is_open());
     }
 
     #[test]
     fn clones_share_one_state() {
         let gate = FrameMetadataGate::new();
         let handed_to_transform = gate.clone();
-        gate.set(Some(3));
+        gate.set(true);
         assert!(handed_to_transform.is_open());
-        assert_eq!(handed_to_transform.extmap_id(), Some(3));
         // A renegotiation where the peer drops support closes it again.
-        gate.set(None);
+        gate.set(false);
         assert!(!handed_to_transform.is_open());
     }
 }

@@ -84,10 +84,9 @@ fn negotiate(pc1: &PeerConnection, pc2: &PeerConnection) {
     pc2.set_remote_description(&offer).expect("pc2 remote");
 
     let answer = pc2.create_answer().expect("answer");
-    assert_eq!(
-        answer.frame_metadata_id(),
-        offer.frame_metadata_id(),
-        "the answer must echo the offer's extmap id"
+    assert!(
+        answer.declares_frame_metadata(),
+        "the answer must mirror the offer's declaration"
     );
     pc2.set_local_description(&answer).expect("pc2 local");
     pc1.set_remote_description(&answer).expect("pc1 remote");
@@ -113,14 +112,15 @@ fn negotiate_with_legacy_peer(pc1: &PeerConnection, pc2: &PeerConnection) {
     pc1.set_remote_description(&answer).expect("pc1 remote");
 }
 
-/// Drop every `a=extmap` line carrying our URI.
+/// Drop the frame-metadata declaration.
 fn strip_frame_metadata(
     sdp: &reactor_webrtc::SessionDescription,
 ) -> reactor_webrtc::SessionDescription {
+    let prefix = format!("a={}:", reactor_webrtc::FRAME_METADATA_ATTRIBUTE);
     let kept: String = sdp
         .sdp
         .lines()
-        .filter(|l| !l.contains(reactor_webrtc::FRAME_METADATA_URI))
+        .filter(|l| !l.starts_with(prefix.as_str()))
         .map(|l| format!("{l}\r\n"))
         .collect();
     reactor_webrtc::SessionDescription {

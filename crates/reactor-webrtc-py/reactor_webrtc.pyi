@@ -50,7 +50,7 @@ class RtcConfiguration:
     frame_metadata: bool
     """Whether this connection takes part in per-frame metadata.
 
-    `True` by default. When on, offers advertise `FRAME_METADATA_URI`, answers
+    `True` by default. When on, offers advertise the capability, answers
     mirror an offer that asked for it, and the metadata steps are wired into the
     video transceivers once the peer agrees.
 
@@ -95,35 +95,24 @@ class SessionDescription:
     def __init__(self, kind: str, sdp: str) -> None: ...
     def ice_ufrags(self) -> list[str]: ...
     def with_ice_credentials(self, ufrag: str, pwd: str) -> SessionDescription: ...
-    def frame_metadata_id(self) -> Optional[int]:
-        """The `a=extmap` id this description declares `FRAME_METADATA_URI` with.
-
-        Read it on an offer to echo the same id back in the answer."""
-        ...
     def declares_frame_metadata(self) -> bool:
-        """Whether this description declares support for frame-metadata trailers.
+        """Whether this description declares frame-metadata support.
+
+        True when it carries a session-level `a=x-reactor-frame-metadata:<version>`
+        at a version this build understands, so a peer speaking a different trailer
+        format reads as unsupported rather than as a partial match.
 
         `set_remote_description` arms the connection's `FrameMetadataGate` from
         exactly this."""
         ...
     def with_frame_metadata(self) -> SessionDescription:
-        """Return a copy declaring frame-metadata support on every video
-        m-section, allocating the lowest free one-byte `a=extmap` id.
+        """Return a copy declaring frame-metadata support, as a session-level
+        attribute inserted before the first media section.
 
         `create_offer` already applies this to every offer and `create_answer`
         mirrors the offer, so callers using this library's signalling path never
         need it. Public for callers that assemble or rewrite SDP themselves.
-
-        Idempotent. Raises if there is no video m-section with an `a=mid:`, or if
-        every id in 1..=14 is already in use."""
-        ...
-    def with_frame_metadata_id(self, id: int) -> SessionDescription:
-        """Return a copy declaring frame-metadata support with a specific
-        `a=extmap` id. This is what `create_answer` uses to echo the offer's id.
-
-        Raises if `id` is outside 1..=255, if it is already bound to a different
-        URI in this description, if there is no video m-section with an `a=mid:`,
-        or if the description already declares support under another id."""
+        Idempotent."""
         ...
 
 # ── Enums ─────────────────────────────────────────────────────────────────────
@@ -196,28 +185,38 @@ class StatsReport:
 
 # ── Frame metadata ────────────────────────────────────────────────────────────
 
-FRAME_METADATA_URI: str
-"""The SDP `a=extmap` URI peers declare frame-metadata support with.
+FRAME_METADATA_ATTRIBUTE: str
+"""The SDP attribute peers declare frame-metadata support with.
 
-The URI is the wire version: an incompatible change to the trailer format mints
-a new one, so a peer speaking the old format never matches one speaking the new.
-No header-extension bytes are emitted for it — the declaration lives in the SDP
-and the RTP stream is untouched."""
+Emitted at session level as `a=x-reactor-frame-metadata:<version>`, before the
+first media section. Session level because support is a property of a peer's
+code, not of one of its tracks.
+
+Unregistered, hence the `x-` prefix. RFC 8866 requires a receiver to ignore an
+attribute it does not recognise, which is what makes it safe to send
+unconditionally. Note that libwebrtc — and browsers — drop unrecognised `a=`
+lines when parsing, so read this from the signalled SDP string rather than from
+anything the stack hands back."""
+
+FRAME_METADATA_VERSION: int
+"""Wire version of the trailer format this build speaks.
+
+A peer declaring a different version reads as unsupported: an incompatible
+change to the trailer bumps this, and old and new then never agree."""
 
 class FrameMetadataGate:
     """What the remote peer declared about frame-metadata support.
 
     Available from `PeerConnection.frame_metadata_gate()`. It starts closed and
-    is armed by `set_remote_description` from whether that description carries
-    `FRAME_METADATA_URI`. Every renegotiation re-arms it, so a peer that drops
-    support closes it again.
+    is armed by `set_remote_description` from whether that description declares
+    the capability. Every renegotiation re-arms it, so a peer that drops support
+    closes it again.
 
     It drives three things, all inside the library: `create_answer` mirrors an
-    offer that declared the capability, under that offer's extmap id;
-    `set_remote_description` installs the metadata transforms on the video
-    transceivers once it is open; and the sender transform appends nothing while
-    it is closed, because handing a trailer to a peer that will not strip it
-    hands the extra bytes to its decoder.
+    offer that declared the capability; `set_remote_description` wires the
+    metadata steps into the video transceivers once it is open; and the sender
+    step appends nothing while it is closed, because handing a trailer to a peer
+    that will not strip it hands the extra bytes to its decoder.
 
     Callers do not have to consult it — pass `user_data` whenever it is
     meaningful. Reading it is useful for diagnostics, since "did this peer
@@ -228,11 +227,6 @@ class FrameMetadataGate:
         ...
     def is_open(self) -> bool:
         """Whether trailers may be appended."""
-        ...
-    def extmap_id(self) -> Optional[int]:
-        """The `a=extmap` id the remote declared the capability under.
-
-        `create_answer` echoes this rather than allocating its own."""
         ...
 
 class FrameMetadata:
@@ -411,26 +405,25 @@ class PeerConnection:
     async def create_offer(self) -> SessionDescription:
         """Create an offer.
 
-        Every offer advertises frame-metadata support (`FRAME_METADATA_URI`) on
-        each video m-section, because this library supports it. A peer that does
-        not understand the URI ignores the line. The declaration is what lets the
-        answerer tell us it strips trailers, which is what opens this
+        Every offer advertises frame-metadata support as a session-level
+        `a=x-reactor-frame-metadata:<version>`, because this library supports it. A
+        peer that does not understand the attribute ignores it. The declaration is
+        what lets the answerer tell us it strips trailers, which is what opens this
         connection's `FrameMetadataGate`."""
         ...
     async def create_answer(self) -> SessionDescription:
         """Create an answer.
 
-        Mirrors the offer on frame metadata: the capability is declared, under
-        the offer's own extmap id, only when the offer declared it. Requires
-        `set_remote_description` to have been called with the offer first, which
-        is already the only valid order."""
+        Mirrors the offer on frame metadata: the capability is declared only when
+        the offer declared it. Requires `set_remote_description` to have been
+        called with the offer first, which is already the only valid order."""
         ...
     async def set_local_description(self, sdp: SessionDescription) -> None: ...
     async def set_remote_description(self, sdp: SessionDescription) -> None:
         """Apply the remote description, and arm this connection's
         `FrameMetadataGate` from it.
 
-        The gate opens when `sdp` declares `FRAME_METADATA_URI` and closes when
+        The gate opens when `sdp` declares the capability and closes when
         it does not, on every call — so a renegotiation in which the peer drops
         support closes it again."""
         ...

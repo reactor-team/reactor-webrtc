@@ -16,8 +16,9 @@
 //!
 //! Per-frame metadata ([`metadata`]) rides in a trailer appended to the encoded
 //! payload, which only works if the peer strips it again. That is negotiated for
-//! you: every [`PeerConnection::create_offer`] advertises the capability as an
-//! `a=extmap`, [`PeerConnection::create_answer`] mirrors an offer that asked for
+//! you: every [`PeerConnection::create_offer`] advertises the capability as a
+//! session-level `a=x-reactor-frame-metadata`,
+//! [`PeerConnection::create_answer`] mirrors an offer that asked for
 //! it, and [`PeerConnection::set_remote_description`] arms a
 //! [`FrameMetadataGate`] from what the remote declared, and installs the metadata
 //! steps on the video transceivers. Callers pass `user_data` when it is meaningful
@@ -59,7 +60,9 @@ pub use encoded::{
     FrameDirection, FrameTransform, RawVideoFrame, VideoCodec,
 };
 pub use media::{AudioFrame, MediaKind, Track, VideoFrame};
-pub use metadata::{FrameMetadata, FrameMetadataGate, FRAME_METADATA_URI};
+pub use metadata::{
+    FrameMetadata, FrameMetadataGate, FRAME_METADATA_ATTRIBUTE, FRAME_METADATA_VERSION,
+};
 pub use observer::PeerConnectionObserver;
 pub use peer_connection::{
     DataChannel, DataChannelState, IceCandidate, IceCandidatePairState, IceCandidatePairStats,

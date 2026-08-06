@@ -151,22 +151,23 @@ track.on_video_frame(on_frame)
 That only works if the far end strips the trailer before its decoder sees it, so
 support is negotiated in the SDP and **you do not have to do anything for it**:
 
-- `create_offer` advertises the capability on every video m-section as
-  `a=extmap:<id> http://reactor.inc/rtp-hdrext/frame-metadata`
-  (`rw.FRAME_METADATA_URI`).
-- `create_answer` mirrors an offer that asked for it, reusing the offer's id.
+- `create_offer` advertises the capability as one session-level
+  `a=x-reactor-frame-metadata:1` (`rw.FRAME_METADATA_ATTRIBUTE`,
+  `rw.FRAME_METADATA_VERSION`).
+- `create_answer` mirrors an offer that asked for it.
 - `set_remote_description` arms `pc.frame_metadata_gate()` and, when it is open,
   installs the embed and strip transforms on the video transceivers. The sender
   transform still checks the gate per frame, so a renegotiation that drops support
   stops the trailers.
 
-A peer that has never heard of the URI ignores the line, the gate stays closed,
+A peer that has never heard of the attribute ignores it, the gate stays closed,
 and `user_data` is silently dropped rather than corrupting that peer's decode.
 Read `pc.frame_metadata_gate().is_open()` if you want to know whether the peer
 agreed.
 
-No RTP bytes are emitted for the extmap itself — libwebrtc declines to map a URI
-it does not know, so the line is a capability flag and nothing more.
+Read the declaration from the signalled SDP string, not from `pc.remoteDescription`
+or its equivalents: libwebrtc and browsers both discard `a=` lines they do not
+recognise while parsing.
 
 A `FrameTransform` of your own composes with the metadata step rather than
 displacing it — the library owns libwebrtc's single transformer slot per
