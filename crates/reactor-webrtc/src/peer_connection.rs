@@ -459,6 +459,15 @@ impl Transceiver {
     }
 
     /// The transceiver's media kind (audio/video).
+    /// Identity of the transceiver itself, as an opaque value.
+    ///
+    /// Stable for the transceiver's life, unlike the handle pointer — `transceivers()`
+    /// allocates a fresh handle each call. Usable as a key before a track is attached
+    /// and before a mid is assigned.
+    pub(crate) fn transceiver_id(&self) -> usize {
+        unsafe { reactor_webrtc_sys::reactor_webrtc_rtp_transceiver_id(self.raw) }
+    }
+
     /// Identity of the track on this transceiver's sender, as an opaque value.
     ///
     /// Only ever compared — it is how the crate recognises which of its own
@@ -531,52 +540,100 @@ impl Transceiver {
 
     /// Attach an encoded-frame transform to this transceiver's **sender**
     /// (encoder → packetizer): observe/replace/drop each encoded frame before
-    /// it is sent. See [`crate::FrameTransform`]. The transform must outlive
-    /// this transceiver's use of it.
+    /// it is sent. See [`crate::FrameTransform`].
+    ///
+    /// Composes rather than replaces. The crate owns libwebrtc's single
+    /// `SetFrameTransformer` slot per sender and runs both this callback and the
+    /// frame-metadata step under it, so encoded-frame access and per-frame metadata
+    /// work on the same transceiver. The callback runs first, before any trailer is
+    /// appended, so it sees exactly the bytes the encoder produced.
+    ///
+    /// Calling this again replaces the callback. The `FrameTransform` may be dropped
+    /// afterwards — the registration holds its own reference.
     pub fn set_sender_transform(&self, transform: &FrameTransform) -> Result<()> {
-        // Claim the slot so the frame-metadata install does not overwrite this on
-        // the next set_remote_description. A caller that takes the sender slot owns
-        // the trailer too — see crate::sender_meta::claimed_sender_slots.
-        crate::sender_meta::claim_sender_slot(self.sender_track_id());
-        let ok = unsafe {
-            reactor_webrtc_sys::reactor_webrtc_rtp_transceiver_set_sender_transform(
-                self.raw,
-                transform.raw(),
-            )
-        };
-        if ok == 1 {
-            Ok(())
-        } else {
-            Err(Error::Webrtc(
-                "transceiver set_sender_transform failed".into(),
-            ))
-        }
+        self.attach_caller_transform(crate::sender_meta::Side::Send, transform)
     }
 
     /// Attach an encoded-frame transform to this transceiver's **receiver**
     /// (depacketizer → decoder): observe each encoded frame before decode, and
     /// [`FrameAction::Drop`](crate::FrameAction) to bypass the decoder. See
-    /// [`crate::FrameTransform`]. The transform must outlive this transceiver's
-    /// use of it.
+    /// [`crate::FrameTransform`].
+    ///
+    /// Composes rather than replaces, as on the sender. The callback runs before the
+    /// metadata trailer is stripped, so it sees exactly the bytes that arrived; call
+    /// [`decode_and_strip_trailer`](crate::metadata::decode_and_strip_trailer)
+    /// yourself if you want the payload without the framing.
     pub fn set_receiver_transform(&self, transform: &FrameTransform) -> Result<()> {
+        self.attach_caller_transform(crate::sender_meta::Side::Receive, transform)
+    }
+
+    fn attach_caller_transform(
+        &self,
+        side: crate::sender_meta::Side,
+        transform: &FrameTransform,
+    ) -> Result<()> {
+        let id = self.transceiver_id();
+        let Some(native) = crate::sender_meta::attach_caller(id, side, transform.callback()) else {
+            // Either the transformer is already attached — the registration above is
+            // all that was needed — or this transceiver has no native identity, in
+            // which case there is nothing to attach it to.
+            return if id == 0 {
+                Err(Error::Webrtc(
+                    "transceiver has no native identity to attach a transform to".into(),
+                ))
+            } else {
+                Ok(())
+            };
+        };
+        self.attach_native_transform(side, &native)
+    }
+
+    /// Attach the crate-owned composed transformer to one side.
+    ///
+    /// Dropping `native` afterwards is safe and is what the callers do: the native
+    /// transformer owns its callback state and the sender/receiver holds a reference
+    /// to it (see the [`crate::FrameTransform`] docs).
+    pub(crate) fn attach_native_transform(
+        &self,
+        side: crate::sender_meta::Side,
+        native: &crate::encoded::NativeTransform,
+    ) -> Result<()> {
         let ok = unsafe {
-            reactor_webrtc_sys::reactor_webrtc_rtp_transceiver_set_receiver_transform(
-                self.raw,
-                transform.raw(),
-            )
+            match side {
+                crate::sender_meta::Side::Send => {
+                    reactor_webrtc_sys::reactor_webrtc_rtp_transceiver_set_sender_transform(
+                        self.raw,
+                        native.raw(),
+                    )
+                }
+                crate::sender_meta::Side::Receive => {
+                    reactor_webrtc_sys::reactor_webrtc_rtp_transceiver_set_receiver_transform(
+                        self.raw,
+                        native.raw(),
+                    )
+                }
+            }
         };
         if ok == 1 {
             Ok(())
         } else {
-            Err(Error::Webrtc(
-                "transceiver set_receiver_transform failed".into(),
-            ))
+            Err(Error::Webrtc(format!(
+                "transceiver set_{}_transform failed",
+                match side {
+                    crate::sender_meta::Side::Send => "sender",
+                    crate::sender_meta::Side::Receive => "receiver",
+                }
+            )))
         }
     }
 }
 
 impl Drop for Transceiver {
     fn drop(&mut self) {
+        // Deliberately *not* forgetting this transceiver's composed slots: handles
+        // are recreated per `transceivers()` call, so dropping one says nothing
+        // about the underlying transceiver going away. The slots are keyed by native
+        // identity and released with the peer connection instead.
         unsafe { reactor_webrtc_sys::reactor_webrtc_rtp_transceiver_destroy(self.raw) }
     }
 }
@@ -1006,6 +1063,10 @@ pub struct PeerConnection {
     // Opened by set_remote_description when the remote declares
     // FRAME_METADATA_URI; read per frame by the sender metadata transforms.
     frame_metadata_gate: crate::metadata::FrameMetadataGate,
+    // RtcConfiguration::frame_metadata. When false this connection behaves like one
+    // built before the capability existed: nothing is advertised, nothing is
+    // mirrored, the gate never opens and no transform is installed.
+    frame_metadata_enabled: bool,
 }
 
 // SAFETY: the native peer connection is internally thread-safe; observer
@@ -1018,12 +1079,14 @@ impl PeerConnection {
         raw: *mut reactor_webrtc_sys::PeerConnection,
         observer: Box<ObserverState>,
         factory: Arc<FactoryHandle>,
+        frame_metadata_enabled: bool,
     ) -> Self {
         Self {
             raw,
             _observer: observer,
             _factory: factory,
             frame_metadata_gate: crate::metadata::FrameMetadataGate::new(),
+            frame_metadata_enabled,
         }
     }
 
@@ -1047,6 +1110,9 @@ impl PeerConnection {
                 self.raw, ud, sdp_ok, sdp_err,
             )
         })?;
+        if !self.frame_metadata_enabled {
+            return Ok(offer);
+        }
         Ok(Self::advertise_frame_metadata(offer, None))
     }
 
@@ -1066,6 +1132,8 @@ impl PeerConnection {
                 self.raw, ud, sdp_ok, sdp_err,
             )
         })?;
+        // The gate is only ever armed when the flag is on, so checking it covers
+        // both "the offer did not ask" and "this connection does not take part".
         match self.frame_metadata_gate.extmap_id() {
             Some(id) => Ok(Self::advertise_frame_metadata(answer, Some(id))),
             None => Ok(answer),
@@ -1103,7 +1171,14 @@ impl PeerConnection {
         self.set_description(sdp, false)?;
         // After the native call, not before: a description libwebrtc rejected was
         // never applied, and must not move the gate.
-        self.frame_metadata_gate.set(sdp.frame_metadata_id());
+        // A disabled connection never arms the gate, so it never answers with the
+        // capability and never installs a transform.
+        self.frame_metadata_gate
+            .set(if self.frame_metadata_enabled {
+                sdp.frame_metadata_id()
+            } else {
+                None
+            });
         self.install_frame_metadata_transforms();
         Ok(())
     }
@@ -1132,23 +1207,21 @@ impl PeerConnection {
             if tc.kind() != MediaKind::Video {
                 continue;
             }
-            let send_id = tc.sender_track_id();
-            if crate::sender_meta::sender_slot_claimed(send_id) {
-                // The caller drives this sender's encoded frames themselves.
-                continue;
+            // Composed, not exclusive: a caller's own transform on either side keeps
+            // working, and attach_* returns a transformer to install only the first
+            // time this side needs one.
+            let id = tc.transceiver_id();
+            if let Some(source) = crate::sender_meta::lookup(tc.sender_track_id()) {
+                if let Some(native) =
+                    crate::sender_meta::attach_embed(id, source, self.frame_metadata_gate.clone())
+                {
+                    let _ = tc.attach_native_transform(crate::sender_meta::Side::Send, &native);
+                }
             }
-            if let Some(source) = crate::sender_meta::lookup(send_id) {
-                let tf =
-                    crate::sender_meta::sender_transform(source, self.frame_metadata_gate.clone());
-                let _ = tc.set_sender_transform(&tf);
-                // Dropping `tf` is safe and deliberate: the native transformer owns
-                // the callback state and the sender holds a reference to it, so it
-                // outlives this handle (see the `encoded` module docs).
-            }
-            let recv_id = tc.receiver_track_id();
-            if let Some(queue) = crate::sender_meta::lookup_receiver(recv_id) {
-                let tf = crate::sender_meta::receiver_transform(queue);
-                let _ = tc.set_receiver_transform(&tf);
+            if let Some(queue) = crate::sender_meta::lookup_receiver(tc.receiver_track_id()) {
+                if let Some(native) = crate::sender_meta::attach_strip(id, queue) {
+                    let _ = tc.attach_native_transform(crate::sender_meta::Side::Receive, &native);
+                }
             }
         }
     }
@@ -1352,6 +1425,12 @@ impl PeerConnection {
 
 impl Drop for PeerConnection {
     fn drop(&mut self) {
+        // Release the composed transform slots first, while the transceivers can
+        // still be enumerated. Keyed by native identity, so leaving them would let a
+        // recycled pointer inherit another connection's callbacks.
+        for tc in self.transceivers() {
+            crate::sender_meta::forget_transceiver(tc.transceiver_id());
+        }
         // Destroy the native PC (stops callbacks) before the observer box drops.
         unsafe { reactor_webrtc_sys::reactor_webrtc_peer_connection_destroy(self.raw) }
     }

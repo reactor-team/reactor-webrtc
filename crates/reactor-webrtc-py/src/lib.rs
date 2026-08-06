@@ -178,6 +178,9 @@ pub struct RtcConfiguration {
     pub ice_connection_receiving_timeout_ms: i32,
     pub ice_check_interval_strong_connectivity_ms: i32,
     tcp_candidate_policy: rw::TcpCandidatePolicy,
+    /// Whether this connection takes part in per-frame metadata. `True` by
+    /// default; see the class docstring in the stub.
+    pub frame_metadata: bool,
 }
 
 #[pymethods]
@@ -194,6 +197,7 @@ impl RtcConfiguration {
         ice_connection_receiving_timeout_ms=0,
         ice_check_interval_strong_connectivity_ms=0,
         tcp_candidate_policy=TcpCandidatePolicy::Disabled,
+        frame_metadata=true,
     ))]
     fn new(
         ice_servers: Vec<IceServer>,
@@ -205,6 +209,7 @@ impl RtcConfiguration {
         ice_connection_receiving_timeout_ms: i32,
         ice_check_interval_strong_connectivity_ms: i32,
         tcp_candidate_policy: TcpCandidatePolicy,
+        frame_metadata: bool,
     ) -> PyResult<Self> {
         Ok(Self {
             ice_servers,
@@ -216,6 +221,7 @@ impl RtcConfiguration {
             ice_connection_receiving_timeout_ms,
             ice_check_interval_strong_connectivity_ms,
             tcp_candidate_policy: rw::TcpCandidatePolicy::from(tcp_candidate_policy),
+            frame_metadata,
         })
     }
     #[getter]
@@ -296,6 +302,15 @@ impl RtcConfiguration {
     fn set_tcp_candidate_policy(&mut self, value: TcpCandidatePolicy) {
         self.tcp_candidate_policy = rw::TcpCandidatePolicy::from(value);
     }
+
+    #[getter]
+    fn frame_metadata(&self) -> bool {
+        self.frame_metadata
+    }
+    #[setter]
+    fn set_frame_metadata(&mut self, value: bool) {
+        self.frame_metadata = value;
+    }
 }
 
 impl From<&RtcConfiguration> for rw::RtcConfiguration {
@@ -329,6 +344,7 @@ impl From<&RtcConfiguration> for rw::RtcConfiguration {
                 None
             },
             tcp_candidate_policy: c.tcp_candidate_policy,
+            frame_metadata: c.frame_metadata,
         }
     }
 }

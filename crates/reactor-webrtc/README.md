@@ -147,12 +147,23 @@ Three details worth knowing:
   `a=extmap-allow-mixed`.
 - **The URI is the version.** An incompatible change to the trailer format mints a
   new URI rather than adding a version field, so old and new never match.
-- **Your own sender transform wins.** `SetFrameTransformer` holds one slot, so
-  calling `Transceiver::set_sender_transform` claims it and the metadata transform
-  is left off that sender — otherwise whether your transform survived would depend
-  on what the remote declared. A caller who takes the slot owns the trailer too,
-  and can build one with `metadata::encode_trailer`. Attach after `set_track`, so
-  the claim has a track to key on.
+- **Your own `FrameTransform` composes with it.** libwebrtc holds one transformer
+  per sender and per receiver, so the crate owns those slots and runs both things
+  that want them. Your callback goes first in both directions, so it sees exactly
+  the bytes that traverse the network — before a trailer is appended on send,
+  before one is stripped on receive. Apply `metadata::decode_and_strip_trailer`
+  yourself if you want the payload without the framing.
+
+To keep frame metadata out of a connection entirely — no `a=extmap`, no mirroring,
+no transforms, `user_data` dropped — build it with the capability off:
+
+```rust
+let config = RtcConfiguration { frame_metadata: false, ..Default::default() };
+```
+
+Worth doing for a peer whose encoded payloads must be byte-identical to the
+encoder's output, a rollout that has not reached both ends, or to rule frame
+metadata out while bisecting something else.
 
 ## Audio modes
 

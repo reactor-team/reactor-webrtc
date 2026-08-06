@@ -559,12 +559,12 @@ class TestFrameMetadata:
             "with the gate closed"
         )
 
-    async def test_caller_sender_transform_survives_negotiation(self, factory):
-        """A caller's own sender FrameTransform is not replaced by the install.
+    async def test_caller_transform_and_metadata_compose(self, factory):
+        """A caller's sender transform and the trailer share one transceiver.
 
-        SetFrameTransformer holds one slot, and the install happens on
-        negotiation — so without the claim guard a custom transform would work
-        against an old peer and silently stop against a new one.
+        libwebrtc gives a sender one frame-transformer slot, so this is only
+        expressible because the library owns it and composes. The callback runs
+        first, on the encoder's output, so it must not see a trailer.
         """
         p1 = make_peer(factory)
         p2 = make_peer(factory)
@@ -574,9 +574,14 @@ class TestFrameMetadata:
         tx1.set_track(video)
 
         ran: list[bool] = []
-        mine = rw.FrameTransform(lambda frame: (ran.append(True), rw.FrameAction.Forward)[1])
-        # After set_track, so the claim has a native track id to key on.
-        tx1.set_sender_transform(mine)
+        saw_trailer: list[bool] = []
+
+        def mine_cb(frame):
+            ran.append(True)
+            saw_trailer.append(bytes(frame.data).endswith(b"RXMT"))
+            return rw.FrameAction.Forward
+
+        tx1.set_sender_transform(rw.FrameTransform(mine_cb))
 
         ok = await connect(p1, p2)
         assert ok, "peers did not connect within timeout"
@@ -586,12 +591,17 @@ class TestFrameMetadata:
         for _ in range(90):
             if ran:
                 break
-            video.push_video_frame(bgra, 320, 240)
+            video.push_video_frame(bgra, 320, 240, user_data=b"composed")
             await asyncio.sleep(0.033)
 
         assert await wait_for(lambda: len(ran) > 0), (
-            "the caller's sender transform was replaced by the metadata install"
+            "the caller's sender transform never ran"
         )
+        assert not any(saw_trailer), (
+            "the caller's transform saw a trailer — it must run before the "
+            "metadata step"
+        )
+
 
 
 class TestFrameMetadataNegotiation:
@@ -679,3 +689,51 @@ class TestFrameMetadataNegotiation:
             offer.with_frame_metadata_id(0)
         with pytest.raises(RuntimeError):
             offer.with_frame_metadata_id(256)
+
+    async def test_disabled_frame_metadata_never_negotiates(self, factory):
+        """frame_metadata=False keeps the capability out of the SDP entirely."""
+        off = rw.RtcConfiguration(frame_metadata=False)
+        assert off.frame_metadata is False
+        assert rw.RtcConfiguration().frame_metadata is True
+
+        obs1 = rw.PeerConnectionObserver()
+        pc1 = factory.create_peer_connection(off, obs1)
+        obs2 = rw.PeerConnectionObserver()
+        pc2 = factory.create_peer_connection(rw.RtcConfiguration(), obs2)
+        pc1.add_transceiver(rw.MediaKind.Video, rw.TransceiverDirection.SendOnly)
+
+        offer = await pc1.create_offer()
+        assert not offer.declares_frame_metadata(), (
+            "a disabled connection must not advertise the capability"
+        )
+        await pc1.set_local_description(offer)
+        await pc2.set_remote_description(offer)
+        answer = await pc2.create_answer()
+        assert not answer.declares_frame_metadata()
+        await pc2.set_local_description(answer)
+        await pc1.set_remote_description(answer)
+        assert not pc1.frame_metadata_gate().is_open()
+        assert not pc2.frame_metadata_gate().is_open()
+
+    async def test_disabled_answerer_does_not_mirror(self, factory):
+        """A disabled answerer stays silent even when the offer declared."""
+        obs3 = rw.PeerConnectionObserver()
+        pc3 = factory.create_peer_connection(rw.RtcConfiguration(), obs3)
+        obs4 = rw.PeerConnectionObserver()
+        pc4 = factory.create_peer_connection(
+            rw.RtcConfiguration(frame_metadata=False), obs4
+        )
+        pc3.add_transceiver(rw.MediaKind.Video, rw.TransceiverDirection.SendOnly)
+
+        offer = await pc3.create_offer()
+        assert offer.declares_frame_metadata()
+        await pc3.set_local_description(offer)
+        await pc4.set_remote_description(offer)
+        answer = await pc4.create_answer()
+        assert not answer.declares_frame_metadata()
+        assert not pc4.frame_metadata_gate().is_open()
+        await pc4.set_local_description(answer)
+        await pc3.set_remote_description(answer)
+        assert not pc3.frame_metadata_gate().is_open(), (
+            "an unmirrored offer must leave the offerer's gate shut"
+        )

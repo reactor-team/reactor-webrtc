@@ -19,9 +19,16 @@
 //! you: every [`PeerConnection::create_offer`] advertises the capability as an
 //! `a=extmap`, [`PeerConnection::create_answer`] mirrors an offer that asked for
 //! it, and [`PeerConnection::set_remote_description`] arms a
-//! [`FrameMetadataGate`] from what the remote declared. Callers pass `user_data`
-//! when it is meaningful and never have to ask what the far end supports — a
-//! trailer reaches the wire only when the peer said it strips them.
+//! [`FrameMetadataGate`] from what the remote declared, and installs the metadata
+//! steps on the video transceivers. Callers pass `user_data` when it is meaningful
+//! and never have to ask what the far end supports — a trailer reaches the wire only
+//! when the peer said it strips them. Set
+//! [`RtcConfiguration::frame_metadata`] to `false` to keep the whole thing out of a
+//! connection.
+//!
+//! A [`FrameTransform`] of your own composes with that rather than displacing it:
+//! the crate owns libwebrtc's single transformer slot per sender/receiver and runs
+//! both, so encoded-frame access and per-frame metadata work on one transceiver.
 //!
 //! Building a real binary or test requires a native `libwebrtc`; set
 //! `REACTOR_WEBRTC_LIB_DIR` or `REACTOR_WEBRTC_PREBUILT_URL`. `cargo check`
@@ -351,7 +358,12 @@ impl PeerConnectionFactory {
                 format!("peer connection creation failed: {reason}")
             }));
         }
-        Ok(PeerConnection::new(raw, state, self.handle()))
+        Ok(PeerConnection::new(
+            raw,
+            state,
+            self.handle(),
+            config.frame_metadata,
+        ))
     }
 
     /// Create a local video track backed by a push-able source

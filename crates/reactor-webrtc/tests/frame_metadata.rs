@@ -498,15 +498,16 @@ fn legacy_peer_gets_no_trailer() {
     println!("legacy_peer_gets_no_trailer ✅  — {frames} frames, 0 trailers");
 }
 
-/// A caller's own sender `FrameTransform` survives negotiation.
+/// A caller's own sender transform and the metadata trailer work on the same
+/// transceiver.
 ///
-/// The metadata install would otherwise take the slot — `SetFrameTransformer` has
-/// only one — and it would do so *conditionally on what the remote declared*, so a
-/// custom transform would work against an old peer and silently stop against a new
-/// one. Attaching to the sender claims the slot; the trailer becomes the caller's
-/// business.
+/// libwebrtc gives a sender one `SetFrameTransformer` slot, so this is only
+/// expressible because the crate owns that slot and composes: the caller's callback
+/// runs first, on the bytes the encoder produced, and the trailer is appended after.
+/// Both observations are checked — the callback ran, *and* the receiver decoded
+/// metadata.
 #[test]
-fn caller_sender_transform_survives_negotiation() {
+fn caller_transform_and_metadata_compose_on_one_sender() {
     let factory = PeerConnectionFactory::new().expect("factory");
     let config = RtcConfiguration::default();
 
@@ -517,43 +518,63 @@ fn caller_sender_transform_survives_negotiation() {
         .add_transceiver(MediaKind::Video, TransceiverDirection::SendOnly)
         .expect("send transceiver");
     let video = factory
-        .create_video_track("claimed-video")
+        .create_video_track("composed-video")
         .expect("video track");
     tx1.set_track(&video).expect("set track");
 
+    // What the caller sees must be the encoder's output, with no trailer yet.
     let ran = Arc::new(AtomicBool::new(false));
+    let saw_trailer = Arc::new(AtomicBool::new(false));
     let mine = FrameTransform::new({
         let ran = ran.clone();
+        let saw_trailer = saw_trailer.clone();
         move |frame| {
             if frame.direction == FrameDirection::Send {
                 ran.store(true, Ordering::SeqCst);
+                if frame.data.ends_with(b"RXMT") {
+                    saw_trailer.store(true, Ordering::SeqCst);
+                }
             }
             FrameAction::Forward
         }
     });
-    // After set_track, so the claim has a native track id to key on.
     tx1.set_sender_transform(&mine).expect("my transform");
 
-    // The gate opens here, which is exactly when the install would clobber.
     negotiate(&pc1, &pc2);
     assert!(pc1.frame_metadata_gate().is_open());
 
+    let received: Arc<Mutex<Vec<FrameMetadata>>> = Arc::new(Mutex::new(Vec::new()));
     let stop = AtomicBool::new(false);
+
     thread::scope(|scope| {
         scope.spawn(|| {
             let mut seed = 0u8;
             while !stop.load(Ordering::SeqCst) {
                 let bgra = varying_bgra(seed);
-                video.push_video_frame(&bgra, W, H);
+                video.push_video_frame_with_metadata(&bgra, W, H, b"composed");
                 seed = seed.wrapping_add(7);
                 thread::sleep(Duration::from_millis(33));
             }
         });
+
         let start = Instant::now();
+        let mut recv_setup = false;
         loop {
             forward_ice(&s1, &pc2);
             forward_ice(&s2, &pc1);
-            if ran.load(Ordering::SeqCst) || start.elapsed() > Duration::from_secs(20) {
+            if !recv_setup {
+                let mut tracks = s2.recv.lock().unwrap();
+                if let Some(track) = tracks.iter_mut().find(|t| t.kind() == MediaKind::Video) {
+                    let out = received.clone();
+                    track.on_video_frame(move |frame| {
+                        if let Some(meta) = frame.metadata {
+                            out.lock().unwrap().push(meta);
+                        }
+                    });
+                    recv_setup = true;
+                }
+            }
+            if received.lock().unwrap().len() >= 2 || start.elapsed() > Duration::from_secs(20) {
                 break;
             }
             thread::sleep(Duration::from_millis(50));
@@ -563,7 +584,79 @@ fn caller_sender_transform_survives_negotiation() {
 
     assert!(
         ran.load(Ordering::SeqCst),
-        "the caller's sender transform was replaced by the metadata install"
+        "the caller's sender transform never ran"
     );
-    println!("caller_sender_transform_survives_negotiation ✅");
+    assert!(
+        !saw_trailer.load(Ordering::SeqCst),
+        "the caller's transform saw a trailer — it must run before the metadata step"
+    );
+    let metas = received.lock().unwrap().clone();
+    assert!(
+        !metas.is_empty(),
+        "no metadata arrived — composing dropped the metadata step"
+    );
+    assert_eq!(metas[0].user_data, b"composed");
+
+    println!(
+        "caller_transform_and_metadata_compose_on_one_sender ✅  — {} metadata frames",
+        metas.len()
+    );
+}
+
+/// `RtcConfiguration::frame_metadata = false` keeps the capability out of the SDP
+/// and off the wire, on a connection that is otherwise identical.
+#[test]
+fn disabled_frame_metadata_never_negotiates() {
+    let factory = PeerConnectionFactory::new().expect("factory");
+    let off = RtcConfiguration {
+        frame_metadata: false,
+        ..Default::default()
+    };
+    let on = RtcConfiguration::default();
+
+    // Offerer disabled: it does not advertise, so the answerer has nothing to
+    // mirror even though the answerer has the capability on.
+    let (pc1, _s1) = make_peer(&factory, &off);
+    let (pc2, _s2) = make_peer(&factory, &on);
+    pc1.add_transceiver(MediaKind::Video, TransceiverDirection::SendOnly)
+        .expect("tx");
+
+    let offer = pc1.create_offer().expect("offer");
+    assert!(
+        !offer.declares_frame_metadata(),
+        "a disabled connection must not advertise the capability"
+    );
+    pc1.set_local_description(&offer).expect("pc1 local");
+    pc2.set_remote_description(&offer).expect("pc2 remote");
+    let answer = pc2.create_answer().expect("answer");
+    assert!(!answer.declares_frame_metadata());
+    pc2.set_local_description(&answer).expect("pc2 local");
+    pc1.set_remote_description(&answer).expect("pc1 remote");
+    assert!(!pc1.frame_metadata_gate().is_open());
+    assert!(!pc2.frame_metadata_gate().is_open());
+
+    // Answerer disabled: the offer declares, but it must not mirror.
+    let (pc3, _s3) = make_peer(&factory, &on);
+    let (pc4, _s4) = make_peer(&factory, &off);
+    pc3.add_transceiver(MediaKind::Video, TransceiverDirection::SendOnly)
+        .expect("tx");
+
+    let offer = pc3.create_offer().expect("offer3");
+    assert!(offer.declares_frame_metadata());
+    pc3.set_local_description(&offer).expect("pc3 local");
+    pc4.set_remote_description(&offer).expect("pc4 remote");
+    let answer = pc4.create_answer().expect("answer3");
+    assert!(
+        !answer.declares_frame_metadata(),
+        "a disabled answerer must not mirror the offer's declaration"
+    );
+    assert!(!pc4.frame_metadata_gate().is_open());
+    pc4.set_local_description(&answer).expect("pc4 local");
+    pc3.set_remote_description(&answer).expect("pc3 remote");
+    assert!(
+        !pc3.frame_metadata_gate().is_open(),
+        "an unmirrored offer must leave the offerer's gate shut"
+    );
+
+    println!("disabled_frame_metadata_never_negotiates ✅");
 }

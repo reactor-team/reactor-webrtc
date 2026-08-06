@@ -160,124 +160,207 @@ pub(crate) fn lookup(track_id: usize) -> Option<Arc<dyn SenderMetaSource>> {
 
 const RECEIVER_META_CAP: usize = 300;
 
-/// Native track ids whose sender slot a caller has claimed with
-/// [`Transceiver::set_sender_transform`](crate::Transceiver::set_sender_transform).
-///
-/// `SetFrameTransformer` is a single slot, so installing the metadata transform
-/// over a caller's own would silently disable a documented feature — and, because
-/// the install happens on negotiation, it would do so only against peers that
-/// declared support. Whether your transform survives would depend on the far end.
-/// A claimed slot is left alone instead; such a caller owns the trailer too, and
-/// can append one with [`crate::metadata::encode_trailer`].
-fn claimed_sender_slots() -> &'static Mutex<std::collections::HashSet<usize>> {
-    static CLAIMED: OnceLock<Mutex<std::collections::HashSet<usize>>> = OnceLock::new();
-    CLAIMED.get_or_init(Mutex::default)
+/// What the frame-metadata step does on one side of a transceiver.
+enum MetaStep {
+    /// Send: append a trailer for frames the source has metadata for.
+    Embed {
+        source: Arc<dyn SenderMetaSource>,
+        gate: crate::metadata::FrameMetadataGate,
+    },
+    /// Receive: strip the trailer and queue the metadata for the video sink.
+    Strip {
+        queue: Arc<ReceiverMetaQueue>,
+        /// Dedup window over (ssrc, rtp timestamp) — WebRTC can reassemble the
+        /// same frame more than once when NACK retransmissions arrive after the
+        /// original packets left the jitter buffer. Duplicates still get stripped
+        /// but skip the queue push, so it stays 1:1 with decoded frames.
+        seen: Mutex<std::collections::VecDeque<(u32, u32)>>,
+    },
 }
 
-/// Record that the caller owns the sender slot for `track_id`.
+/// One side of one transceiver's encoded-frame pipeline.
 ///
-/// A no-op for id 0, which is what a transceiver with no track yet reports: there
-/// is nothing to key the claim on, so a caller that attaches a sender transform
-/// before its track loses the guard. Attach after `set_track` to keep it.
-pub(crate) fn claim_sender_slot(track_id: usize) {
-    if track_id == 0 {
+/// libwebrtc gives a sender and a receiver a single `SetFrameTransformer` slot
+/// each, so the crate owns it and runs both things that want it: the caller's
+/// [`FrameTransform`](crate::FrameTransform) callback, and the frame-metadata step.
+/// Without this, attaching a transform would silently disable metadata (or the
+/// reverse), and — since metadata is installed on negotiation — which one you got
+/// would depend on what the remote declared.
+///
+/// Either part may be absent and either may be set later, in any order: whichever
+/// arrives first installs the native transformer, and the other is picked up on the
+/// next frame.
+#[derive(Default)]
+pub(crate) struct ComposedSlot {
+    caller: Mutex<Option<Arc<Mutex<crate::encoded::EncodedCb>>>>,
+    meta: Mutex<Option<MetaStep>>,
+    installed: std::sync::atomic::AtomicBool,
+}
+
+impl ComposedSlot {
+    /// Run the composed pipeline for one frame.
+    ///
+    /// The caller's callback runs **first in both directions**, so it always sees
+    /// exactly the bytes that traverse the network: on send, before the trailer is
+    /// appended; on receive, before it is stripped. A caller that wants the payload
+    /// without the framing can apply
+    /// [`decode_and_strip_trailer`](crate::metadata::decode_and_strip_trailer)
+    /// itself. Dropping the frame skips the metadata step entirely — there will be
+    /// no decoded frame for it to belong to.
+    fn run(&self, frame: &crate::encoded::EncodedFrame) -> crate::encoded::FrameAction {
+        let caller = self.caller.lock().ok().and_then(|g| g.clone());
+        if let Some(cb) = caller {
+            let action = match cb.lock() {
+                Ok(mut cb) => cb(frame),
+                Err(_) => crate::encoded::FrameAction::Forward,
+            };
+            if action == crate::encoded::FrameAction::Drop {
+                return crate::encoded::FrameAction::Drop;
+            }
+        }
+        if let Ok(meta) = self.meta.lock() {
+            match meta.as_ref() {
+                Some(MetaStep::Embed { source, gate }) => {
+                    // Ask the source even with the gate shut: a FIFO-backed source
+                    // has to be drained to stay in step with its frames.
+                    let m = source.take(frame);
+                    if gate.is_open() {
+                        if let Some(ref m) = m {
+                            let trailer = crate::metadata::encode_trailer(m);
+                            let mut out = frame.data.to_vec();
+                            out.extend_from_slice(&trailer);
+                            frame.replace_data(&out);
+                        }
+                    }
+                }
+                Some(MetaStep::Strip { queue, seen }) => {
+                    if let Some((m, stripped)) =
+                        crate::metadata::decode_and_strip_trailer(frame.data)
+                    {
+                        frame.replace_data(&stripped);
+                        let key = (frame.ssrc, frame.timestamp);
+                        let dup = seen.lock().ok().is_some_and(|mut g| {
+                            if g.contains(&key) {
+                                true
+                            } else {
+                                if g.len() >= 32 {
+                                    g.pop_front();
+                                }
+                                g.push_back(key);
+                                false
+                            }
+                        });
+                        if !dup {
+                            if let Ok(mut q) = queue.lock() {
+                                if q.len() >= RECEIVER_META_CAP {
+                                    q.pop_front();
+                                }
+                                q.push_back(m);
+                            }
+                        }
+                    }
+                }
+                None => {}
+            }
+        }
+        crate::encoded::FrameAction::Forward
+    }
+
+    fn set_caller(&self, cb: Arc<Mutex<crate::encoded::EncodedCb>>) {
+        if let Ok(mut slot) = self.caller.lock() {
+            *slot = Some(cb);
+        }
+    }
+
+    fn set_meta(&self, step: MetaStep) {
+        if let Ok(mut slot) = self.meta.lock() {
+            *slot = Some(step);
+        }
+    }
+
+    /// True the first time it is called, so the native transformer is attached once.
+    fn claim_install(&self) -> bool {
+        !self
+            .installed
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Which side of a transceiver a slot belongs to.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum Side {
+    Send,
+    Receive,
+}
+
+type SlotRegistry = Mutex<HashMap<(usize, Side), Arc<ComposedSlot>>>;
+
+/// Keyed by the *transceiver's* native identity, which is stable from the moment
+/// the transceiver exists — before a track is attached and before a mid is
+/// assigned. (The handle pointer is not: `transceivers()` allocates a fresh one
+/// each call.)
+fn slots() -> &'static SlotRegistry {
+    static SLOTS: OnceLock<SlotRegistry> = OnceLock::new();
+    SLOTS.get_or_init(SlotRegistry::default)
+}
+
+fn slot_for(transceiver_id: usize, side: Side) -> Option<Arc<ComposedSlot>> {
+    if transceiver_id == 0 {
+        return None;
+    }
+    let mut map = slots().lock().ok()?;
+    Some(Arc::clone(map.entry((transceiver_id, side)).or_default()))
+}
+
+/// Drop both slots for a transceiver, so a recycled native pointer starts clean.
+pub(crate) fn forget_transceiver(transceiver_id: usize) {
+    if transceiver_id == 0 {
         return;
     }
-    if let Ok(mut set) = claimed_sender_slots().lock() {
-        set.insert(track_id);
+    if let Ok(mut map) = slots().lock() {
+        map.remove(&(transceiver_id, Side::Send));
+        map.remove(&(transceiver_id, Side::Receive));
     }
 }
 
-pub(crate) fn sender_slot_claimed(track_id: usize) -> bool {
-    claimed_sender_slots()
-        .lock()
-        .map(|set| set.contains(&track_id))
-        .unwrap_or(false)
+/// Build the native transformer that runs `slot`.
+fn native_for(slot: Arc<ComposedSlot>) -> crate::encoded::NativeTransform {
+    crate::encoded::NativeTransform::new(move |frame| slot.run(frame))
 }
 
-/// Forget the claim for `track_id`, so a recycled native pointer cannot inherit it.
-pub(crate) fn release_sender_slot(track_id: usize) {
-    if track_id == 0 {
-        return;
-    }
-    if let Ok(mut set) = claimed_sender_slots().lock() {
-        set.remove(&track_id);
-    }
+/// Register a caller callback on one side, installing the native transformer if it
+/// is not there yet. Returns the transformer to attach, or `None` if the slot was
+/// already installed (nothing to attach — the existing one picks the callback up).
+pub(crate) fn attach_caller(
+    transceiver_id: usize,
+    side: Side,
+    cb: Arc<Mutex<crate::encoded::EncodedCb>>,
+) -> Option<crate::encoded::NativeTransform> {
+    let slot = slot_for(transceiver_id, side)?;
+    slot.set_caller(cb);
+    slot.claim_install().then(|| native_for(slot))
 }
 
-/// Build the sender transform: append a trailer to each outgoing encoded frame
-/// for which `source` has metadata, while `gate` is open.
-///
-/// Installed by
-/// [`PeerConnection::set_remote_description`](crate::PeerConnection::set_remote_description)
-/// once the remote has declared that it strips trailers. The gate is still
-/// consulted per frame rather than trusted at install time, because a
-/// renegotiation can close it under a transform that is already attached.
-pub(crate) fn sender_transform(
+/// Configure the send-side metadata step, installing the transformer if needed.
+pub(crate) fn attach_embed(
+    transceiver_id: usize,
     source: Arc<dyn SenderMetaSource>,
     gate: crate::metadata::FrameMetadataGate,
-) -> crate::encoded::FrameTransform {
-    crate::encoded::FrameTransform::new(move |frame| {
-        if frame.direction != crate::encoded::FrameDirection::Send {
-            return crate::encoded::FrameAction::Forward;
-        }
-        // Ask the source unconditionally, even with the gate shut: a FIFO-backed
-        // source has to be drained to stay in step with the frames it belongs to.
-        let meta = source.take(frame);
-        if gate.is_open() {
-            if let Some(ref m) = meta {
-                let trailer = crate::metadata::encode_trailer(m);
-                let mut new_data = frame.data.to_vec();
-                new_data.extend_from_slice(&trailer);
-                frame.replace_data(&new_data);
-            }
-        }
-        crate::encoded::FrameAction::Forward
-    })
+) -> Option<crate::encoded::NativeTransform> {
+    let slot = slot_for(transceiver_id, Side::Send)?;
+    slot.set_meta(MetaStep::Embed { source, gate });
+    slot.claim_install().then(|| native_for(slot))
 }
 
-/// Build the receiver transform: strip the trailer from each inbound encoded
-/// frame and push the metadata onto `queue`, which the track's video sink drains
-/// one entry per decoded frame.
-///
-/// Metadata is delivered in FIFO order. The native transformer fires once per
-/// fully-reassembled encoded frame, so packet loss skips the metadata push and the
-/// decoded frame together and the queue does not drift. A mismatch needs a
-/// decoder-level edge case — a synthesised concealment frame, or H.264
-/// non-reference frame discard.
-pub(crate) fn receiver_transform(queue: Arc<ReceiverMetaQueue>) -> crate::encoded::FrameTransform {
-    // Dedup window: WebRTC can reassemble the same frame more than once when NACK
-    // retransmissions arrive after the original packets left the jitter buffer.
-    // Duplicates still get stripped, but skip the push so the queue stays 1:1 with
-    // decoded frames.
-    let seen: Mutex<std::collections::VecDeque<(u32, u32)>> = Mutex::default();
-    crate::encoded::FrameTransform::new(move |frame| {
-        if frame.direction != crate::encoded::FrameDirection::Receive {
-            return crate::encoded::FrameAction::Forward;
-        }
-        if let Some((meta, stripped)) = crate::metadata::decode_and_strip_trailer(frame.data) {
-            frame.replace_data(&stripped);
-            let key = (frame.ssrc, frame.timestamp);
-            let is_dup = seen.lock().ok().is_some_and(|mut g| {
-                if g.contains(&key) {
-                    true
-                } else {
-                    if g.len() >= 32 {
-                        g.pop_front();
-                    }
-                    g.push_back(key);
-                    false
-                }
-            });
-            if !is_dup {
-                if let Ok(mut guard) = queue.lock() {
-                    if guard.len() >= RECEIVER_META_CAP {
-                        guard.pop_front();
-                    }
-                    guard.push_back(meta);
-                }
-            }
-        }
-        crate::encoded::FrameAction::Forward
-    })
+/// Configure the receive-side metadata step, installing the transformer if needed.
+pub(crate) fn attach_strip(
+    transceiver_id: usize,
+    queue: Arc<ReceiverMetaQueue>,
+) -> Option<crate::encoded::NativeTransform> {
+    let slot = slot_for(transceiver_id, Side::Receive)?;
+    slot.set_meta(MetaStep::Strip {
+        queue,
+        seen: Mutex::default(),
+    });
+    slot.claim_install().then(|| native_for(slot))
 }

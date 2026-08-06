@@ -516,6 +516,11 @@ extern "C" {
         transceiver: *mut RtpTransceiver,
         direction: c_int,
     ) -> c_int;
+    /// Identity of the transceiver itself, as an opaque value — **not** an owning
+    /// handle. Stable for the transceiver's life, unlike the handle pointer, which
+    /// is a fresh allocation per `transceivers()` call. Usable as a key before any
+    /// track is attached and before a mid is assigned.
+    pub fn reactor_webrtc_rtp_transceiver_id(transceiver: *mut RtpTransceiver) -> usize;
     /// Identity of the track on this transceiver's sender, as an opaque value —
     /// **not** an owning handle. The value is only ever compared, never
     /// dereferenced or released, and no reference is taken. Returns 0 when the

@@ -16,6 +16,13 @@
 //!   [`FrameAction::Forward`] lets the local decoder run as usual.
 //!
 //! The closure runs on a WebRTC thread and must not block it.
+//!
+//! libwebrtc allows one transformer per sender and one per receiver, so the crate
+//! owns those slots and composes: your callback runs alongside the per-frame
+//! metadata step ([`crate::metadata`]) rather than displacing it. Your callback goes
+//! first in both directions, which means it always sees exactly the bytes that
+//! traverse the network — before a trailer is appended on send, before one is
+//! stripped on receive. Returning [`FrameAction::Drop`] skips the metadata step too.
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
@@ -82,7 +89,7 @@ impl EncodedFrame<'_> {
     }
 }
 
-type EncodedCb = Box<dyn for<'a> FnMut(&EncodedFrame<'a>) -> FrameAction + Send>;
+pub(crate) type EncodedCb = Box<dyn for<'a> FnMut(&EncodedFrame<'a>) -> FrameAction + Send>;
 
 // Heap-pinned callback state; owned by the *native* transformer (freed via
 // `free_state_tramp` when its last ref drops), so it outlives every callback
@@ -148,23 +155,56 @@ extern "C" fn free_state_tramp(ud: *mut c_void) {
     drop(unsafe { Box::from_raw(ud as *mut TransformState) });
 }
 
-/// An encoded-frame transformer. Attach it to a transceiver's sender/receiver;
-/// see the [module docs](self). Dropping the handle releases the binding's
-/// reference — the native transformer (and the callback) live until every
-/// sender/receiver it's attached to also releases it.
+/// A callback over encoded frames, to be attached to a transceiver's
+/// sender/receiver; see the [module docs](self).
+///
+/// This is a *registration*, not a native object. Attaching it does not take
+/// libwebrtc's single `SetFrameTransformer` slot — the crate owns one transformer
+/// per sender and per receiver, and composes this callback with its own
+/// frame-metadata step (see [`crate::metadata`]). That is what lets a caller use
+/// encoded-frame access and per-frame metadata on the same transceiver, which a
+/// single slot cannot express.
+///
+/// Attaching the same `FrameTransform` to more than one sender/receiver shares one
+/// callback, serialised by its mutex.
+#[derive(Clone)]
 pub struct FrameTransform {
+    cb: Arc<Mutex<EncodedCb>>,
+}
+
+impl FrameTransform {
+    /// Create a transform running `cb` per encoded frame. The closure runs on a
+    /// WebRTC thread and must not block it.
+    pub fn new(cb: impl for<'a> FnMut(&EncodedFrame<'a>) -> FrameAction + Send + 'static) -> Self {
+        Self {
+            cb: Arc::new(Mutex::new(Box::new(cb))),
+        }
+    }
+
+    pub(crate) fn callback(&self) -> Arc<Mutex<EncodedCb>> {
+        Arc::clone(&self.cb)
+    }
+}
+
+/// The native transformer: one per sender/receiver, owned by the crate.
+///
+/// The composed root that [`FrameTransform`] callbacks and the frame-metadata step
+/// both run under. Dropping this handle releases the binding's reference; the
+/// native object and its callback state live until every sender/receiver it is
+/// attached to also releases it, which is why the install path can attach and drop.
+pub(crate) struct NativeTransform {
     raw: *mut reactor_webrtc_sys::FrameTransformer,
 }
 
 // SAFETY: the callback is Mutex-guarded and the native transformer is
 // internally thread-safe; the handle only owns a ref-counted pointer.
-unsafe impl Send for FrameTransform {}
-unsafe impl Sync for FrameTransform {}
+unsafe impl Send for NativeTransform {}
+unsafe impl Sync for NativeTransform {}
 
-impl FrameTransform {
-    /// Create a transformer running `cb` per encoded frame. The closure runs on
-    /// a WebRTC thread and must not block it.
-    pub fn new(cb: impl for<'a> FnMut(&EncodedFrame<'a>) -> FrameAction + Send + 'static) -> Self {
+impl NativeTransform {
+    pub(crate) fn new(
+        cb: impl for<'a> FnMut(&EncodedFrame<'a>) -> FrameAction + Send + 'static,
+    ) -> Self {
         // Leak the state; the native transformer owns it and frees it via
         // free_state_tramp when its last ref drops.
         let state = Box::into_raw(Box::new(TransformState {
@@ -189,7 +229,7 @@ impl FrameTransform {
     }
 }
 
-impl Drop for FrameTransform {
+impl Drop for NativeTransform {
     fn drop(&mut self) {
         if !self.raw.is_null() {
             unsafe { reactor_webrtc_sys::reactor_webrtc_frame_transformer_destroy(self.raw) }

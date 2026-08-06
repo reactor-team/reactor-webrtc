@@ -42,9 +42,12 @@ pub struct VideoFrame<'a> {
     pub bgra: &'a [u8],
     pub width: u32,
     pub height: u32,
-    /// Metadata attached by the sender via [`Track::push_video_frame_with_metadata`]
-    /// or [`Track::sender_metadata_transform`], decoded from the packet trailer.
-    /// `None` when no trailer was present in the encoded frame.
+    /// Metadata attached by the sender via
+    /// [`Track::push_video_frame_with_metadata`], decoded from the packet trailer.
+    ///
+    /// `None` when no trailer was present — which includes every frame from a peer
+    /// that did not negotiate the capability, and every frame on a connection built
+    /// with [`RtcConfiguration::frame_metadata`](crate::RtcConfiguration) off.
     pub metadata: Option<crate::metadata::FrameMetadata>,
 }
 
@@ -416,7 +419,6 @@ impl Drop for Track {
             let source: Arc<dyn crate::sender_meta::SenderMetaSource> = self.sender_meta.clone();
             crate::sender_meta::deregister(self.native_id, &source);
             crate::sender_meta::deregister_receiver(self.native_id, &self.receiver_meta);
-            crate::sender_meta::release_sender_slot(self.native_id);
         }
         // Detaches the C++ sink before the sink-state boxes are freed.
         unsafe { reactor_webrtc_sys::reactor_webrtc_media_stream_track_destroy(self.raw) }

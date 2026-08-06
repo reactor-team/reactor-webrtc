@@ -47,6 +47,21 @@ class RtcConfiguration:
     ice_connection_receiving_timeout_ms: int  # 0 = libwebrtc default (~30 000 ms)
     ice_check_interval_strong_connectivity_ms: int  # 0 = libwebrtc default
     tcp_candidate_policy: TcpCandidatePolicy
+    frame_metadata: bool
+    """Whether this connection takes part in per-frame metadata.
+
+    `True` by default. When on, offers advertise `FRAME_METADATA_URI`, answers
+    mirror an offer that asked for it, and the metadata steps are wired into the
+    video transceivers once the peer agrees.
+
+    Set `False` to keep the capability out of the SDP entirely: offers do not
+    advertise it, answers stay silent even when the offer declared it, the gate
+    never opens, and `user_data` passed to a push is dropped. Nothing about the
+    connection differs from one built before the capability existed.
+
+    Reasons to: a peer whose encoded payloads must be byte-identical to what the
+    encoder produced, a deployment that has not rolled the capability out to both
+    ends yet, or ruling frame metadata out while bisecting something else."""
     def __init__(
         self,
         ice_servers: list[IceServer] = ...,
@@ -58,6 +73,7 @@ class RtcConfiguration:
         ice_connection_receiving_timeout_ms: int = 0,
         ice_check_interval_strong_connectivity_ms: int = 0,
         tcp_candidate_policy: TcpCandidatePolicy = ...,
+        frame_metadata: bool = True,
     ) -> None: ...
 
 # ── Signaling types ───────────────────────────────────────────────────────────
@@ -257,12 +273,14 @@ class EncodedFrame:
     def replace_data(self, new_data: bytes) -> None: ...
 
 class FrameTransform:
-    """Encoded-frame transformer attached to a transceiver sender or receiver.
+    """An encoded-frame callback attached to a transceiver sender or receiver.
 
     Create from a Python callable with `FrameTransform(callback)`.
 
-    The frame-metadata transforms are not among these — the library builds and
-    installs them itself once the capability has been negotiated.
+    This is a registration, not a native object: attaching it does not take
+    libwebrtc's single frame-transformer slot. The library owns that slot and
+    composes this callback with its own frame-metadata step, so encoded-frame
+    access and per-frame metadata work on the same transceiver.
 
     Callback signature: `callback(frame: EncodedFrame) -> FrameAction`"""
 
@@ -352,14 +370,17 @@ class Transceiver:
         """Attach a FrameTransform to the sender path of this transceiver.
         The transform runs after the encoder, before RTP packetization.
 
-        Doing this also claims the slot: the frame-metadata transform the library
-        would otherwise install on negotiation is left off this sender, since
-        `SetFrameTransformer` holds only one. Such a caller owns the trailer too.
-        Attach after `set_track` so the claim has a track to key on."""
+        Composes rather than replaces: the callback runs first, on the bytes the
+        encoder produced, and the frame-metadata trailer is appended after. Calling
+        this again replaces the callback."""
         ...
     def set_receiver_transform(self, transform: FrameTransform) -> None:
         """Attach a FrameTransform to the receiver path of this transceiver.
-        The transform runs after RTP depacketization, before the decoder."""
+        The transform runs after RTP depacketization, before the decoder.
+
+        Composes rather than replaces, as on the sender. The callback runs before
+        the metadata trailer is stripped, so it sees exactly the bytes that
+        arrived."""
         ...
 
 # ── Data channel ──────────────────────────────────────────────────────────────

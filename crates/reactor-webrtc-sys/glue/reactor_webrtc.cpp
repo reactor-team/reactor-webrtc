@@ -1445,6 +1445,20 @@ int reactor_webrtc_rtp_transceiver_set_direction(void* transceiver, int directio
   return err.ok() ? 1 : 0;
 }
 
+// Identity of the *transceiver* itself, as an opaque value — not an owning
+// handle.
+//
+// Unlike the ReactorTransceiver handle, which is a fresh heap object on every
+// transceivers() call, the native RtpTransceiverInterface behind it is stable for
+// the life of the transceiver. That makes this usable as a key from the moment the
+// transceiver exists — before any track is attached, and before the first SDP
+// exchange assigns a mid.
+uintptr_t reactor_webrtc_rtp_transceiver_id(void* transceiver) {
+  auto* h = reinterpret_cast<ReactorTransceiver*>(transceiver);
+  if (!h || !h->tc) return 0;
+  return reinterpret_cast<uintptr_t>(h->tc.get());
+}
+
 // Identity of the track currently attached to this transceiver's sender, as an
 // opaque value — NOT an owning handle.
 //

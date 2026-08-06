@@ -168,10 +168,19 @@ agreed.
 No RTP bytes are emitted for the extmap itself — libwebrtc declines to map a URI
 it does not know, so the line is a capability flag and nothing more.
 
-Calling `Transceiver.set_sender_transform` claims that sender's single transform
-slot, and the metadata transform is then left off it: a caller who takes the slot
-owns the trailer too. Attach it after `set_track` so the claim has a track to key
-on.
+A `FrameTransform` of your own composes with the metadata step rather than
+displacing it — the library owns libwebrtc's single transformer slot per
+sender/receiver and runs both. Your callback goes first in both directions, so it
+sees exactly the bytes that traverse the network.
+
+To keep frame metadata out of a connection entirely:
+
+```python
+config = rw.RtcConfiguration(frame_metadata=False)
+```
+
+No `a=extmap`, no mirroring, no transforms, and `user_data` is dropped — the
+connection is indistinguishable from one built before the capability existed.
 
 ## Choosing your own ICE credentials
 
