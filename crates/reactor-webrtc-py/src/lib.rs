@@ -1647,20 +1647,25 @@ impl PeerConnection {
         })
     }
 
-    /// Adjust the bandwidth estimate limits and starting point.
+    /// Adjust the bandwidth estimate limits and starting point. Natively awaitable.
     ///
     /// Pass `None` to leave a value at its libwebrtc default. A value of 0 is
     /// treated as `None` (unset). Units are bits-per-second.
     #[pyo3(signature = (min_bps=None, start_bps=None, max_bps=None))]
-    fn set_bitrate(
+    fn set_bitrate<'py>(
         &self,
-        py: Python,
+        py: Python<'py>,
         min_bps: Option<i32>,
         start_bps: Option<i32>,
         max_bps: Option<i32>,
-    ) -> PyResult<()> {
-        py.allow_threads(|| self.pc().set_bitrate(min_bps, start_bps, max_bps))
-            .map_err(err)
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(self.pc());
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            tokio::task::spawn_blocking(move || inner.set_bitrate(min_bps, start_bps, max_bps))
+                .await
+                .map_err(join_err)?
+                .map_err(err)
+        })
     }
 }
 

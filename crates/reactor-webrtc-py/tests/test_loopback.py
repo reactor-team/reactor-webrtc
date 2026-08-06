@@ -184,6 +184,15 @@ class TestPeerConnection:
             assert isinstance(c, rw.IceCandidate)
             assert c.candidate.startswith("candidate:")
 
+    async def test_set_bitrate_is_awaitable(self, factory):
+        p = make_peer(factory)
+        await p.pc.set_bitrate(100_000, 500_000, 2_000_000)
+
+    async def test_set_bitrate_rejects_inconsistent_bounds(self, factory):
+        p = make_peer(factory)
+        with pytest.raises(RuntimeError):
+            await p.pc.set_bitrate(2_000_000, 500_000, 100_000)  # min above max
+
 
 # ── Data channel ─────────────────────────────────────────────────────────────
 
