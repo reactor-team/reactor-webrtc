@@ -112,6 +112,31 @@ Android build completes without `use of undeclared identifier 'org_webrtc_*_claz
 
 ---
 
+### 0003 — disable CREL relocations for linux/arm64
+
+`0003-disable-crel-for-arm64.patch` · touches `build/config/compiler/BUILD.gn` (+3/-1 lines)
+
+**What.** Extends an existing upstream exclusion in the `compiler` config so
+`current_cpu != "arm64"` is also required before `-Wa,--crel,--allow-experimental-crel`
+is added to `cflags` on Linux.
+
+**Why.** Upstream already excludes `arm`/`s390x` from CREL (compact
+relocations) because it segfaults there (see the upstream `TODO(crbug.com/376278218)`
+and the linked `llvm-project` issue in the patch context) — but not `arm64`.
+`reactor-webrtc-sys` links the prebuilt `libwebrtc.a` on Linux arm64 hosts with
+**GNU ld**, not lld, and GNU ld does not yet support CREL relocations: a
+`libwebrtc.a` compiled with them fails to link there with relocation errors.
+
+**How it works.** One-line change to the existing `if` condition — no new gn
+arg, no build.rs change. The linux/arm64 build (cross-compiled from x86_64,
+see the parent `README.md` → "Bundled libc++") simply never emits CREL for
+its objects, so GNU ld reads a compatible archive.
+
+**Verify.** `reactor-webrtc-sys`'s lib-link test links and runs on Linux
+arm64 without relocation errors from the linker.
+
+---
+
 ## Planned (not yet authored — need their target builds to validate)
 
 - **Symbol isolation** — keep WebRTC's C++ symbols from clashing when a consumer

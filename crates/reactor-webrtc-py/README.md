@@ -110,14 +110,15 @@ for pair in report.candidate_pairs:
 | `RtcConfiguration` | ICE servers, ICE transport type, gathering policy |
 | `IceServer` | A STUN or TURN server entry |
 | `IceCandidate` | A trickled ICE candidate |
-| `SessionDescription` | SDP offer or answer (`kind`, `sdp`, `ice_ufrags`, `with_ice_credentials`, `frame_metadata_id`) |
+| `SessionDescription` | SDP offer or answer (`kind`, `sdp`, `ice_ufrags`, `with_ice_credentials`, `declares_frame_metadata`, `with_frame_metadata`) |
 | `FrameMetadata` | Per-frame `frame_id`, `timestamp`, `user_data` |
 | `FrameMetadataGate` | What the remote declared about per-frame metadata |
 | `Track` | Local (push frames) or remote (attach sink) media track |
 | `EncodedVideoTrack` | Push pre-encoded video (H.264 Annex-B, VP8, VP9, …) |
-| `Transceiver` | RTP m-section: `mid`, `kind`, `set_track`, `set_direction` |
+| `Transceiver` | RTP m-section: `mid`, `kind`, `set_track`, `set_direction`, `set_sender_transform`, `set_receiver_transform` |
 | `DataChannel` | SCTP data channel: `send`, `on_message`, `on_open`, … |
 | `StatsReport` | `inbound_rtp`, `outbound_rtp`, `candidate_pairs` |
+| `FrameMetadata`, `FrameAction`, `EncodedFrame`, `FrameTransform` | Per-frame metadata trailers and custom encoded-frame transforms — see [`docs/frame-metadata.md`](../../docs/frame-metadata.md) |
 
 | Enum | Values |
 |------|--------|
@@ -132,6 +133,14 @@ for pair in report.candidate_pairs:
 |---------------------|--------|
 | `RtcConfiguration.ice_transport_type` | `all` (default), `relay`, `no_host`, `none` |
 | `RtcConfiguration.continual_gathering_policy` | `once` (default), `continually` |
+| `RtcConfiguration.bundle_policy` | `Balanced` (default), `MaxBundle`, `MaxCompat` |
+| `RtcConfiguration.tcp_candidate_policy` | `Disabled` (default), `Enabled` |
+
+`RtcConfiguration` also takes a `min_port`/`max_port` pair (UDP port range),
+`ice_connection_receiving_timeout_ms`, and
+`ice_check_interval_strong_connectivity_ms`; `PeerConnection.set_bitrate`
+sets congestion-control bitrate limits after the connection is created. All
+covered in [`docs/configuration.md`](../../docs/configuration.md).
 
 ## Per-frame metadata
 
@@ -217,10 +226,10 @@ newline in a credential from injecting an SDP line.
 
 `PeerConnection`'s signaling methods (`create_offer`, `create_answer`,
 `set_local_description`, `set_remote_description`, `add_ice_candidate`,
-`get_stats`) are natively awaitable — `await` them directly, no
-`asyncio.to_thread()`/executor wrapping needed. They still take a few
-milliseconds to resolve while the WebRTC engine responds, but that wait
-happens off the event loop thread, so it never blocks other coroutines.
+`get_stats`) plus `set_bitrate` are natively awaitable — `await` them
+directly, no `asyncio.to_thread()`/executor wrapping needed. They still take
+a few milliseconds to resolve while the WebRTC engine responds, but that
+wait happens off the event loop thread, so it never blocks other coroutines.
 
 Every other method (`add_track`, `add_transceiver`, `transceivers`,
 `create_data_channel`, and everything on `Track`/`Transceiver`/`DataChannel`) is
