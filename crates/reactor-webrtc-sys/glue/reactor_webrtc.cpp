@@ -793,6 +793,16 @@ class StatsCallback : public webrtc::RTCStatsCollectorCallback {
     }
     if (callback_)
       callback_(userdata_, entries.data(), static_cast<int>(entries.size()));
+
+    // Matches the extra AddRef taken in reactor_webrtc_peer_connection_get_stats
+    // before this object was handed to GetStats(). GetStats() is proxied onto
+    // the signaling thread, and nothing in the public API guarantees the real
+    // PeerConnection::GetStats body (which takes its own ref) has run by the
+    // time GetStats() returns to the caller. Without this extra ref, the
+    // caller's local scoped_refptr can drop the last reference and delete
+    // `this` before the queued call ever reaches the signaling thread — a
+    // use-after-free that only shows up as a rare, timing-dependent segfault.
+    Release();
   }
 
  private:
@@ -2030,8 +2040,14 @@ void reactor_webrtc_peer_connection_get_stats(
     if (callback) callback(userdata, nullptr, 0);
     return;
   }
-  rpc->pc->GetStats(
-      webrtc::make_ref_counted<StatsCallback>(userdata, callback).get());
+  // Take an extra ref before GetStats() sees this object, released at the end
+  // of OnStatsDelivered — see the comment there for why. `cb` itself is a
+  // second, independent reference that still unwinds normally at the end of
+  // this function.
+  webrtc::scoped_refptr<StatsCallback> cb =
+      webrtc::make_ref_counted<StatsCallback>(userdata, callback);
+  cb->AddRef();
+  rpc->pc->GetStats(cb.get());
 }
 
 }  // extern "C"
