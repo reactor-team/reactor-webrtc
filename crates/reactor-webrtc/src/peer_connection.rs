@@ -459,6 +459,22 @@ impl Transceiver {
     }
 
     /// The transceiver's media kind (audio/video).
+    /// Identity of the track on this transceiver's sender, as an opaque value.
+    ///
+    /// Only ever compared — it is how the crate recognises which of its own
+    /// [`Track`](crate::Track)s a transceiver is sending, so that state living in
+    /// that track can be found from here. 0 when the sender has no track.
+    pub(crate) fn sender_track_id(&self) -> usize {
+        unsafe { reactor_webrtc_sys::reactor_webrtc_rtp_transceiver_sender_track_id(self.raw) }
+    }
+
+    /// Identity of the track this transceiver's receiver delivers, on the same
+    /// terms as [`sender_track_id`](Self::sender_track_id). Non-zero once the
+    /// remote description has been applied.
+    pub(crate) fn receiver_track_id(&self) -> usize {
+        unsafe { reactor_webrtc_sys::reactor_webrtc_rtp_transceiver_receiver_track_id(self.raw) }
+    }
+
     pub fn kind(&self) -> MediaKind {
         let k = unsafe { reactor_webrtc_sys::reactor_webrtc_rtp_transceiver_media_kind(self.raw) };
         MediaKind::from_raw(k)
@@ -518,6 +534,10 @@ impl Transceiver {
     /// it is sent. See [`crate::FrameTransform`]. The transform must outlive
     /// this transceiver's use of it.
     pub fn set_sender_transform(&self, transform: &FrameTransform) -> Result<()> {
+        // Claim the slot so the frame-metadata install does not overwrite this on
+        // the next set_remote_description. A caller that takes the sender slot owns
+        // the trailer too — see crate::sender_meta::claimed_sender_slots.
+        crate::sender_meta::claim_sender_slot(self.sender_track_id());
         let ok = unsafe {
             reactor_webrtc_sys::reactor_webrtc_rtp_transceiver_set_sender_transform(
                 self.raw,
@@ -1084,7 +1104,53 @@ impl PeerConnection {
         // After the native call, not before: a description libwebrtc rejected was
         // never applied, and must not move the gate.
         self.frame_metadata_gate.set(sdp.frame_metadata_id());
+        self.install_frame_metadata_transforms();
         Ok(())
+    }
+
+    /// Attach the frame-metadata transforms to every video transceiver, now that
+    /// the remote has said it strips trailers.
+    ///
+    /// Runs after the remote description has been applied, which is what makes it
+    /// possible at all: libwebrtc creates a receiver's track while applying the
+    /// description (the same point `on_track` fires), so both directions are
+    /// reachable from a transceiver by the time this runs.
+    ///
+    /// Silent about failures on purpose. A transceiver with no track, a track whose
+    /// Rust wrapper has already been dropped, or a native attach that declines —
+    /// none of these are the caller's problem to handle, and none should fail
+    /// `set_remote_description`. The consequence is only that metadata does not
+    /// flow, which is the same as not having negotiated it.
+    fn install_frame_metadata_transforms(&self) {
+        if !self.frame_metadata_gate.is_open() {
+            // Nothing to install. A transform left over from a previous generation
+            // keeps consulting the gate per frame, so a peer that dropped support
+            // stops getting trailers without anything being detached here.
+            return;
+        }
+        for tc in self.transceivers() {
+            if tc.kind() != MediaKind::Video {
+                continue;
+            }
+            let send_id = tc.sender_track_id();
+            if crate::sender_meta::sender_slot_claimed(send_id) {
+                // The caller drives this sender's encoded frames themselves.
+                continue;
+            }
+            if let Some(source) = crate::sender_meta::lookup(send_id) {
+                let tf =
+                    crate::sender_meta::sender_transform(source, self.frame_metadata_gate.clone());
+                let _ = tc.set_sender_transform(&tf);
+                // Dropping `tf` is safe and deliberate: the native transformer owns
+                // the callback state and the sender holds a reference to it, so it
+                // outlives this handle (see the `encoded` module docs).
+            }
+            let recv_id = tc.receiver_track_id();
+            if let Some(queue) = crate::sender_meta::lookup_receiver(recv_id) {
+                let tf = crate::sender_meta::receiver_transform(queue);
+                let _ = tc.set_receiver_transform(&tf);
+            }
+        }
     }
 
     /// This connection's frame-metadata gate: what the remote peer declared.

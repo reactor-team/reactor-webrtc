@@ -132,11 +132,6 @@ class TestEncodedFrameMetadata:
         tx1 = p1.pc.add_transceiver(rw.MediaKind.Video, rw.TransceiverDirection.SendOnly)
         tx1.set_track(enc_track)
 
-        send_tf = enc_track.sender_metadata_transform(  # noqa: F841 — must stay alive
-            p1.pc.frame_metadata_gate()
-        )
-        tx1.set_sender_transform(send_tf)
-
         ok = await connect(p1, p2)
         assert ok, "peers did not connect within timeout"
 
@@ -184,14 +179,11 @@ class TestEncodedFrameMetadata:
         factory, enc_track = enc_factory_and_track
 
         recv_track_ref: list = []
-        recv_tf_ref: list = []
         received_meta: list = []
 
         def on_track(kind, track):
             if kind == rw.MediaKind.Video:
                 recv_track_ref.append(track)
-                recv_tf = track.receiver_metadata_transform()
-                recv_tf_ref.append(recv_tf)
                 track.on_video_frame(
                     lambda bgra, w, h, meta: received_meta.append(meta) if meta is not None else None
                 )
@@ -202,20 +194,11 @@ class TestEncodedFrameMetadata:
         tx3 = p3.pc.add_transceiver(rw.MediaKind.Video, rw.TransceiverDirection.SendOnly)
         tx3.set_track(enc_track)
 
-        send_tf2 = enc_track.sender_metadata_transform(  # noqa: F841
-            p3.pc.frame_metadata_gate()
-        )
-        tx3.set_sender_transform(send_tf2)
-
+        # The strip transform is installed by set_remote_description; nothing to
+        # attach here.
         ok = await connect(p3, p4)
         assert ok, "peers did not connect within timeout"
-
-        assert recv_tf_ref, "on_track was not called"
-
-        for t in p4.pc.transceivers():
-            if t.kind() == rw.MediaKind.Video:
-                t.set_receiver_transform(recv_tf_ref[0])
-                break
+        assert recv_track_ref, "on_track was not called"
 
         user_data = b"enc-e2e-meta"
         dummy_frame = bytes(4)

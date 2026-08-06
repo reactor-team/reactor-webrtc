@@ -196,11 +196,12 @@ class FrameMetadataGate:
     `FRAME_METADATA_URI`. Every renegotiation re-arms it, so a peer that drops
     support closes it again.
 
-    It drives two things, both inside the library: `create_answer` mirrors an
-    offer that declared the capability, under that offer's extmap id; and the
-    sender metadata transform appends nothing while the gate is closed, because
-    handing a trailer to a peer that will not strip it hands the extra bytes to
-    its decoder.
+    It drives three things, all inside the library: `create_answer` mirrors an
+    offer that declared the capability, under that offer's extmap id;
+    `set_remote_description` installs the metadata transforms on the video
+    transceivers once it is open; and the sender transform appends nothing while
+    it is closed, because handing a trailer to a peer that will not strip it
+    hands the extra bytes to its decoder.
 
     Callers do not have to consult it — pass `user_data` whenever it is
     meaningful. Reading it is useful for diagnostics, since "did this peer
@@ -258,10 +259,10 @@ class EncodedFrame:
 class FrameTransform:
     """Encoded-frame transformer attached to a transceiver sender or receiver.
 
-    Create from a Python callable with `FrameTransform(callback)`, or obtain a
-    pre-built metadata transform from
-    `Track.sender_metadata_transform()` / `receiver_metadata_transform()` or
-    `EncodedVideoTrack.sender_metadata_transform()`.
+    Create from a Python callable with `FrameTransform(callback)`.
+
+    The frame-metadata transforms are not among these — the library builds and
+    installs them itself once the capability has been negotiated.
 
     Callback signature: `callback(frame: EncodedFrame) -> FrameAction`"""
 
@@ -281,25 +282,9 @@ class Track:
         """Push a raw BGRA video frame into a local video track.
 
         Pass `user_data` (bytes) to embed per-frame metadata in the encoded
-        packet trailer. Requires `sender_metadata_transform()` to be attached
-        to the sender transceiver beforehand; otherwise `user_data` is
-        silently ignored — as it is while the peer has not declared support
-        (see `FrameMetadataGate`)."""
-        ...
-    def sender_metadata_transform(self, gate: FrameMetadataGate) -> FrameTransform:
-        """Return a FrameTransform that appends a metadata trailer to encoded
-        frames on the send path. Attach to the sender transceiver with
-        `Transceiver.set_sender_transform` before the SDP exchange.
-
-        `gate` comes from `PeerConnection.frame_metadata_gate()`. Attach this
-        unconditionally: while the remote has not declared support, every frame
-        is forwarded untouched even when `push_video_frame` was given
-        `user_data`."""
-        ...
-    def receiver_metadata_transform(self) -> FrameTransform:
-        """Return a FrameTransform that strips the metadata trailer from
-        received encoded frames. After attachment, `on_video_frame` callbacks
-        carry a `FrameMetadata` when the sender included a trailer."""
+        packet trailer. Nothing else has to be arranged: the trailer is appended
+        once the peer has declared that it strips them, and `user_data` is
+        silently dropped while it has not (see `FrameMetadataGate`)."""
         ...
     def on_video_frame(
         self,
@@ -349,20 +334,9 @@ class EncodedVideoTrack:
         """Push a compressed video frame (Annex-B H.264 or VP8/VP9).
 
         Pass `user_data` (bytes) to embed per-frame metadata in the encoded
-        packet trailer. Requires `sender_metadata_transform()` to be attached
-        to the sender transceiver beforehand; otherwise `user_data` is
-        silently ignored — as it is while the peer has not declared support
-        (see `FrameMetadataGate`)."""
-        ...
-    def sender_metadata_transform(self, gate: FrameMetadataGate) -> FrameTransform:
-        """Return a sender FrameTransform that embeds per-frame metadata
-        trailers. Attach to the sender transceiver with
-        `Transceiver.set_sender_transform` before the SDP exchange.
-
-        `gate` comes from `PeerConnection.frame_metadata_gate()`, so the peer
-        connection has to exist first. While the remote has not declared
-        support, frames are forwarded untouched even when `user_data` was
-        supplied."""
+        packet trailer. Nothing else has to be arranged: the trailer is appended
+        once the peer has declared that it strips them, and `user_data` is
+        silently dropped while it has not (see `FrameMetadataGate`)."""
         ...
     def add_to_peer_connection(self, pc: PeerConnection) -> None: ...
     def add_transceiver(
@@ -376,7 +350,12 @@ class Transceiver:
     def set_direction(self, direction: TransceiverDirection) -> None: ...
     def set_sender_transform(self, transform: FrameTransform) -> None:
         """Attach a FrameTransform to the sender path of this transceiver.
-        The transform runs after the encoder, before RTP packetization."""
+        The transform runs after the encoder, before RTP packetization.
+
+        Doing this also claims the slot: the frame-metadata transform the library
+        would otherwise install on negotiation is left off this sender, since
+        `SetFrameTransformer` holds only one. Such a caller owns the trailer too.
+        Attach after `set_track` so the claim has a track to key on."""
         ...
     def set_receiver_transform(self, transform: FrameTransform) -> None:
         """Attach a FrameTransform to the receiver path of this transceiver.
@@ -435,11 +414,11 @@ class PeerConnection:
         support closes it again."""
         ...
     def frame_metadata_gate(self) -> FrameMetadataGate:
-        """A handle to this connection's frame-metadata gate, for passing to
-        `Track.sender_metadata_transform()`.
+        """What the remote peer declared about frame-metadata support.
 
-        Cheap and shareable; hand one to every sender transform on this
-        connection. It stays closed until `set_remote_description` sees a remote
+        Diagnostic: the library already consults it when answering, when
+        installing the transforms, and when appending a trailer, so a caller does
+        not need to. It stays closed until `set_remote_description` sees a remote
         description that declares support."""
         ...
     async def add_ice_candidate(self, candidate: IceCandidate) -> None: ...

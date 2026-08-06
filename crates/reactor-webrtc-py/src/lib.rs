@@ -978,8 +978,9 @@ impl Track {
     ///
     /// Pass `user_data` (bytes) to embed per-frame metadata in the encoded
     /// packet trailer. `frame_id` and `timestamp` are computed automatically.
-    /// Requires [`sender_metadata_transform`] to be attached to the sender
-    /// transceiver beforehand; otherwise `user_data` is silently ignored.
+    /// Nothing else has to be arranged: the trailer is appended once the peer has
+    /// declared that it strips them, and `user_data` is silently dropped while it
+    /// has not. See `PeerConnection.frame_metadata_gate()`.
     #[pyo3(signature = (bgra, width, height, user_data=None))]
     fn push_video_frame(
         &self,
@@ -1017,30 +1018,6 @@ impl Track {
             }
         }
         Ok(())
-    }
-
-    /// Return a `FrameTransform` that appends a metadata trailer to encoded
-    /// frames on the send path. Attach it to the sender transceiver with
-    /// `Transceiver.set_sender_transform` before the SDP exchange.
-    ///
-    /// `gate` comes from `PeerConnection.frame_metadata_gate()`. Attach this
-    /// unconditionally: while the remote has not declared support, every frame is
-    /// forwarded untouched even when `push_video_frame` was given `user_data`.
-    fn sender_metadata_transform(&mut self, gate: &FrameMetadataGate) -> FrameTransform {
-        FrameTransform {
-            inner: self.inner.sender_metadata_transform(&gate.inner),
-        }
-    }
-
-    /// Return a `FrameTransform` that strips the metadata trailer from received
-    /// encoded frames. Attach it to the receiver transceiver with
-    /// `Transceiver.set_receiver_transform` before the SDP exchange. After
-    /// attachment, `on_video_frame` callbacks will carry `metadata` when the
-    /// sender included a trailer.
-    fn receiver_metadata_transform(&mut self) -> FrameTransform {
-        FrameTransform {
-            inner: self.inner.receiver_metadata_transform(),
-        }
     }
 
     /// Register a callback for decoded video frames from a remote track.
@@ -1157,20 +1134,6 @@ impl EncodedVideoTrack {
         match user_data {
             Some(ud) => self.inner.push_encoded_frame_with_metadata(frame, ud),
             None => self.inner.push_encoded_frame(frame),
-        }
-    }
-
-    /// Return a sender [`FrameTransform`] that embeds per-frame metadata
-    /// trailers. Call before the first SDP exchange and attach the result to
-    /// the sender transceiver with `Transceiver.set_sender_transform`. After
-    /// that, `push_encoded_frame(data, user_data=...)` will embed metadata.
-    ///
-    /// `gate` comes from `PeerConnection.frame_metadata_gate()`, so the peer
-    /// connection has to exist first. While the remote has not declared support,
-    /// frames are forwarded untouched even when `user_data` was supplied.
-    fn sender_metadata_transform(&mut self, gate: &FrameMetadataGate) -> FrameTransform {
-        FrameTransform {
-            inner: self.inner.sender_metadata_transform(&gate.inner),
         }
     }
 

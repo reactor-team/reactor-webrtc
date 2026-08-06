@@ -155,8 +155,10 @@ support is negotiated in the SDP and **you do not have to do anything for it**:
   `a=extmap:<id> http://reactor.inc/rtp-hdrext/frame-metadata`
   (`rw.FRAME_METADATA_URI`).
 - `create_answer` mirrors an offer that asked for it, reusing the offer's id.
-- `set_remote_description` arms `pc.frame_metadata_gate()`, and the sender
-  transform appends nothing while it is closed.
+- `set_remote_description` arms `pc.frame_metadata_gate()` and, when it is open,
+  installs the embed and strip transforms on the video transceivers. The sender
+  transform still checks the gate per frame, so a renegotiation that drops support
+  stops the trailers.
 
 A peer that has never heard of the URI ignores the line, the gate stays closed,
 and `user_data` is silently dropped rather than corrupting that peer's decode.
@@ -165,6 +167,11 @@ agreed.
 
 No RTP bytes are emitted for the extmap itself — libwebrtc declines to map a URI
 it does not know, so the line is a capability flag and nothing more.
+
+Calling `Transceiver.set_sender_transform` claims that sender's single transform
+slot, and the metadata transform is then left off it: a caller who takes the slot
+owns the trailer too. Attach it after `set_track` so the claim has a track to key
+on.
 
 ## Choosing your own ICE credentials
 

@@ -118,13 +118,18 @@ track.on_video_frame(|frame| {
 ```
 
 That only works if the far end strips the trailer before its decoder sees it, so
-support is negotiated in the SDP and **you do not have to do anything for it**:
+support is negotiated in the SDP and **you do not have to do anything for it** —
+there are no transforms to build or attach:
 
 - `create_offer` advertises the capability on every video m-section as
   `a=extmap:<id> http://reactor.inc/rtp-hdrext/frame-metadata`.
 - `create_answer` mirrors an offer that asked for it, reusing the offer's id.
-- `set_remote_description` arms the connection's `FrameMetadataGate` from what the
-  remote declared, and the sender transform appends nothing while it is closed.
+- `set_remote_description` arms the connection's `FrameMetadataGate` and, when it
+  is open, installs the embed and strip transforms on the video transceivers. The
+  remote track exists by then: libwebrtc creates it while applying the
+  description, which is the same point `on_track` fires.
+- The sender transform still consults the gate per frame, so a renegotiation in
+  which the peer drops support stops the trailers without detaching anything.
 
 A peer that has never heard of the URI ignores the line — RFC 8866 requires
 unrecognised attributes to be ignored — and the gate stays closed, so `user_data`
@@ -142,6 +147,12 @@ Three details worth knowing:
   `a=extmap-allow-mixed`.
 - **The URI is the version.** An incompatible change to the trailer format mints a
   new URI rather than adding a version field, so old and new never match.
+- **Your own sender transform wins.** `SetFrameTransformer` holds one slot, so
+  calling `Transceiver::set_sender_transform` claims it and the metadata transform
+  is left off that sender — otherwise whether your transform survived would depend
+  on what the remote declared. A caller who takes the slot owns the trailer too,
+  and can build one with `metadata::encode_trailer`. Attach after `set_track`, so
+  the claim has a track to key on.
 
 ## Audio modes
 

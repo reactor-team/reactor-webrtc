@@ -579,13 +579,30 @@ pub struct EncodedVideoTrack {
     dummy: Vec<u8>,
     width: u32,
     height: u32,
-    // FIFO metadata queue for push_encoded_frame_with_metadata. Set by
-    // sender_metadata_transform(); the sender FrameTransform pops one entry
-    // per encoded frame in push order. Using a FIFO avoids timestamp
-    // correlation: capture_time_ms is unreliable because VideoStreamEncoder
-    // clamps future timestamps back to post_time, which can collide when two
-    // pushes land in the same millisecond.
-    sender_meta_fifo: Option<Arc<Mutex<VecDeque<crate::metadata::FrameMetadata>>>>,
+    // FIFO metadata queue for push_encoded_frame_with_metadata: the sender
+    // FrameTransform pops one entry per encoded frame in push order. A FIFO rather
+    // than timestamp correlation because capture_time_ms is unreliable here —
+    // VideoStreamEncoder clamps future timestamps back to post_time, which can
+    // collide when two pushes land in the same millisecond.
+    sender_meta_fifo: Arc<FifoMeta>,
+}
+
+/// An [`EncodedVideoTrack`]'s outgoing metadata, in push order.
+///
+/// Registered in [`crate::sender_meta`] under the inner track's native identity,
+/// *replacing* the timestamp-keyed source that [`crate::Track`] registered for it:
+/// for a pre-encoded track, push order is the correlation that holds.
+#[derive(Default)]
+pub(crate) struct FifoMeta(Mutex<VecDeque<crate::metadata::FrameMetadata>>);
+
+impl crate::sender_meta::SenderMetaSource for FifoMeta {
+    fn take(&self, _frame: &EncodedFrame) -> Option<crate::metadata::FrameMetadata> {
+        // Pops whether or not the caller will use the result. The queue is filled
+        // by push_encoded_frame_with_metadata regardless of what the peer declared,
+        // so leaving entries in place would grow it for as long as the peer
+        // declines and then emit stale metadata if it ever accepted.
+        self.0.lock().ok()?.pop_front()
+    }
 }
 
 // SAFETY: the queue is Mutex-guarded and the dummy buffer is owned; both are
@@ -601,13 +618,19 @@ impl EncodedVideoTrack {
         height: u32,
     ) -> Self {
         let dummy = vec![0u8; (width * height * 4) as usize];
+        let sender_meta_fifo = Arc::new(FifoMeta::default());
+        // Overwrite the inner Track's timestamp-keyed registration: both describe
+        // the same native track, and for pre-encoded frames the FIFO is the one
+        // that correlates correctly.
+        let source: Arc<dyn crate::sender_meta::SenderMetaSource> = sender_meta_fifo.clone();
+        crate::sender_meta::register(track.native_id(), &source);
         Self {
             track,
             queue,
             dummy,
             width,
             height,
-            sender_meta_fifo: None,
+            sender_meta_fifo,
         }
     }
 
@@ -616,57 +639,6 @@ impl EncodedVideoTrack {
     /// the send-only transceiver.
     pub fn track(&self) -> &crate::media::Track {
         &self.track
-    }
-
-    /// Attach a per-frame metadata sender transform to this track.
-    ///
-    /// Call this before the first SDP exchange, then pass the returned
-    /// [`FrameTransform`](crate::FrameTransform) to
-    /// [`Transceiver::set_sender_transform`](crate::Transceiver::set_sender_transform).
-    /// After that, [`push_encoded_frame_with_metadata`](Self::push_encoded_frame_with_metadata)
-    /// will embed metadata into every encoded frame before packetization.
-    ///
-    /// Uses a FIFO queue rather than `capture_time_ms` correlation: the encoder
-    /// fires the sender transform exactly once per encoded frame in push order,
-    /// so a simple queue pop is sufficient and avoids the timestamp-clamping
-    /// issue where `VideoStreamEncoder::OnFrame` discards future timestamps.
-    ///
-    /// # The gate
-    ///
-    /// `gate` is what makes attaching this unconditionally safe. Take it from
-    /// [`PeerConnection::frame_metadata_gate`](crate::PeerConnection::frame_metadata_gate);
-    /// while the remote has not declared support, frames are forwarded untouched
-    /// even when
-    /// [`push_encoded_frame_with_metadata`](Self::push_encoded_frame_with_metadata)
-    /// supplied `user_data`, because appending a trailer the peer will not strip
-    /// hands the extra bytes to its decoder.
-    pub fn sender_metadata_transform(
-        &mut self,
-        gate: &crate::metadata::FrameMetadataGate,
-    ) -> crate::FrameTransform {
-        let fifo: Arc<Mutex<VecDeque<crate::metadata::FrameMetadata>>> =
-            Arc::new(Mutex::new(VecDeque::new()));
-        self.sender_meta_fifo = Some(fifo.clone());
-        let gate = gate.clone();
-        crate::encoded::FrameTransform::new(move |frame| {
-            if frame.direction != FrameDirection::Send {
-                return FrameAction::Forward;
-            }
-            // Pop even when the gate is closed. push_encoded_frame_with_metadata
-            // enqueues without consulting the gate, so skipping the pop would let
-            // the queue grow for as long as the peer declines the capability, and
-            // would then start emitting stale metadata if it ever accepted it.
-            let meta = fifo.lock().ok().and_then(|mut g| g.pop_front());
-            if gate.is_open() {
-                if let Some(ref m) = meta {
-                    let trailer = crate::metadata::encode_trailer(m);
-                    let mut new_data = frame.data.to_vec();
-                    new_data.extend_from_slice(&trailer);
-                    frame.replace_data(&new_data);
-                }
-            }
-            FrameAction::Forward
-        })
     }
 
     /// Inject a pre-encoded frame into the WebRTC RTP stack.
@@ -710,8 +682,8 @@ impl EncodedVideoTrack {
         };
         // Enqueue metadata first so the FIFO entry is always present when the
         // sender FrameTransform fires on the encoder thread.
-        if let Some(ref fifo) = self.sender_meta_fifo {
-            fifo.lock().unwrap().push_back(meta);
+        if let Ok(mut fifo) = self.sender_meta_fifo.0.lock() {
+            fifo.push_back(meta);
         }
         self.queue.lock().unwrap().push_back(frame);
         self.track

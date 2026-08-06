@@ -157,27 +157,19 @@ fn frame_metadata_roundtrip() {
     let tx1 = pc1
         .add_transceiver(MediaKind::Video, TransceiverDirection::SendOnly)
         .expect("send transceiver");
-    let mut video = factory
+    let video = factory
         .create_video_track("meta-video")
         .expect("video track");
     tx1.set_track(&video).expect("set track");
 
-    let send_tf = video.sender_metadata_transform(&pc1.frame_metadata_gate());
-    tx1.set_sender_transform(&send_tf)
-        .expect("sender transform");
-
+    // Nothing is attached by hand: negotiate() advertises the capability, the
+    // answer mirrors it, and set_remote_description installs both transforms.
     negotiate(&pc1, &pc2);
-
-    let rx2 = pc2
-        .transceivers()
-        .into_iter()
-        .find(|t| t.kind() == MediaKind::Video)
-        .expect("pc2 video transceiver");
+    assert!(pc1.frame_metadata_gate().is_open());
 
     let received: Arc<Mutex<Vec<FrameMetadata>>> = Arc::new(Mutex::new(Vec::new()));
     let user_data: &[u8] = b"reactor-meta-e2e";
     let stop = AtomicBool::new(false);
-    let mut recv_tf_holder = None;
 
     thread::scope(|scope| {
         scope.spawn(|| {
@@ -201,10 +193,6 @@ fn frame_metadata_roundtrip() {
             if !recv_setup {
                 let mut tracks = s2.recv.lock().unwrap();
                 if let Some(track) = tracks.iter_mut().find(|t| t.kind() == MediaKind::Video) {
-                    let recv_tf = track.receiver_metadata_transform();
-                    rx2.set_receiver_transform(&recv_tf)
-                        .expect("receiver transform");
-
                     let out = received.clone();
                     track.on_video_frame(move |frame| {
                         if let Some(meta) = frame.metadata {
@@ -212,7 +200,6 @@ fn frame_metadata_roundtrip() {
                         }
                     });
 
-                    recv_tf_holder = Some(recv_tf);
                     recv_setup = true;
                 }
             }
@@ -252,89 +239,6 @@ fn frame_metadata_roundtrip() {
         "frame_metadata_roundtrip ✅  — {} metadata frames received",
         metas.len()
     );
-    drop(send_tf);
-    drop(recv_tf_holder);
-}
-
-/// A receiver that does not attach a `receiver_metadata_transform` must still
-/// decode frames cleanly and `VideoFrame::metadata` is `None` for every frame.
-///
-/// Negotiation makes this pairing unreachable in practice — a peer that declares
-/// the capability attaches the transform — so this exercises a receiver that
-/// declares support (as every reactor-webrtc answer does) and then fails to
-/// honour it, to pin the property that matters on its own: trailing bytes left in
-/// the payload do not break the decoder.
-#[test]
-fn no_transform_peer_decodes_cleanly() {
-    let factory = PeerConnectionFactory::new().expect("factory");
-    let config = RtcConfiguration::default();
-
-    let (pc1, s1) = make_peer(&factory, &config);
-    let (pc2, s2) = make_peer(&factory, &config);
-
-    let tx1 = pc1
-        .add_transceiver(MediaKind::Video, TransceiverDirection::SendOnly)
-        .expect("send transceiver");
-    let mut video = factory
-        .create_video_track("notf-video")
-        .expect("video track");
-    tx1.set_track(&video).expect("set track");
-
-    let send_tf = video.sender_metadata_transform(&pc1.frame_metadata_gate());
-    tx1.set_sender_transform(&send_tf)
-        .expect("sender transform");
-
-    negotiate(&pc1, &pc2);
-
-    let got_frame = Arc::new(AtomicBool::new(false));
-    let stop = AtomicBool::new(false);
-    let mut sink_setup = false;
-
-    thread::scope(|scope| {
-        scope.spawn(|| {
-            let mut seed = 0u8;
-            while !stop.load(Ordering::SeqCst) {
-                let bgra = varying_bgra(seed);
-                video.push_video_frame_with_metadata(&bgra, W, H, b"dropped");
-                seed = seed.wrapping_add(7);
-                thread::sleep(Duration::from_millis(33));
-            }
-        });
-
-        let start = Instant::now();
-        loop {
-            forward_ice(&s1, &pc2);
-            forward_ice(&s2, &pc1);
-
-            if !sink_setup {
-                let mut tracks = s2.recv.lock().unwrap();
-                if let Some(track) = tracks.iter_mut().find(|t| t.kind() == MediaKind::Video) {
-                    let flag = got_frame.clone();
-                    track.on_video_frame(move |frame| {
-                        assert!(
-                            frame.metadata.is_none(),
-                            "expected no metadata without receiver_metadata_transform"
-                        );
-                        flag.store(true, Ordering::SeqCst);
-                    });
-                    sink_setup = true;
-                }
-            }
-
-            if got_frame.load(Ordering::SeqCst) || start.elapsed() > Duration::from_secs(20) {
-                break;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        stop.store(true, Ordering::SeqCst);
-    });
-
-    assert!(
-        got_frame.load(Ordering::SeqCst),
-        "no decoded frame received within 20 s — receiver without transform must still decode"
-    );
-    println!("no_transform_peer_decodes_cleanly ✅");
-    drop(send_tf);
 }
 
 /// Full E2E for `EncodedVideoTrack::push_encoded_frame_with_metadata`.
@@ -411,35 +315,24 @@ fn encoded_frame_metadata_roundtrip() {
         .expect("no VP8 key frame captured in phase 1");
 
     // ── Phase 2: replay with metadata via EncodedVideoTrack ──────────────────
-    let (factory2, mut enc_track) =
+    let (factory2, enc_track) =
         PeerConnectionFactory::with_encoded_video_track("enc-meta", W, H).expect("factory2");
 
     let (pc3, s3) = make_peer(&factory2, &config);
     let (pc4, s4) = make_peer(&factory2, &config);
 
-    // The gate belongs to the connection, so the transform is built after the
-    // peer connection exists rather than alongside the track.
-    let send_tf = enc_track.sender_metadata_transform(&pc3.frame_metadata_gate());
-
     let tx3 = pc3
         .add_transceiver(MediaKind::Video, TransceiverDirection::SendOnly)
         .expect("tx3");
     tx3.set_track(enc_track.track()).expect("set track");
-    tx3.set_sender_transform(&send_tf)
-        .expect("sender transform");
 
+    // The FIFO source EncodedVideoTrack registered for this native track is what
+    // the installed transform finds — no wiring here.
     negotiate(&pc3, &pc4);
-
-    let rx4 = pc4
-        .transceivers()
-        .into_iter()
-        .find(|t| t.kind() == MediaKind::Video)
-        .expect("pc4 video transceiver");
 
     let received: Arc<Mutex<Vec<FrameMetadata>>> = Arc::new(Mutex::new(Vec::new()));
     let user_data: &[u8] = b"enc-meta-e2e";
     let stop = AtomicBool::new(false);
-    let mut recv_tf_holder = None;
 
     thread::scope(|scope| {
         scope.spawn(|| {
@@ -468,16 +361,12 @@ fn encoded_frame_metadata_roundtrip() {
             if !recv_setup {
                 let mut tracks = s4.recv.lock().unwrap();
                 if let Some(track) = tracks.iter_mut().find(|t| t.kind() == MediaKind::Video) {
-                    let recv_tf = track.receiver_metadata_transform();
-                    rx4.set_receiver_transform(&recv_tf)
-                        .expect("receiver transform");
                     let out = received.clone();
                     track.on_video_frame(move |frame| {
                         if let Some(meta) = frame.metadata {
                             out.lock().unwrap().push(meta);
                         }
                     });
-                    recv_tf_holder = Some(recv_tf);
                     recv_setup = true;
                 }
             }
@@ -517,21 +406,19 @@ fn encoded_frame_metadata_roundtrip() {
         "encoded_frame_metadata_roundtrip ✅  — {} metadata frames received",
         metas.len()
     );
-    drop(send_tf);
-    drop(recv_tf_holder);
 }
 
-/// A peer that never declares `FRAME_METADATA_URI` must receive frames with no
-/// trailer at all, even though the sender keeps calling
-/// `push_video_frame_with_metadata`.
+/// Against a peer that never declares the capability, no trailer reaches the wire
+/// at all — asserted on the encoded bytes, not on the absence of decoded metadata.
 ///
-/// This is the whole point of the gate: the push site cannot see the negotiated
-/// state, so the library has to be the one that declines. The receiver here
-/// *does* attach a strip transform, which makes the assertion sharp — it would
-/// surface a trailer if one were appended, rather than silently tolerating it
-/// the way a decoder does.
+/// This is what the gate is for: `push_video_frame_with_metadata` keeps being
+/// called, and the push site has no way to know the far end would not strip. The
+/// receiver here installs its own `FrameTransform` to inspect the payload, which
+/// is also how the assertion stays honest — with no declaration there is no strip
+/// transform, so "metadata is None" would be true whether or not a trailer was
+/// appended.
 #[test]
-fn closed_gate_suppresses_the_trailer() {
+fn legacy_peer_gets_no_trailer() {
     let factory = PeerConnectionFactory::new().expect("factory");
     let config = RtcConfiguration::default();
 
@@ -541,19 +428,14 @@ fn closed_gate_suppresses_the_trailer() {
     let tx1 = pc1
         .add_transceiver(MediaKind::Video, TransceiverDirection::SendOnly)
         .expect("send transceiver");
-    let mut video = factory
-        .create_video_track("gated-video")
+    let video = factory
+        .create_video_track("legacy-video")
         .expect("video track");
     tx1.set_track(&video).expect("set track");
 
-    let gate = pc1.frame_metadata_gate();
-    let send_tf = video.sender_metadata_transform(&gate);
-    tx1.set_sender_transform(&send_tf)
-        .expect("sender transform");
-
     negotiate_with_legacy_peer(&pc1, &pc2);
     assert!(
-        !gate.is_open(),
+        !pc1.frame_metadata_gate().is_open(),
         "gate must stay closed when the answer does not declare support"
     );
 
@@ -563,11 +445,25 @@ fn closed_gate_suppresses_the_trailer() {
         .find(|t| t.kind() == MediaKind::Video)
         .expect("pc2 video transceiver");
 
-    let frames = Arc::new(Mutex::new(0usize));
-    let with_metadata = Arc::new(Mutex::new(0usize));
-    let stop = AtomicBool::new(false);
-    let mut recv_tf_holder = None;
+    let seen = Arc::new(Mutex::new(0usize));
+    let trailers = Arc::new(Mutex::new(0usize));
+    let inspect = FrameTransform::new({
+        let seen = seen.clone();
+        let trailers = trailers.clone();
+        move |frame| {
+            if frame.direction == FrameDirection::Receive {
+                *seen.lock().unwrap() += 1;
+                if frame.data.ends_with(b"RXMT") {
+                    *trailers.lock().unwrap() += 1;
+                }
+            }
+            FrameAction::Forward
+        }
+    });
+    rx2.set_receiver_transform(&inspect)
+        .expect("inspect transform");
 
+    let stop = AtomicBool::new(false);
     thread::scope(|scope| {
         scope.spawn(|| {
             let mut seed = 0u8;
@@ -580,34 +476,10 @@ fn closed_gate_suppresses_the_trailer() {
         });
 
         let start = Instant::now();
-        let mut recv_setup = false;
-
         loop {
             forward_ice(&s1, &pc2);
             forward_ice(&s2, &pc1);
-
-            if !recv_setup {
-                let mut tracks = s2.recv.lock().unwrap();
-                if let Some(track) = tracks.iter_mut().find(|t| t.kind() == MediaKind::Video) {
-                    let recv_tf = track.receiver_metadata_transform();
-                    rx2.set_receiver_transform(&recv_tf)
-                        .expect("receiver transform");
-
-                    let n = frames.clone();
-                    let meta_n = with_metadata.clone();
-                    track.on_video_frame(move |frame| {
-                        *n.lock().unwrap() += 1;
-                        if frame.metadata.is_some() {
-                            *meta_n.lock().unwrap() += 1;
-                        }
-                    });
-
-                    recv_tf_holder = Some(recv_tf);
-                    recv_setup = true;
-                }
-            }
-
-            if *frames.lock().unwrap() >= 5 || start.elapsed() > Duration::from_secs(20) {
+            if *seen.lock().unwrap() >= 5 || start.elapsed() > Duration::from_secs(20) {
                 break;
             }
             thread::sleep(Duration::from_millis(50));
@@ -615,15 +487,83 @@ fn closed_gate_suppresses_the_trailer() {
         stop.store(true, Ordering::SeqCst);
     });
 
-    let decoded = *frames.lock().unwrap();
-    let tagged = *with_metadata.lock().unwrap();
-    assert!(decoded > 0, "no frames decoded within 20 s");
+    let frames = *seen.lock().unwrap();
+    let tagged = *trailers.lock().unwrap();
+    assert!(frames > 0, "no encoded frames arrived within 20 s");
     assert_eq!(
         tagged, 0,
-        "{tagged} of {decoded} frames carried a trailer with the gate closed"
+        "{tagged} of {frames} encoded frames carried a trailer with the gate closed"
     );
 
-    println!("closed_gate_suppresses_the_trailer ✅  — {decoded} frames, 0 trailers");
-    drop(send_tf);
-    drop(recv_tf_holder);
+    println!("legacy_peer_gets_no_trailer ✅  — {frames} frames, 0 trailers");
+}
+
+/// A caller's own sender `FrameTransform` survives negotiation.
+///
+/// The metadata install would otherwise take the slot — `SetFrameTransformer` has
+/// only one — and it would do so *conditionally on what the remote declared*, so a
+/// custom transform would work against an old peer and silently stop against a new
+/// one. Attaching to the sender claims the slot; the trailer becomes the caller's
+/// business.
+#[test]
+fn caller_sender_transform_survives_negotiation() {
+    let factory = PeerConnectionFactory::new().expect("factory");
+    let config = RtcConfiguration::default();
+
+    let (pc1, s1) = make_peer(&factory, &config);
+    let (pc2, s2) = make_peer(&factory, &config);
+
+    let tx1 = pc1
+        .add_transceiver(MediaKind::Video, TransceiverDirection::SendOnly)
+        .expect("send transceiver");
+    let video = factory
+        .create_video_track("claimed-video")
+        .expect("video track");
+    tx1.set_track(&video).expect("set track");
+
+    let ran = Arc::new(AtomicBool::new(false));
+    let mine = FrameTransform::new({
+        let ran = ran.clone();
+        move |frame| {
+            if frame.direction == FrameDirection::Send {
+                ran.store(true, Ordering::SeqCst);
+            }
+            FrameAction::Forward
+        }
+    });
+    // After set_track, so the claim has a native track id to key on.
+    tx1.set_sender_transform(&mine).expect("my transform");
+
+    // The gate opens here, which is exactly when the install would clobber.
+    negotiate(&pc1, &pc2);
+    assert!(pc1.frame_metadata_gate().is_open());
+
+    let stop = AtomicBool::new(false);
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            let mut seed = 0u8;
+            while !stop.load(Ordering::SeqCst) {
+                let bgra = varying_bgra(seed);
+                video.push_video_frame(&bgra, W, H);
+                seed = seed.wrapping_add(7);
+                thread::sleep(Duration::from_millis(33));
+            }
+        });
+        let start = Instant::now();
+        loop {
+            forward_ice(&s1, &pc2);
+            forward_ice(&s2, &pc1);
+            if ran.load(Ordering::SeqCst) || start.elapsed() > Duration::from_secs(20) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        stop.store(true, Ordering::SeqCst);
+    });
+
+    assert!(
+        ran.load(Ordering::SeqCst),
+        "the caller's sender transform was replaced by the metadata install"
+    );
+    println!("caller_sender_transform_survives_negotiation ✅");
 }

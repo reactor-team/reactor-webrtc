@@ -35,6 +35,7 @@ pub mod metadata;
 mod observer;
 mod peer_connection;
 pub mod platform;
+mod sender_meta;
 
 use std::collections::VecDeque;
 use std::ffi::CString;

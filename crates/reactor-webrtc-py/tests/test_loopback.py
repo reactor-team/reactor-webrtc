@@ -472,14 +472,11 @@ class TestFrameMetadata:
     async def test_frame_metadata_roundtrip(self, factory):
         """Metadata pushed by the sender arrives in on_video_frame as FrameMetadata."""
         recv_track_ref: list = []  # keeps the Track alive — Drop removes the sink
-        recv_tf_ref: list = []  # keeps the FrameTransform alive
         received_meta: list[rw.FrameMetadata] = []
 
         def on_track(kind, track):
             if kind == rw.MediaKind.Video:
                 recv_track_ref.append(track)  # prevent GC → Drop → RemoveSink
-                recv_tf = track.receiver_metadata_transform()
-                recv_tf_ref.append(recv_tf)
                 track.on_video_frame(
                     lambda bgra, w, h, meta: received_meta.append(meta) if meta is not None else None
                 )
@@ -490,21 +487,11 @@ class TestFrameMetadata:
         video = factory.create_video_track("meta-video")
         tx1 = p1.pc.add_transceiver(rw.MediaKind.Video, rw.TransceiverDirection.SendOnly)
         tx1.set_track(video)
-        send_tf = video.sender_metadata_transform(  # noqa: F841 — must stay alive
-            p1.pc.frame_metadata_gate()
-        )
-        tx1.set_sender_transform(send_tf)
-
+        # Nothing attached by hand: create_offer advertises, the answer mirrors,
+        # and set_remote_description installs both transforms.
         ok = await connect(p1, p2)
         assert ok, "peers did not connect within timeout"
-
-        # on_track fired during negotiate(); the receiver transform is ready.
-        # Wire it to the transceiver now that we have the pc2 handle.
-        assert recv_tf_ref, "on_track was not called during SDP negotiation"
-        for t in p2.pc.transceivers():
-            if t.kind() == rw.MediaKind.Video:
-                t.set_receiver_transform(recv_tf_ref[0])
-                break
+        assert p1.pc.frame_metadata_gate().is_open()
 
         user_data = b"reactor-py-e2e"
         bgra = bytes(320 * 240 * 4)
@@ -523,112 +510,88 @@ class TestFrameMetadata:
         assert meta.frame_id > 0, "frame_id must be non-zero"
         assert meta.timestamp > 0, "timestamp must be non-zero"
 
-    async def test_no_transform_peer_decodes_cleanly(self, factory):
-        """A receiver without receiver_metadata_transform still decodes frames; metadata is None.
+    async def test_legacy_peer_gets_no_trailer(self, factory):
+        """Against a peer that never declares, no trailer reaches the wire at all.
 
-        Negotiation makes this pairing unreachable in practice — a peer that
-        declares the capability attaches the transform — so this exercises a
-        receiver that declares support (as every answer does) and then fails to
-        honour it, to pin the property that matters on its own: trailing bytes
-        do not break the decoder.
+        Asserted on the encoded bytes rather than on the absence of decoded
+        metadata: with no declaration there is no strip transform either, so
+        "metadata is None" would hold whether or not a trailer was appended.
         """
-        recv_track_ref: list = []  # keeps the Track alive — Drop removes the sink
-        received_frames: list = []
-
-        def on_track(kind, track):
-            if kind == rw.MediaKind.Video:
-                recv_track_ref.append(track)  # prevent GC → Drop → RemoveSink
-                track.on_video_frame(
-                    lambda bgra, w, h, meta: received_frames.append((w, h, meta))
-                )
-
+        recv_track_ref: list = []
         p1 = make_peer(factory)
-        p2 = make_peer(factory, on_track=on_track)
-
-        video = factory.create_video_track("notf-video")
-        tx1 = p1.pc.add_transceiver(rw.MediaKind.Video, rw.TransceiverDirection.SendOnly)
-        tx1.set_track(video)
-        send_tf = video.sender_metadata_transform(  # noqa: F841 — must stay alive
-            p1.pc.frame_metadata_gate()
+        p2 = make_peer(
+            factory,
+            on_track=lambda kind, track: recv_track_ref.append(track),
         )
-        tx1.set_sender_transform(send_tf)
 
-        ok = await connect(p1, p2)
-        assert ok, "peers did not connect within timeout"
-
-        bgra = bytes(320 * 240 * 4)
-        for _ in range(90):
-            if received_frames:
-                break
-            video.push_video_frame(bgra, 320, 240, user_data=b"dropped")
-            await asyncio.sleep(0.033)
-
-        ok = await wait_for(lambda: len(received_frames) > 0)
-        assert ok, "no decoded frame received within timeout"
-
-        _, _, meta = received_frames[0]
-        assert meta is None, "expected metadata=None without receiver_metadata_transform"
-
-    async def test_closed_gate_suppresses_the_trailer(self, factory):
-        """Without a declared capability, user_data never reaches the wire.
-
-        The push site cannot see the negotiated state, so the library has to be
-        the one that declines. The receiver here *does* attach a strip
-        transform, which makes the assertion sharp: it would surface a trailer
-        if one were appended.
-        """
-        recv_track_ref: list = []  # keeps the Track alive — Drop removes the sink
-        recv_tf_ref: list = []
-        received_frames: list = []
-
-        def on_track(kind, track):
-            if kind == rw.MediaKind.Video:
-                recv_track_ref.append(track)
-                recv_tf = track.receiver_metadata_transform()
-                recv_tf_ref.append(recv_tf)
-                track.on_video_frame(
-                    lambda bgra, w, h, meta: received_frames.append(meta)
-                )
-
-        p1 = make_peer(factory)
-        p2 = make_peer(factory, on_track=on_track)
-
-        video = factory.create_video_track("gated-video")
+        video = factory.create_video_track("legacy-video")
         tx1 = p1.pc.add_transceiver(rw.MediaKind.Video, rw.TransceiverDirection.SendOnly)
         tx1.set_track(video)
-        gate = p1.pc.frame_metadata_gate()
-        assert not gate.is_open(), "gate must start closed"
-        send_tf = video.sender_metadata_transform(gate)  # noqa: F841 — must stay alive
-        tx1.set_sender_transform(send_tf)
 
-        # A peer that never declares the capability.
         ok = await connect(p1, p2, legacy_peer=True)
         assert ok, "peers did not connect within timeout"
-        assert not gate.is_open(), "gate must stay closed when the answer is silent"
+        assert not p1.pc.frame_metadata_gate().is_open()
 
-        assert recv_tf_ref, "on_track was not called during SDP negotiation"
+        seen: list[bool] = []
+
+        # A transform in the receiver slot only ever sees ingress frames, so no
+        # direction check is needed.
+        def inspect_recv(frame):
+            seen.append(bytes(frame.data).endswith(b"RXMT"))
+            return rw.FrameAction.Forward
+
+        inspect_tf = rw.FrameTransform(inspect_recv)
         for t in p2.pc.transceivers():
             if t.kind() == rw.MediaKind.Video:
-                t.set_receiver_transform(recv_tf_ref[0])
+                t.set_receiver_transform(inspect_tf)
                 break
 
         bgra = bytes(320 * 240 * 4)
         for _ in range(90):
-            if len(received_frames) >= 3:
+            if len(seen) >= 5:
                 break
             video.push_video_frame(bgra, 320, 240, user_data=b"must-not-ship")
             await asyncio.sleep(0.033)
 
-        ok = await wait_for(lambda: len(received_frames) > 0)
-        assert ok, "no decoded frame received within timeout"
-        tagged = [m for m in received_frames if m is not None]
-        assert not tagged, (
-            f"{len(tagged)} of {len(received_frames)} frames carried a trailer "
+        assert await wait_for(lambda: len(seen) > 0), "no encoded frames arrived"
+        assert not any(seen), (
+            f"{sum(seen)} of {len(seen)} encoded frames carried a trailer "
             "with the gate closed"
         )
 
+    async def test_caller_sender_transform_survives_negotiation(self, factory):
+        """A caller's own sender FrameTransform is not replaced by the install.
 
-# ── SDP capability negotiation ────────────────────────────────────────────────
+        SetFrameTransformer holds one slot, and the install happens on
+        negotiation — so without the claim guard a custom transform would work
+        against an old peer and silently stop against a new one.
+        """
+        p1 = make_peer(factory)
+        p2 = make_peer(factory)
+
+        video = factory.create_video_track("claimed-video")
+        tx1 = p1.pc.add_transceiver(rw.MediaKind.Video, rw.TransceiverDirection.SendOnly)
+        tx1.set_track(video)
+
+        ran: list[bool] = []
+        mine = rw.FrameTransform(lambda frame: (ran.append(True), rw.FrameAction.Forward)[1])
+        # After set_track, so the claim has a native track id to key on.
+        tx1.set_sender_transform(mine)
+
+        ok = await connect(p1, p2)
+        assert ok, "peers did not connect within timeout"
+        assert p1.pc.frame_metadata_gate().is_open()
+
+        bgra = bytes(320 * 240 * 4)
+        for _ in range(90):
+            if ran:
+                break
+            video.push_video_frame(bgra, 320, 240)
+            await asyncio.sleep(0.033)
+
+        assert await wait_for(lambda: len(ran) > 0), (
+            "the caller's sender transform was replaced by the metadata install"
+        )
 
 
 class TestFrameMetadataNegotiation:
