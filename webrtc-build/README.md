@@ -12,10 +12,10 @@ committed (see `../.gitignore`).
    `gclient sync` to the pinned `WEBRTC_BRANCH`/`WEBRTC_COMMIT`. It prints the
    resolved commit so it can be locked in `WEBRTC_VERSION`.
 2. **Patch** — applies `patches/*.patch` (`git apply --3way`) deterministically
-   after the sync, so they survive minor upstream drift. Currently one patch
-   (builtin codec factories); the full series + rationale is in
-   [`patches/README.md`](patches/README.md). On Windows the patch targets are
-   normalized to LF first (the checkout is CRLF).
+   after the sync, so they survive minor upstream drift. The full series +
+   rationale for each patch is in [`patches/README.md`](patches/README.md).
+   On Windows the patch targets are normalized to LF first (the checkout is
+   CRLF).
 3. **Configure + compile** — `gn gen` with our args (below) + `ninja -C … webrtc`
    → a single static `obj/libwebrtc.a` (`obj/webrtc.lib` on Windows).
 4. **Package** — `package.sh` (POSIX) / `build.ps1` (Windows) stages the lib +
@@ -29,8 +29,10 @@ committed (see `../.gitignore`).
    `reactor-webrtc-sys` (build.rs mode 2) consumes them via their stable
    release-download URLs:
    `…/releases/download/<tag>/reactor-webrtc-<os>-<arch>-<profile>.tar.zst`
-   (+ the matching `.sha256`). The current release is
-   [`webrtc-7907-a5ddff60-p1`](https://github.com/reactor-team/reactor-webrtc/releases/tag/webrtc-7907-a5ddff60-p1).
+   (+ the matching `.sha256`). The current tag is derived from
+   [`WEBRTC_VERSION`](../WEBRTC_VERSION) — see the
+   [Releases page](https://github.com/reactor-team/reactor-webrtc/releases)
+   for the exact artifact.
 
 ## Audio/network processing in the pipeline
 
@@ -156,8 +158,9 @@ Per-target toolchain notes (why each differs) live at the top of `build.sh`
   `package.sh`, `sbom.py`, `publish.sh`.
 - ✅ CI on GitHub Actions: fast checks (`ci.yml`) + heavy per-target builds
   (`webrtc-build.yml`). **All matrix targets build + package + upload green**
-  (`branch-heads/7907`, commit locked in `WEBRTC_VERSION`), and are **published**
-  as GitHub Release `webrtc-7907-a5ddff60-p1`.
+  for the milestone/commit pinned in `WEBRTC_VERSION`, and are **published**
+  as a [GitHub Release](https://github.com/reactor-team/reactor-webrtc/releases)
+  tagged from that same file.
 - ✅ `build.rs` mode 2 (prebuilt download + sha256 verify + extract) implemented
   and consumed from the published release.
 - ✅ Real-link proof: `reactor-webrtc-sys` glue links + runs against the lib on

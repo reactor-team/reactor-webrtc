@@ -317,6 +317,38 @@ jobs:
       - name: Run Python tests against the built wheel
         run: mise run //crates/reactor-webrtc-py:test
 
+  # Advisory only: never referenced by ci-complete's `needs`, so it can never
+  # block a merge. Flags — via a ::warning:: annotation, not a failing step —
+  # a PR that touches public config/API surface without touching any
+  # documentation, per CONTRIBUTING.md's "keep docs in sync" step. A path-based
+  # heuristic can't know whether docs actually needed updating, so it only
+  # warns; treat a warning here as a prompt to double-check, not a verdict.
+  docs-check:
+    name: Docs freshness (advisory)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Check whether public-surface changes came with a docs update
+        shell: bash
+        run: |
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+          CHANGED=$(git diff --name-only "$BASE" "$HEAD")
+
+          SURFACE_HIT=$(echo "$CHANGED" | grep -E '^(crates/reactor-webrtc-py/reactor_webrtc\.pyi|crates/reactor-webrtc/src/config\.rs)$' || true)
+          DOCS_HIT=$(echo "$CHANGED" | grep -E '^(docs/.*\.md|README\.md|crates/[^/]+/README\.md)$' || true)
+
+          if [ -n "$SURFACE_HIT" ] && [ -z "$DOCS_HIT" ]; then
+            echo "::warning::This PR changes public config/API surface but no docs/README file. Changed surface files:"
+            echo "$SURFACE_HIT" | sed 's/^/::warning::  - /'
+            echo "::warning::If this doesn't need a docs update, ignore this — it's advisory only and does not block merging (see CONTRIBUTING.md)."
+          else
+            echo "No advisory needed."
+          fi
+
   ci-complete:
     name: CI Complete
     needs: [lint, prebuilt-check, test, build-wheel, test-py]

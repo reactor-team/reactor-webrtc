@@ -5,9 +5,8 @@ Safe, idiomatic Rust API over an owned build of Google's WebRTC engine
 
 ## Quick start
 
-```toml
-[dependencies]
-reactor-webrtc = "0.2"
+```sh
+cargo add reactor-webrtc
 ```
 
 The build script automatically downloads the correct `libwebrtc` prebuilt for
@@ -52,12 +51,18 @@ pc.set_local_description(&offer)?;
 | `EncodedVideoTrack` | Push pre-encoded video frames (H.264, VP8, VP9, …) |
 | `Transceiver` | RTP send/recv direction + MID |
 | `StatsReport` | `inbound_rtp`, `outbound_rtp`, `candidate_pairs` |
-| `SessionDescription` | SDP offer or answer; `ice_ufrags`, `with_ice_credentials`, `frame_metadata_id` |
+| `SessionDescription` | SDP offer or answer; `ice_ufrags`, `with_ice_credentials`, `declares_frame_metadata`, `with_frame_metadata` |
 | `FrameMetadataGate` | What the remote declared about per-frame metadata |
 | `IceCandidate` | Trickled ICE candidate |
-| `RtcConfiguration` | ICE servers + transport policy |
+| `RtcConfiguration` | ICE servers/policy, port range, bundle policy, TCP candidates, ICE timeouts — see [`docs/configuration.md`](../../docs/configuration.md) |
 | `AdmMode` | `Synthetic` (push PCM) or `Platform` (real mic/speaker) |
 | `ApmConfig` | AEC3, noise suppression, AGC, high-pass filter |
+
+`PeerConnection::set_bitrate` sets congestion-control bitrate limits after
+the connection is created — also covered in
+[`docs/configuration.md`](../../docs/configuration.md). For per-frame
+metadata and custom encoded-frame transforms, see
+[`docs/frame-metadata.md`](../../docs/frame-metadata.md).
 
 ## Choosing your own ICE credentials
 
