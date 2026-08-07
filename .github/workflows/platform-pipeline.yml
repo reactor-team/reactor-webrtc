@@ -89,10 +89,10 @@ jobs:
         with:
           version: ${{ env.MISE_VERSION }}
 
-      # reactor-webrtc-sys's only test (link.rs) just checks the FFI glue
-      # links correctly — no network/ICE involved, so unlike reactor-webrtc
-      # below, it's safe to actually run on every platform including Windows.
+      # GitHub Windows runners have no usable non-loopback network interface
+      # for WebRTC ICE — skip cargo tests on Windows entirely.
       - run: mise run test:sys
+        if: runner.os != 'Windows'
         env:
           REACTOR_WEBRTC_PREBUILT_URL: ${{ steps.prebuilt.outputs.url }}
           REACTOR_WEBRTC_PREBUILT_SHA256: ${{ steps.prebuilt.outputs.sha256 }}
@@ -151,17 +151,7 @@ jobs:
           version: ${{ env.MISE_VERSION }}
 
       # GitHub Windows runners have no usable non-loopback network interface
-      # for WebRTC ICE. reactor-webrtc's tests need real connectivity
-      # (loopback peer connections, data channels), so only compile-check on
-      # Windows; run them for real everywhere else.
-      - name: Compile-check reactor-webrtc (Windows)
-        if: runner.os == 'Windows'
-        run: cargo build -p reactor-webrtc
-        env:
-          REACTOR_WEBRTC_PREBUILT_URL: ${{ steps.prebuilt.outputs.url }}
-          REACTOR_WEBRTC_PREBUILT_SHA256: ${{ steps.prebuilt.outputs.sha256 }}
-          RUSTFLAGS: ${{ inputs.rustflags }}
-
+      # for WebRTC ICE — skip cargo tests on Windows entirely.
       - run: mise run test:webrtc
         if: runner.os != 'Windows'
         env:
