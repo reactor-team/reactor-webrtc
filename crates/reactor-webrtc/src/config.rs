@@ -141,7 +141,7 @@ pub struct RtcConfiguration {
     /// ([`crate::metadata`]).
     ///
     /// On by default. When on, offers advertise
-    /// [`FRAME_METADATA_URI`](crate::FRAME_METADATA_URI), answers mirror an offer
+    /// [`FRAME_METADATA_ATTRIBUTE`](crate::FRAME_METADATA_ATTRIBUTE), answers mirror an offer
     /// that asked for it, and the metadata steps are wired into the video
     /// transceivers once the peer agrees.
     ///
@@ -176,7 +176,7 @@ impl Default for RtcConfiguration {
             ice_check_interval_strong_connectivity_ms: None,
             tcp_candidate_policy: TcpCandidatePolicy::default(),
             // On by default: the capability is backwards-compatible by
-            // construction — a peer that does not understand the extmap ignores it
+            // construction — a peer that does not understand the attribute ignores it
             // and the gate stays closed — so opting in is not the caller's job.
             frame_metadata: true,
         }

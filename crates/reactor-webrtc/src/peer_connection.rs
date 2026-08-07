@@ -327,6 +327,7 @@ impl IceGatheringState {
 /// `mid` (available after `set_local_description`) maps it to an SDP m-section.
 pub struct Transceiver {
     raw: *mut reactor_webrtc_sys::RtpTransceiver,
+    pc_id: usize,
 }
 
 // SAFETY: the native transceiver is internally thread-safe.
@@ -334,8 +335,8 @@ unsafe impl Send for Transceiver {}
 unsafe impl Sync for Transceiver {}
 
 impl Transceiver {
-    pub(crate) fn from_raw(raw: *mut reactor_webrtc_sys::RtpTransceiver) -> Self {
-        Self { raw }
+    pub(crate) fn from_raw(raw: *mut reactor_webrtc_sys::RtpTransceiver, pc_id: usize) -> Self {
+        Self { raw, pc_id }
     }
 
     /// The transceiver's media kind (audio/video).
@@ -396,6 +397,13 @@ impl Transceiver {
             reactor_webrtc_sys::reactor_webrtc_rtp_transceiver_set_track(self.raw, track.raw())
         };
         if ok == 1 {
+            // Re-wire the embed source when the gate is already open (replaceTrack
+            // post-negotiation). Without this the old track's source stays in the
+            // slot and pushes to the new track are silently dropped until the next
+            // renegotiation re-runs install_frame_metadata_transforms.
+            if let Some(source) = crate::sender_meta::lookup(self.sender_track_id()) {
+                crate::sender_meta::update_embed_source(self.pc_id, self.transceiver_id(), source);
+            }
             Ok(())
         } else {
             Err(Error::Webrtc("transceiver set_track failed".into()))
@@ -453,7 +461,9 @@ impl Transceiver {
         transform: &FrameTransform,
     ) -> Result<()> {
         let id = self.transceiver_id();
-        let Some(native) = crate::sender_meta::attach_caller(id, side, transform.callback()) else {
+        let Some(native) =
+            crate::sender_meta::attach_caller(self.pc_id, id, side, transform.callback())
+        else {
             // Either the transformer is already attached — the registration above is
             // all that was needed — or this transceiver has no native identity, in
             // which case there is nothing to attach it to.
@@ -465,7 +475,14 @@ impl Transceiver {
                 Ok(())
             };
         };
-        self.attach_native_transform(side, &native)
+        let result = self.attach_native_transform(side, &native);
+        if result.is_err() {
+            // The slot was claimed but the native attach failed: un-claim it so
+            // a retry can install a new transformer rather than seeing installed=true
+            // and silently doing nothing.
+            crate::sender_meta::release_install(self.pc_id, id, side);
+        }
+        result
     }
 
     /// Attach the crate-owned composed transformer to one side.
@@ -1017,8 +1034,20 @@ impl PeerConnection {
         Ok(answer)
     }
 
+    /// Apply the local description.
+    ///
+    /// Also runs the frame-metadata install, for the same reason
+    /// [`set_remote_description`](Self::set_remote_description) does. An answerer
+    /// applies the offer *before* it attaches its outbound tracks — apply, attach,
+    /// answer — so at the point the remote description armed the gate a sender had
+    /// no track to find metadata state on. By the time the answer is set locally it
+    /// does. Installing at both points covers the offerer (armed by the answer) and
+    /// the answerer (tracks attached after the offer) without either needing to know
+    /// which role it is playing.
     pub fn set_local_description(&self, sdp: &SessionDescription) -> Result<()> {
-        self.set_description(sdp, true)
+        self.set_description(sdp, true)?;
+        self.install_frame_metadata_transforms();
+        Ok(())
     }
 
     /// Apply the remote description, and arm this connection's
@@ -1062,11 +1091,16 @@ impl PeerConnection {
     /// description (the same point `on_track` fires), so both directions are
     /// reachable from a transceiver by the time this runs.
     ///
+    /// Idempotent, and run from both `set_local_description` and
+    /// `set_remote_description`: whichever of the two comes after the tracks were
+    /// attached is the one that finds them. A slot installs its native transformer
+    /// once and picks up a metadata step configured later on the next frame.
+    ///
     /// Silent about failures on purpose. A transceiver with no track, a track whose
     /// Rust wrapper has already been dropped, or a native attach that declines —
     /// none of these are the caller's problem to handle, and none should fail
-    /// `set_remote_description`. The consequence is only that metadata does not
-    /// flow, which is the same as not having negotiated it.
+    /// applying a description. The consequence is only that metadata does not flow,
+    /// which is the same as not having negotiated it.
     fn install_frame_metadata_transforms(&self) {
         if !self.frame_metadata_gate.is_open() {
             // Nothing to install. A step left over from a previous generation keeps
@@ -1074,7 +1108,17 @@ impl PeerConnection {
             // getting trailers without anything being detached here.
             return;
         }
-        for tc in self.transceivers() {
+        let pc_id = self.raw as usize;
+        let transceivers = self.transceivers();
+        // Prune slots for transceivers that libwebrtc stopped and freed internally
+        // (ClearStoppedTransceivers) without going through our Drop path. Doing it
+        // here closes the address-reuse window: a new transceiver at the same native
+        // address would otherwise inherit a stale slot with installed=true and never
+        // get a transformer of its own.
+        let live_tc_ids: std::collections::HashSet<usize> =
+            transceivers.iter().map(|tc| tc.transceiver_id()).collect();
+        crate::sender_meta::prune_stale_slots(pc_id, &live_tc_ids);
+        for tc in &transceivers {
             if tc.kind() != MediaKind::Video {
                 continue;
             }
@@ -1083,15 +1127,36 @@ impl PeerConnection {
             // time this side needs one.
             let id = tc.transceiver_id();
             if let Some(source) = crate::sender_meta::lookup(tc.sender_track_id()) {
-                if let Some(native) =
-                    crate::sender_meta::attach_embed(id, source, self.frame_metadata_gate.clone())
-                {
-                    let _ = tc.attach_native_transform(crate::sender_meta::Side::Send, &native);
+                if let Some(native) = crate::sender_meta::attach_embed(
+                    pc_id,
+                    id,
+                    source,
+                    self.frame_metadata_gate.clone(),
+                ) {
+                    if tc
+                        .attach_native_transform(crate::sender_meta::Side::Send, &native)
+                        .is_err()
+                    {
+                        crate::sender_meta::release_install(
+                            pc_id,
+                            id,
+                            crate::sender_meta::Side::Send,
+                        );
+                    }
                 }
             }
             if let Some(queue) = crate::sender_meta::lookup_receiver(tc.receiver_track_id()) {
-                if let Some(native) = crate::sender_meta::attach_strip(id, queue) {
-                    let _ = tc.attach_native_transform(crate::sender_meta::Side::Receive, &native);
+                if let Some(native) = crate::sender_meta::attach_strip(pc_id, id, queue) {
+                    if tc
+                        .attach_native_transform(crate::sender_meta::Side::Receive, &native)
+                        .is_err()
+                    {
+                        crate::sender_meta::release_install(
+                            pc_id,
+                            id,
+                            crate::sender_meta::Side::Receive,
+                        );
+                    }
                 }
             }
         }
@@ -1145,6 +1210,11 @@ impl PeerConnection {
             reactor_webrtc_sys::reactor_webrtc_peer_connection_add_track(self.raw, track.raw())
         };
         if ok == 1 {
+            // Re-run after add_track so that an answerer that calls
+            // set_remote_description → add_track → create_answer → set_local_description
+            // does not have to wait for set_local_description to wire metadata.
+            // Idempotent: a pre-negotiation call is a no-op (gate is still closed).
+            self.install_frame_metadata_transforms();
             Ok(())
         } else {
             Err(Error::Webrtc("add_track failed".into()))
@@ -1175,7 +1245,7 @@ impl PeerConnection {
         if raw.is_null() {
             Err(Error::Webrtc("add_transceiver failed".into()))
         } else {
-            Ok(Transceiver::from_raw(raw))
+            Ok(Transceiver::from_raw(raw, self.raw as usize))
         }
     }
 
@@ -1193,7 +1263,7 @@ impl PeerConnection {
                 let raw = unsafe {
                     reactor_webrtc_sys::reactor_webrtc_peer_connection_get_transceiver(self.raw, i)
                 };
-                (!raw.is_null()).then(|| Transceiver::from_raw(raw))
+                (!raw.is_null()).then(|| Transceiver::from_raw(raw, self.raw as usize))
             })
             .collect()
     }
@@ -1286,10 +1356,11 @@ impl PeerConnection {
 impl Drop for PeerConnection {
     fn drop(&mut self) {
         // Release the composed transform slots first, while the transceivers can
-        // still be enumerated. Keyed by native identity, so leaving them would let a
-        // recycled pointer inherit another connection's callbacks.
+        // still be enumerated. Keyed by (pc_id, tc_id), so leaving them would let a
+        // recycled pointer on the same or another connection inherit stale callbacks.
+        let pc_id = self.raw as usize;
         for tc in self.transceivers() {
-            crate::sender_meta::forget_transceiver(tc.transceiver_id());
+            crate::sender_meta::forget_transceiver(pc_id, tc.transceiver_id());
         }
         // Destroy the native PC (stops callbacks) before the observer box drops.
         unsafe { reactor_webrtc_sys::reactor_webrtc_peer_connection_destroy(self.raw) }

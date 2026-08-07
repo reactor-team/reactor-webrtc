@@ -660,3 +660,109 @@ fn disabled_frame_metadata_never_negotiates() {
 
     println!("disabled_frame_metadata_never_negotiates ✅");
 }
+
+/// The answerer attaches its outbound track *after* applying the offer, and
+/// metadata still flows.
+///
+/// This is the order a server-side peer actually uses — apply the offer, attach
+/// tracks, answer — and it is not the order the install can assume. When the offer
+/// armed the gate, the sender had no track to find metadata state on; the install
+/// has to run again once the answer is set locally. Regression test for exactly
+/// that: found by reactor-runtime's loopback, where metadata silently never
+/// arrived.
+#[test]
+fn answerer_attaching_its_track_after_the_offer_still_sends_metadata() {
+    let factory = PeerConnectionFactory::new().expect("factory");
+    let config = RtcConfiguration::default();
+
+    let (offerer, s1) = make_peer(&factory, &config);
+    let (answerer, s2) = make_peer(&factory, &config);
+
+    // The offerer only receives; the answerer is the one that sends metadata.
+    offerer
+        .add_transceiver(MediaKind::Video, TransceiverDirection::RecvOnly)
+        .expect("recv transceiver");
+
+    let offer = offerer.create_offer().expect("offer");
+    offerer
+        .set_local_description(&offer)
+        .expect("offerer local");
+    answerer
+        .set_remote_description(&offer)
+        .expect("answerer remote");
+
+    // Only now — after the offer has been applied — does the answerer attach the
+    // track its sender will use.
+    let video = factory
+        .create_video_track("late-video")
+        .expect("video track");
+    let tx = answerer
+        .transceivers()
+        .into_iter()
+        .find(|t| t.kind() == MediaKind::Video)
+        .expect("answerer video transceiver");
+    tx.set_track(&video).expect("set track");
+    tx.set_direction(TransceiverDirection::SendOnly)
+        .expect("send only");
+
+    let answer = answerer.create_answer().expect("answer");
+    answerer
+        .set_local_description(&answer)
+        .expect("answerer local");
+    offerer
+        .set_remote_description(&answer)
+        .expect("offerer remote");
+    assert!(answerer.frame_metadata_gate().is_open());
+
+    let received: Arc<Mutex<Vec<FrameMetadata>>> = Arc::new(Mutex::new(Vec::new()));
+    let stop = AtomicBool::new(false);
+
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            let mut seed = 0u8;
+            while !stop.load(Ordering::SeqCst) {
+                let bgra = varying_bgra(seed);
+                video.push_video_frame_with_metadata(&bgra, W, H, b"late-attach");
+                seed = seed.wrapping_add(7);
+                thread::sleep(Duration::from_millis(33));
+            }
+        });
+
+        let start = Instant::now();
+        let mut recv_setup = false;
+        loop {
+            forward_ice(&s2, &offerer);
+            forward_ice(&s1, &answerer);
+            if !recv_setup {
+                let mut tracks = s1.recv.lock().unwrap();
+                if let Some(track) = tracks.iter_mut().find(|t| t.kind() == MediaKind::Video) {
+                    let out = received.clone();
+                    track.on_video_frame(move |frame| {
+                        if let Some(meta) = frame.metadata {
+                            out.lock().unwrap().push(meta);
+                        }
+                    });
+                    recv_setup = true;
+                }
+            }
+            if received.lock().unwrap().len() >= 2 || start.elapsed() > Duration::from_secs(20) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        stop.store(true, Ordering::SeqCst);
+    });
+
+    let metas = received.lock().unwrap().clone();
+    assert!(
+        !metas.is_empty(),
+        "no metadata arrived — the install did not pick up a track attached after \
+         the offer was applied"
+    );
+    assert_eq!(metas[0].user_data, b"late-attach");
+
+    println!(
+        "answerer_attaching_its_track_after_the_offer_still_sends_metadata ✅  — {} frames",
+        metas.len()
+    );
+}

@@ -832,16 +832,11 @@ impl From<rw::StatsReport> for StatsReport {
 
 /// Whether the remote peer has declared that it strips metadata trailers.
 ///
-/// Obtained from `PeerConnection.frame_metadata_gate()` and passed to
-/// `Track.sender_metadata_transform()` /
-/// `EncodedVideoTrack.sender_metadata_transform()`. The sender transform consults
-/// it per frame and appends nothing while it is closed.
-///
-/// It starts closed and is armed by `set_remote_description`, which opens it when
-/// the remote description declares `FRAME_METADATA_URI`. Attach the transforms
-/// unconditionally and pass `user_data` whenever it is meaningful; the gate is
-/// what keeps a trailer off the wire when the peer would not strip it, and the
-/// push site is in no position to know that.
+/// Obtained from `PeerConnection.frame_metadata_gate()`. It starts closed and is
+/// armed by `set_remote_description`, which opens it when the remote description
+/// declares `FRAME_METADATA_ATTRIBUTE`. The library consults the gate internally
+/// when appending trailers; callers do not need to check it before pushing
+/// `user_data`.
 #[pyclass]
 #[derive(Clone, Default)]
 pub struct FrameMetadataGate {
@@ -1090,9 +1085,9 @@ impl EncodedVideoTrack {
     /// Pass `width=0`, `height=0`, `rtp_timestamp=0` to inherit from the
     /// track's configured resolution.
     /// Pass `user_data` (bytes) to embed per-frame metadata in the encoded
-    /// packet trailer (same mechanism as `Track.push_video_frame`). Requires
-    /// `Track.sender_metadata_transform` to be attached to the sender
-    /// transceiver beforehand; otherwise `user_data` is silently ignored.
+    /// packet trailer (same mechanism as `Track.push_video_frame`). Metadata
+    /// is only sent when the peer has negotiated support; otherwise `user_data`
+    /// is silently dropped.
     #[pyo3(signature = (data, is_key_frame=false, width=0, height=0, rtp_timestamp=0, user_data=None))]
     fn push_encoded_frame(
         &self,
@@ -1231,8 +1226,8 @@ impl EncodedFrame {
 /// An encoded-frame transformer. Attach to a transceiver's sender or receiver
 /// via `Transceiver.set_sender_transform` / `set_receiver_transform`.
 ///
-/// Create from a Python callable with `FrameTransform(callback)`, or obtain
-/// from `Track.sender_metadata_transform()` / `receiver_metadata_transform()`.
+/// Create from a Python callable with `FrameTransform(callback)` and attach
+/// via `Transceiver.set_sender_transform()` / `set_receiver_transform()`.
 #[pyclass]
 pub struct FrameTransform {
     inner: rw::FrameTransform,
@@ -1636,9 +1631,9 @@ impl PeerConnection {
     /// Apply the remote description, and arm this connection's
     /// `FrameMetadataGate` from it.
     ///
-    /// The gate opens when `sdp` declares `FRAME_METADATA_URI` and closes when it
-    /// does not, on every call — so a renegotiation in which the peer drops
-    /// support closes it again.
+    /// The gate opens when `sdp` declares `FRAME_METADATA_ATTRIBUTE` and closes
+    /// when it does not, on every call — so a renegotiation in which the peer
+    /// drops support closes it again.
     fn set_remote_description<'py>(
         &self,
         py: Python<'py>,
@@ -1654,12 +1649,12 @@ impl PeerConnection {
         })
     }
 
-    /// A handle to this connection's frame-metadata gate, for passing to
-    /// `Track.sender_metadata_transform()`.
+    /// A handle to this connection's frame-metadata gate.
     ///
-    /// Cheap and shareable; hand one to every sender transform on this
-    /// connection. It stays closed until `set_remote_description` sees a remote
-    /// description that declares support.
+    /// Cheap and shareable. It stays closed until `set_remote_description` sees
+    /// a remote description that declares support. Reading it is diagnostic —
+    /// the library consults it internally when answering and when appending
+    /// trailers, so callers do not need to check it before pushing `user_data`.
     fn frame_metadata_gate(&self) -> FrameMetadataGate {
         FrameMetadataGate {
             inner: self.pc().frame_metadata_gate(),

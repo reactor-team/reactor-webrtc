@@ -293,33 +293,92 @@ pub(crate) enum Side {
     Receive,
 }
 
-type SlotRegistry = Mutex<HashMap<(usize, Side), Arc<ComposedSlot>>>;
+// Keyed by (pc_id, transceiver_id, side) so that a recycled native transceiver
+// address on a *different* peer connection does not collide with a stale entry
+// from a previous connection on the same process, and so that pruning in
+// `install_frame_metadata_transforms` can distinguish this PC's slots from
+// another PC's.
+type SlotRegistry = Mutex<HashMap<(usize, usize, Side), Arc<ComposedSlot>>>;
 
-/// Keyed by the *transceiver's* native identity, which is stable from the moment
-/// the transceiver exists — before a track is attached and before a mid is
-/// assigned. (The handle pointer is not: `transceivers()` allocates a fresh one
-/// each call.)
+/// Keyed by the *transceiver's* native identity combined with the owning PC's
+/// identity. Both are stable for the transceiver's life and the PC's life
+/// respectively. The handle pointer is NOT stable — `transceivers()` allocates
+/// a fresh handle each call.
 fn slots() -> &'static SlotRegistry {
     static SLOTS: OnceLock<SlotRegistry> = OnceLock::new();
     SLOTS.get_or_init(SlotRegistry::default)
 }
 
-fn slot_for(transceiver_id: usize, side: Side) -> Option<Arc<ComposedSlot>> {
+fn slot_for(pc_id: usize, transceiver_id: usize, side: Side) -> Option<Arc<ComposedSlot>> {
     if transceiver_id == 0 {
         return None;
     }
     let mut map = slots().lock().ok()?;
-    Some(Arc::clone(map.entry((transceiver_id, side)).or_default()))
+    Some(Arc::clone(
+        map.entry((pc_id, transceiver_id, side)).or_default(),
+    ))
 }
 
 /// Drop both slots for a transceiver, so a recycled native pointer starts clean.
-pub(crate) fn forget_transceiver(transceiver_id: usize) {
+pub(crate) fn forget_transceiver(pc_id: usize, transceiver_id: usize) {
     if transceiver_id == 0 {
         return;
     }
     if let Ok(mut map) = slots().lock() {
-        map.remove(&(transceiver_id, Side::Send));
-        map.remove(&(transceiver_id, Side::Receive));
+        map.remove(&(pc_id, transceiver_id, Side::Send));
+        map.remove(&(pc_id, transceiver_id, Side::Receive));
+    }
+}
+
+/// Remove every slot that belongs to `pc_id` but whose transceiver is no longer
+/// in `live_tc_ids`. Call this at the top of every `install_frame_metadata_transforms`
+/// run to collect slots for transceivers that libwebrtc stopped and freed
+/// internally (e.g. via `ClearStoppedTransceivers`) without going through our
+/// `Drop` path, and to close the address-reuse window those stale entries create.
+pub(crate) fn prune_stale_slots(pc_id: usize, live_tc_ids: &std::collections::HashSet<usize>) {
+    if let Ok(mut map) = slots().lock() {
+        map.retain(|&(pid, tid, _), _| pid != pc_id || live_tc_ids.contains(&tid));
+    }
+}
+
+/// Reset the install flag so that the next `attach_*` call for the same side
+/// can install a new native transformer. Call this when `attach_native_transform`
+/// returns an error after `attach_embed`/`attach_strip`/`attach_caller` returned
+/// `Some(native)` — without it, the slot is permanently marked as installed
+/// even though no transformer was ever attached.
+pub(crate) fn release_install(pc_id: usize, transceiver_id: usize, side: Side) {
+    if let Some(slot) = slot_for(pc_id, transceiver_id, side) {
+        slot.installed
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Swap in a new metadata source on an already-installed embed slot without
+/// touching anything else (gate, caller callback, or the native transformer).
+///
+/// Called after `Transceiver::set_track` when the gate is already open — the
+/// slot is installed but its source still points at the old track. The next
+/// frame picks up the new source automatically because `run()` reads `meta`
+/// under a lock.
+pub(crate) fn update_embed_source(
+    pc_id: usize,
+    transceiver_id: usize,
+    source: Arc<dyn SenderMetaSource>,
+) {
+    if transceiver_id == 0 {
+        return;
+    }
+    if let Some(slot) = slot_for(pc_id, transceiver_id, Side::Send) {
+        if slot.installed.load(std::sync::atomic::Ordering::Acquire) {
+            if let Ok(mut meta) = slot.meta.lock() {
+                if let Some(MetaStep::Embed {
+                    source: ref mut s, ..
+                }) = *meta
+                {
+                    *s = source;
+                }
+            }
+        }
     }
 }
 
@@ -332,32 +391,35 @@ fn native_for(slot: Arc<ComposedSlot>) -> crate::encoded::NativeTransform {
 /// is not there yet. Returns the transformer to attach, or `None` if the slot was
 /// already installed (nothing to attach — the existing one picks the callback up).
 pub(crate) fn attach_caller(
+    pc_id: usize,
     transceiver_id: usize,
     side: Side,
     cb: Arc<Mutex<crate::encoded::EncodedCb>>,
 ) -> Option<crate::encoded::NativeTransform> {
-    let slot = slot_for(transceiver_id, side)?;
+    let slot = slot_for(pc_id, transceiver_id, side)?;
     slot.set_caller(cb);
     slot.claim_install().then(|| native_for(slot))
 }
 
 /// Configure the send-side metadata step, installing the transformer if needed.
 pub(crate) fn attach_embed(
+    pc_id: usize,
     transceiver_id: usize,
     source: Arc<dyn SenderMetaSource>,
     gate: crate::metadata::FrameMetadataGate,
 ) -> Option<crate::encoded::NativeTransform> {
-    let slot = slot_for(transceiver_id, Side::Send)?;
+    let slot = slot_for(pc_id, transceiver_id, Side::Send)?;
     slot.set_meta(MetaStep::Embed { source, gate });
     slot.claim_install().then(|| native_for(slot))
 }
 
 /// Configure the receive-side metadata step, installing the transformer if needed.
 pub(crate) fn attach_strip(
+    pc_id: usize,
     transceiver_id: usize,
     queue: Arc<ReceiverMetaQueue>,
 ) -> Option<crate::encoded::NativeTransform> {
-    let slot = slot_for(transceiver_id, Side::Receive)?;
+    let slot = slot_for(pc_id, transceiver_id, Side::Receive)?;
     slot.set_meta(MetaStep::Strip {
         queue,
         seen: Mutex::default(),

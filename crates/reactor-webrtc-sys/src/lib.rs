@@ -568,12 +568,12 @@ extern "C" {
     ) -> c_int;
     /// Release a transformer handle (the sender/receiver keep their own ref).
     pub fn reactor_webrtc_frame_transformer_destroy(transformer: *mut FrameTransformer);
-    /// Destroy a track handle (detaches any sink, releases the track + source).
     /// Identity of the native track behind this handle, as an opaque value —
     /// **not** an owning handle, on the same terms as
     /// [`reactor_webrtc_rtp_transceiver_sender_track_id`], whose value this is
     /// comparable with. Returns 0 for a handle with no track.
     pub fn reactor_webrtc_media_stream_track_id(track: *mut MediaStreamTrack) -> usize;
+    /// Destroy a track handle (detaches any sink, releases the track + source).
     pub fn reactor_webrtc_media_stream_track_destroy(track: *mut MediaStreamTrack);
 
     // ── Audio tracks ─────────────────────────────────────────────────────────
