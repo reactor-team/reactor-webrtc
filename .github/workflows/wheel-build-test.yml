@@ -1,0 +1,145 @@
+name: Wheel build + test
+
+# Called once per platform (as a matrix of workflow_call) from ci.yml's
+# build-wheel job. Each call gets its own build -> test job chain, so
+# platforms build and test fully in parallel with each other, and a failed
+# `test` can be re-run on its own without re-running `build`.
+on:
+  workflow_call:
+    inputs:
+      platform:
+        required: true
+        type: string
+      os:
+        required: true
+        type: string
+      rustflags:
+        required: false
+        type: string
+        default: ""
+
+env:
+  # Mirrors ci.yml's workflow-level env. The `with:` block of a job that
+  # calls a reusable workflow can't reach the `env` context, so this can't be
+  # threaded through as an input — keep MISE_VERSION in sync with ci.yml's.
+  MISE_VERSION: "2026.6.14"   # pinned; must be >= mise.toml min_version
+  MISE_LOCKED: "1"
+  MISE_DISABLE_TOOLS: "rust,rustup,aqua:rust-lang/rustup"
+
+jobs:
+  build:
+    name: build wheel (${{ inputs.platform }})
+    runs-on: ${{ inputs.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # Derive the prebuilt URL+SHA256 from WEBRTC_VERSION so this job always
+      # builds against the prebuilt that matches the current source tree.
+      - name: Resolve libwebrtc prebuilt
+        id: prebuilt
+        shell: bash
+        run: |
+          source WEBRTC_VERSION
+          MILESTONE=${WEBRTC_BRANCH#branch-heads/}
+          COMMIT_SHORT=${WEBRTC_COMMIT:0:8}
+          TAG="webrtc-${MILESTONE}-${COMMIT_SHORT}-p${REACTOR_PATCH_LEVEL}"
+          ASSET="reactor-webrtc-${{ inputs.platform }}-release.tar.zst"
+          BASE="https://github.com/${{ github.repository }}/releases/download/${TAG}"
+          echo "Resolving '${ASSET}' in release '${TAG}'..."
+          SHA256=$(curl -fsSL --retry 3 "${BASE}/${ASSET}.sha256" | awk '{print $1}')
+          if [ -z "$SHA256" ]; then
+            echo "::error::Empty sha256 sidecar for '${ASSET}' in release '${TAG}'"
+            exit 1
+          fi
+          echo "url=${BASE}/${ASSET}" >> "$GITHUB_OUTPUT"
+          echo "sha256=${SHA256}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache-on-failure: true
+
+      # The bundled libc++ headers require clang >= 20. apt.llvm.org provides
+      # aarch64 packages for Noble — same install procedure as x64.
+      - name: Install clang-21 (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/llvm.asc
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang-21
+          echo "CXX=clang++-21" >> "$GITHUB_ENV"
+
+      # mise's bash task runner (Git Bash) does not inherit the PATH additions
+      # from setup-rust-toolchain. Export CARGO as an absolute path; maturin
+      # respects this env var and skips the PATH lookup entirely.
+      - name: Export CARGO path for mise bash tasks (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Add-Content $env:GITHUB_ENV "CARGO=$(rustup which cargo)"
+
+      # hk ships no x86_64-apple-darwin binary; disable it so mise install
+      # doesn't error under MISE_LOCKED=1 (hk is only needed for git hooks).
+      - name: Disable hk on mac-x64
+        if: inputs.platform == 'mac-x64'
+        run: echo "MISE_DISABLE_TOOLS=${{ env.MISE_DISABLE_TOOLS }},hk" >> "$GITHUB_ENV"
+
+      - uses: jdx/mise-action@v4
+        with:
+          version: ${{ env.MISE_VERSION }}
+
+      - name: Set macOS deployment target (mac-x64)
+        if: inputs.platform == 'mac-x64'
+        run: echo "MACOSX_DEPLOYMENT_TARGET=13.0" >> "$GITHUB_ENV"
+
+      - name: Build wheel (non-Windows)
+        if: runner.os != 'Windows'
+        run: mise run //crates/reactor-webrtc-py:build
+        env:
+          REACTOR_WEBRTC_PREBUILT_URL: ${{ steps.prebuilt.outputs.url }}
+          REACTOR_WEBRTC_PREBUILT_SHA256: ${{ steps.prebuilt.outputs.sha256 }}
+          RUSTFLAGS: ${{ inputs.rustflags }}
+
+      - name: Build wheel (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $cargo = (Get-Command cargo -ErrorAction Stop).Source
+          Write-Host "cargo: $cargo"
+          $env:CARGO = $cargo
+          maturin build --release `
+            --manifest-path "$env:GITHUB_WORKSPACE\crates\reactor-webrtc-py\Cargo.toml"
+        env:
+          REACTOR_WEBRTC_PREBUILT_URL: ${{ steps.prebuilt.outputs.url }}
+          REACTOR_WEBRTC_PREBUILT_SHA256: ${{ steps.prebuilt.outputs.sha256 }}
+          RUSTFLAGS: ${{ inputs.rustflags }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheel-${{ inputs.platform }}
+          path: target/wheels/reactor_webrtc-*.whl
+          if-no-files-found: error
+
+  test:
+    name: pytest (${{ inputs.platform }}, built wheel)
+    needs: build
+    runs-on: ${{ inputs.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: wheel-${{ inputs.platform }}
+          path: target/wheels
+
+      # hk ships no x86_64-apple-darwin binary; disable it so mise install
+      # doesn't error under MISE_LOCKED=1 (hk is only needed for git hooks).
+      - name: Disable hk on mac-x64
+        if: inputs.platform == 'mac-x64'
+        run: echo "MISE_DISABLE_TOOLS=${{ env.MISE_DISABLE_TOOLS }},hk" >> "$GITHUB_ENV"
+
+      - uses: jdx/mise-action@v4
+        with:
+          version: ${{ env.MISE_VERSION }}
+
+      - name: Run Python tests against the built wheel
+        run: mise run //crates/reactor-webrtc-py:test
