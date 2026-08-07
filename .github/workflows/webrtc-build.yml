@@ -253,6 +253,12 @@ jobs:
           sudo apt-get install -y --no-install-recommends clang-21
           echo "CXX=clang++-21" >> "$GITHUB_ENV"
 
+      # hk ships no x86_64-apple-darwin binary; disable it so mise install
+      # doesn't error under MISE_LOCKED=1 (hk is only needed for git hooks).
+      - name: Disable hk on mac-x64
+        if: matrix.os == 'mac' && matrix.arch == 'x64'
+        run: echo "MISE_DISABLE_TOOLS=${{ env.MISE_DISABLE_TOOLS }},hk" >> "$GITHUB_ENV"
+
       - uses: jdx/mise-action@v4
         with:
           version: ${{ env.MISE_VERSION }}
@@ -324,6 +330,12 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends clang-21
           echo "CXX=clang++-21" >> "$GITHUB_ENV"
+
+      # hk ships no x86_64-apple-darwin binary; disable it so mise install
+      # doesn't error under MISE_LOCKED=1 (hk is only needed for git hooks).
+      - name: Disable hk on mac-x64
+        if: matrix.os == 'mac' && matrix.arch == 'x64'
+        run: echo "MISE_DISABLE_TOOLS=${{ env.MISE_DISABLE_TOOLS }},hk" >> "$GITHUB_ENV"
 
       - uses: jdx/mise-action@v4
         with:
@@ -397,6 +409,12 @@ jobs:
           sudo apt-get install -y --no-install-recommends clang-21
           echo "CXX=clang++-21" >> "$GITHUB_ENV"
 
+      # hk ships no x86_64-apple-darwin binary; disable it so mise install
+      # doesn't error under MISE_LOCKED=1 (hk is only needed for git hooks).
+      - name: Disable hk on mac-x64
+        if: matrix.os == 'mac' && matrix.arch == 'x64'
+        run: echo "MISE_DISABLE_TOOLS=${{ env.MISE_DISABLE_TOOLS }},hk" >> "$GITHUB_ENV"
+
       - uses: jdx/mise-action@v4
         with:
           version: ${{ env.MISE_VERSION }}
@@ -467,6 +485,11 @@ jobs:
         with:
           name: wheel-${{ matrix.os }}-${{ matrix.arch }}
           path: target/wheels
+      # hk ships no x86_64-apple-darwin binary; disable it so mise install
+      # doesn't error under MISE_LOCKED=1 (hk is only needed for git hooks).
+      - name: Disable hk on mac-x64
+        if: matrix.os == 'mac' && matrix.arch == 'x64'
+        run: echo "MISE_DISABLE_TOOLS=${{ env.MISE_DISABLE_TOOLS }},hk" >> "$GITHUB_ENV"
       - uses: jdx/mise-action@v4
         with:
           version: ${{ env.MISE_VERSION }}
