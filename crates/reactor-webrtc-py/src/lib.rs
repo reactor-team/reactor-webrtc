@@ -178,6 +178,9 @@ pub struct RtcConfiguration {
     pub ice_connection_receiving_timeout_ms: i32,
     pub ice_check_interval_strong_connectivity_ms: i32,
     tcp_candidate_policy: rw::TcpCandidatePolicy,
+    /// Whether this connection takes part in per-frame metadata. `True` by
+    /// default; see the class docstring in the stub.
+    pub frame_metadata: bool,
 }
 
 #[pymethods]
@@ -194,6 +197,7 @@ impl RtcConfiguration {
         ice_connection_receiving_timeout_ms=0,
         ice_check_interval_strong_connectivity_ms=0,
         tcp_candidate_policy=TcpCandidatePolicy::Disabled,
+        frame_metadata=true,
     ))]
     fn new(
         ice_servers: Vec<IceServer>,
@@ -205,6 +209,7 @@ impl RtcConfiguration {
         ice_connection_receiving_timeout_ms: i32,
         ice_check_interval_strong_connectivity_ms: i32,
         tcp_candidate_policy: TcpCandidatePolicy,
+        frame_metadata: bool,
     ) -> PyResult<Self> {
         Ok(Self {
             ice_servers,
@@ -216,6 +221,7 @@ impl RtcConfiguration {
             ice_connection_receiving_timeout_ms,
             ice_check_interval_strong_connectivity_ms,
             tcp_candidate_policy: rw::TcpCandidatePolicy::from(tcp_candidate_policy),
+            frame_metadata,
         })
     }
     #[getter]
@@ -296,6 +302,15 @@ impl RtcConfiguration {
     fn set_tcp_candidate_policy(&mut self, value: TcpCandidatePolicy) {
         self.tcp_candidate_policy = rw::TcpCandidatePolicy::from(value);
     }
+
+    #[getter]
+    fn frame_metadata(&self) -> bool {
+        self.frame_metadata
+    }
+    #[setter]
+    fn set_frame_metadata(&mut self, value: bool) {
+        self.frame_metadata = value;
+    }
 }
 
 impl From<&RtcConfiguration> for rw::RtcConfiguration {
@@ -329,6 +344,7 @@ impl From<&RtcConfiguration> for rw::RtcConfiguration {
                 None
             },
             tcp_candidate_policy: c.tcp_candidate_policy,
+            frame_metadata: c.frame_metadata,
         }
     }
 }
@@ -403,19 +419,11 @@ impl SessionDescription {
     /// One per m-section: bundled sections repeat the same value, while a
     /// non-BUNDLE description has a distinct ufrag per transport.
     fn ice_ufrags(&self) -> Vec<String> {
-        // Read straight off the SDP rather than through `to_rust_sdp`: parsing
-        // ufrags does not need `kind`, and routing it through the converter would
-        // turn an unrelated "unknown SDP kind" into an empty list — which reads
-        // exactly like a description that carries no credentials. Python can set
-        // `kind` to any string, so that mistake is one typo away.
-        rw::SessionDescription {
-            kind: rw::SdpType::Offer,
-            sdp: self.sdp.clone(),
-        }
-        .ice_ufrags()
-        .into_iter()
-        .map(str::to_owned)
-        .collect()
+        self.as_rust_for_reading()
+            .ice_ufrags()
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
     }
 
     /// Return a copy with every `ice-ufrag` and `ice-pwd` replaced.
@@ -437,6 +445,49 @@ impl SessionDescription {
             .with_ice_credentials(ufrag, pwd)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(out.into())
+    }
+
+    /// Whether this description declares frame-metadata support.
+    ///
+    /// True when it carries a session-level `a=x-reactor-frame-metadata:<version>`
+    /// at a version this build understands. A peer speaking a different trailer
+    /// format therefore reads as unsupported rather than as a partial match.
+    ///
+    /// `set_remote_description` arms the connection's `FrameMetadataGate` from
+    /// exactly this.
+    fn declares_frame_metadata(&self) -> bool {
+        self.as_rust_for_reading().declares_frame_metadata()
+    }
+
+    /// Return a copy declaring frame-metadata support, as a session-level attribute.
+    ///
+    /// `create_offer` already applies this to every offer and `create_answer`
+    /// mirrors the offer, so callers using this library's signalling path never need
+    /// it. Public for callers that assemble or rewrite SDP themselves. Idempotent.
+    fn with_frame_metadata(&self) -> Self {
+        // Preserves `kind` verbatim instead of validating it: declaring the
+        // capability does not depend on the SDP type, so an unfamiliar `kind` is not
+        // a reason to raise here. Same reasoning as `as_rust_for_reading`.
+        Self {
+            kind: self.kind.clone(),
+            sdp: self.as_rust_for_reading().with_frame_metadata().sdp,
+        }
+    }
+}
+
+impl SessionDescription {
+    /// The SDP as a Rust description, for read-only queries that do not depend
+    /// on `kind`.
+    ///
+    /// Reading through `to_rust_sdp` instead would turn an unrelated "unknown SDP
+    /// kind" into an empty/`None` answer — indistinguishable from a description
+    /// that genuinely carries nothing. Python can set `kind` to any string, so
+    /// that mistake is one typo away.
+    fn as_rust_for_reading(&self) -> rw::SessionDescription {
+        rw::SessionDescription {
+            kind: rw::SdpType::Offer,
+            sdp: self.sdp.clone(),
+        }
     }
 }
 
@@ -779,6 +830,48 @@ impl From<rw::StatsReport> for StatsReport {
 
 // ── FrameMetadata ─────────────────────────────────────────────────────────────
 
+/// Whether the remote peer has declared that it strips metadata trailers.
+///
+/// Obtained from `PeerConnection.frame_metadata_gate()`. It starts closed and is
+/// armed by `set_remote_description`, which opens it when the remote description
+/// declares `FRAME_METADATA_ATTRIBUTE`. The library consults the gate internally
+/// when appending trailers; callers do not need to check it before pushing
+/// `user_data`.
+#[pyclass]
+#[derive(Clone, Default)]
+pub struct FrameMetadataGate {
+    inner: rw::FrameMetadataGate,
+}
+
+#[pymethods]
+impl FrameMetadataGate {
+    /// A closed gate, not attached to any peer connection.
+    ///
+    /// Useful in tests and for a sender that negotiated support out of band.
+    /// Production code takes one from `PeerConnection.frame_metadata_gate()` so
+    /// that `set_remote_description` arms it.
+    #[new]
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether trailers may be appended.
+    fn is_open(&self) -> bool {
+        self.inner.is_open()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "FrameMetadataGate({})",
+            if self.inner.is_open() {
+                "open"
+            } else {
+                "closed"
+            }
+        )
+    }
+}
+
 /// Metadata attached to a video frame via the packet trailer.
 ///
 /// All fields default to zero / empty when not set by the sender.
@@ -859,8 +952,9 @@ impl Track {
     ///
     /// Pass `user_data` (bytes) to embed per-frame metadata in the encoded
     /// packet trailer. `frame_id` and `timestamp` are computed automatically.
-    /// Requires [`sender_metadata_transform`] to be attached to the sender
-    /// transceiver beforehand; otherwise `user_data` is silently ignored.
+    /// Nothing else has to be arranged: the trailer is appended once the peer has
+    /// declared that it strips them, and `user_data` is silently dropped while it
+    /// has not. See `PeerConnection.frame_metadata_gate()`.
     #[pyo3(signature = (bgra, width, height, user_data=None))]
     fn push_video_frame(
         &self,
@@ -898,26 +992,6 @@ impl Track {
             }
         }
         Ok(())
-    }
-
-    /// Return a `FrameTransform` that appends a metadata trailer to encoded
-    /// frames on the send path. Attach it to the sender transceiver with
-    /// `Transceiver.set_sender_transform` before the SDP exchange.
-    fn sender_metadata_transform(&mut self) -> FrameTransform {
-        FrameTransform {
-            inner: self.inner.sender_metadata_transform(),
-        }
-    }
-
-    /// Return a `FrameTransform` that strips the metadata trailer from received
-    /// encoded frames. Attach it to the receiver transceiver with
-    /// `Transceiver.set_receiver_transform` before the SDP exchange. After
-    /// attachment, `on_video_frame` callbacks will carry `metadata` when the
-    /// sender included a trailer.
-    fn receiver_metadata_transform(&mut self) -> FrameTransform {
-        FrameTransform {
-            inner: self.inner.receiver_metadata_transform(),
-        }
     }
 
     /// Register a callback for decoded video frames from a remote track.
@@ -1011,9 +1085,9 @@ impl EncodedVideoTrack {
     /// Pass `width=0`, `height=0`, `rtp_timestamp=0` to inherit from the
     /// track's configured resolution.
     /// Pass `user_data` (bytes) to embed per-frame metadata in the encoded
-    /// packet trailer (same mechanism as `Track.push_video_frame`). Requires
-    /// `Track.sender_metadata_transform` to be attached to the sender
-    /// transceiver beforehand; otherwise `user_data` is silently ignored.
+    /// packet trailer (same mechanism as `Track.push_video_frame`). Metadata
+    /// is only sent when the peer has negotiated support; otherwise `user_data`
+    /// is silently dropped.
     #[pyo3(signature = (data, is_key_frame=false, width=0, height=0, rtp_timestamp=0, user_data=None))]
     fn push_encoded_frame(
         &self,
@@ -1034,16 +1108,6 @@ impl EncodedVideoTrack {
         match user_data {
             Some(ud) => self.inner.push_encoded_frame_with_metadata(frame, ud),
             None => self.inner.push_encoded_frame(frame),
-        }
-    }
-
-    /// Return a sender [`FrameTransform`] that embeds per-frame metadata
-    /// trailers. Call before the first SDP exchange and attach the result to
-    /// the sender transceiver with `Transceiver.set_sender_transform`. After
-    /// that, `push_encoded_frame(data, user_data=...)` will embed metadata.
-    fn sender_metadata_transform(&mut self) -> FrameTransform {
-        FrameTransform {
-            inner: self.inner.sender_metadata_transform(),
         }
     }
 
@@ -1162,8 +1226,8 @@ impl EncodedFrame {
 /// An encoded-frame transformer. Attach to a transceiver's sender or receiver
 /// via `Transceiver.set_sender_transform` / `set_receiver_transform`.
 ///
-/// Create from a Python callable with `FrameTransform(callback)`, or obtain
-/// from `Track.sender_metadata_transform()` / `receiver_metadata_transform()`.
+/// Create from a Python callable with `FrameTransform(callback)` and attach
+/// via `Transceiver.set_sender_transform()` / `set_receiver_transform()`.
 #[pyclass]
 pub struct FrameTransform {
     inner: rw::FrameTransform,
@@ -1564,6 +1628,12 @@ impl PeerConnection {
                 .map_err(err)
         })
     }
+    /// Apply the remote description, and arm this connection's
+    /// `FrameMetadataGate` from it.
+    ///
+    /// The gate opens when `sdp` declares `FRAME_METADATA_ATTRIBUTE` and closes
+    /// when it does not, on every call — so a renegotiation in which the peer
+    /// drops support closes it again.
     fn set_remote_description<'py>(
         &self,
         py: Python<'py>,
@@ -1577,6 +1647,18 @@ impl PeerConnection {
                 .map_err(join_err)?
                 .map_err(err)
         })
+    }
+
+    /// A handle to this connection's frame-metadata gate.
+    ///
+    /// Cheap and shareable. It stays closed until `set_remote_description` sees
+    /// a remote description that declares support. Reading it is diagnostic —
+    /// the library consults it internally when answering and when appending
+    /// trailers, so callers do not need to check it before pushing `user_data`.
+    fn frame_metadata_gate(&self) -> FrameMetadataGate {
+        FrameMetadataGate {
+            inner: self.pc().frame_metadata_gate(),
+        }
     }
     fn add_ice_candidate<'py>(
         &self,
@@ -1844,6 +1926,7 @@ fn reactor_webrtc(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<IceCandidatePairStats>()?;
     m.add_class::<StatsReport>()?;
     m.add_class::<FrameMetadata>()?;
+    m.add_class::<FrameMetadataGate>()?;
     m.add_class::<FrameAction>()?;
     m.add_class::<EncodedFrame>()?;
     m.add_class::<FrameTransform>()?;
@@ -1854,5 +1937,11 @@ fn reactor_webrtc(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PeerConnectionObserver>()?;
     m.add_class::<PeerConnection>()?;
     m.add_class::<PeerConnectionFactory>()?;
+
+    // The SDP attribute peers declare frame-metadata support with, and the trailer
+    // version this wheel speaks. Exposed so that a caller inspecting or building SDP
+    // by hand does not have to hardcode either.
+    m.add("FRAME_METADATA_ATTRIBUTE", rw::FRAME_METADATA_ATTRIBUTE)?;
+    m.add("FRAME_METADATA_VERSION", rw::FRAME_METADATA_VERSION)?;
     Ok(())
 }

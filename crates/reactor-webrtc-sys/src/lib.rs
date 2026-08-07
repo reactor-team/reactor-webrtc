@@ -516,6 +516,27 @@ extern "C" {
         transceiver: *mut RtpTransceiver,
         direction: c_int,
     ) -> c_int;
+    /// Identity of the transceiver itself, as an opaque value — **not** an owning
+    /// handle. Stable for the transceiver's life, unlike the handle pointer, which
+    /// is a fresh allocation per `transceivers()` call. Usable as a key before any
+    /// track is attached and before a mid is assigned.
+    pub fn reactor_webrtc_rtp_transceiver_id(transceiver: *mut RtpTransceiver) -> usize;
+    /// Identity of the track on this transceiver's sender, as an opaque value —
+    /// **not** an owning handle. The value is only ever compared, never
+    /// dereferenced or released, and no reference is taken. Returns 0 when the
+    /// sender has no track.
+    ///
+    /// Two Rust wrappers around the same native track share this value, which is
+    /// what makes it usable as a key for finding the wrapper's own state.
+    pub fn reactor_webrtc_rtp_transceiver_sender_track_id(
+        transceiver: *mut RtpTransceiver,
+    ) -> usize;
+    /// Identity of the track this transceiver's receiver delivers, on the same
+    /// non-owning terms as [`reactor_webrtc_rtp_transceiver_sender_track_id`].
+    /// Available once the remote description has been applied.
+    pub fn reactor_webrtc_rtp_transceiver_receiver_track_id(
+        transceiver: *mut RtpTransceiver,
+    ) -> usize;
     /// Release a transceiver handle.
     pub fn reactor_webrtc_rtp_transceiver_destroy(transceiver: *mut RtpTransceiver);
 
@@ -547,6 +568,11 @@ extern "C" {
     ) -> c_int;
     /// Release a transformer handle (the sender/receiver keep their own ref).
     pub fn reactor_webrtc_frame_transformer_destroy(transformer: *mut FrameTransformer);
+    /// Identity of the native track behind this handle, as an opaque value —
+    /// **not** an owning handle, on the same terms as
+    /// [`reactor_webrtc_rtp_transceiver_sender_track_id`], whose value this is
+    /// comparable with. Returns 0 for a handle with no track.
+    pub fn reactor_webrtc_media_stream_track_id(track: *mut MediaStreamTrack) -> usize;
     /// Destroy a track handle (detaches any sink, releases the track + source).
     pub fn reactor_webrtc_media_stream_track_destroy(track: *mut MediaStreamTrack);
 

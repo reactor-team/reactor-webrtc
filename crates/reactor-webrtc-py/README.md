@@ -110,7 +110,9 @@ for pair in report.candidate_pairs:
 | `RtcConfiguration` | ICE servers, ICE transport type, gathering policy |
 | `IceServer` | A STUN or TURN server entry |
 | `IceCandidate` | A trickled ICE candidate |
-| `SessionDescription` | SDP offer or answer (`kind`, `sdp`, `ice_ufrags`, `with_ice_credentials`) |
+| `SessionDescription` | SDP offer or answer (`kind`, `sdp`, `ice_ufrags`, `with_ice_credentials`, `frame_metadata_id`) |
+| `FrameMetadata` | Per-frame `frame_id`, `timestamp`, `user_data` |
+| `FrameMetadataGate` | What the remote declared about per-frame metadata |
 | `Track` | Local (push frames) or remote (attach sink) media track |
 | `EncodedVideoTrack` | Push pre-encoded video (H.264 Annex-B, VP8, VP9, …) |
 | `Transceiver` | RTP m-section: `mid`, `kind`, `set_track`, `set_direction` |
@@ -130,6 +132,56 @@ for pair in report.candidate_pairs:
 |---------------------|--------|
 | `RtcConfiguration.ice_transport_type` | `all` (default), `relay`, `no_host`, `none` |
 | `RtcConfiguration.continual_gathering_policy` | `once` (default), `continually` |
+
+## Per-frame metadata
+
+Arbitrary bytes can ride alongside each encoded video frame, in a protobuf
+trailer appended to the payload:
+
+```python
+video.push_video_frame(bgra, 320, 240, user_data=b"anything you like")
+
+def on_frame(bgra, w, h, meta):
+    if meta is not None:
+        print(meta.frame_id, meta.timestamp, meta.user_data)
+
+track.on_video_frame(on_frame)
+```
+
+That only works if the far end strips the trailer before its decoder sees it, so
+support is negotiated in the SDP and **you do not have to do anything for it**:
+
+- `create_offer` advertises the capability as one session-level
+  `a=x-reactor-frame-metadata:1` (`rw.FRAME_METADATA_ATTRIBUTE`,
+  `rw.FRAME_METADATA_VERSION`).
+- `create_answer` mirrors an offer that asked for it.
+- `set_remote_description` arms `pc.frame_metadata_gate()` and, when it is open,
+  installs the embed and strip transforms on the video transceivers. The sender
+  transform still checks the gate per frame, so a renegotiation that drops support
+  stops the trailers.
+
+A peer that has never heard of the attribute ignores it, the gate stays closed,
+and `user_data` is silently dropped rather than corrupting that peer's decode.
+Read `pc.frame_metadata_gate().is_open()` if you want to know whether the peer
+agreed.
+
+Read the declaration from the signalled SDP string, not from `pc.remoteDescription`
+or its equivalents: libwebrtc and browsers both discard `a=` lines they do not
+recognise while parsing.
+
+A `FrameTransform` of your own composes with the metadata step rather than
+displacing it — the library owns libwebrtc's single transformer slot per
+sender/receiver and runs both. Your callback goes first in both directions, so it
+sees exactly the bytes that traverse the network.
+
+To keep frame metadata out of a connection entirely:
+
+```python
+config = rw.RtcConfiguration(frame_metadata=False)
+```
+
+No `a=extmap`, no mirroring, no transforms, and `user_data` is dropped — the
+connection is indistinguishable from one built before the capability existed.
 
 ## Choosing your own ICE credentials
 

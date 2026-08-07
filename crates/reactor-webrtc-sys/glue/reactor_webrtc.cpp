@@ -1445,6 +1445,50 @@ int reactor_webrtc_rtp_transceiver_set_direction(void* transceiver, int directio
   return err.ok() ? 1 : 0;
 }
 
+// Identity of the *transceiver* itself, as an opaque value — not an owning
+// handle.
+//
+// Unlike the ReactorTransceiver handle, which is a fresh heap object on every
+// transceivers() call, the native RtpTransceiverInterface behind it is stable for
+// the life of the transceiver. That makes this usable as a key from the moment the
+// transceiver exists — before any track is attached, and before the first SDP
+// exchange assigns a mid.
+uintptr_t reactor_webrtc_rtp_transceiver_id(void* transceiver) {
+  auto* h = reinterpret_cast<ReactorTransceiver*>(transceiver);
+  if (!h || !h->tc) return 0;
+  return reinterpret_cast<uintptr_t>(h->tc.get());
+}
+
+// Identity of the track currently attached to this transceiver's sender, as an
+// opaque value — NOT an owning handle.
+//
+// The pointer is only ever compared, never dereferenced or released, and no
+// reference is taken: the caller uses it to recognise which of its own tracks
+// this transceiver is sending. Returns 0 when the sender has no track.
+//
+// A `void*` rather than a ReactorMediaStreamTrack: the native
+// MediaStreamTrackInterface is what two Rust wrappers around the same track have
+// in common, which is exactly the identity being asked for. Wrapping it in a new
+// handle would produce an object with its own state and defeat the purpose.
+uintptr_t reactor_webrtc_rtp_transceiver_sender_track_id(void* transceiver) {
+  auto* h = reinterpret_cast<ReactorTransceiver*>(transceiver);
+  if (!h || !h->tc || !h->tc->sender()) return 0;
+  auto track = h->tc->sender()->track();
+  return reinterpret_cast<uintptr_t>(track.get());
+}
+
+// Identity of the track this transceiver's receiver delivers, on the same
+// non-owning terms as reactor_webrtc_rtp_transceiver_sender_track_id.
+//
+// Available once the remote description has been applied — the receiver's track
+// is created while applying it, which is the same point on_track fires.
+uintptr_t reactor_webrtc_rtp_transceiver_receiver_track_id(void* transceiver) {
+  auto* h = reinterpret_cast<ReactorTransceiver*>(transceiver);
+  if (!h || !h->tc || !h->tc->receiver()) return 0;
+  auto track = h->tc->receiver()->track();
+  return reinterpret_cast<uintptr_t>(track.get());
+}
+
 // Destroy a transceiver handle (releases our reference).
 void reactor_webrtc_rtp_transceiver_destroy(void* transceiver) {
   delete reinterpret_cast<ReactorTransceiver*>(transceiver);
@@ -1944,6 +1988,16 @@ int reactor_webrtc_rtp_transceiver_set_receiver_transform(void* transceiver,
 // Release a transformer handle (our reference; sender/receiver keep theirs).
 void reactor_webrtc_frame_transformer_destroy(void* transformer) {
   delete reinterpret_cast<ReactorTransformerHandle*>(transformer);
+}
+
+// Identity of the native track behind this handle, as an opaque value — not an
+// owning handle, on the same terms as
+// reactor_webrtc_rtp_transceiver_sender_track_id, whose value this is comparable
+// with. Returns 0 for a handle with no track.
+uintptr_t reactor_webrtc_media_stream_track_id(void* track) {
+  auto* h = reinterpret_cast<ReactorMediaStreamTrack*>(track);
+  if (!h) return 0;
+  return reinterpret_cast<uintptr_t>(h->track.get());
 }
 
 // Destroy a track handle (detaches any sink and releases the track + source).

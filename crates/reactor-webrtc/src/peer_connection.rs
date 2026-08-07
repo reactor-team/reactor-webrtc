@@ -192,6 +192,88 @@ impl SessionDescription {
             sdp: out,
         })
     }
+
+    /// Whether this description declares frame-metadata support.
+    ///
+    /// True when it carries a session-level
+    /// `a=x-reactor-frame-metadata:<version>` whose version this build understands
+    /// ([`FRAME_METADATA_VERSION`](crate::metadata::FRAME_METADATA_VERSION)). A peer
+    /// speaking a different trailer format therefore reads as unsupported rather
+    /// than as a partial match.
+    ///
+    /// Read off the SDP string, not from libwebrtc: it drops `a=` lines it does not
+    /// recognise when parsing, so the parsed description never carries this.
+    ///
+    /// This is what [`PeerConnection::set_remote_description`] arms the connection's
+    /// [`FrameMetadataGate`](crate::FrameMetadataGate) from.
+    pub fn declares_frame_metadata(&self) -> bool {
+        let prefix = format!("a={}:", crate::metadata::FRAME_METADATA_ATTRIBUTE);
+        self.sdp.lines().any(|line| {
+            line.strip_prefix(prefix.as_str())
+                .and_then(|v| v.trim_end().parse::<u32>().ok())
+                .is_some_and(|v| v == crate::metadata::FRAME_METADATA_VERSION)
+        })
+    }
+
+    /// Return a copy declaring frame-metadata support, as a session-level attribute.
+    ///
+    /// [`create_offer`](PeerConnection::create_offer) already applies this to every
+    /// offer, and [`create_answer`](PeerConnection::create_answer) mirrors the offer
+    /// — so a caller using this crate's signalling path never needs it. It is public
+    /// for callers that assemble or rewrite descriptions themselves.
+    ///
+    /// Idempotent: a description that already declares the capability comes back
+    /// unchanged, as does one with no lines at all.
+    ///
+    /// # Why a bespoke attribute
+    ///
+    /// The declaration says only "this peer understands the trailer". An
+    /// `a=extmap` would have been the recognisable spelling, but it means "I will
+    /// send this RTP header extension", which is not true — no header extension is
+    /// ever emitted — and it would drag in a shared id namespace that the *peer*
+    /// validates (RFC 8843 requires one id to mean one URI across a BUNDLE group),
+    /// so a collision would surface as the far side's `set_remote_description`
+    /// failing. An unregistered `x-` attribute claims nothing false and has no id
+    /// to collide.
+    ///
+    /// The cost is that libwebrtc discards it while parsing, so it is only ever
+    /// readable from the SDP string. Nothing here depends on the parsed form.
+    ///
+    /// # Placement
+    ///
+    /// Inserted immediately before the first `m=` line, which is the end of the
+    /// session section: RFC 8866 §5 puts session-level attributes after `t=`/`z=`/`k=`
+    /// and before the first media description, and everything preceding the first
+    /// `m=` is by definition session level.
+    pub fn with_frame_metadata(&self) -> Self {
+        if self.declares_frame_metadata() || self.sdp.lines().next().is_none() {
+            return self.clone();
+        }
+        let declaration = format!(
+            "a={}:{}\r\n",
+            crate::metadata::FRAME_METADATA_ATTRIBUTE,
+            crate::metadata::FRAME_METADATA_VERSION
+        );
+        let mut out = String::with_capacity(self.sdp.len() + declaration.len());
+        let mut inserted = false;
+        for line in self.sdp.lines() {
+            if !inserted && line.starts_with("m=") {
+                out.push_str(&declaration);
+                inserted = true;
+            }
+            out.push_str(line);
+            out.push_str("\r\n");
+        }
+        // A description with no media section at all: session level is still session
+        // level, so it goes at the end.
+        if !inserted {
+            out.push_str(&declaration);
+        }
+        Self {
+            kind: self.kind,
+            sdp: out,
+        }
+    }
 }
 
 /// A trickled ICE candidate.
@@ -245,6 +327,7 @@ impl IceGatheringState {
 /// `mid` (available after `set_local_description`) maps it to an SDP m-section.
 pub struct Transceiver {
     raw: *mut reactor_webrtc_sys::RtpTransceiver,
+    pc_id: usize,
 }
 
 // SAFETY: the native transceiver is internally thread-safe.
@@ -252,11 +335,36 @@ unsafe impl Send for Transceiver {}
 unsafe impl Sync for Transceiver {}
 
 impl Transceiver {
-    pub(crate) fn from_raw(raw: *mut reactor_webrtc_sys::RtpTransceiver) -> Self {
-        Self { raw }
+    pub(crate) fn from_raw(raw: *mut reactor_webrtc_sys::RtpTransceiver, pc_id: usize) -> Self {
+        Self { raw, pc_id }
     }
 
     /// The transceiver's media kind (audio/video).
+    /// Identity of the transceiver itself, as an opaque value.
+    ///
+    /// Stable for the transceiver's life, unlike the handle pointer — `transceivers()`
+    /// allocates a fresh handle each call. Usable as a key before a track is attached
+    /// and before a mid is assigned.
+    pub(crate) fn transceiver_id(&self) -> usize {
+        unsafe { reactor_webrtc_sys::reactor_webrtc_rtp_transceiver_id(self.raw) }
+    }
+
+    /// Identity of the track on this transceiver's sender, as an opaque value.
+    ///
+    /// Only ever compared — it is how the crate recognises which of its own
+    /// [`Track`](crate::Track)s a transceiver is sending, so that state living in
+    /// that track can be found from here. 0 when the sender has no track.
+    pub(crate) fn sender_track_id(&self) -> usize {
+        unsafe { reactor_webrtc_sys::reactor_webrtc_rtp_transceiver_sender_track_id(self.raw) }
+    }
+
+    /// Identity of the track this transceiver's receiver delivers, on the same
+    /// terms as [`sender_track_id`](Self::sender_track_id). Non-zero once the
+    /// remote description has been applied.
+    pub(crate) fn receiver_track_id(&self) -> usize {
+        unsafe { reactor_webrtc_sys::reactor_webrtc_rtp_transceiver_receiver_track_id(self.raw) }
+    }
+
     pub fn kind(&self) -> MediaKind {
         let k = unsafe { reactor_webrtc_sys::reactor_webrtc_rtp_transceiver_media_kind(self.raw) };
         MediaKind::from_raw(k)
@@ -289,6 +397,13 @@ impl Transceiver {
             reactor_webrtc_sys::reactor_webrtc_rtp_transceiver_set_track(self.raw, track.raw())
         };
         if ok == 1 {
+            // Re-wire the embed source when the gate is already open (replaceTrack
+            // post-negotiation). Without this the old track's source stays in the
+            // slot and pushes to the new track are silently dropped until the next
+            // renegotiation re-runs install_frame_metadata_transforms.
+            if let Some(source) = crate::sender_meta::lookup(self.sender_track_id()) {
+                crate::sender_meta::update_embed_source(self.pc_id, self.transceiver_id(), source);
+            }
             Ok(())
         } else {
             Err(Error::Webrtc("transceiver set_track failed".into()))
@@ -313,48 +428,109 @@ impl Transceiver {
 
     /// Attach an encoded-frame transform to this transceiver's **sender**
     /// (encoder → packetizer): observe/replace/drop each encoded frame before
-    /// it is sent. See [`crate::FrameTransform`]. The transform must outlive
-    /// this transceiver's use of it.
+    /// it is sent. See [`crate::FrameTransform`].
+    ///
+    /// Composes rather than replaces. The crate owns libwebrtc's single
+    /// `SetFrameTransformer` slot per sender and runs both this callback and the
+    /// frame-metadata step under it, so encoded-frame access and per-frame metadata
+    /// work on the same transceiver. The callback runs first, before any trailer is
+    /// appended, so it sees exactly the bytes the encoder produced.
+    ///
+    /// Calling this again replaces the callback. The `FrameTransform` may be dropped
+    /// afterwards — the registration holds its own reference.
     pub fn set_sender_transform(&self, transform: &FrameTransform) -> Result<()> {
-        let ok = unsafe {
-            reactor_webrtc_sys::reactor_webrtc_rtp_transceiver_set_sender_transform(
-                self.raw,
-                transform.raw(),
-            )
-        };
-        if ok == 1 {
-            Ok(())
-        } else {
-            Err(Error::Webrtc(
-                "transceiver set_sender_transform failed".into(),
-            ))
-        }
+        self.attach_caller_transform(crate::sender_meta::Side::Send, transform)
     }
 
     /// Attach an encoded-frame transform to this transceiver's **receiver**
     /// (depacketizer → decoder): observe each encoded frame before decode, and
     /// [`FrameAction::Drop`](crate::FrameAction) to bypass the decoder. See
-    /// [`crate::FrameTransform`]. The transform must outlive this transceiver's
-    /// use of it.
+    /// [`crate::FrameTransform`].
+    ///
+    /// Composes rather than replaces, as on the sender. The callback runs before the
+    /// metadata trailer is stripped, so it sees exactly the bytes that arrived; call
+    /// [`decode_and_strip_trailer`](crate::metadata::decode_and_strip_trailer)
+    /// yourself if you want the payload without the framing.
     pub fn set_receiver_transform(&self, transform: &FrameTransform) -> Result<()> {
+        self.attach_caller_transform(crate::sender_meta::Side::Receive, transform)
+    }
+
+    fn attach_caller_transform(
+        &self,
+        side: crate::sender_meta::Side,
+        transform: &FrameTransform,
+    ) -> Result<()> {
+        let id = self.transceiver_id();
+        let Some(native) =
+            crate::sender_meta::attach_caller(self.pc_id, id, side, transform.callback())
+        else {
+            // Either the transformer is already attached — the registration above is
+            // all that was needed — or this transceiver has no native identity, in
+            // which case there is nothing to attach it to.
+            return if id == 0 {
+                Err(Error::Webrtc(
+                    "transceiver has no native identity to attach a transform to".into(),
+                ))
+            } else {
+                Ok(())
+            };
+        };
+        let result = self.attach_native_transform(side, &native);
+        if result.is_err() {
+            // The slot was claimed but the native attach failed: un-claim it so
+            // a retry can install a new transformer rather than seeing installed=true
+            // and silently doing nothing.
+            crate::sender_meta::release_install(self.pc_id, id, side);
+        }
+        result
+    }
+
+    /// Attach the crate-owned composed transformer to one side.
+    ///
+    /// Dropping `native` afterwards is safe and is what the callers do: the native
+    /// transformer owns its callback state and the sender/receiver holds a reference
+    /// to it (see the [`crate::FrameTransform`] docs).
+    pub(crate) fn attach_native_transform(
+        &self,
+        side: crate::sender_meta::Side,
+        native: &crate::encoded::NativeTransform,
+    ) -> Result<()> {
         let ok = unsafe {
-            reactor_webrtc_sys::reactor_webrtc_rtp_transceiver_set_receiver_transform(
-                self.raw,
-                transform.raw(),
-            )
+            match side {
+                crate::sender_meta::Side::Send => {
+                    reactor_webrtc_sys::reactor_webrtc_rtp_transceiver_set_sender_transform(
+                        self.raw,
+                        native.raw(),
+                    )
+                }
+                crate::sender_meta::Side::Receive => {
+                    reactor_webrtc_sys::reactor_webrtc_rtp_transceiver_set_receiver_transform(
+                        self.raw,
+                        native.raw(),
+                    )
+                }
+            }
         };
         if ok == 1 {
             Ok(())
         } else {
-            Err(Error::Webrtc(
-                "transceiver set_receiver_transform failed".into(),
-            ))
+            Err(Error::Webrtc(format!(
+                "transceiver set_{}_transform failed",
+                match side {
+                    crate::sender_meta::Side::Send => "sender",
+                    crate::sender_meta::Side::Receive => "receiver",
+                }
+            )))
         }
     }
 }
 
 impl Drop for Transceiver {
     fn drop(&mut self) {
+        // Deliberately *not* forgetting this transceiver's composed slots: handles
+        // are recreated per `transceivers()` call, so dropping one says nothing
+        // about the underlying transceiver going away. The slots are keyed by native
+        // identity and released with the peer connection instead.
         unsafe { reactor_webrtc_sys::reactor_webrtc_rtp_transceiver_destroy(self.raw) }
     }
 }
@@ -781,6 +957,13 @@ pub struct PeerConnection {
     // as this connection exists — destroying it dispatches onto them, so it
     // must not be destroyed after they are.
     _factory: Arc<FactoryHandle>,
+    // Opened by set_remote_description when the remote declares
+    // FRAME_METADATA_URI; read per frame by the sender metadata transforms.
+    frame_metadata_gate: crate::metadata::FrameMetadataGate,
+    // RtcConfiguration::frame_metadata. When false this connection behaves like one
+    // built before the capability existed: nothing is advertised, nothing is
+    // mirrored, the gate never opens and no transform is installed.
+    frame_metadata_enabled: bool,
 }
 
 // SAFETY: the native peer connection is internally thread-safe; observer
@@ -793,35 +976,192 @@ impl PeerConnection {
         raw: *mut reactor_webrtc_sys::PeerConnection,
         observer: Box<ObserverState>,
         factory: Arc<FactoryHandle>,
+        frame_metadata_enabled: bool,
     ) -> Self {
         Self {
             raw,
             _observer: observer,
             _factory: factory,
+            frame_metadata_gate: crate::metadata::FrameMetadataGate::new(),
+            frame_metadata_enabled,
         }
     }
 
     // ── Signaling (blocking on the native callback) ──────────────────────────
+
+    /// Create an offer.
+    ///
+    /// Every offer advertises frame-metadata support as a session-level
+    /// `a=x-reactor-frame-metadata:<version>`, because this crate does support it. A
+    /// peer that does not understand the attribute ignores it — RFC 8866 §6 requires
+    /// unrecognised attributes to be ignored.
+    ///
+    /// The declaration is what lets the answerer tell us it strips trailers, which
+    /// is what opens this connection's
+    /// [`FrameMetadataGate`](crate::FrameMetadataGate).
     pub fn create_offer(&self) -> Result<SessionDescription> {
-        run_sdp(|ud| unsafe {
+        let offer = run_sdp(|ud| unsafe {
             reactor_webrtc_sys::reactor_webrtc_peer_connection_create_offer(
                 self.raw, ud, sdp_ok, sdp_err,
             )
-        })
+        })?;
+        if !self.frame_metadata_enabled {
+            return Ok(offer);
+        }
+        Ok(offer.with_frame_metadata())
     }
+
+    /// Create an answer.
+    ///
+    /// Mirrors the offer on frame metadata: the capability is declared only when the
+    /// offer declared it. Introducing it in an answer that was not offered it is not
+    /// something offer/answer can express, so a silent offer produces a silent answer
+    /// and the gate stays closed in both directions.
+    ///
+    /// Requires [`set_remote_description`](Self::set_remote_description) to have been
+    /// called with the offer first, which is already the only valid order.
     pub fn create_answer(&self) -> Result<SessionDescription> {
-        run_sdp(|ud| unsafe {
+        let answer = run_sdp(|ud| unsafe {
             reactor_webrtc_sys::reactor_webrtc_peer_connection_create_answer(
                 self.raw, ud, sdp_ok, sdp_err,
             )
-        })
+        })?;
+        // The gate is only ever armed when the flag is on, so this covers both "the
+        // offer did not ask" and "this connection does not take part".
+        if self.frame_metadata_gate.is_open() {
+            return Ok(answer.with_frame_metadata());
+        }
+        Ok(answer)
     }
+
+    /// Apply the local description.
+    ///
+    /// Also runs the frame-metadata install, for the same reason
+    /// [`set_remote_description`](Self::set_remote_description) does. An answerer
+    /// applies the offer *before* it attaches its outbound tracks — apply, attach,
+    /// answer — so at the point the remote description armed the gate a sender had
+    /// no track to find metadata state on. By the time the answer is set locally it
+    /// does. Installing at both points covers the offerer (armed by the answer) and
+    /// the answerer (tracks attached after the offer) without either needing to know
+    /// which role it is playing.
     pub fn set_local_description(&self, sdp: &SessionDescription) -> Result<()> {
-        self.set_description(sdp, true)
+        self.set_description(sdp, true)?;
+        self.install_frame_metadata_transforms();
+        Ok(())
     }
+
+    /// Apply the remote description, and arm this connection's
+    /// [`FrameMetadataGate`](crate::FrameMetadataGate) from it.
+    ///
+    /// The gate opens when `sdp` declares the capability and closes when it does
+    /// not, on every call — so a renegotiation in which the peer drops support
+    /// closes it again.
+    ///
+    /// On an answerer this runs before [`create_answer`](Self::create_answer), which
+    /// is what lets the answer mirror the offer.
     pub fn set_remote_description(&self, sdp: &SessionDescription) -> Result<()> {
-        self.set_description(sdp, false)
+        self.set_description(sdp, false)?;
+        // After the native call, not before: a description libwebrtc rejected was
+        // never applied, and must not move the gate.
+        //
+        // A disabled connection never arms the gate, so it never answers with the
+        // capability and never installs a transform.
+        self.frame_metadata_gate
+            .set(self.frame_metadata_enabled && sdp.declares_frame_metadata());
+        self.install_frame_metadata_transforms();
+        Ok(())
     }
+
+    /// This connection's frame-metadata gate: what the remote peer declared.
+    ///
+    /// Cloneable and cheap. Reading it is diagnostic — the library already consults
+    /// it when answering, when installing the transforms, and when appending a
+    /// trailer, so a caller does not need to. It stays closed until
+    /// [`set_remote_description`](Self::set_remote_description) sees a remote
+    /// description that declares support.
+    pub fn frame_metadata_gate(&self) -> crate::metadata::FrameMetadataGate {
+        self.frame_metadata_gate.clone()
+    }
+
+    /// Wire the frame-metadata steps into every video transceiver, now that the
+    /// remote has said it strips trailers.
+    ///
+    /// Runs after the remote description has been applied, which is what makes it
+    /// possible at all: libwebrtc creates a receiver's track while applying the
+    /// description (the same point `on_track` fires), so both directions are
+    /// reachable from a transceiver by the time this runs.
+    ///
+    /// Idempotent, and run from both `set_local_description` and
+    /// `set_remote_description`: whichever of the two comes after the tracks were
+    /// attached is the one that finds them. A slot installs its native transformer
+    /// once and picks up a metadata step configured later on the next frame.
+    ///
+    /// Silent about failures on purpose. A transceiver with no track, a track whose
+    /// Rust wrapper has already been dropped, or a native attach that declines —
+    /// none of these are the caller's problem to handle, and none should fail
+    /// applying a description. The consequence is only that metadata does not flow,
+    /// which is the same as not having negotiated it.
+    fn install_frame_metadata_transforms(&self) {
+        if !self.frame_metadata_gate.is_open() {
+            // Nothing to install. A step left over from a previous generation keeps
+            // consulting the gate per frame, so a peer that dropped support stops
+            // getting trailers without anything being detached here.
+            return;
+        }
+        let pc_id = self.raw as usize;
+        let transceivers = self.transceivers();
+        // Prune slots for transceivers that libwebrtc stopped and freed internally
+        // (ClearStoppedTransceivers) without going through our Drop path. Doing it
+        // here closes the address-reuse window: a new transceiver at the same native
+        // address would otherwise inherit a stale slot with installed=true and never
+        // get a transformer of its own.
+        let live_tc_ids: std::collections::HashSet<usize> =
+            transceivers.iter().map(|tc| tc.transceiver_id()).collect();
+        crate::sender_meta::prune_stale_slots(pc_id, &live_tc_ids);
+        for tc in &transceivers {
+            if tc.kind() != MediaKind::Video {
+                continue;
+            }
+            // Composed, not exclusive: a caller's own transform on either side keeps
+            // working, and attach_* returns a transformer to install only the first
+            // time this side needs one.
+            let id = tc.transceiver_id();
+            if let Some(source) = crate::sender_meta::lookup(tc.sender_track_id()) {
+                if let Some(native) = crate::sender_meta::attach_embed(
+                    pc_id,
+                    id,
+                    source,
+                    self.frame_metadata_gate.clone(),
+                ) {
+                    if tc
+                        .attach_native_transform(crate::sender_meta::Side::Send, &native)
+                        .is_err()
+                    {
+                        crate::sender_meta::release_install(
+                            pc_id,
+                            id,
+                            crate::sender_meta::Side::Send,
+                        );
+                    }
+                }
+            }
+            if let Some(queue) = crate::sender_meta::lookup_receiver(tc.receiver_track_id()) {
+                if let Some(native) = crate::sender_meta::attach_strip(pc_id, id, queue) {
+                    if tc
+                        .attach_native_transform(crate::sender_meta::Side::Receive, &native)
+                        .is_err()
+                    {
+                        crate::sender_meta::release_install(
+                            pc_id,
+                            id,
+                            crate::sender_meta::Side::Receive,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     fn set_description(&self, sdp: &SessionDescription, local: bool) -> Result<()> {
         let ty = CString::new(sdp.kind.as_str()).unwrap();
         let body = CString::new(sdp.sdp.as_str())
@@ -870,6 +1210,11 @@ impl PeerConnection {
             reactor_webrtc_sys::reactor_webrtc_peer_connection_add_track(self.raw, track.raw())
         };
         if ok == 1 {
+            // Re-run after add_track so that an answerer that calls
+            // set_remote_description → add_track → create_answer → set_local_description
+            // does not have to wait for set_local_description to wire metadata.
+            // Idempotent: a pre-negotiation call is a no-op (gate is still closed).
+            self.install_frame_metadata_transforms();
             Ok(())
         } else {
             Err(Error::Webrtc("add_track failed".into()))
@@ -900,7 +1245,7 @@ impl PeerConnection {
         if raw.is_null() {
             Err(Error::Webrtc("add_transceiver failed".into()))
         } else {
-            Ok(Transceiver::from_raw(raw))
+            Ok(Transceiver::from_raw(raw, self.raw as usize))
         }
     }
 
@@ -918,7 +1263,7 @@ impl PeerConnection {
                 let raw = unsafe {
                     reactor_webrtc_sys::reactor_webrtc_peer_connection_get_transceiver(self.raw, i)
                 };
-                (!raw.is_null()).then(|| Transceiver::from_raw(raw))
+                (!raw.is_null()).then(|| Transceiver::from_raw(raw, self.raw as usize))
             })
             .collect()
     }
@@ -1010,6 +1355,13 @@ impl PeerConnection {
 
 impl Drop for PeerConnection {
     fn drop(&mut self) {
+        // Release the composed transform slots first, while the transceivers can
+        // still be enumerated. Keyed by (pc_id, tc_id), so leaving them would let a
+        // recycled pointer on the same or another connection inherit stale callbacks.
+        let pc_id = self.raw as usize;
+        for tc in self.transceivers() {
+            crate::sender_meta::forget_transceiver(pc_id, tc.transceiver_id());
+        }
         // Destroy the native PC (stops callbacks) before the observer box drops.
         unsafe { reactor_webrtc_sys::reactor_webrtc_peer_connection_destroy(self.raw) }
     }
@@ -1173,5 +1525,195 @@ mod sdp_ice_credentials_tests {
             sdp: "v=0\r\n".into(),
         };
         assert!(none.ice_ufrags().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod sdp_frame_metadata_tests {
+    use super::*;
+    use crate::metadata::{FRAME_METADATA_ATTRIBUTE, FRAME_METADATA_VERSION};
+
+    fn declaration() -> String {
+        format!("a={FRAME_METADATA_ATTRIBUTE}:{FRAME_METADATA_VERSION}")
+    }
+
+    /// A bundled audio+video description, as libwebrtc emits one, with `extra`
+    /// spliced in at session level (after `t=`, before the first `m=`).
+    fn described(extra: &str) -> SessionDescription {
+        SessionDescription {
+            kind: SdpType::Offer,
+            sdp: format!(
+                "v=0\r\n\
+                 o=- 1 2 IN IP4 127.0.0.1\r\n\
+                 s=-\r\n\
+                 t=0 0\r\n\
+                 a=group:BUNDLE 0 1\r\n\
+                 {extra}\
+                 m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+                 c=IN IP4 0.0.0.0\r\n\
+                 a=mid:0\r\n\
+                 m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+                 c=IN IP4 0.0.0.0\r\n\
+                 a=mid:1\r\n\
+                 a=fingerprint:sha-256 AA:BB\r\n"
+            ),
+        }
+    }
+
+    fn bundled() -> SessionDescription {
+        described("")
+    }
+
+    #[test]
+    fn declares_once_at_session_level() {
+        let out = bundled().with_frame_metadata();
+        assert!(out.declares_frame_metadata());
+        assert_eq!(out.sdp.matches(&declaration()).count(), 1);
+    }
+
+    #[test]
+    fn inserted_before_the_first_media_section() {
+        // RFC 8866 §5 puts session-level attributes after t=/z=/k= and before the
+        // first media description; everything before the first m= is session level.
+        let out = bundled().with_frame_metadata();
+        let lines: Vec<&str> = out.sdp.lines().collect();
+        let at = |needle: &str| lines.iter().position(|l| l.starts_with(needle)).unwrap();
+        assert!(at("t=") < at("a=x-reactor-frame-metadata:"));
+        assert!(at("a=x-reactor-frame-metadata:") < at("m="));
+    }
+
+    #[test]
+    fn declares_on_an_audio_only_description() {
+        // Session level, so there is nothing about video to condition it on — and a
+        // renegotiation that adds video must not have to introduce the capability.
+        let audio_only = SessionDescription {
+            kind: SdpType::Offer,
+            sdp: "v=0\r\nt=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:0\r\n".into(),
+        };
+        let out = audio_only.with_frame_metadata();
+        assert!(out.declares_frame_metadata());
+        let lines: Vec<&str> = out.sdp.lines().collect();
+        let declared = lines
+            .iter()
+            .position(|l| l.starts_with("a=x-reactor-frame-metadata:"))
+            .expect("declaration");
+        let first_media = lines.iter().position(|l| l.starts_with("m=")).expect("m=");
+        assert!(
+            declared < first_media,
+            "declaration landed inside a media section"
+        );
+    }
+
+    #[test]
+    fn declares_on_a_description_with_no_media_section() {
+        let no_media = SessionDescription {
+            kind: SdpType::Offer,
+            sdp: "v=0\r\nt=0 0\r\n".into(),
+        };
+        assert!(no_media.with_frame_metadata().declares_frame_metadata());
+    }
+
+    #[test]
+    fn an_empty_description_is_left_alone() {
+        // Emitting a lone attribute line would be invalid SDP, and there is nothing
+        // useful to declare it on.
+        let empty = SessionDescription {
+            kind: SdpType::Offer,
+            sdp: String::new(),
+        };
+        let out = empty.with_frame_metadata();
+        assert!(out.sdp.is_empty());
+        assert!(!out.declares_frame_metadata());
+    }
+
+    #[test]
+    fn is_idempotent() {
+        let once = bundled().with_frame_metadata();
+        let twice = once.with_frame_metadata();
+        assert_eq!(once.sdp, twice.sdp);
+        assert_eq!(once.sdp.matches(&declaration()).count(), 1);
+    }
+
+    #[test]
+    fn a_different_version_reads_as_unsupported() {
+        // The version is the compatibility token: a peer speaking a future trailer
+        // format must not look like a peer speaking this one.
+        let future = described(&format!(
+            "a={FRAME_METADATA_ATTRIBUTE}:{}\r\n",
+            FRAME_METADATA_VERSION + 1
+        ));
+        assert!(!future.declares_frame_metadata());
+        // …and declaring ours alongside it works.
+        let out = future.with_frame_metadata();
+        assert!(out.declares_frame_metadata());
+    }
+
+    #[test]
+    fn a_malformed_version_reads_as_unsupported() {
+        for bad in ["", "abc", "1.0", "-1"] {
+            let d = described(&format!("a={FRAME_METADATA_ATTRIBUTE}:{bad}\r\n"));
+            assert!(
+                !d.declares_frame_metadata(),
+                "accepted version {bad:?} as ours"
+            );
+        }
+    }
+
+    #[test]
+    fn a_similar_attribute_name_does_not_match() {
+        let d = described(&format!(
+            "a={FRAME_METADATA_ATTRIBUTE}-2:{FRAME_METADATA_VERSION}\r\n"
+        ));
+        assert!(!d.declares_frame_metadata());
+    }
+
+    #[test]
+    fn leaves_everything_else_intact() {
+        let before = bundled();
+        let after = before.with_frame_metadata();
+        for keep in [
+            "a=group:BUNDLE 0 1",
+            "m=audio 9 UDP/TLS/RTP/SAVPF 111",
+            "m=video 9 UDP/TLS/RTP/SAVPF 96",
+            "a=mid:1",
+            "a=fingerprint:sha-256 AA:BB",
+        ] {
+            assert!(after.sdp.contains(keep), "lost {keep:?}");
+        }
+        assert_eq!(after.sdp.lines().count(), before.sdp.lines().count() + 1);
+        assert_eq!(after.kind, before.kind);
+    }
+
+    #[test]
+    fn output_is_crlf_terminated() {
+        let out = bundled().with_frame_metadata();
+        assert!(out.sdp.ends_with("\r\n"));
+        assert_eq!(
+            out.sdp.matches('\n').count(),
+            out.sdp.matches("\r\n").count()
+        );
+    }
+}
+
+#[cfg(test)]
+mod frame_metadata_gate_tests {
+    use crate::metadata::FrameMetadataGate;
+
+    #[test]
+    fn starts_closed() {
+        // Closed-by-default is the safe direction: a sender that has not yet applied
+        // a remote description must not append trailers.
+        assert!(!FrameMetadataGate::new().is_open());
+    }
+
+    #[test]
+    fn clones_share_one_state() {
+        let gate = FrameMetadataGate::new();
+        let handed_to_transform = gate.clone();
+        gate.set(true);
+        assert!(handed_to_transform.is_open());
+        // A renegotiation where the peer drops support closes it again.
+        gate.set(false);
+        assert!(!handed_to_transform.is_open());
     }
 }

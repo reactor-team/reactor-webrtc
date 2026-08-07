@@ -47,6 +47,21 @@ class RtcConfiguration:
     ice_connection_receiving_timeout_ms: int  # 0 = libwebrtc default (~30 000 ms)
     ice_check_interval_strong_connectivity_ms: int  # 0 = libwebrtc default
     tcp_candidate_policy: TcpCandidatePolicy
+    frame_metadata: bool
+    """Whether this connection takes part in per-frame metadata.
+
+    `True` by default. When on, offers advertise the capability, answers
+    mirror an offer that asked for it, and the metadata steps are wired into the
+    video transceivers once the peer agrees.
+
+    Set `False` to keep the capability out of the SDP entirely: offers do not
+    advertise it, answers stay silent even when the offer declared it, the gate
+    never opens, and `user_data` passed to a push is dropped. Nothing about the
+    connection differs from one built before the capability existed.
+
+    Reasons to: a peer whose encoded payloads must be byte-identical to what the
+    encoder produced, a deployment that has not rolled the capability out to both
+    ends yet, or ruling frame metadata out while bisecting something else."""
     def __init__(
         self,
         ice_servers: list[IceServer] = ...,
@@ -58,6 +73,7 @@ class RtcConfiguration:
         ice_connection_receiving_timeout_ms: int = 0,
         ice_check_interval_strong_connectivity_ms: int = 0,
         tcp_candidate_policy: TcpCandidatePolicy = ...,
+        frame_metadata: bool = True,
     ) -> None: ...
 
 # ── Signaling types ───────────────────────────────────────────────────────────
@@ -79,6 +95,25 @@ class SessionDescription:
     def __init__(self, kind: str, sdp: str) -> None: ...
     def ice_ufrags(self) -> list[str]: ...
     def with_ice_credentials(self, ufrag: str, pwd: str) -> SessionDescription: ...
+    def declares_frame_metadata(self) -> bool:
+        """Whether this description declares frame-metadata support.
+
+        True when it carries a session-level `a=x-reactor-frame-metadata:<version>`
+        at a version this build understands, so a peer speaking a different trailer
+        format reads as unsupported rather than as a partial match.
+
+        `set_remote_description` arms the connection's `FrameMetadataGate` from
+        exactly this."""
+        ...
+    def with_frame_metadata(self) -> SessionDescription:
+        """Return a copy declaring frame-metadata support, as a session-level
+        attribute inserted before the first media section.
+
+        `create_offer` already applies this to every offer and `create_answer`
+        mirrors the offer, so callers using this library's signalling path never
+        need it. Public for callers that assemble or rewrite SDP themselves.
+        Idempotent."""
+        ...
 
 # ── Enums ─────────────────────────────────────────────────────────────────────
 
@@ -150,6 +185,50 @@ class StatsReport:
 
 # ── Frame metadata ────────────────────────────────────────────────────────────
 
+FRAME_METADATA_ATTRIBUTE: str
+"""The SDP attribute peers declare frame-metadata support with.
+
+Emitted at session level as `a=x-reactor-frame-metadata:<version>`, before the
+first media section. Session level because support is a property of a peer's
+code, not of one of its tracks.
+
+Unregistered, hence the `x-` prefix. RFC 8866 requires a receiver to ignore an
+attribute it does not recognise, which is what makes it safe to send
+unconditionally. Note that libwebrtc — and browsers — drop unrecognised `a=`
+lines when parsing, so read this from the signalled SDP string rather than from
+anything the stack hands back."""
+
+FRAME_METADATA_VERSION: int
+"""Wire version of the trailer format this build speaks.
+
+A peer declaring a different version reads as unsupported: an incompatible
+change to the trailer bumps this, and old and new then never agree."""
+
+class FrameMetadataGate:
+    """What the remote peer declared about frame-metadata support.
+
+    Available from `PeerConnection.frame_metadata_gate()`. It starts closed and
+    is armed by `set_remote_description` from whether that description declares
+    the capability. Every renegotiation re-arms it, so a peer that drops support
+    closes it again.
+
+    It drives three things, all inside the library: `create_answer` mirrors an
+    offer that declared the capability; `set_remote_description` wires the
+    metadata steps into the video transceivers once it is open; and the sender
+    step appends nothing while it is closed, because handing a trailer to a peer
+    that will not strip it hands the extra bytes to its decoder.
+
+    Callers do not have to consult it — pass `user_data` whenever it is
+    meaningful. Reading it is useful for diagnostics, since "did this peer
+    agree?" is otherwise invisible."""
+
+    def __init__(self) -> None:
+        """A closed gate, not attached to any peer connection. Useful in tests."""
+        ...
+    def is_open(self) -> bool:
+        """Whether trailers may be appended."""
+        ...
+
 class FrameMetadata:
     """Metadata attached to a video frame via the RTP packet trailer.
 
@@ -188,12 +267,14 @@ class EncodedFrame:
     def replace_data(self, new_data: bytes) -> None: ...
 
 class FrameTransform:
-    """Encoded-frame transformer attached to a transceiver sender or receiver.
+    """An encoded-frame callback attached to a transceiver sender or receiver.
 
-    Create from a Python callable with `FrameTransform(callback)`, or obtain a
-    pre-built metadata transform from
-    `Track.sender_metadata_transform()` / `receiver_metadata_transform()` or
-    `EncodedVideoTrack.sender_metadata_transform()`.
+    Create from a Python callable with `FrameTransform(callback)`.
+
+    This is a registration, not a native object: attaching it does not take
+    libwebrtc's single frame-transformer slot. The library owns that slot and
+    composes this callback with its own frame-metadata step, so encoded-frame
+    access and per-frame metadata work on the same transceiver.
 
     Callback signature: `callback(frame: EncodedFrame) -> FrameAction`"""
 
@@ -213,19 +294,9 @@ class Track:
         """Push a raw BGRA video frame into a local video track.
 
         Pass `user_data` (bytes) to embed per-frame metadata in the encoded
-        packet trailer. Requires `sender_metadata_transform()` to be attached
-        to the sender transceiver beforehand; otherwise `user_data` is
-        silently ignored."""
-        ...
-    def sender_metadata_transform(self) -> FrameTransform:
-        """Return a FrameTransform that appends a metadata trailer to encoded
-        frames on the send path. Attach to the sender transceiver with
-        `Transceiver.set_sender_transform` before the SDP exchange."""
-        ...
-    def receiver_metadata_transform(self) -> FrameTransform:
-        """Return a FrameTransform that strips the metadata trailer from
-        received encoded frames. After attachment, `on_video_frame` callbacks
-        carry a `FrameMetadata` when the sender included a trailer."""
+        packet trailer. Nothing else has to be arranged: the trailer is appended
+        once the peer has declared that it strips them, and `user_data` is
+        silently dropped while it has not (see `FrameMetadataGate`)."""
         ...
     def on_video_frame(
         self,
@@ -275,14 +346,9 @@ class EncodedVideoTrack:
         """Push a compressed video frame (Annex-B H.264 or VP8/VP9).
 
         Pass `user_data` (bytes) to embed per-frame metadata in the encoded
-        packet trailer. Requires `sender_metadata_transform()` to be attached
-        to the sender transceiver beforehand; otherwise `user_data` is
-        silently ignored."""
-        ...
-    def sender_metadata_transform(self) -> FrameTransform:
-        """Return a sender FrameTransform that embeds per-frame metadata
-        trailers. Attach to the sender transceiver with
-        `Transceiver.set_sender_transform` before the SDP exchange."""
+        packet trailer. Nothing else has to be arranged: the trailer is appended
+        once the peer has declared that it strips them, and `user_data` is
+        silently dropped while it has not (see `FrameMetadataGate`)."""
         ...
     def add_to_peer_connection(self, pc: PeerConnection) -> None: ...
     def add_transceiver(
@@ -296,11 +362,19 @@ class Transceiver:
     def set_direction(self, direction: TransceiverDirection) -> None: ...
     def set_sender_transform(self, transform: FrameTransform) -> None:
         """Attach a FrameTransform to the sender path of this transceiver.
-        The transform runs after the encoder, before RTP packetization."""
+        The transform runs after the encoder, before RTP packetization.
+
+        Composes rather than replaces: the callback runs first, on the bytes the
+        encoder produced, and the frame-metadata trailer is appended after. Calling
+        this again replaces the callback."""
         ...
     def set_receiver_transform(self, transform: FrameTransform) -> None:
         """Attach a FrameTransform to the receiver path of this transceiver.
-        The transform runs after RTP depacketization, before the decoder."""
+        The transform runs after RTP depacketization, before the decoder.
+
+        Composes rather than replaces, as on the sender. The callback runs before
+        the metadata trailer is stripped, so it sees exactly the bytes that
+        arrived."""
         ...
 
 # ── Data channel ──────────────────────────────────────────────────────────────
@@ -328,10 +402,39 @@ class PeerConnectionObserver:
 # ── Peer connection ───────────────────────────────────────────────────────────
 
 class PeerConnection:
-    async def create_offer(self) -> SessionDescription: ...
-    async def create_answer(self) -> SessionDescription: ...
+    async def create_offer(self) -> SessionDescription:
+        """Create an offer.
+
+        Every offer advertises frame-metadata support as a session-level
+        `a=x-reactor-frame-metadata:<version>`, because this library supports it. A
+        peer that does not understand the attribute ignores it. The declaration is
+        what lets the answerer tell us it strips trailers, which is what opens this
+        connection's `FrameMetadataGate`."""
+        ...
+    async def create_answer(self) -> SessionDescription:
+        """Create an answer.
+
+        Mirrors the offer on frame metadata: the capability is declared only when
+        the offer declared it. Requires `set_remote_description` to have been
+        called with the offer first, which is already the only valid order."""
+        ...
     async def set_local_description(self, sdp: SessionDescription) -> None: ...
-    async def set_remote_description(self, sdp: SessionDescription) -> None: ...
+    async def set_remote_description(self, sdp: SessionDescription) -> None:
+        """Apply the remote description, and arm this connection's
+        `FrameMetadataGate` from it.
+
+        The gate opens when `sdp` declares the capability and closes when
+        it does not, on every call — so a renegotiation in which the peer drops
+        support closes it again."""
+        ...
+    def frame_metadata_gate(self) -> FrameMetadataGate:
+        """What the remote peer declared about frame-metadata support.
+
+        Diagnostic: the library already consults it when answering, when
+        installing the transforms, and when appending a trailer, so a caller does
+        not need to. It stays closed until `set_remote_description` sees a remote
+        description that declares support."""
+        ...
     async def add_ice_candidate(self, candidate: IceCandidate) -> None: ...
     def add_track(self, track: Track) -> None: ...
     def add_transceiver(

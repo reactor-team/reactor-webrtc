@@ -10,10 +10,80 @@
 //! `proto_len`, decodes the protobuf slice, and calls `replace_data` with the
 //! original payload (minus the trailer) before forwarding to the decoder.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use prost::Message;
 
 const MAGIC: &[u8; 4] = b"RXMT";
 const FRAMING: usize = 4 /* proto_len: u32 */ + 4 /* magic */;
+
+/// The SDP attribute name a peer declares to say it understands the trailer this
+/// module defines. Emitted at **session level** as `a=x-reactor-frame-metadata:<version>`.
+///
+/// A session-level line rather than a per-m-section one because support is a
+/// property of a peer's code, not of one of its tracks — no peer understands the
+/// trailer on one video track and not another.
+///
+/// Unregistered, hence the `x-` prefix. RFC 8866 §6 requires a receiver to ignore
+/// an attribute it does not recognise, which is what makes the declaration safe to
+/// send unconditionally: a peer that has never heard of it is unaffected.
+///
+/// Note that libwebrtc drops unrecognised `a=` lines when it parses a description,
+/// so this is readable from the SDP **string** and not from anything libwebrtc
+/// hands back. Everything here reads
+/// [`SessionDescription::sdp`](crate::SessionDescription::sdp) directly for that
+/// reason.
+pub const FRAME_METADATA_ATTRIBUTE: &str = "x-reactor-frame-metadata";
+
+/// Wire version of the trailer format in this module.
+///
+/// A peer declaring a different version reads as *unsupported*: an incompatible
+/// change to the trailer bumps this, and old and new then never agree.
+pub const FRAME_METADATA_VERSION: u32 = 1;
+
+/// What the remote peer declared about frame-metadata support, as negotiated.
+///
+/// A connection's gate is available from
+/// [`PeerConnection::frame_metadata_gate`][gate]. It starts **closed** and is
+/// armed by [`PeerConnection::set_remote_description`][srd] from whether that
+/// description carries [`FRAME_METADATA_ATTRIBUTE`]. Every renegotiation re-arms it, so
+/// a peer that drops support closes it again.
+///
+/// It drives two things, both inside the library:
+///
+/// * [`create_answer`][ca] mirrors the offer — it declares the capability only when
+///   the offer declared it.
+/// * The sender metadata transform consults it per frame and appends nothing
+///   while it is closed, because handing a trailer to a peer that will not strip
+///   it hands the extra bytes to that peer's decoder.
+///
+/// Callers do not have to consult it: pass `user_data` whenever it is meaningful
+/// and let the negotiated state decide whether it reaches the wire. Reading it is
+/// still useful for diagnostics — "did this peer agree?" is otherwise invisible.
+///
+/// [gate]: crate::PeerConnection::frame_metadata_gate
+/// [srd]: crate::PeerConnection::set_remote_description
+/// [ca]: crate::PeerConnection::create_answer
+#[derive(Clone, Debug, Default)]
+pub struct FrameMetadataGate(Arc<AtomicBool>);
+
+impl FrameMetadataGate {
+    /// A closed gate, not attached to any peer connection. Useful in tests.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether trailers may be appended.
+    pub fn is_open(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    /// Arm from whether a remote description declared support.
+    pub(crate) fn set(&self, declared: bool) {
+        self.0.store(declared, Ordering::Relaxed);
+    }
+}
 
 /// Per-frame metadata carried alongside an encoded video frame.
 ///

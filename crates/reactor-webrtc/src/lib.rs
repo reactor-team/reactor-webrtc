@@ -14,6 +14,23 @@
 //! description before it is set locally, which is where libwebrtc reads the
 //! transport's ICE parameters from.
 //!
+//! Per-frame metadata ([`metadata`]) rides in a trailer appended to the encoded
+//! payload, which only works if the peer strips it again. That is negotiated for
+//! you: every [`PeerConnection::create_offer`] advertises the capability as a
+//! session-level `a=x-reactor-frame-metadata`,
+//! [`PeerConnection::create_answer`] mirrors an offer that asked for
+//! it, and [`PeerConnection::set_remote_description`] arms a
+//! [`FrameMetadataGate`] from what the remote declared, and installs the metadata
+//! steps on the video transceivers. Callers pass `user_data` when it is meaningful
+//! and never have to ask what the far end supports — a trailer reaches the wire only
+//! when the peer said it strips them. Set
+//! [`RtcConfiguration::frame_metadata`] to `false` to keep the whole thing out of a
+//! connection.
+//!
+//! A [`FrameTransform`] of your own composes with that rather than displacing it:
+//! the crate owns libwebrtc's single transformer slot per sender/receiver and runs
+//! both, so encoded-frame access and per-frame metadata work on one transceiver.
+//!
 //! Building a real binary or test requires a native `libwebrtc`; set
 //! `REACTOR_WEBRTC_LIB_DIR` or `REACTOR_WEBRTC_PREBUILT_URL`. `cargo check`
 //! works without one.
@@ -26,6 +43,7 @@ pub mod metadata;
 mod observer;
 mod peer_connection;
 pub mod platform;
+mod sender_meta;
 
 use std::collections::VecDeque;
 use std::ffi::CString;
@@ -42,7 +60,9 @@ pub use encoded::{
     FrameDirection, FrameTransform, RawVideoFrame, VideoCodec,
 };
 pub use media::{AudioFrame, MediaKind, Track, VideoFrame};
-pub use metadata::FrameMetadata;
+pub use metadata::{
+    FrameMetadata, FrameMetadataGate, FRAME_METADATA_ATTRIBUTE, FRAME_METADATA_VERSION,
+};
 pub use observer::PeerConnectionObserver;
 pub use peer_connection::{
     DataChannel, DataChannelState, IceCandidate, IceCandidatePairState, IceCandidatePairStats,
@@ -341,7 +361,12 @@ impl PeerConnectionFactory {
                 format!("peer connection creation failed: {reason}")
             }));
         }
-        Ok(PeerConnection::new(raw, state, self.handle()))
+        Ok(PeerConnection::new(
+            raw,
+            state,
+            self.handle(),
+            config.frame_metadata,
+        ))
     }
 
     /// Create a local video track backed by a push-able source

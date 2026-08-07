@@ -137,6 +137,25 @@ pub struct RtcConfiguration {
     /// Whether libwebrtc gathers TCP ICE candidates.
     /// Disabled by default; enable only when UDP is firewalled.
     pub tcp_candidate_policy: TcpCandidatePolicy,
+    /// Whether this connection takes part in per-frame metadata
+    /// ([`crate::metadata`]).
+    ///
+    /// On by default. When on, offers advertise
+    /// [`FRAME_METADATA_ATTRIBUTE`](crate::FRAME_METADATA_ATTRIBUTE), answers mirror an offer
+    /// that asked for it, and the metadata steps are wired into the video
+    /// transceivers once the peer agrees.
+    ///
+    /// Turn it off to keep the capability out of the SDP entirely: offers do not
+    /// advertise it, answers stay silent even when the offer declared it, the
+    /// [`FrameMetadataGate`](crate::FrameMetadataGate) never opens, and `user_data`
+    /// passed to a push is dropped. Nothing about the connection differs from one
+    /// built before the capability existed.
+    ///
+    /// Reasons to: a peer whose encoded payloads must be byte-identical to what
+    /// the encoder produced, a deployment that has not rolled the capability out
+    /// to both ends yet, or ruling frame metadata out while bisecting something
+    /// else.
+    pub frame_metadata: bool,
 }
 
 impl Default for RtcConfiguration {
@@ -156,6 +175,10 @@ impl Default for RtcConfiguration {
             ice_connection_receiving_timeout_ms: None,
             ice_check_interval_strong_connectivity_ms: None,
             tcp_candidate_policy: TcpCandidatePolicy::default(),
+            // On by default: the capability is backwards-compatible by
+            // construction — a peer that does not understand the attribute ignores it
+            // and the gate stays closed — so opting in is not the caller's job.
+            frame_metadata: true,
         }
     }
 }
