@@ -1,5 +1,3 @@
-# Copyright (c) 2026 Reactor Technologies, Inc. All rights reserved.
-#
 # Self-contained Codex code review for pull requests. The entire review
 # lifecycle lives in this file: an acknowledge comment when a review starts,
 # scope selection (incremental by default, full on request), inline findings,
