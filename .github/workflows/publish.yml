@@ -1,13 +1,19 @@
 name: Publish
 
-# Triggered by a semver tag (v0.1.0, v1.2.3, …) or manually for a dry run.
-# Each crate carries its own version in its Cargo.toml — bump only the crates
-# that changed before tagging. The publish steps skip crates whose current
-# version is already on crates.io, so unchanged crates are never re-published.
+# Triggered automatically on every push to main. A `detect-versions` job diffs
+# each crate's Cargo.toml version against the previous commit on main; only
+# crates/packages whose version actually changed get published, each getting
+# its own tag (reactor-webrtc-sys-vX.Y.Z, reactor-webrtc-vX.Y.Z,
+# reactor-webrtc-py-vX.Y.Z) created *after* a successful publish — so a tag
+# existing always means that version is really out.
+#
+# workflow_dispatch remains for manual dry runs (or a manual real re-publish
+# for partial-release recovery) — it always attempts all packages, relying on
+# the same-version-already-published skip checks below. Manual runs never
+# create tags; tag creation only happens on the automatic push-triggered path.
 on:
   push:
-    tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+'
+    branches: [main]
   workflow_dispatch:
     inputs:
       dry_run:
@@ -15,19 +21,82 @@ on:
         type: boolean
         default: true
 
-# Prevent two publish runs from racing on the same tag.
+# Prevent two publish runs from racing on main.
 concurrency:
   group: publish-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
+  # ── 0. Detect which package(s) had their Cargo.toml version bumped ─────
+  detect-versions:
+    name: Detect version bumps
+    runs-on: ubuntu-latest
+    outputs:
+      sys_bumped: ${{ steps.diff.outputs.sys_bumped }}
+      sys_version: ${{ steps.diff.outputs.sys_version }}
+      webrtc_bumped: ${{ steps.diff.outputs.webrtc_bumped }}
+      webrtc_version: ${{ steps.diff.outputs.webrtc_version }}
+      py_bumped: ${{ steps.diff.outputs.py_bumped }}
+      py_version: ${{ steps.diff.outputs.py_version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Diff Cargo.toml versions against the previous commit on main
+        id: diff
+        run: |
+          if [ "${{ github.event_name }}" != "push" ]; then
+            echo "sys_bumped=false" >> "$GITHUB_OUTPUT"
+            echo "webrtc_bumped=false" >> "$GITHUB_OUTPUT"
+            echo "py_bumped=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          BEFORE="${{ github.event.before }}"
+          AFTER="${{ github.sha }}"
+
+          if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            echo "::warning::No previous commit to diff against (new branch or force-push) — skipping bump detection."
+            echo "sys_bumped=false" >> "$GITHUB_OUTPUT"
+            echo "webrtc_bumped=false" >> "$GITHUB_OUTPUT"
+            echo "py_bumped=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          version_at() {
+            git show "$1:$2" 2>/dev/null | grep -m1 '^version' | sed -E 's/version[[:space:]]*=[[:space:]]*"([^"]+)"/\1/'
+          }
+
+          check() {
+            local key="$1" path="$2" old new
+            old=$(version_at "$BEFORE" "$path")
+            new=$(version_at "$AFTER" "$path")
+            if [ -n "$new" ] && [ "$old" != "$new" ]; then
+              echo "::notice::${key}: ${old:-<none>} -> ${new}"
+              echo "${key}_bumped=true" >> "$GITHUB_OUTPUT"
+              echo "${key}_version=${new}" >> "$GITHUB_OUTPUT"
+            else
+              echo "${key}_bumped=false" >> "$GITHUB_OUTPUT"
+            fi
+          }
+
+          check sys    crates/reactor-webrtc-sys/Cargo.toml
+          check webrtc crates/reactor-webrtc/Cargo.toml
+          check py     crates/reactor-webrtc-py/Cargo.toml
+
   # ── 1. Rust crates → crates.io ──────────────────────────────────────────
   publish-crates:
     name: Publish crates to crates.io
+    needs: detect-versions
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      needs.detect-versions.outputs.sys_bumped == 'true' ||
+      needs.detect-versions.outputs.webrtc_bumped == 'true'
     runs-on: ubuntu-latest
     environment: crates-io
     permissions:
-      contents: read   # actions/checkout
+      contents: write  # actions/checkout + pushing version tags
       id-token: write  # OIDC trusted publishing — no API token required
     steps:
       - uses: actions/checkout@v7
@@ -97,12 +166,42 @@ jobs:
           cargo package -p reactor-webrtc-sys --no-verify --list
           cargo package -p reactor-webrtc      --no-verify --list
 
+      # Only the automatic push-triggered path tags — a tag existing always
+      # means that version was actually published. Manual workflow_dispatch
+      # runs (dry run or real recovery publish) never create tags.
+      - name: Tag published crates
+        if: ${{ github.event_name == 'push' }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          tag_if_new() {
+            local tag="$1"
+            if git ls-remote --exit-code --tags origin "refs/tags/${tag}" > /dev/null 2>&1; then
+              echo "::notice::Tag ${tag} already exists — skipping"
+            else
+              git tag "${tag}"
+              git push origin "${tag}"
+            fi
+          }
+
+          if [ "${{ needs.detect-versions.outputs.sys_bumped }}" = "true" ]; then
+            tag_if_new "reactor-webrtc-sys-v${{ needs.detect-versions.outputs.sys_version }}"
+          fi
+          if [ "${{ needs.detect-versions.outputs.webrtc_bumped }}" = "true" ]; then
+            tag_if_new "reactor-webrtc-v${{ needs.detect-versions.outputs.webrtc_version }}"
+          fi
+
   # ── 2. Python wheels → PyPI ─────────────────────────────────────────────
   # Dependency chain for the wheel build: reactor-webrtc-py → reactor-webrtc
   # → reactor-webrtc-sys. Cargo resolves the local path deps automatically;
   # no manual ordering needed within the build step.
   build-wheels:
     name: Build wheel · ${{ matrix.platform }}
+    needs: detect-versions
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      needs.detect-versions.outputs.py_bumped == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -221,16 +320,25 @@ jobs:
           path: dist/*.whl
           if-no-files-found: error
 
-  # publish-python runs only after BOTH build-wheels AND publish-crates succeed,
-  # ensuring we never publish to PyPI if the crates release failed.
+  # publish-python runs only after build-wheels succeeds and publish-crates
+  # either succeeded or was skipped (e.g. only reactor-webrtc-py bumped this
+  # time) — never after publish-crates actually failed.
   publish-python:
     name: Publish Python package to PyPI
-    needs: [build-wheels, publish-crates]
+    needs: [detect-versions, build-wheels, publish-crates]
+    if: |
+      always() &&
+      needs.build-wheels.result == 'success' &&
+      contains(fromJSON('["success", "skipped"]'), needs.publish-crates.result) &&
+      (github.event_name == 'workflow_dispatch' || needs.detect-versions.outputs.py_bumped == 'true')
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
+      contents: write  # pushing the version tag
       id-token: write  # OIDC trusted publishing — no API token required
     steps:
+      - uses: actions/checkout@v7
+
       - uses: actions/download-artifact@v8
         with:
           pattern: wheel-*
@@ -240,8 +348,25 @@ jobs:
       - name: List wheels
         run: ls -lh dist/
 
-      - name: Publish to PyPI
+      # PyPI rejects re-uploading an existing version outright, so — unlike
+      # the crates.io side — check first rather than let the publish step fail.
+      - name: Check if already published
+        id: check
         if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+        run: |
+          VERSION="${{ needs.detect-versions.outputs.py_version }}"
+          if [ -z "$VERSION" ]; then
+            VERSION=$(basename "$(ls dist/*.whl | head -1)" | sed -E 's/^reactor_webrtc-([0-9.]+)-.*/\1/')
+          fi
+          if curl -sf -o /dev/null "https://pypi.org/pypi/reactor-webrtc/${VERSION}/json"; then
+            echo "::notice::reactor-webrtc@${VERSION} already on PyPI — skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish to PyPI
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) && steps.check.outputs.skip != 'true' }}
         uses: pypa/gh-action-pypi-publish@release/v1
         # No token needed — uses OIDC trusted publishing configured on PyPI.
         # Set up at: https://pypi.org/manage/project/reactor-webrtc/settings/publishing/
@@ -252,3 +377,19 @@ jobs:
         run: |
           echo "DRY RUN — wheels that would be published:"
           ls -1 dist/
+
+      # Only the automatic push-triggered path tags — see the note on the
+      # equivalent step in publish-crates.
+      - name: Tag published package
+        if: ${{ github.event_name == 'push' && needs.detect-versions.outputs.py_bumped == 'true' && steps.check.outputs.skip != 'true' }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          TAG="reactor-webrtc-py-v${{ needs.detect-versions.outputs.py_version }}"
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" > /dev/null 2>&1; then
+            echo "::notice::Tag ${TAG} already exists — skipping"
+          else
+            git tag "${TAG}"
+            git push origin "${TAG}"
+          fi
