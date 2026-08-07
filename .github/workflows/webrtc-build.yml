@@ -193,8 +193,8 @@ jobs:
   # but tests must run on the native ubuntu-24.04-arm runner.
   # win/x64 tests were previously skipped in the build job; they run here.
 
-  test:
-    name: cargo test (${{ matrix.os }}-${{ matrix.arch }})
+  sys:
+    name: reactor-webrtc-sys build + check (${{ matrix.os }}-${{ matrix.arch }})
     needs: build
     strategy:
       fail-fast: false
@@ -209,6 +209,9 @@ jobs:
           - os: mac
             arch: arm64
             runner: macos-15
+          - os: mac
+            arch: x64
+            runner: macos-15-intel
           - os: win
             arch: x64
             runner: windows-latest
@@ -249,6 +252,12 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends clang-21
           echo "CXX=clang++-21" >> "$GITHUB_ENV"
+
+      # hk ships no x86_64-apple-darwin binary; disable it so mise install
+      # doesn't error under MISE_LOCKED=1 (hk is only needed for git hooks).
+      - name: Disable hk on mac-x64
+        if: matrix.os == 'mac' && matrix.arch == 'x64'
+        run: echo "MISE_DISABLE_TOOLS=${{ env.MISE_DISABLE_TOOLS }},hk" >> "$GITHUB_ENV"
 
       - uses: jdx/mise-action@v4
         with:
@@ -256,15 +265,15 @@ jobs:
 
       # GitHub Windows runners have no usable non-loopback network interface
       # for WebRTC ICE — skip cargo tests on Windows entirely.
-      - run: mise run test
+      - run: mise run test:sys
         if: runner.os != 'Windows'
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
           MACOSX_DEPLOYMENT_TARGET: "13.0"
 
-  build-wheel:
-    name: build wheel (${{ matrix.os }}-${{ matrix.arch }})
-    needs: build
+  webrtc:
+    name: reactor-webrtc build + check (${{ matrix.os }}-${{ matrix.arch }})
+    needs: sys
     strategy:
       fail-fast: false
       matrix:
@@ -278,6 +287,9 @@ jobs:
           - os: mac
             arch: arm64
             runner: macos-15
+          - os: mac
+            arch: x64
+            runner: macos-15-intel
           - os: win
             arch: x64
             runner: windows-latest
@@ -318,6 +330,90 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends clang-21
           echo "CXX=clang++-21" >> "$GITHUB_ENV"
+
+      # hk ships no x86_64-apple-darwin binary; disable it so mise install
+      # doesn't error under MISE_LOCKED=1 (hk is only needed for git hooks).
+      - name: Disable hk on mac-x64
+        if: matrix.os == 'mac' && matrix.arch == 'x64'
+        run: echo "MISE_DISABLE_TOOLS=${{ env.MISE_DISABLE_TOOLS }},hk" >> "$GITHUB_ENV"
+
+      - uses: jdx/mise-action@v4
+        with:
+          version: ${{ env.MISE_VERSION }}
+
+      # GitHub Windows runners have no usable non-loopback network interface
+      # for WebRTC ICE — skip cargo tests on Windows entirely.
+      - run: mise run test:webrtc
+        if: runner.os != 'Windows'
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+          MACOSX_DEPLOYMENT_TARGET: "13.0"
+
+  build-wheel:
+    name: build wheel (${{ matrix.os }}-${{ matrix.arch }})
+    needs: [build, webrtc]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: x64
+            runner: ubuntu-latest
+          - os: linux
+            arch: arm64
+            runner: ubuntu-24.04-arm
+          - os: mac
+            arch: arm64
+            runner: macos-15
+          - os: mac
+            arch: x64
+            runner: macos-15-intel
+          - os: win
+            arch: x64
+            runner: windows-latest
+            rustflags: "-C target-feature=+crt-static"
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      MISE_VERSION: "2026.6.14"
+      MISE_LOCKED: "1"
+      MISE_DISABLE_TOOLS: "rust,rustup,aqua:rust-lang/rustup"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download prebuilt artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: prebuilt-${{ matrix.os }}-${{ matrix.arch }}
+          path: dl
+
+      - name: Extract prebuilt
+        run: |
+          command -v zstd >/dev/null 2>&1 || sudo apt-get install -y --no-install-recommends zstd || brew install zstd || true
+          mkdir -p prebuilt
+          zstd -dc dl/*.tar.zst | tar -x -C prebuilt
+          echo "REACTOR_WEBRTC_LIB_DIR=$GITHUB_WORKSPACE/prebuilt" >> "$GITHUB_ENV"
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache-on-failure: true
+
+      - name: Install clang-21 (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/llvm.asc
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang-21
+          echo "CXX=clang++-21" >> "$GITHUB_ENV"
+
+      # hk ships no x86_64-apple-darwin binary; disable it so mise install
+      # doesn't error under MISE_LOCKED=1 (hk is only needed for git hooks).
+      - name: Disable hk on mac-x64
+        if: matrix.os == 'mac' && matrix.arch == 'x64'
+        run: echo "MISE_DISABLE_TOOLS=${{ env.MISE_DISABLE_TOOLS }},hk" >> "$GITHUB_ENV"
 
       - uses: jdx/mise-action@v4
         with:
@@ -369,6 +465,9 @@ jobs:
           - os: mac
             arch: arm64
             runner: macos-15
+          - os: mac
+            arch: x64
+            runner: macos-15-intel
           - os: win
             arch: x64
             runner: windows-latest
@@ -386,6 +485,11 @@ jobs:
         with:
           name: wheel-${{ matrix.os }}-${{ matrix.arch }}
           path: target/wheels
+      # hk ships no x86_64-apple-darwin binary; disable it so mise install
+      # doesn't error under MISE_LOCKED=1 (hk is only needed for git hooks).
+      - name: Disable hk on mac-x64
+        if: matrix.os == 'mac' && matrix.arch == 'x64'
+        run: echo "MISE_DISABLE_TOOLS=${{ env.MISE_DISABLE_TOOLS }},hk" >> "$GITHUB_ENV"
       - uses: jdx/mise-action@v4
         with:
           version: ${{ env.MISE_VERSION }}
@@ -393,7 +497,7 @@ jobs:
 
   # Publish the per-target prebuilts as a GitHub Release (opt-in via dispatch).
   publish:
-    needs: [build, test, build-wheel, test-py]
+    needs: [build, sys, webrtc, build-wheel, test-py]
     if: github.event_name == 'workflow_dispatch' && inputs.publish
     runs-on: ubuntu-latest
     # Cutting a release ships prebuilt native binaries that downstream packages
