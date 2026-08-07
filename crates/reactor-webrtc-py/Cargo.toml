@@ -1,6 +1,6 @@
 [package]
 name = "reactor-webrtc-py"
-version = "0.7.1"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false  # distributed as a Python wheel (PyPI), not a crate
@@ -10,7 +10,7 @@ name = "reactor_webrtc"
 crate-type = ["cdylib"]
 
 [dependencies]
-reactor-webrtc = { path = "../reactor-webrtc", version = "0.7.1" }
+reactor-webrtc = { workspace = true }
 pyo3 = { version = "0.22", features = ["extension-module", "abi3-py310"] }
 # Bridges PeerConnection's blocking signaling ops into native Python awaitables
 # (see the "Async signaling" section of README.md). No I/O/timer drivers are

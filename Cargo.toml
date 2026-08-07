@@ -13,9 +13,18 @@ default-members = [
 ]
 
 [workspace.package]
+version = "0.7.1"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/reactor-team/reactor-webrtc"
+
+# Internal path dependencies between the workspace's own crates, centralized
+# here so the version requirement lives in one place instead of drifting out
+# of sync with [workspace.package].version on every bump — see the
+# "Versioning and releases" section of CONTRIBUTING.md.
+[workspace.dependencies]
+reactor-webrtc-sys = { path = "crates/reactor-webrtc-sys", version = "0.7.1" }
+reactor-webrtc = { path = "crates/reactor-webrtc", version = "0.7.1" }
 
 # The pinned upstream WebRTC milestone is tracked in ./WEBRTC_VERSION and baked
 # into the prebuilt artifacts produced by ./webrtc-build.
