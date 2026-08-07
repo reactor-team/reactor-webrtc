@@ -112,12 +112,40 @@ git push --force-with-lease
 
 ## Versioning and releases
 
-`reactor-webrtc-sys` and `reactor-webrtc` are versioned together — bump both
-in lockstep in your PR when either crate's public surface changes.
-`reactor-webrtc-py` (the Python wheel) carries its own version, since a
-Python-only change doesn't always warrant a core-crate release. Pushing a
-`vX.Y.Z` tag runs `publish.yml`, which publishes the changed crates to
-crates.io and builds + publishes the wheel to PyPI.
+`reactor-webrtc-sys`, `reactor-webrtc`, and `reactor-webrtc-py` are always
+released **in lockstep, at the same version** — there is no such thing as,
+say, `reactor-webrtc-sys` at `0.8.0` while `reactor-webrtc` is still at
+`0.7.2`. The version lives in exactly one place: `[workspace.package].version`
+in the root `Cargo.toml`. Every crate's own `Cargo.toml` inherits it via
+`version.workspace = true` — none of them declare their own `version` field.
+To cut a release, bump that one field in your PR; nothing else needs a
+version edit.
+
+The internal dependency between the three crates
+(`reactor-webrtc` → `reactor-webrtc-sys`, `reactor-webrtc-py` →
+`reactor-webrtc`) is centralized the same way, via `[workspace.dependencies]`
+in the root `Cargo.toml` — each crate depends on the sibling with
+`{ workspace = true }` rather than its own `path` + `version`. This exists so
+a bump can't accidentally publish (say) `reactor-webrtc@0.8.0` while its
+published metadata still requires `reactor-webrtc-sys@^0.7.0` — Cargo has no
+built-in way to inherit a *dependency's* version requirement from
+`[workspace.package].version`, so this second table needs its version
+strings bumped by hand alongside the first, but both live in the same file.
+
+Merging that bump to `main` publishes automatically: `publish.yml` diffs the
+workspace version against the previous commit, and if it changed, publishes
+`reactor-webrtc-sys` + `reactor-webrtc` to crates.io and builds + publishes
+the `reactor-webrtc-py` wheel to PyPI. Once all three have actually shipped,
+it tags the release `vX.Y.Z` — a `v*` tag existing always means the full
+release went out, never a partial one. If a merge doesn't bump the version,
+nothing publishes.
+
+No manual tagging step is needed or expected. `workflow_dispatch` on
+`publish.yml` exists only for a dry run (build everything, publish nothing)
+or a manual re-publish if a previous run failed partway through — crates.io
+and PyPI publishing aren't atomic across packages, so a prior run can fail
+after crates.io succeeded but before PyPI did; every publish step checks "is
+this version already out?" first, so re-running is always safe.
 
 ## Reporting a bug or requesting a feature
 
