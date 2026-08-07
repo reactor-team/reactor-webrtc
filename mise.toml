@@ -86,13 +86,27 @@ run = "cargo clippy --workspace -- -D warnings"
 description = "[Testing] Workspace tests via nextest + doctests (requires a prebuilt libwebrtc)"
 # Needs a native lib: set REACTOR_WEBRTC_LIB_DIR to a staged build, or
 # REACTOR_WEBRTC_PREBUILT_URL/_SHA256 to a published prebuilt (see README).
+# Split into per-crate tasks so CI can gate reactor-webrtc's build+check on
+# reactor-webrtc-sys's passing first, matching the crate dependency order.
+depends = ["test:sys", "test:webrtc"]
+
+[tasks."test:sys"]
+description = "[Testing] reactor-webrtc-sys tests via nextest + doctests (requires a prebuilt libwebrtc)"
+# reactor-webrtc-sys's only test (link.rs) just checks the FFI glue links
+# correctly - no network/ICE involved, so it runs fine on every platform.
+run = [
+  "cargo nextest run -p reactor-webrtc-sys --no-tests=pass",
+  "cargo test -p reactor-webrtc-sys --doc",
+]
+
+[tasks."test:webrtc"]
+description = "[Testing] reactor-webrtc tests via nextest + doctests (requires a prebuilt libwebrtc)"
 # nextest runs the unit/integration tests (fast, per-test process isolation) but
 # does NOT run doctests, so `cargo test --doc` covers reactor-webrtc's doc
-# examples. reactor-webrtc-py has no Rust tests (it is covered by pytest) - its
-# cdylib is excluded here so the Rust test run stays free of a Python build dep.
+# examples. reactor-webrtc-py has no Rust tests (it is covered by pytest).
 run = [
-  "cargo nextest run --workspace --exclude reactor-webrtc-py --no-tests=pass",
-  "cargo test --workspace --exclude reactor-webrtc-py --doc",
+  "cargo nextest run -p reactor-webrtc --no-tests=pass",
+  "cargo test -p reactor-webrtc --doc",
 ]
 
 [tasks.lint]
