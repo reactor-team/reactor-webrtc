@@ -1339,14 +1339,24 @@ impl Transceiver {
 
     /// Attach a local track to the sender slot. Accepts either a `Track` or an
     /// `EncodedVideoTrack`.
-    fn set_track(&self, track: &Bound<'_, PyAny>) -> PyResult<()> {
+    fn set_track(&self, py: Python, track: &Bound<'_, PyAny>) -> PyResult<()> {
+        // Reaches the sender through two signaling-thread proxy calls, so the GIL
+        // has to be free for the duration.
         if let Ok(t) = track.downcast::<Track>() {
             let t = t.borrow();
-            return self.inner.set_track(&t.inner).map_err(err);
+            // The borrow guard carries a GIL token, so the native reference has
+            // to be taken out of it before the GIL is released.
+            let native: &rw::Track = &t.inner;
+            return py
+                .allow_threads(|| self.inner.set_track(native))
+                .map_err(err);
         }
         if let Ok(enc) = track.downcast::<EncodedVideoTrack>() {
             let enc = enc.borrow();
-            return self.inner.set_track(enc.inner.track()).map_err(err);
+            let native: &rw::Track = enc.inner.track();
+            return py
+                .allow_threads(|| self.inner.set_track(native))
+                .map_err(err);
         }
         Err(PyTypeError::new_err(
             "track must be a Track or EncodedVideoTrack",
@@ -1416,38 +1426,48 @@ impl DataChannel {
     }
 
     /// Register `callback(data: bytes, binary: bool)` for incoming messages.
-    fn on_message(&mut self, callback: PyObject) {
-        self.inner.on_message(move |data, binary| {
-            Python::with_gil(|py| {
-                let bytes = PyBytes::new_bound(py, data);
-                let _ = callback.call1(py, (bytes, binary));
+    fn on_message(&mut self, py: Python, callback: PyObject) {
+        // Registering re-registers the native observer, which dispatches to the
+        // thread that delivers messages into Python. The GIL has to be free.
+        py.allow_threads(|| {
+            self.inner.on_message(move |data, binary| {
+                Python::with_gil(|py| {
+                    let bytes = PyBytes::new_bound(py, data);
+                    let _ = callback.call1(py, (bytes, binary));
+                });
             });
         });
     }
 
     /// Register `callback(state: DataChannelState)` for state transitions.
-    fn on_state_change(&mut self, callback: PyObject) {
-        self.inner.on_state_change(move |s| {
-            Python::with_gil(|py| {
-                let _ = callback.call1(py, (DataChannelState::from(s),));
+    fn on_state_change(&mut self, py: Python, callback: PyObject) {
+        py.allow_threads(|| {
+            self.inner.on_state_change(move |s| {
+                Python::with_gil(|py| {
+                    let _ = callback.call1(py, (DataChannelState::from(s),));
+                });
             });
         });
     }
 
     /// Fire `callback()` once when the channel opens.
-    fn on_open(&mut self, callback: PyObject) {
-        self.inner.on_open(move || {
-            Python::with_gil(|py| {
-                let _ = callback.call0(py);
+    fn on_open(&mut self, py: Python, callback: PyObject) {
+        py.allow_threads(|| {
+            self.inner.on_open(move || {
+                Python::with_gil(|py| {
+                    let _ = callback.call0(py);
+                });
             });
         });
     }
 
     /// Fire `callback()` once when the channel closes.
-    fn on_close(&mut self, callback: PyObject) {
-        self.inner.on_close(move || {
-            Python::with_gil(|py| {
-                let _ = callback.call0(py);
+    fn on_close(&mut self, py: Python, callback: PyObject) {
+        py.allow_threads(|| {
+            self.inner.on_close(move || {
+                Python::with_gil(|py| {
+                    let _ = callback.call0(py);
+                });
             });
         });
     }

@@ -89,6 +89,15 @@ CASES = {
         "extra = pc.add_transceiver(rw.MediaKind.Audio, rw.TransceiverDirection.RecvOnly)",
     ),
     "create_data_channel": ("", 'channel = pc.create_data_channel("probe-data")'),
+    "set_track": (
+        'sender = pc.add_transceiver(rw.MediaKind.Video, rw.TransceiverDirection.SendOnly); '
+        'cam = factory.create_video_track("cam")',
+        "sender.set_track(cam)",
+    ),
+    "on_message": (
+        'channel = pc.create_data_channel("probe-messages")',
+        "channel.on_message(lambda *_: None)",
+    ),
     "on_video_frame": (
         'sink = factory.create_video_track("sink-probe")',
         "sink.on_video_frame(lambda *_: None)",
