@@ -939,7 +939,7 @@ impl From<rw::FrameMetadata> for FrameMetadata {
 /// Audio frames are interleaved signed 16-bit little-endian PCM bytes.
 #[pyclass]
 pub struct Track {
-    inner: rw::Track,
+    inner: ManuallyDrop<rw::Track>,
 }
 
 #[pymethods]
@@ -1001,28 +1001,33 @@ impl Track {
     /// For backward compatibility with 3-argument callbacks
     /// `callback(bgra, width, height)`, the 4-argument call is retried as a
     /// 3-argument call on `TypeError` when `metadata` is `None`.
-    fn on_video_frame(&mut self, callback: PyObject) {
-        self.inner.on_video_frame(move |frame| {
-            Python::with_gil(|py| {
-                let bytes = PyBytes::new_bound(py, frame.bgra);
-                let meta = frame.metadata.map(|m| {
-                    Py::new(py, FrameMetadata::from(m))
-                        .map(|p| p.into_any())
-                        .unwrap_or_else(|_| py.None())
-                });
-                match meta {
-                    Some(m) => {
-                        let _ = callback.call1(py, (bytes, frame.width, frame.height, m));
-                    }
-                    None => {
-                        // Try 4-arg (with None); fall back to legacy 3-arg on TypeError.
-                        let result = callback
-                            .call1(py, (bytes.clone(), frame.width, frame.height, py.None()));
-                        if result.is_err() {
-                            let _ = callback.call1(py, (bytes, frame.width, frame.height));
+    fn on_video_frame(&mut self, py: Python, callback: PyObject) {
+        // Attaching a sink dispatches synchronously to the worker thread, which
+        // is also where another track's frame callback re-enters Python. The GIL
+        // has to be free across the dispatch or the two deadlock.
+        py.allow_threads(|| {
+            self.inner.on_video_frame(move |frame| {
+                Python::with_gil(|py| {
+                    let bytes = PyBytes::new_bound(py, frame.bgra);
+                    let meta = frame.metadata.map(|m| {
+                        Py::new(py, FrameMetadata::from(m))
+                            .map(|p| p.into_any())
+                            .unwrap_or_else(|_| py.None())
+                    });
+                    match meta {
+                        Some(m) => {
+                            let _ = callback.call1(py, (bytes, frame.width, frame.height, m));
+                        }
+                        None => {
+                            // Try 4-arg (with None); fall back to legacy 3-arg on TypeError.
+                            let result = callback
+                                .call1(py, (bytes.clone(), frame.width, frame.height, py.None()));
+                            if result.is_err() {
+                                let _ = callback.call1(py, (bytes, frame.width, frame.height));
+                            }
                         }
                     }
-                }
+                });
             });
         });
     }
@@ -1045,13 +1050,16 @@ impl Track {
 
     /// Register `callback(pcm: bytes, sample_rate, channels, frames)` for
     /// decoded audio from a remote track. `pcm` is i16 little-endian.
-    fn on_audio_frame(&mut self, callback: PyObject) {
-        self.inner.on_audio_frame(move |frame| {
-            Python::with_gil(|py| {
-                let raw: Vec<u8> = frame.pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
-                let bytes = PyBytes::new_bound(py, &raw);
-                let _ =
-                    callback.call1(py, (bytes, frame.sample_rate, frame.channels, frame.frames));
+    fn on_audio_frame(&mut self, py: Python, callback: PyObject) {
+        // Same worker-thread dispatch as `on_video_frame`.
+        py.allow_threads(|| {
+            self.inner.on_audio_frame(move |frame| {
+                Python::with_gil(|py| {
+                    let raw: Vec<u8> = frame.pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
+                    let bytes = PyBytes::new_bound(py, &raw);
+                    let _ = callback
+                        .call1(py, (bytes, frame.sample_rate, frame.channels, frame.frames));
+                });
             });
         });
     }
@@ -1059,7 +1067,19 @@ impl Track {
 
 impl Track {
     fn from_rust(track: rw::Track) -> Self {
-        Self { inner: track }
+        Self {
+            inner: ManuallyDrop::new(track),
+        }
+    }
+}
+
+impl Drop for Track {
+    fn drop(&mut self) {
+        // Releasing the native track dispatches to the thread that owns it,
+        // where a frame or candidate callback may be inside Python. Release the
+        // GIL so that callback can finish and the dispatch can be serviced.
+        let inner = unsafe { ManuallyDrop::take(&mut self.inner) };
+        Python::with_gil(|py| py.allow_threads(|| drop(inner)));
     }
 }
 
@@ -1072,7 +1092,15 @@ impl Track {
 /// or `add_transceiver` to wire it into a `PeerConnection`.
 #[pyclass]
 pub struct EncodedVideoTrack {
-    inner: rw::EncodedVideoTrack,
+    inner: ManuallyDrop<rw::EncodedVideoTrack>,
+}
+
+impl Drop for EncodedVideoTrack {
+    fn drop(&mut self) {
+        // Wraps a native track; same dispatch-on-release as `Track`.
+        let inner = unsafe { ManuallyDrop::take(&mut self.inner) };
+        Python::with_gil(|py| py.allow_threads(|| drop(inner)));
+    }
 }
 
 #[pymethods]
@@ -1088,9 +1116,11 @@ impl EncodedVideoTrack {
     /// packet trailer (same mechanism as `Track.push_video_frame`). Metadata
     /// is only sent when the peer has negotiated support; otherwise `user_data`
     /// is silently dropped.
+    #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (data, is_key_frame=false, width=0, height=0, rtp_timestamp=0, user_data=None))]
     fn push_encoded_frame(
         &self,
+        py: Python,
         data: &[u8],
         is_key_frame: bool,
         width: u32,
@@ -1105,10 +1135,10 @@ impl EncodedVideoTrack {
             height,
             rtp_timestamp,
         };
-        match user_data {
+        py.allow_threads(|| match user_data {
             Some(ud) => self.inner.push_encoded_frame_with_metadata(frame, ud),
             None => self.inner.push_encoded_frame(frame),
-        }
+        });
     }
 
     /// Add this track to a peer connection via `add_track` (creates a sendrecv
@@ -1136,7 +1166,9 @@ impl EncodedVideoTrack {
             })
             .map_err(err)?;
         py.allow_threads(|| t.set_track(track)).map_err(err)?;
-        Ok(Transceiver { inner: t })
+        Ok(Transceiver {
+            inner: ManuallyDrop::new(t),
+        })
     }
 }
 
@@ -1281,7 +1313,16 @@ impl FrameTransform {
 /// An RTP transceiver (one m-section in the SDP).
 #[pyclass]
 pub struct Transceiver {
-    inner: rw::Transceiver,
+    inner: ManuallyDrop<rw::Transceiver>,
+}
+
+impl Drop for Transceiver {
+    fn drop(&mut self) {
+        // Holds native sender and receiver references; releasing them dispatches
+        // to the signaling thread, which may be inside Python.
+        let inner = unsafe { ManuallyDrop::take(&mut self.inner) };
+        Python::with_gil(|py| py.allow_threads(|| drop(inner)));
+    }
 }
 
 #[pymethods]
@@ -1693,7 +1734,9 @@ impl PeerConnection {
             self.pc()
                 .add_transceiver(rust_kind, rw::TransceiverDirection::from(direction))
         })
-        .map(|t| Transceiver { inner: t })
+        .map(|t| Transceiver {
+            inner: ManuallyDrop::new(t),
+        })
         .map_err(err)
     }
     fn create_data_channel(&self, py: Python, label: &str) -> PyResult<DataChannel> {
@@ -1711,7 +1754,9 @@ impl PeerConnection {
     fn transceivers(&self, py: Python) -> Vec<Transceiver> {
         py.allow_threads(|| self.pc().transceivers())
             .into_iter()
-            .map(|t| Transceiver { inner: t })
+            .map(|t| Transceiver {
+                inner: ManuallyDrop::new(t),
+            })
             .collect()
     }
 
@@ -1817,8 +1862,12 @@ impl PeerConnectionFactory {
     ) -> PyResult<PeerConnection> {
         let rust_config = rw::RtcConfiguration::from(config);
         let rust_obs = observer.build_rust_observer(py);
-        self.inner
-            .create_peer_connection(&rust_config, rust_obs)
+        // Creating a peer connection dispatches synchronously to the signaling
+        // thread, which is also where another connection's observer callbacks
+        // (an ICE candidate, say) re-enter Python. Holding the GIL across the
+        // dispatch deadlocks the two: this thread waits for the signaling
+        // thread, which waits for the GIL.
+        py.allow_threads(|| self.inner.create_peer_connection(&rust_config, rust_obs))
             .map(|inner| PeerConnection {
                 inner: Some(Arc::new(inner)),
             })
@@ -1826,17 +1875,15 @@ impl PeerConnectionFactory {
     }
 
     /// Create a local video track (push frames via `Track.push_video_frame`).
-    fn create_video_track(&self, id: &str) -> PyResult<Track> {
-        self.inner
-            .create_video_track(id)
+    fn create_video_track(&self, py: Python, id: &str) -> PyResult<Track> {
+        py.allow_threads(|| self.inner.create_video_track(id))
             .map(Track::from_rust)
             .map_err(err)
     }
 
     /// Create a local audio track. Feed samples via `push_audio_frame`.
-    fn create_audio_track(&self, id: &str) -> PyResult<Track> {
-        self.inner
-            .create_audio_track(id)
+    fn create_audio_track(&self, py: Python, id: &str) -> PyResult<Track> {
+        py.allow_threads(|| self.inner.create_audio_track(id))
             .map(Track::from_rust)
             .map_err(err)
     }
@@ -1845,9 +1892,8 @@ impl PeerConnectionFactory {
     /// Feed samples via `track.push_pcm(pcm_bytes, sample_rate, channels)`.
     /// Each call returns an independent track — different audio can be pushed
     /// to different peer connections.
-    fn create_audio_track_with_local_source(&self, id: &str) -> PyResult<Track> {
-        self.inner
-            .create_audio_track_with_local_source(id)
+    fn create_audio_track_with_local_source(&self, py: Python, id: &str) -> PyResult<Track> {
+        py.allow_threads(|| self.inner.create_audio_track_with_local_source(id))
             .map(Track::from_rust)
             .map_err(err)
     }
@@ -1885,7 +1931,14 @@ impl PeerConnectionFactory {
     ) -> PyResult<(Self, EncodedVideoTrack)> {
         claim_factory()?;
         rw::PeerConnectionFactory::with_encoded_video_track(track_id, width, height)
-            .map(|(f, t)| (Self { inner: f }, EncodedVideoTrack { inner: t }))
+            .map(|(f, t)| {
+                (
+                    Self { inner: f },
+                    EncodedVideoTrack {
+                        inner: ManuallyDrop::new(t),
+                    },
+                )
+            })
             .map_err(|e| {
                 FACTORY_LIVE.store(false, Ordering::SeqCst);
                 err(e)
