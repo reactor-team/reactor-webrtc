@@ -1654,9 +1654,10 @@ impl PeerConnectionObserver {
 /// An RTCPeerConnection.
 ///
 /// Signaling methods (`create_offer`, `create_answer`, `set_local_description`,
-/// `set_remote_description`, `add_ice_candidate`, `get_stats`) are natively
-/// awaitable — `await` them directly from an async context, no executor
-/// wrapping needed. Every other method is a fast synchronous call.
+/// `set_remote_description`, `add_ice_candidate`, `get_stats`, `set_bitrate`,
+/// `transceivers`) are natively awaitable — `await` them directly from an
+/// async context, no executor wrapping needed. Every other method is a fast
+/// synchronous call.
 #[pyclass]
 pub struct PeerConnection {
     inner: Option<Arc<rw::PeerConnection>>,
@@ -1804,14 +1805,20 @@ impl PeerConnection {
     /// All transceivers on this peer connection, in offer m-section order after
     /// `set_remote_description`. Use this (together with `Transceiver.set_track`)
     /// to attach local tracks to the transceivers auto-created from the remote
-    /// offer's recvonly m-sections.
-    fn transceivers(&self, py: Python) -> Vec<Transceiver> {
-        py.allow_threads(|| self.pc().transceivers())
-            .into_iter()
-            .map(|t| Transceiver {
-                inner: ManuallyDrop::new(t),
-            })
-            .collect()
+    /// offer's recvonly m-sections. Natively awaitable.
+    fn transceivers<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(self.pc());
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let ts = tokio::task::spawn_blocking(move || inner.transceivers())
+                .await
+                .map_err(join_err)?;
+            Ok(ts
+                .into_iter()
+                .map(|t| Transceiver {
+                    inner: ManuallyDrop::new(t),
+                })
+                .collect::<Vec<_>>())
+        })
     }
 
     /// Collect a stats snapshot from the WebRTC engine. Natively awaitable.

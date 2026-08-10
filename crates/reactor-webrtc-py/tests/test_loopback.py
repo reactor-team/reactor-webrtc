@@ -572,7 +572,7 @@ class TestFrameMetadata:
             return rw.FrameAction.Forward
 
         inspect_tf = rw.FrameTransform(inspect_recv)
-        for t in p2.pc.transceivers():
+        for t in await p2.pc.transceivers():
             if t.kind() == rw.MediaKind.Video:
                 t.set_receiver_transform(inspect_tf)
                 break
