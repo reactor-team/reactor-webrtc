@@ -848,7 +848,9 @@ type SdpTx = SyncSender<Result<SessionDescription>>;
 type CompleteTx = SyncSender<Result<()>>;
 
 extern "C" fn sdp_ok(ud: *mut c_void, ty: *const c_char, sdp: *const c_char) {
-    let tx = unsafe { &*(ud as *const SdpTx) };
+    // Reclaims this callback's own strong ref (see the comment on `run_sdp`
+    // for why the caller cannot be the sole owner of the box).
+    let tx = unsafe { Arc::from_raw(ud as *const SdpTx) };
     let kind = unsafe { CStr::from_ptr(ty) }.to_string_lossy();
     let sdp = unsafe { CStr::from_ptr(sdp) }
         .to_string_lossy()
@@ -860,14 +862,14 @@ extern "C" fn sdp_ok(ud: *mut c_void, ty: *const c_char, sdp: *const c_char) {
     let _ = tx.try_send(result);
 }
 extern "C" fn sdp_err(ud: *mut c_void, message: *const c_char) {
-    let tx = unsafe { &*(ud as *const SdpTx) };
+    let tx = unsafe { Arc::from_raw(ud as *const SdpTx) };
     let msg = unsafe { CStr::from_ptr(message) }
         .to_string_lossy()
         .into_owned();
     let _ = tx.try_send(Err(Error::Webrtc(msg)));
 }
 extern "C" fn complete_cb(ud: *mut c_void, error: *const c_char) {
-    let tx = unsafe { &*(ud as *const CompleteTx) };
+    let tx = unsafe { Arc::from_raw(ud as *const CompleteTx) };
     let r = if error.is_null() {
         Ok(())
     } else {
@@ -883,7 +885,7 @@ extern "C" fn complete_cb(ud: *mut c_void, error: *const c_char) {
 type StatsTx = SyncSender<StatsReport>;
 
 extern "C" fn stats_cb(ud: *mut c_void, entries: *const ReactorStatEntry, count: c_int) {
-    let tx = unsafe { &*(ud as *const StatsTx) };
+    let tx = unsafe { Arc::from_raw(ud as *const StatsTx) };
     let slice = if entries.is_null() || count <= 0 {
         &[][..]
     } else {
@@ -920,30 +922,57 @@ extern "C" fn stats_cb(ud: *mut c_void, entries: *const ReactorStatEntry, count:
     let _ = tx.try_send(report);
 }
 
+// `call` dispatches onto a libwebrtc thread that invokes the C callback
+// asynchronously; the public API gives no guarantee that thread has finished
+// unwinding out of the callback (still touching `tx` inside its own `notify()`
+// after `try_send`'s value became visible to `recv_timeout`) by the time this
+// function's wait returns. Sharing the box via `Arc` instead of freeing it
+// unilaterally here means whichever side — this caller, or the callback —
+// finishes last is the one that frees it, closing that use-after-free window.
+// Mirrors the AddRef/Release fix applied to StatsCallback on the C++ side.
+//
+// Two consequences of the `Arc::from_raw` in each callback above, since it's
+// the contract those four `extern "C"` fns must honour:
+// - Exactly-once delivery is now a *safety* requirement, not just a
+//   correctness one: a second `Arc::from_raw` on the same pointer double-frees
+//   once both callback-side refs drop. Holds today (`CreateSdpObserver` fires
+//   exactly one of `OnSuccess`/`OnFailure`; the `Set*DescObserver`s and
+//   `AddIceCandidate`'s completion each fire once; every early-return path in
+//   the glue invokes the callback before returning) but isn't enforced by the
+//   type system.
+// - If a callback is *never* invoked (e.g. an in-flight completion dropped
+//   during peer-connection teardown), its ref is never reclaimed and the
+//   channel leaks. Deliberate — a leak beats the UAF it replaces — but it
+//   does mean "whichever side finishes last frees it" assumes the callback
+//   side eventually runs at all.
+
 fn run_stats(call: impl FnOnce(*mut c_void)) -> Result<StatsReport> {
     let (tx, rx) = sync_channel::<StatsReport>(1);
-    let p = Box::into_raw(Box::new(tx));
+    let tx = Arc::new(tx);
+    let p = Arc::into_raw(tx.clone());
     call(p as *mut c_void);
     let r = rx.recv_timeout(OP_TIMEOUT);
-    drop(unsafe { Box::from_raw(p) });
+    drop(tx);
     r.map_err(|_| Error::Webrtc("get_stats timed out".into()))
 }
 
 fn run_sdp(call: impl FnOnce(*mut c_void)) -> Result<SessionDescription> {
     let (tx, rx) = sync_channel::<Result<SessionDescription>>(1);
-    let p = Box::into_raw(Box::new(tx));
+    let tx = Arc::new(tx);
+    let p = Arc::into_raw(tx.clone());
     call(p as *mut c_void);
     let r = rx.recv_timeout(OP_TIMEOUT);
-    drop(unsafe { Box::from_raw(p) });
+    drop(tx);
     r.map_err(|_| Error::Webrtc("sdp operation timed out".into()))?
 }
 
 fn run_complete(call: impl FnOnce(*mut c_void)) -> Result<()> {
     let (tx, rx) = sync_channel::<Result<()>>(1);
-    let p = Box::into_raw(Box::new(tx));
+    let tx = Arc::new(tx);
+    let p = Arc::into_raw(tx.clone());
     call(p as *mut c_void);
     let r = rx.recv_timeout(OP_TIMEOUT);
-    drop(unsafe { Box::from_raw(p) });
+    drop(tx);
     r.map_err(|_| Error::Webrtc("operation timed out".into()))?
 }
 
