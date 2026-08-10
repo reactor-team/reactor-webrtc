@@ -1,5 +1,5 @@
-//! Stress test for the `run_sdp`/`run_complete`/`run_stats` async-op bridge in
-//! `peer_connection.rs`.
+//! Stress test / manual reproducer for the `run_sdp`/`run_complete`/
+//! `run_stats` async-op bridge in `peer_connection.rs`.
 //!
 //! Each bridge hands libwebrtc's signaling thread a pointer to a boxed
 //! `SyncSender`, waits on the paired `Receiver`, and — in the buggy version —
@@ -10,17 +10,25 @@
 //! flaky, timing-dependent segfault (`EXC_BAD_ACCESS`/`SIGSEGV`) inside
 //! `std::sync::mpmc::waker::SyncWaker::notify`.
 //!
-//! This can't be forced deterministically without patching `std`'s internals.
-//! Empirically, hammering `create_offer` alone with no media flowing, even at
-//! very high concurrency/volume, was not enough to reproduce it — the
-//! original crash happened inside a real loopback connection with audio +
-//! video actually flowing (more libwebrtc subsystems active, more threads
-//! under real load). This test repeatedly runs a full connect-with-media
-//! cycle instead of a bare `create_offer` loop, and is meant to be run as
-//! several concurrent *processes* (see the repo's segfault investigation
-//! notes) rather than relying on in-process thread concurrency alone — the
-//! original crash reproduced under cross-process CPU contention (parallel
-//! pytest workers), not multiple threads sharing one factory.
+//! This can't be forced deterministically without patching `std`'s internals,
+//! and empirically a single process — even hammering `create_offer` with no
+//! media flowing across dozens of threads — was not enough to reproduce it.
+//! What did: several concurrent *processes* (cross-process CPU contention,
+//! the way parallel pytest workers on CI ended up producing it), each
+//! running a real loopback connection with audio + video actually flowing.
+//! `#[ignore]`d so it doesn't cost every `cargo test` run on every platform
+//! for a reproduction path that single-process runs can't exercise anyway;
+//! run it manually as the reproducer it's meant to be:
+//!
+//! ```sh
+//! cargo build --release --tests -p reactor-webrtc
+//! bin=$(find target/release/deps -maxdepth 1 -name 'sdp_bridge_race-*' -perm +111)
+//! for i in 1 2 3 4 5 6; do "$bin" --ignored --nocapture & done; wait
+//! ```
+//!
+//! Against the unfixed bridge this reliably kills all 6 processes with
+//! SIGSEGV (exit 139) within the first cycle or two; against the fix, all 6
+//! complete ~1700 connect cycles apiece in the 45s budget below with none.
 #![cfg(have_libwebrtc)]
 
 use std::collections::VecDeque;
@@ -90,11 +98,14 @@ fn forward_ice(from: &Shared, to: &PeerConnection) {
 }
 
 #[test]
+#[ignore = "reproducer meant to be run as several concurrent processes — see module docs"]
 fn sdp_bridge_survives_repeated_connects_with_media() {
     let factory = PeerConnectionFactory::new().expect("factory");
     let config = RtcConfiguration::default();
     let deadline = Instant::now() + Duration::from_secs(45);
     let mut iterations = 0u32;
+    let mut connected_iterations = 0u32;
+    const PER_CYCLE_TIMEOUT: Duration = Duration::from_secs(10);
 
     while Instant::now() < deadline {
         let (pc1, s1) = make_peer(&factory, &config);
@@ -116,11 +127,19 @@ fn sdp_bridge_survives_repeated_connects_with_media() {
             .expect("pc1 remote answer");
 
         let stop = AtomicBool::new(false);
+        let mut this_cycle_connected = false;
         thread::scope(|scope| {
             scope.spawn(|| {
+                // Its own deadline, independent of `stop`: if the main leg of
+                // this scope panics (e.g. a `get_stats` timeout under the
+                // heavy contention this test is designed for) before it can
+                // set `stop`, this thread must still exit on its own —
+                // otherwise `thread::scope` blocks joining it forever and a
+                // test failure turns into an indefinite CI hang.
+                let pump_deadline = Instant::now() + PER_CYCLE_TIMEOUT + Duration::from_secs(1);
                 let (w, h) = (320u32, 240u32);
                 let bgra = vec![0x40u8; (w * h * 4) as usize];
-                while !stop.load(Ordering::SeqCst) {
+                while !stop.load(Ordering::SeqCst) && Instant::now() < pump_deadline {
                     video.push_video_frame(&bgra, w, h);
                     thread::sleep(Duration::from_millis(15));
                 }
@@ -133,7 +152,11 @@ fn sdp_bridge_survives_repeated_connects_with_media() {
                 let _ = pc1.get_stats().expect("get_stats");
                 let connected = s2.connected.load(Ordering::SeqCst);
                 let media = s2.video_frames.load(Ordering::SeqCst) > 0;
-                if (connected && media) || start.elapsed() > Duration::from_secs(10) {
+                if connected && media {
+                    this_cycle_connected = true;
+                    break;
+                }
+                if start.elapsed() > PER_CYCLE_TIMEOUT {
                     break;
                 }
                 thread::sleep(Duration::from_millis(10));
@@ -142,8 +165,20 @@ fn sdp_bridge_survives_repeated_connects_with_media() {
         });
 
         iterations += 1;
+        if this_cycle_connected {
+            connected_iterations += 1;
+        }
     }
 
-    println!("sdp_bridge_survives_repeated_connects_with_media: {iterations} connect cycles completed with no crash");
-    assert!(iterations > 0, "no iterations completed — setup is broken");
+    println!(
+        "sdp_bridge_survives_repeated_connects_with_media: \
+         {connected_iterations}/{iterations} connect cycles succeeded with no crash"
+    );
+    // A UAF in the bridge kills the process outright (this assertion never
+    // gets to run) — this guards against the other way the test could go
+    // quietly wrong: the bridge silently breaking so nothing ever connects.
+    assert_eq!(
+        connected_iterations, iterations,
+        "at least one connect cycle failed to connect+receive media within {PER_CYCLE_TIMEOUT:?}"
+    );
 }

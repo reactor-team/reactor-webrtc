@@ -930,6 +930,21 @@ extern "C" fn stats_cb(ud: *mut c_void, entries: *const ReactorStatEntry, count:
 // unilaterally here means whichever side — this caller, or the callback —
 // finishes last is the one that frees it, closing that use-after-free window.
 // Mirrors the AddRef/Release fix applied to StatsCallback on the C++ side.
+//
+// Two consequences of the `Arc::from_raw` in each callback above, since it's
+// the contract those four `extern "C"` fns must honour:
+// - Exactly-once delivery is now a *safety* requirement, not just a
+//   correctness one: a second `Arc::from_raw` on the same pointer double-frees
+//   once both callback-side refs drop. Holds today (`CreateSdpObserver` fires
+//   exactly one of `OnSuccess`/`OnFailure`; the `Set*DescObserver`s and
+//   `AddIceCandidate`'s completion each fire once; every early-return path in
+//   the glue invokes the callback before returning) but isn't enforced by the
+//   type system.
+// - If a callback is *never* invoked (e.g. an in-flight completion dropped
+//   during peer-connection teardown), its ref is never reclaimed and the
+//   channel leaks. Deliberate — a leak beats the UAF it replaces — but it
+//   does mean "whichever side finishes last frees it" assumes the callback
+//   side eventually runs at all.
 
 fn run_stats(call: impl FnOnce(*mut c_void)) -> Result<StatsReport> {
     let (tx, rx) = sync_channel::<StatsReport>(1);
