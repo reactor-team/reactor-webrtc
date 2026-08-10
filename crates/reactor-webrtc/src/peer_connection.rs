@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use reactor_webrtc_sys::ReactorStatEntry;
 
-use crate::encoded::FrameTransform;
+use crate::encoded::{FrameTransform, VideoCodec};
 use crate::media::{MediaKind, Track};
 use crate::observer::ObserverState;
 use crate::{Error, FactoryHandle, Result};
@@ -428,6 +428,41 @@ impl Transceiver {
             Ok(())
         } else {
             Err(Error::Webrtc("transceiver set_direction failed".into()))
+        }
+    }
+
+    /// Reorder this video transceiver's codec preferences: `codecs`, most
+    /// preferred first, sort ahead of every other codec the endpoint
+    /// supports. Mirrors [`RTCRtpTransceiver.setCodecPreferences`](
+    /// https://w3c.github.io/webrtc-pc/#dom-rtcrtptransceiver-setcodecpreferences).
+    ///
+    /// Nothing is dropped: a codec left out of `codecs`, and every
+    /// retransmission/RED/FEC entry, keeps its original relative order after
+    /// the preferred ones — retransmission stays associated with its codec,
+    /// and the peer that doesn't support a preferred codec still gets an
+    /// offer/answer it can negotiate against. A codec named in `codecs` that
+    /// this endpoint does not actually support is silently ignored rather
+    /// than treated as an error.
+    ///
+    /// Takes effect on the next [`PeerConnection::create_offer`] or
+    /// [`PeerConnection::create_answer`] for this transceiver's m-section —
+    /// call it before negotiating. Returns an error if this transceiver
+    /// carries audio, not video.
+    pub fn set_codec_preferences(&self, codecs: &[VideoCodec]) -> Result<()> {
+        let wire: Vec<u32> = codecs.iter().map(|c| *c as u32).collect();
+        let ok = unsafe {
+            reactor_webrtc_sys::reactor_webrtc_rtp_transceiver_set_codec_preferences(
+                self.raw,
+                wire.as_ptr(),
+                wire.len() as c_int,
+            )
+        };
+        if ok == 1 {
+            Ok(())
+        } else {
+            Err(Error::Webrtc(
+                "transceiver set_codec_preferences failed (not a video transceiver?)".into(),
+            ))
         }
     }
 

@@ -147,6 +147,13 @@ class TransceiverDirection:
     RecvOnly: TransceiverDirection
     Inactive: TransceiverDirection
 
+class VideoCodec:
+    Vp8: VideoCodec
+    Vp9: VideoCodec
+    Av1: VideoCodec
+    H264: VideoCodec
+    H265: VideoCodec
+
 # ── Stats ─────────────────────────────────────────────────────────────────────
 
 class IceCandidatePairState:
@@ -365,6 +372,14 @@ class Transceiver:
         lets the remote sync a published audio track against a published video
         track. It reaches the wire in the next offer or answer."""
     def set_direction(self, direction: TransceiverDirection) -> None: ...
+    def set_codec_preferences(self, codecs: list[VideoCodec]) -> None:
+        """Reorder this video transceiver's codec preferences: `codecs`, most
+        preferred first, sort ahead of every other codec the endpoint
+        supports; nothing is dropped. Must be called before
+        create_answer()/create_offer() for the change to appear in the SDP.
+        Raises if this transceiver carries audio, not video.
+        """
+        ...
     def set_sender_transform(self, transform: FrameTransform) -> None:
         """Attach a FrameTransform to the sender path of this transceiver.
         The transform runs after the encoder, before RTP packetization.

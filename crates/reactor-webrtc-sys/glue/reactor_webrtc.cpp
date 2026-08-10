@@ -71,6 +71,7 @@
 #include "api/video_codecs/builtin_video_decoder_factory.h"
 #include "api/video_codecs/builtin_video_encoder_factory.h"
 #include "api/video_codecs/video_encoder_factory.h"
+#include "media/base/media_constants.h"
 #include "media/base/video_broadcaster.h"
 #include "modules/audio_device/include/audio_device_default.h"
 #include "modules/video_coding/codecs/interface/common_constants.h"
@@ -513,6 +514,11 @@ struct ReactorDataChannel {
 // A transceiver handle (the `RtpTransceiver` in the Rust API).
 struct ReactorTransceiver {
   webrtc::scoped_refptr<webrtc::RtpTransceiverInterface> tc;
+  // Kept alive (ref-counted) so codec-preference queries can reach
+  // GetRtpSenderCapabilities/GetRtpReceiverCapabilities from the transceiver
+  // handle alone, independent of whether the owning ReactorPeerConnection has
+  // since been destroyed.
+  webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> factory;
 };
 
 // Owns the three WebRTC threads alongside the factory. The threads must outlive
@@ -592,6 +598,11 @@ class ReactorPcObserver : public webrtc::PeerConnectionObserver {
 struct ReactorPeerConnection {
   std::unique_ptr<ReactorPcObserver> observer;
   webrtc::scoped_refptr<webrtc::PeerConnectionInterface> pc;
+  // The factory this connection was created from. GetRtpSenderCapabilities /
+  // GetRtpReceiverCapabilities (codec-preference queries) live on the factory,
+  // not the connection, so transceiver handles need it too — see
+  // ReactorTransceiver::factory.
+  webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> factory;
 };
 
 // Forwards CreateOffer/CreateAnswer results to C callbacks.
@@ -956,6 +967,7 @@ void* reactor_webrtc_peer_connection_create(void* factory,
   }
 
   auto rpc = std::make_unique<ReactorPeerConnection>();
+  rpc->factory = rf->factory;
   ReactorPcCallbacks cb{};
   if (callbacks) cb = *callbacks;
   rpc->observer = std::make_unique<ReactorPcObserver>(cb);
@@ -1394,7 +1406,7 @@ void* reactor_webrtc_peer_connection_add_transceiver(void* pc, int media_kind,
   init.direction = static_cast<webrtc::RtpTransceiverDirection>(direction);
   auto result = rpc->pc->AddTransceiver(mt, init);
   if (!result.ok()) return nullptr;
-  return new ReactorTransceiver{result.MoveValue()};
+  return new ReactorTransceiver{result.MoveValue(), rpc->factory};
 }
 
 // Number of transceivers on the peer connection (post-negotiation this
@@ -1412,7 +1424,7 @@ void* reactor_webrtc_peer_connection_get_transceiver(void* pc, int index) {
   if (!rpc || !rpc->pc || index < 0) return nullptr;
   auto tcs = rpc->pc->GetTransceivers();
   if (static_cast<size_t>(index) >= tcs.size()) return nullptr;
-  return new ReactorTransceiver{tcs[static_cast<size_t>(index)]};
+  return new ReactorTransceiver{tcs[static_cast<size_t>(index)], rpc->factory};
 }
 
 // Media kind of a transceiver: 0 = audio, 1 = video, -1 = unknown.
@@ -1478,6 +1490,66 @@ int reactor_webrtc_rtp_transceiver_set_direction(void* transceiver, int directio
   auto dir = static_cast<webrtc::RtpTransceiverDirection>(direction);
   auto err = h->tc->SetDirectionWithError(dir);
   return err.ok() ? 1 : 0;
+}
+
+// Map a VideoCodecType wire value (VP8=1, VP9=2, AV1=3, H264=4, H265=5, as
+// mirrored in ReactorEncodedFrame::codec below) to the codec name libwebrtc's
+// RtpCodecCapability::name carries for it. Returns null for an unknown value.
+static const char* video_codec_name(uint32_t wire) {
+  switch (wire) {
+    case 1: return webrtc::kVp8CodecName;
+    case 2: return webrtc::kVp9CodecName;
+    case 3: return webrtc::kAv1CodecName;
+    case 4: return webrtc::kH264CodecName;
+    case 5: return webrtc::kH265CodecName;
+    default: return nullptr;
+  }
+}
+
+// Reorder this video transceiver's codec preferences so entries matching
+// `codecs` (VideoCodecType wire values, most preferred first) sort ahead of
+// every other codec. Nothing is dropped: codecs not named in the list, and
+// every retransmission/RED/FEC entry, keep their original relative order
+// after the preferred ones — so retransmission stays associated with its
+// codec and negotiation never loses a capability the endpoint actually has.
+// Takes effect on the next create_offer()/create_answer() for this
+// transceiver's m-section. Returns 1 on success, 0 on failure (not a video
+// transceiver, or libwebrtc rejected the result).
+int reactor_webrtc_rtp_transceiver_set_codec_preferences(void* transceiver,
+                                                          const uint32_t* codecs,
+                                                          int codecs_len) {
+  auto* h = reinterpret_cast<ReactorTransceiver*>(transceiver);
+  if (!h || !h->tc || !h->factory) return 0;
+  if (h->tc->media_type() != webrtc::MediaType::VIDEO) return 0;
+
+  // Sender capabilities alone, not a union with GetRtpReceiverCapabilities:
+  // the two lists can carry the *same* codec with different
+  // `scalability_modes` (an encode-only concept), which compare unequal under
+  // RtpCodecCapability::operator==. Unioning them would let one codec's
+  // sender and receiver variants both through, and libwebrtc can assign them
+  // the same payload type — a real "Duplicate payload type in codec list"
+  // negotiation failure, not just a cosmetic one.
+  webrtc::RtpCapabilities caps =
+      h->factory->GetRtpSenderCapabilities(webrtc::MediaType::VIDEO);
+
+  std::vector<webrtc::RtpCodecCapability> ordered;
+  ordered.reserve(caps.codecs.size());
+  std::vector<bool> used(caps.codecs.size(), false);
+  for (int i = 0; i < codecs_len && codecs; ++i) {
+    const char* name = video_codec_name(codecs[i]);
+    if (!name) continue;
+    for (size_t j = 0; j < caps.codecs.size(); ++j) {
+      if (!used[j] && caps.codecs[j].name == name) {
+        ordered.push_back(caps.codecs[j]);
+        used[j] = true;
+      }
+    }
+  }
+  for (size_t j = 0; j < caps.codecs.size(); ++j) {
+    if (!used[j]) ordered.push_back(caps.codecs[j]);
+  }
+
+  return h->tc->SetCodecPreferences(ordered).ok() ? 1 : 0;
 }
 
 // Identity of the *transceiver* itself, as an opaque value — not an owning

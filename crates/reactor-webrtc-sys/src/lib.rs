@@ -516,6 +516,17 @@ extern "C" {
         transceiver: *mut RtpTransceiver,
         direction: c_int,
     ) -> c_int;
+    /// Reorder a video transceiver's codec preferences: entries in `codecs`
+    /// (VideoCodecType wire values, most preferred first) sort ahead of every
+    /// other codec, which keeps its original relative order. Nothing is
+    /// dropped. Takes effect on the next create_offer()/create_answer() for
+    /// this transceiver. Returns 1 on success, 0 on failure (not a video
+    /// transceiver, or libwebrtc rejected the result).
+    pub fn reactor_webrtc_rtp_transceiver_set_codec_preferences(
+        transceiver: *mut RtpTransceiver,
+        codecs: *const u32,
+        codecs_len: c_int,
+    ) -> c_int;
     /// Identity of the transceiver itself, as an opaque value — **not** an owning
     /// handle. Stable for the transceiver's life, unlike the handle pointer, which
     /// is a fresh allocation per `transceivers()` call. Usable as a key before any
