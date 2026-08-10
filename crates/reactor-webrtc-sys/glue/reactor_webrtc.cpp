@@ -1552,6 +1552,46 @@ int reactor_webrtc_rtp_transceiver_set_codec_preferences(void* transceiver,
   return h->tc->SetCodecPreferences(ordered).ok() ? 1 : 0;
 }
 
+// SetCodecPreferences only controls SDP negotiation — what gets offered/
+// answered, and in what order. It does *not* determine which of the
+// negotiated codecs this transceiver's own sender actually encodes with;
+// that is a separate, later decision (libwebrtc's "codec switching":
+// RtpParameters::encodings[].codec). Call this once negotiation has
+// completed (after set_local_description) to make the sender's first
+// negotiated codec — the one set_codec_preferences put first — the one it
+// actually uses, instead of whatever it would otherwise have picked (e.g.
+// the remote offer's own original order). Returns 1 on success, 0 on
+// failure (no sender, no negotiated codecs yet, or libwebrtc rejected it).
+int reactor_webrtc_rtp_transceiver_lock_negotiated_send_codec(void* transceiver) {
+  auto* h = reinterpret_cast<ReactorTransceiver*>(transceiver);
+  if (!h || !h->tc) return 0;
+
+  // codec_preferences() is what set_codec_preferences configured — the
+  // source of truth for "most preferred", in name-only terms (it is a
+  // capability, not a negotiated payload type). RtpParameters::codecs (from
+  // GetParameters() below) is NOT in this order — empirically it stays in a
+  // fixed, implementation-determined order regardless of codec_preferences(),
+  // so codecs[0] cannot be assumed to be the preferred one. Matching by name
+  // against the actual negotiated list is what makes this correct.
+  auto preferences = h->tc->codec_preferences();
+  if (preferences.empty()) return 0;
+  const std::string& want = preferences[0].name;
+
+  auto sender = h->tc->sender();
+  if (!sender) return 0;
+
+  webrtc::RtpParameters params = sender->GetParameters();
+  if (params.encodings.empty()) return 0;
+
+  for (auto& c : params.codecs) {
+    if (c.name == want) {
+      params.encodings[0].codec = webrtc::RtpCodec(c);
+      return sender->SetParameters(params).ok() ? 1 : 0;
+    }
+  }
+  return 0;  // the preferred codec was not actually negotiated for this sender
+}
+
 // Identity of the *transceiver* itself, as an opaque value — not an owning
 // handle.
 //

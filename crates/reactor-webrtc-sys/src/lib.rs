@@ -527,6 +527,18 @@ extern "C" {
         codecs: *const u32,
         codecs_len: c_int,
     ) -> c_int;
+    /// Make this transceiver's sender actually encode with the codec
+    /// [`reactor_webrtc_rtp_transceiver_set_codec_preferences`] put first,
+    /// instead of whatever it would otherwise pick (e.g. the remote offer's
+    /// own codec order). `set_codec_preferences` only controls SDP
+    /// negotiation — it does not by itself change which negotiated codec an
+    /// existing sender encodes with. Call this only after negotiation has
+    /// completed (`set_local_description`), once the sender's parameters
+    /// reflect the negotiated codec list. Returns 1 on success, 0 on failure
+    /// (no sender, no negotiated codecs yet, or libwebrtc rejected it).
+    pub fn reactor_webrtc_rtp_transceiver_lock_negotiated_send_codec(
+        transceiver: *mut RtpTransceiver,
+    ) -> c_int;
     /// Identity of the transceiver itself, as an opaque value — **not** an owning
     /// handle. Stable for the transceiver's life, unlike the handle pointer, which
     /// is a fresh allocation per `transceivers()` call. Usable as a key before any

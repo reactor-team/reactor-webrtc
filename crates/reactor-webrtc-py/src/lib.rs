@@ -1408,6 +1408,22 @@ impl Transceiver {
             .map_err(err)
     }
 
+    /// Make this transceiver's sender actually encode with the codec
+    /// `set_codec_preferences` put first, instead of whatever it would
+    /// otherwise pick (e.g. the remote offer's own codec order — what a
+    /// fresh answerer's sender follows by default). `set_codec_preferences`
+    /// only controls SDP negotiation; it does not by itself change which
+    /// negotiated codec an existing sender encodes with.
+    ///
+    /// Call this only after negotiation has completed — after
+    /// `set_local_description` — once the sender's parameters reflect the
+    /// negotiated codec list. Raises if called before that, or if this
+    /// transceiver has no sender.
+    fn lock_negotiated_send_codec(&self, py: Python) -> PyResult<()> {
+        py.allow_threads(|| self.inner.lock_negotiated_send_codec())
+            .map_err(err)
+    }
+
     /// Attach a `FrameTransform` to the sender path of this transceiver.
     /// The transform runs after the encoder, before RTP packetization.
     fn set_sender_transform(&self, py: Python, transform: &FrameTransform) -> PyResult<()> {

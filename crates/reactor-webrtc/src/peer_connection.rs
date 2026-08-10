@@ -466,6 +466,34 @@ impl Transceiver {
         }
     }
 
+    /// Make this transceiver's sender actually encode with the codec
+    /// [`set_codec_preferences`](Self::set_codec_preferences) put first,
+    /// instead of whatever it would otherwise pick — such as the remote
+    /// offer's own codec order, which is what a fresh answerer's sender
+    /// follows by default. `set_codec_preferences` only controls SDP
+    /// negotiation (what gets offered/answered, and in what order); it does
+    /// not by itself change which of the negotiated codecs an existing
+    /// sender encodes with — that is libwebrtc's separate "codec switching"
+    /// mechanism (an encoding's `codec` parameter).
+    ///
+    /// Call this only after negotiation has completed — after
+    /// [`PeerConnection::set_local_description`] — once the sender's
+    /// parameters reflect the negotiated codec list. Calling it before that
+    /// returns an error, since there is nothing negotiated yet to lock onto.
+    pub fn lock_negotiated_send_codec(&self) -> Result<()> {
+        let ok = unsafe {
+            reactor_webrtc_sys::reactor_webrtc_rtp_transceiver_lock_negotiated_send_codec(self.raw)
+        };
+        if ok == 1 {
+            Ok(())
+        } else {
+            Err(Error::Webrtc(
+                "transceiver lock_negotiated_send_codec failed (no sender, or negotiation not complete yet?)"
+                    .into(),
+            ))
+        }
+    }
+
     /// Attach an encoded-frame transform to this transceiver's **sender**
     /// (encoder → packetizer): observe/replace/drop each encoded frame before
     /// it is sent. See [`crate::FrameTransform`].
