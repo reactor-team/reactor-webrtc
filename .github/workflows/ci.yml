@@ -56,9 +56,9 @@ jobs:
 
   # Check whether the prebuilt for the current WEBRTC_VERSION has already been
   # published to GitHub Releases.  When REACTOR_PATCH_LEVEL is bumped on a
-  # webrtc-build PR the new prebuilt doesn't exist yet — test/build-wheel skip
-  # here (they run in webrtc-build.yml using the CI-built artifact instead).
-  # Once the patch is published, test/build-wheel run normally on every CI push.
+  # webrtc-build PR the new prebuilt doesn't exist yet — platform-pipeline
+  # skips here (webrtc-build.yml covers this PR using the CI-built artifact
+  # instead). Once the patch is published, platform-pipeline runs normally.
   prebuilt-check:
     name: Check prebuilt availability
     runs-on: ubuntu-latest
@@ -76,107 +76,20 @@ jobs:
           echo "Probing release '${TAG}'..."
           if curl -fsSL --retry 3 --max-time 20 "$URL" > /dev/null 2>&1; then
             echo "available=true"  >> "$GITHUB_OUTPUT"
-            echo "Release '${TAG}' is published — test/build-wheel will run."
+            echo "Release '${TAG}' is published — platform-pipeline will run."
           else
             echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::Release '${TAG}' not yet published — test/build-wheel skip here; webrtc-build.yml covers this PR."
+            echo "::notice::Release '${TAG}' not yet published — platform-pipeline skips here; webrtc-build.yml covers this PR."
           fi
 
-  test:
-    name: cargo test (${{ matrix.platform }})
-    needs: [prebuilt-check]
-    if: needs.prebuilt-check.outputs.available == 'true'
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: linux-x64
-            os: ubuntu-latest
-
-          - platform: linux-arm64
-            os: ubuntu-24.04-arm
-
-          - platform: mac-arm64
-            os: macos-latest
-
-          - platform: mac-x64
-            os: macos-15-intel
-
-          - platform: win-x64
-            os: windows-latest
-            # libwebrtc.lib uses /MT (static CRT); Rust must match to avoid LNK2038.
-            rustflags: "-C target-feature=+crt-static"
-
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v7
-
-      # Derive the prebuilt URL+SHA256 from WEBRTC_VERSION so this job always
-      # tests the prebuilt that matches the current source tree, and stays in
-      # sync automatically when REACTOR_PATCH_LEVEL is bumped.
-      - name: Resolve libwebrtc prebuilt
-        id: prebuilt
-        shell: bash
-        run: |
-          source WEBRTC_VERSION
-          MILESTONE=${WEBRTC_BRANCH#branch-heads/}
-          COMMIT_SHORT=${WEBRTC_COMMIT:0:8}
-          TAG="webrtc-${MILESTONE}-${COMMIT_SHORT}-p${REACTOR_PATCH_LEVEL}"
-          ASSET="reactor-webrtc-${{ matrix.platform }}-release.tar.zst"
-          BASE="https://github.com/${{ github.repository }}/releases/download/${TAG}"
-          echo "Resolving '${ASSET}' in release '${TAG}'..."
-          SHA256=$(curl -fsSL --retry 3 "${BASE}/${ASSET}.sha256" | awk '{print $1}')
-          if [ -z "$SHA256" ]; then
-            echo "::error::Empty sha256 sidecar for '${ASSET}' in release '${TAG}'"
-            exit 1
-          fi
-          echo "url=${BASE}/${ASSET}" >> "$GITHUB_OUTPUT"
-          echo "sha256=${SHA256}" >> "$GITHUB_OUTPUT"
-
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          cache-on-failure: true
-
-      # The bundled libc++ headers require clang >= 20. apt.llvm.org provides
-      # aarch64 packages for Noble — same install procedure as x64.
-      - name: Install clang-21 (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/llvm.asc
-          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm.list
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends clang-21
-          echo "CXX=clang++-21" >> "$GITHUB_ENV"
-
-      # mise's bash task runner (Git Bash) does not inherit the PATH additions
-      # from setup-rust-toolchain. Export CARGO as an absolute path; maturin and
-      # cargo-nextest both respect this env var and skip the PATH lookup entirely.
-      - name: Export CARGO path for mise bash tasks (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: Add-Content $env:GITHUB_ENV "CARGO=$(rustup which cargo)"
-
-      # hk ships no x86_64-apple-darwin binary; disable it so mise install
-      # doesn't error under MISE_LOCKED=1 (hk is only needed for git hooks).
-      - name: Disable hk on mac-x64
-        if: matrix.platform == 'mac-x64'
-        run: echo "MISE_DISABLE_TOOLS=${{ env.MISE_DISABLE_TOOLS }},hk" >> "$GITHUB_ENV"
-
-      - uses: jdx/mise-action@v4
-        with:
-          version: ${{ env.MISE_VERSION }}
-
-      # GitHub Windows runners have no usable non-loopback network interface
-      # for WebRTC ICE — skip cargo tests on Windows entirely.
-      - run: mise run test
-        if: runner.os != 'Windows'
-        env:
-          REACTOR_WEBRTC_PREBUILT_URL: ${{ steps.prebuilt.outputs.url }}
-          REACTOR_WEBRTC_PREBUILT_SHA256: ${{ steps.prebuilt.outputs.sha256 }}
-          RUSTFLAGS: ${{ matrix.rustflags }}
-
-  build-wheel:
-    name: build reactor-webrtc wheel (${{ matrix.platform }})
+  # Each matrix entry calls platform-pipeline.yml once, which runs the full
+  # per-platform chain: reactor-webrtc-sys build+check -> reactor-webrtc
+  # build+check -> wheel build -> pytest, each stage gating the next. Platforms
+  # run fully in parallel with each other (no shared "wait for the whole
+  # matrix" barrier), and any stage can be re-run on its own without
+  # re-running the stages before it.
+  platform-pipeline:
+    name: ${{ matrix.platform }}
     needs: [prebuilt-check]
     if: needs.prebuilt-check.outputs.available == 'true'
     strategy:
@@ -199,123 +112,11 @@ jobs:
             os: windows-latest
             rustflags: "-C target-feature=+crt-static"
 
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Resolve libwebrtc prebuilt
-        id: prebuilt
-        shell: bash
-        run: |
-          source WEBRTC_VERSION
-          MILESTONE=${WEBRTC_BRANCH#branch-heads/}
-          COMMIT_SHORT=${WEBRTC_COMMIT:0:8}
-          TAG="webrtc-${MILESTONE}-${COMMIT_SHORT}-p${REACTOR_PATCH_LEVEL}"
-          ASSET="reactor-webrtc-${{ matrix.platform }}-release.tar.zst"
-          BASE="https://github.com/${{ github.repository }}/releases/download/${TAG}"
-          echo "Resolving '${ASSET}' in release '${TAG}'..."
-          SHA256=$(curl -fsSL --retry 3 "${BASE}/${ASSET}.sha256" | awk '{print $1}')
-          if [ -z "$SHA256" ]; then
-            echo "::error::Empty sha256 sidecar for '${ASSET}' in release '${TAG}'"
-            exit 1
-          fi
-          echo "url=${BASE}/${ASSET}" >> "$GITHUB_OUTPUT"
-          echo "sha256=${SHA256}" >> "$GITHUB_OUTPUT"
-
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          cache-on-failure: true
-
-      - name: Install clang-21 (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/llvm.asc
-          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm.list
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends clang-21
-          echo "CXX=clang++-21" >> "$GITHUB_ENV"
-
-      - name: Export CARGO path for mise bash tasks (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: Add-Content $env:GITHUB_ENV "CARGO=$(rustup which cargo)"
-
-      # hk ships no x86_64-apple-darwin binary; disable it so mise install
-      # doesn't error under MISE_LOCKED=1 (hk is only needed for git hooks).
-      - name: Disable hk on mac-x64
-        if: matrix.platform == 'mac-x64'
-        run: echo "MISE_DISABLE_TOOLS=${{ env.MISE_DISABLE_TOOLS }},hk" >> "$GITHUB_ENV"
-
-      - uses: jdx/mise-action@v4
-        with:
-          version: ${{ env.MISE_VERSION }}
-
-      - name: Set macOS deployment target (mac-x64)
-        if: matrix.platform == 'mac-x64'
-        run: echo "MACOSX_DEPLOYMENT_TARGET=13.0" >> "$GITHUB_ENV"
-
-      - name: Build wheel (non-Windows)
-        if: runner.os != 'Windows'
-        run: mise run //crates/reactor-webrtc-py:build
-        env:
-          REACTOR_WEBRTC_PREBUILT_URL: ${{ steps.prebuilt.outputs.url }}
-          REACTOR_WEBRTC_PREBUILT_SHA256: ${{ steps.prebuilt.outputs.sha256 }}
-          RUSTFLAGS: ${{ matrix.rustflags }}
-
-      - name: Build wheel (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $cargo = (Get-Command cargo -ErrorAction Stop).Source
-          Write-Host "cargo: $cargo"
-          $env:CARGO = $cargo
-          maturin build --release `
-            --manifest-path "$env:GITHUB_WORKSPACE\crates\reactor-webrtc-py\Cargo.toml"
-        env:
-          REACTOR_WEBRTC_PREBUILT_URL: ${{ steps.prebuilt.outputs.url }}
-          REACTOR_WEBRTC_PREBUILT_SHA256: ${{ steps.prebuilt.outputs.sha256 }}
-          RUSTFLAGS: ${{ matrix.rustflags }}
-
-      - uses: actions/upload-artifact@v7
-        with:
-          name: wheel-${{ matrix.platform }}
-          path: target/wheels/reactor_webrtc-*.whl
-          if-no-files-found: error
-
-  test-py:
-    name: pytest (${{ matrix.platform }}, built wheel)
-    needs: build-wheel
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: linux-x64
-            os: ubuntu-latest
-          - platform: linux-arm64
-            os: ubuntu-24.04-arm
-          - platform: mac-arm64
-            os: macos-latest
-          - platform: mac-x64
-            os: macos-15-intel
-          - platform: win-x64
-            os: windows-latest
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
-        with:
-          name: wheel-${{ matrix.platform }}
-          path: target/wheels
-      # hk ships no x86_64-apple-darwin binary; disable it so mise install
-      # doesn't error under MISE_LOCKED=1 (hk is only needed for git hooks).
-      - name: Disable hk on mac-x64
-        if: matrix.platform == 'mac-x64'
-        run: echo "MISE_DISABLE_TOOLS=${{ env.MISE_DISABLE_TOOLS }},hk" >> "$GITHUB_ENV"
-      - uses: jdx/mise-action@v4
-        with:
-          version: ${{ env.MISE_VERSION }}
-      - name: Run Python tests against the built wheel
-        run: mise run //crates/reactor-webrtc-py:test
+    uses: ./.github/workflows/platform-pipeline.yml
+    with:
+      platform: ${{ matrix.platform }}
+      os: ${{ matrix.os }}
+      rustflags: ${{ matrix.rustflags }}
 
   # Advisory only: never referenced by ci-complete's `needs`, so it can never
   # block a merge. Flags — via a ::warning:: annotation, not a failing step —
@@ -351,7 +152,7 @@ jobs:
 
   ci-complete:
     name: CI Complete
-    needs: [lint, prebuilt-check, test, build-wheel, test-py]
+    needs: [lint, prebuilt-check, platform-pipeline]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -360,9 +161,7 @@ jobs:
           for r in \
             "${{ needs.lint.result }}" \
             "${{ needs.prebuilt-check.result }}" \
-            "${{ needs.test.result }}" \
-            "${{ needs.build-wheel.result }}" \
-            "${{ needs.test-py.result }}"; do
+            "${{ needs.platform-pipeline.result }}"; do
             if [ "$r" = "failure" ] || [ "$r" = "cancelled" ]; then
               echo "::error::a required job failed ($r)"; exit 1
             fi
