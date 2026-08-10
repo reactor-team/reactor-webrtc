@@ -78,6 +78,22 @@ video.push_encoded_frame(
 )
 ```
 
+## Codec preferences
+
+```python
+tx = pc.add_transceiver(rw.MediaKind.Video, rw.TransceiverDirection.SendOnly)
+tx.set_track(video_track)
+tx.set_codec_preferences([rw.VideoCodec.Vp9, rw.VideoCodec.Vp8])
+
+answer = await pc.create_answer()
+await pc.set_local_description(answer)
+
+# Only after set_local_description does the sender's negotiated codec list
+# exist to lock onto — set_codec_preferences alone shapes the SDP, not which
+# negotiated codec this side's own sender actually encodes with.
+tx.lock_negotiated_send_codec()
+```
+
 ## Receiving media
 
 ```python
@@ -115,7 +131,7 @@ for pair in report.candidate_pairs:
 | `FrameMetadataGate` | What the remote declared about per-frame metadata |
 | `Track` | Local (push frames) or remote (attach sink) media track |
 | `EncodedVideoTrack` | Push pre-encoded video (H.264 Annex-B, VP8, VP9, …) |
-| `Transceiver` | RTP m-section: `mid`, `kind`, `set_track`, `set_direction`, `set_sender_transform`, `set_receiver_transform` |
+| `Transceiver` | RTP m-section: `mid`, `kind`, `set_track`, `set_direction`, `set_codec_preferences`, `lock_negotiated_send_codec`, `set_sender_transform`, `set_receiver_transform` |
 | `DataChannel` | SCTP data channel: `send`, `on_message`, `on_open`, … |
 | `StatsReport` | `inbound_rtp`, `outbound_rtp`, `candidate_pairs` |
 | `FrameMetadata`, `FrameAction`, `EncodedFrame`, `FrameTransform` | Per-frame metadata trailers and custom encoded-frame transforms — see [`docs/frame-metadata.md`](../../docs/frame-metadata.md) |
@@ -125,6 +141,7 @@ for pair in report.candidate_pairs:
 | `PeerConnectionState` | `New`, `Connecting`, `Connected`, `Disconnected`, `Failed`, `Closed` |
 | `IceGatheringState` | `New`, `Gathering`, `Complete` |
 | `TransceiverDirection` | `SendRecv`, `SendOnly`, `RecvOnly`, `Inactive` |
+| `VideoCodec` | `Vp8`, `Vp9`, `Av1`, `H264`, `H265` |
 | `MediaKind` | `Audio`, `Video` |
 | `DataChannelState` | `Connecting`, `Open`, `Closing`, `Closed` |
 | `IceCandidatePairState` | `Waiting`, `InProgress`, `Failed`, `Succeeded`, `Cancelled` |
