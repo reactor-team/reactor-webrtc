@@ -449,12 +449,16 @@ impl Transceiver {
     /// call it before negotiating. Returns an error if this transceiver
     /// carries audio, not video.
     pub fn set_codec_preferences(&self, codecs: &[VideoCodec]) -> Result<()> {
-        let wire: Vec<u32> = codecs.iter().map(|c| *c as u32).collect();
+        let names: Vec<CString> = codecs
+            .iter()
+            .map(|c| CString::new(c.name()).expect("codec name is a static ASCII string"))
+            .collect();
+        let ptrs: Vec<*const c_char> = names.iter().map(|n| n.as_ptr()).collect();
         let ok = unsafe {
-            reactor_webrtc_sys::reactor_webrtc_rtp_transceiver_set_codec_preferences(
+            reactor_webrtc_sys::reactor_webrtc_rtp_transceiver_set_video_codec_preferences(
                 self.raw,
-                wire.as_ptr(),
-                wire.len() as c_int,
+                ptrs.as_ptr(),
+                ptrs.len() as c_int,
             )
         };
         if ok == 1 {

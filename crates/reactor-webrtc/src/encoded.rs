@@ -263,6 +263,21 @@ impl VideoCodec {
             _ => None,
         }
     }
+
+    /// The name libwebrtc's codec capabilities carry for this codec (e.g.
+    /// `RtpCodecCapability::name`) — what
+    /// [`Transceiver::set_codec_preferences`](crate::Transceiver::set_codec_preferences)
+    /// matches against, as a plain string rather than a wire-format integer
+    /// that both sides of the FFI boundary have to keep in sync by hand.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Vp8 => "VP8",
+            Self::Vp9 => "VP9",
+            Self::Av1 => "AV1",
+            Self::H264 => "H264",
+            Self::H265 => "H265",
+        }
+    }
 }
 
 /// Raw I420 video frame delivered to a [`CustomVideoEncoder`] callback.

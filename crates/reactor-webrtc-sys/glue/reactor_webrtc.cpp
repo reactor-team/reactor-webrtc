@@ -71,7 +71,6 @@
 #include "api/video_codecs/builtin_video_decoder_factory.h"
 #include "api/video_codecs/builtin_video_encoder_factory.h"
 #include "api/video_codecs/video_encoder_factory.h"
-#include "media/base/media_constants.h"
 #include "media/base/video_broadcaster.h"
 #include "modules/audio_device/include/audio_device_default.h"
 #include "modules/video_coding/codecs/interface/common_constants.h"
@@ -1492,32 +1491,18 @@ int reactor_webrtc_rtp_transceiver_set_direction(void* transceiver, int directio
   return err.ok() ? 1 : 0;
 }
 
-// Map a VideoCodecType wire value (VP8=1, VP9=2, AV1=3, H264=4, H265=5, as
-// mirrored in ReactorEncodedFrame::codec below) to the codec name libwebrtc's
-// RtpCodecCapability::name carries for it. Returns null for an unknown value.
-static const char* video_codec_name(uint32_t wire) {
-  switch (wire) {
-    case 1: return webrtc::kVp8CodecName;
-    case 2: return webrtc::kVp9CodecName;
-    case 3: return webrtc::kAv1CodecName;
-    case 4: return webrtc::kH264CodecName;
-    case 5: return webrtc::kH265CodecName;
-    default: return nullptr;
-  }
-}
-
 // Reorder this video transceiver's codec preferences so entries matching
-// `codecs` (VideoCodecType wire values, most preferred first) sort ahead of
-// every other codec. Nothing is dropped: codecs not named in the list, and
-// every retransmission/RED/FEC entry, keep their original relative order
-// after the preferred ones — so retransmission stays associated with its
-// codec and negotiation never loses a capability the endpoint actually has.
-// Takes effect on the next create_offer()/create_answer() for this
-// transceiver's m-section. Returns 1 on success, 0 on failure (not a video
-// transceiver, or libwebrtc rejected the result).
-int reactor_webrtc_rtp_transceiver_set_codec_preferences(void* transceiver,
-                                                          const uint32_t* codecs,
-                                                          int codecs_len) {
+// `codec_names` (libwebrtc codec names such as "VP8"/"VP9"/"AV1"/"H264"/
+// "H265", most preferred first) sort ahead of every other codec. Nothing is
+// dropped: codecs not named in the list, and every retransmission/RED/FEC
+// entry, keep their original relative order after the preferred ones — so
+// retransmission stays associated with its codec and negotiation never
+// loses a capability the endpoint actually has. Takes effect on the next
+// create_offer()/create_answer() for this transceiver's m-section. Returns
+// 1 on success, 0 on failure (not a video transceiver, or libwebrtc
+// rejected the result).
+int reactor_webrtc_rtp_transceiver_set_video_codec_preferences(
+    void* transceiver, const char* const* codec_names, int codecs_len) {
   auto* h = reinterpret_cast<ReactorTransceiver*>(transceiver);
   if (!h || !h->tc || !h->factory) return 0;
   if (h->tc->media_type() != webrtc::MediaType::VIDEO) return 0;
@@ -1535,8 +1520,8 @@ int reactor_webrtc_rtp_transceiver_set_codec_preferences(void* transceiver,
   std::vector<webrtc::RtpCodecCapability> ordered;
   ordered.reserve(caps.codecs.size());
   std::vector<bool> used(caps.codecs.size(), false);
-  for (int i = 0; i < codecs_len && codecs; ++i) {
-    const char* name = video_codec_name(codecs[i]);
+  for (int i = 0; i < codecs_len && codec_names; ++i) {
+    const char* name = codec_names[i];
     if (!name) continue;
     for (size_t j = 0; j < caps.codecs.size(); ++j) {
       if (!used[j] && caps.codecs[j].name == name) {
