@@ -1340,8 +1340,8 @@ impl Transceiver {
     /// Attach a local track to the sender slot. Accepts either a `Track` or an
     /// `EncodedVideoTrack`.
     fn set_track(&self, py: Python, track: &Bound<'_, PyAny>) -> PyResult<()> {
-        // Reaches the sender through two signaling-thread proxy calls, so the GIL
-        // has to be free for the duration.
+        // Reaches the sender through several signaling-thread proxy calls, so the
+        // GIL has to be free for the duration.
         if let Ok(t) = track.downcast::<Track>() {
             let t = t.borrow();
             // The borrow guard carries a GIL token, so the native reference has

@@ -358,7 +358,12 @@ class EncodedVideoTrack:
 class Transceiver:
     def mid(self) -> Optional[str]: ...
     def kind(self) -> MediaKind: ...
-    def set_track(self, track: Union[Track, EncodedVideoTrack]) -> None: ...
+    def set_track(self, track: Union[Track, EncodedVideoTrack]) -> None:
+        """Attach a local track to this transceiver's sender.
+
+        The track joins the one MediaStream this peer publishes under, which is what
+        lets the remote sync a published audio track against a published video
+        track. It reaches the wire in the next offer or answer."""
     def set_direction(self, direction: TransceiverDirection) -> None: ...
     def set_sender_transform(self, transform: FrameTransform) -> None:
         """Attach a FrameTransform to the sender path of this transceiver.

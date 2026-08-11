@@ -392,6 +392,11 @@ impl Transceiver {
     }
 
     /// Attach a local track to this transceiver's sender (for sendonly/sendrecv).
+    ///
+    /// The track is published in the same MediaStream as every other track this
+    /// peer sends, the way [`PeerConnection::add_track`] publishes one. The
+    /// remote groups the streams it receives by that id, so an audio track and a
+    /// video track published here play out in sync with each other.
     pub fn set_track(&self, track: &Track) -> Result<()> {
         let ok = unsafe {
             reactor_webrtc_sys::reactor_webrtc_rtp_transceiver_set_track(self.raw, track.raw())
@@ -1234,6 +1239,9 @@ impl PeerConnection {
 
     // ── Tracks / data channels ───────────────────────────────────────────────
     /// Add a local track (creates a sendrecv transceiver).
+    ///
+    /// Every track a peer publishes shares one MediaStream, so the remote can
+    /// sync the audio it receives against the video.
     pub fn add_track(&self, track: &Track) -> Result<()> {
         let ok = unsafe {
             reactor_webrtc_sys::reactor_webrtc_peer_connection_add_track(self.raw, track.raw())
