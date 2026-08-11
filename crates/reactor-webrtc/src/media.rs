@@ -144,8 +144,11 @@ extern "C" fn audio_sink_tramp(
 pub struct Track {
     raw: *mut reactor_webrtc_sys::MediaStreamTrack,
     kind: MediaKind,
-    video_sink: Option<Box<VideoSinkState>>,
-    audio_sink: Option<Box<AudioSinkState>>,
+    // Mutex, not a plain field, so on_video_frame/on_audio_frame can take &self:
+    // Transceiver.set_track needs to share a Track behind an Arc (for the Python
+    // binding's spawn_blocking future), which rules out ever taking &mut self.
+    video_sink: Mutex<Option<Box<VideoSinkState>>>,
+    audio_sink: Mutex<Option<Box<AudioSinkState>>>,
     // Always present: push_video_frame_with_metadata fills it, and the sender
     // transform the peer connection installs after negotiation reads it. There is
     // nothing to switch on — an empty map simply yields no metadata.
@@ -169,10 +172,10 @@ pub struct Track {
     _factory: Arc<FactoryHandle>,
 }
 
-// SAFETY: the native track is internally thread-safe; sink callbacks are
-// guarded by a Mutex, and the `&self` methods (frame push) go through WebRTC's
-// internally-locked broadcaster, so a `&Track` may be shared across threads.
-// Sink (re)attachment takes `&mut self`, so it cannot race a shared push.
+// SAFETY: the native track is internally thread-safe; sink callbacks and sink
+// (re)attachment are both guarded by a Mutex, and the other `&self` methods
+// (frame push) go through WebRTC's internally-locked broadcaster, so a
+// `&Track` may be shared and used concurrently across threads.
 unsafe impl Send for Track {}
 unsafe impl Sync for Track {}
 
@@ -195,8 +198,8 @@ impl Track {
         Self {
             raw,
             kind,
-            video_sink: None,
-            audio_sink: None,
+            video_sink: Mutex::new(None),
+            audio_sink: Mutex::new(None),
             sender_meta,
             native_id,
             receiver_meta,
@@ -351,7 +354,7 @@ impl Track {
     /// metadata trailer and the peer connection installed the strip transform —
     /// which it does automatically, on both peers, once the capability has been
     /// negotiated. Nothing here has to be arranged for it.
-    pub fn on_video_frame(&mut self, cb: impl for<'a> FnMut(VideoFrame<'a>) + Send + 'static) {
+    pub fn on_video_frame(&self, cb: impl for<'a> FnMut(VideoFrame<'a>) + Send + 'static) {
         let state = Box::new(VideoSinkState {
             cb: Mutex::new(Box::new(cb)),
             receiver_meta: self.receiver_meta.clone(),
@@ -360,7 +363,8 @@ impl Track {
         unsafe {
             reactor_webrtc_sys::reactor_webrtc_video_track_add_sink(self.raw, ud, video_sink_tramp);
         }
-        self.video_sink = Some(state);
+        // Drops the previous sink Box, if any, same as an `Option` field replace.
+        *self.video_sink.lock().expect("video_sink mutex poisoned") = Some(state);
     }
 
     /// Push interleaved i16 PCM to a local audio track created with
@@ -398,7 +402,7 @@ impl Track {
 
     /// Subscribe to decoded PCM from a (remote) audio track. Replaces any
     /// previous sink. The closure runs on a WebRTC thread.
-    pub fn on_audio_frame(&mut self, cb: impl for<'a> FnMut(AudioFrame<'a>) + Send + 'static) {
+    pub fn on_audio_frame(&self, cb: impl for<'a> FnMut(AudioFrame<'a>) + Send + 'static) {
         let state = Box::new(AudioSinkState {
             cb: Mutex::new(Box::new(cb)),
         });
@@ -406,7 +410,8 @@ impl Track {
         unsafe {
             reactor_webrtc_sys::reactor_webrtc_audio_track_add_sink(self.raw, ud, audio_sink_tramp);
         }
-        self.audio_sink = Some(state);
+        // Drops the previous sink Box, if any, same as an `Option` field replace.
+        *self.audio_sink.lock().expect("audio_sink mutex poisoned") = Some(state);
     }
 }
 

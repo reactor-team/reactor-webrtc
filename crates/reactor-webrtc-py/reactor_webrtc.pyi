@@ -365,7 +365,7 @@ class EncodedVideoTrack:
 class Transceiver:
     def mid(self) -> Optional[str]: ...
     def kind(self) -> MediaKind: ...
-    def set_track(self, track: Union[Track, EncodedVideoTrack]) -> None:
+    async def set_track(self, track: Union[Track, EncodedVideoTrack]) -> None:
         """Attach a local track to this transceiver's sender.
 
         The track joins the one MediaStream this peer publishes under, which is what

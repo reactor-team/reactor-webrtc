@@ -517,7 +517,7 @@ class TestFrameMetadata:
 
         video = factory.create_video_track("meta-video")
         tx1 = p1.pc.add_transceiver(rw.MediaKind.Video, rw.TransceiverDirection.SendOnly)
-        tx1.set_track(video)
+        await tx1.set_track(video)
         # Nothing attached by hand: create_offer advertises, the answer mirrors,
         # and set_remote_description installs both transforms.
         ok = await connect(p1, p2)
@@ -557,7 +557,7 @@ class TestFrameMetadata:
 
         video = factory.create_video_track("legacy-video")
         tx1 = p1.pc.add_transceiver(rw.MediaKind.Video, rw.TransceiverDirection.SendOnly)
-        tx1.set_track(video)
+        await tx1.set_track(video)
 
         ok = await connect(p1, p2, legacy_peer=True)
         assert ok, "peers did not connect within timeout"
@@ -602,7 +602,7 @@ class TestFrameMetadata:
 
         video = factory.create_video_track("claimed-video")
         tx1 = p1.pc.add_transceiver(rw.MediaKind.Video, rw.TransceiverDirection.SendOnly)
-        tx1.set_track(video)
+        await tx1.set_track(video)
 
         ran: list[bool] = []
         saw_trailer: list[bool] = []

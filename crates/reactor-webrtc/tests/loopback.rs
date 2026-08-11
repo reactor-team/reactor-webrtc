@@ -51,7 +51,7 @@ fn make_peer(
         })
         .on_track({
             let s = shared.clone();
-            move |kind, mut track| {
+            move |kind, track| {
                 match kind {
                     MediaKind::Video => {
                         let s = s.clone();
