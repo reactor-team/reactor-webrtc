@@ -83,16 +83,16 @@ video.push_encoded_frame(
 ```python
 tx = pc.add_transceiver(rw.MediaKind.Video, rw.TransceiverDirection.SendOnly)
 tx.set_track(video_track)
-tx.set_codec_preferences([rw.VideoCodec.Vp9, rw.VideoCodec.Vp8])
+await tx.set_codec_preferences([rw.VideoCodec.Vp9, rw.VideoCodec.Vp8])
 
 answer = await pc.create_answer()
 await pc.set_local_description(answer)
-
-# Only after set_local_description does the sender's negotiated codec list
-# exist to lock onto — set_codec_preferences alone shapes the SDP, not which
-# negotiated codec this side's own sender actually encodes with.
-tx.lock_negotiated_send_codec()
 ```
+
+`set_local_description`/`set_remote_description` also make this
+transceiver's own sender actually encode with whichever preferred codec was
+negotiated, once negotiation completes — not just list it first in the SDP.
+No further call needed.
 
 ## Receiving media
 
@@ -131,7 +131,7 @@ for pair in report.candidate_pairs:
 | `FrameMetadataGate` | What the remote declared about per-frame metadata |
 | `Track` | Local (push frames) or remote (attach sink) media track |
 | `EncodedVideoTrack` | Push pre-encoded video (H.264 Annex-B, VP8, VP9, …) |
-| `Transceiver` | RTP m-section: `mid`, `kind`, `set_track`, `set_direction`, `set_codec_preferences`, `lock_negotiated_send_codec`, `set_sender_transform`, `set_receiver_transform` |
+| `Transceiver` | RTP m-section: `mid`, `kind`, `set_track`, `set_direction`, `set_codec_preferences`, `set_sender_transform`, `set_receiver_transform` |
 | `DataChannel` | SCTP data channel: `send`, `on_message`, `on_open`, … |
 | `StatsReport` | `inbound_rtp`, `outbound_rtp`, `candidate_pairs` |
 | `FrameMetadata`, `FrameAction`, `EncodedFrame`, `FrameTransform` | Per-frame metadata trailers and custom encoded-frame transforms — see [`docs/frame-metadata.md`](../../docs/frame-metadata.md) |
@@ -243,15 +243,17 @@ newline in a credential from injecting an SDP line.
 
 `PeerConnection`'s signaling methods (`create_offer`, `create_answer`,
 `set_local_description`, `set_remote_description`, `add_ice_candidate`,
-`get_stats`) plus `set_bitrate` are natively awaitable — `await` them
-directly, no `asyncio.to_thread()`/executor wrapping needed. They still take
-a few milliseconds to resolve while the WebRTC engine responds, but that
-wait happens off the event loop thread, so it never blocks other coroutines.
+`get_stats`, `transceivers`) plus `set_bitrate` are natively awaitable —
+`await` them directly, no `asyncio.to_thread()`/executor wrapping needed.
+They still take a few milliseconds to resolve while the WebRTC engine
+responds, but that wait happens off the event loop thread, so it never
+blocks other coroutines. On `Transceiver`, `set_direction` and
+`set_codec_preferences` are the same way.
 
-Every other method (`add_track`, `add_transceiver`, `transceivers`,
-`create_data_channel`, and everything on `Track`/`Transceiver`/`DataChannel`) is
-a fast synchronous call with no native round-trip, and stays a plain function
-call — no `await`.
+Every other method (`add_track`, `add_transceiver`, `create_data_channel`,
+`Transceiver.set_track`/`set_sender_transform`/`set_receiver_transform`, and
+everything on `Track`/`DataChannel`) is a fast synchronous call with no
+native round-trip, and stays a plain function call — no `await`.
 
 Callbacks fire on WebRTC internal threads with the GIL acquired; keep them
 fast.

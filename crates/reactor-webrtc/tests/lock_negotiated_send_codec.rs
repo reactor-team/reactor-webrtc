@@ -1,9 +1,13 @@
-//! `Transceiver::lock_negotiated_send_codec` — proves `set_codec_preferences`
-//! alone is not enough for an **answerer**'s own sender: it reorders the SDP,
-//! but the sender still encodes with whatever it would have picked anyway
-//! (the remote offer's own codec order) until `lock_negotiated_send_codec`
-//! is also called after negotiation completes. Verified against the actual
-//! encoded bitstream's `mime_type`, not just the SDP text.
+//! `set_codec_preferences` alone is not enough for an **answerer**'s own
+//! sender: it reorders the SDP, but the sender still encodes with whatever
+//! it would have picked anyway (the remote offer's own codec order), unless
+//! something also locks the sender onto the preferred codec once
+//! negotiation completes. `PeerConnection::set_local_description` does that
+//! automatically for every video transceiver with a preference set — this
+//! test proves the answerer's sender ends up encoding with the preferred
+//! codec without any call beyond `set_codec_preferences` and the normal
+//! signaling sequence. Verified against the actual encoded bitstream's
+//! `mime_type`, not just the SDP text.
 #![cfg(have_libwebrtc)]
 
 use std::collections::VecDeque;
@@ -75,7 +79,7 @@ fn default_first_video_codec(factory: &PeerConnectionFactory) -> String {
 }
 
 #[test]
-fn lock_negotiated_send_codec_makes_the_answerer_actually_encode_with_it() {
+fn set_local_description_locks_the_answerer_send_codec_automatically() {
     let factory = PeerConnectionFactory::new().expect("factory");
 
     let default_first = default_first_video_codec(&factory);
@@ -119,11 +123,9 @@ fn lock_negotiated_send_codec_makes_the_answerer_actually_encode_with_it() {
         .expect("pc1 remote answer");
 
     // The SDP already lists the preferred codec first (proven by
-    // codec_preferences.rs); without lock_negotiated_send_codec, the sender
-    // still encodes with whatever it would have picked anyway.
-    tx2.lock_negotiated_send_codec()
-        .expect("lock negotiated send codec");
-
+    // codec_preferences.rs). `pc2.set_local_description(&answer)` above is
+    // what should have also locked the sender itself onto that codec,
+    // with no further call needed.
     let seen_mime = Arc::new(Mutex::new(None::<String>));
     let send_tf = FrameTransform::new({
         let seen_mime = seen_mime.clone();

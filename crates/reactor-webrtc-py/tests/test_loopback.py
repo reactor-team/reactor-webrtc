@@ -217,17 +217,17 @@ class TestPeerConnection:
         )
         preferred_name = "VP8" if preferred == rw.VideoCodec.Vp8 else "VP9"
 
-        t.set_codec_preferences([preferred])
+        await t.set_codec_preferences([preferred])
         reordered_sdp = (await p.pc.create_offer()).sdp
         assert first_video_codec(reordered_sdp) == preferred_name
         # Reordered, not dropped: the old default is still offered somewhere.
         assert f" {default_first}/" in reordered_sdp
 
-    def test_set_codec_preferences_rejects_audio_transceiver(self, factory):
+    async def test_set_codec_preferences_rejects_audio_transceiver(self, factory):
         p = make_peer(factory)
         t = p.pc.add_transceiver(rw.MediaKind.Audio, rw.TransceiverDirection.SendRecv)
         with pytest.raises(RuntimeError, match="set_codec_preferences"):
-            t.set_codec_preferences([rw.VideoCodec.Vp8])
+            await t.set_codec_preferences([rw.VideoCodec.Vp8])
 
     def test_add_video_track(self, factory):
         p = make_peer(factory)

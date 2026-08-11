@@ -371,26 +371,19 @@ class Transceiver:
         The track joins the one MediaStream this peer publishes under, which is what
         lets the remote sync a published audio track against a published video
         track. It reaches the wire in the next offer or answer."""
-    def set_direction(self, direction: TransceiverDirection) -> None: ...
-    def set_codec_preferences(self, codecs: list[VideoCodec]) -> None:
+    async def set_direction(self, direction: TransceiverDirection) -> None: ...
+    async def set_codec_preferences(self, codecs: list[VideoCodec]) -> None:
         """Reorder this video transceiver's codec preferences: `codecs`, most
         preferred first, sort ahead of every other codec the endpoint
         supports; nothing is dropped. Must be called before
         create_answer()/create_offer() for the change to appear in the SDP.
         Raises if this transceiver carries audio, not video.
-        """
-        ...
-    def lock_negotiated_send_codec(self) -> None:
-        """Make this transceiver's sender actually encode with the codec
-        set_codec_preferences put first, instead of whatever it would
-        otherwise pick (e.g. the remote offer's own codec order).
-        set_codec_preferences only controls SDP negotiation; it does not by
-        itself change which negotiated codec an existing sender encodes with.
 
-        Call this only after negotiation has completed — after
-        set_local_description — once the sender's parameters reflect the
-        negotiated codec list. Raises if called before that, or if this
-        transceiver has no sender.
+        Once negotiation completes, PeerConnection.set_local_description /
+        set_remote_description also make this transceiver's own sender
+        actually encode with whichever preferred codec was negotiated, not
+        just list it first in the SDP — handled automatically, no further
+        call needed.
         """
         ...
     def set_sender_transform(self, transform: FrameTransform) -> None:

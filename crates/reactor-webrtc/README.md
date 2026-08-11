@@ -49,7 +49,7 @@ pc.set_local_description(&offer)?;
 | `DataChannel` | Reliable/unreliable messaging over SCTP |
 | `Track` | Local (push frames) or remote (attach a sink) media track |
 | `EncodedVideoTrack` | Push pre-encoded video frames (H.264, VP8, VP9, …) |
-| `Transceiver` | RTP send/recv direction + MID; `set_codec_preferences`/`lock_negotiated_send_codec` for video codec choice |
+| `Transceiver` | RTP send/recv direction + MID; `set_codec_preferences` for video codec choice |
 | `StatsReport` | `inbound_rtp`, `outbound_rtp`, `candidate_pairs` |
 | `SessionDescription` | SDP offer or answer; `ice_ufrags`, `with_ice_credentials`, `declares_frame_metadata`, `with_frame_metadata` |
 | `FrameMetadataGate` | What the remote declared about per-frame metadata |
@@ -110,11 +110,6 @@ tx.set_codec_preferences(&[VideoCodec::Vp9, VideoCodec::Vp8])?;
 
 let answer = pc.create_answer()?;
 pc.set_local_description(&answer)?;
-
-// Only after set_local_description does the sender's negotiated codec list
-// exist to lock onto — set_codec_preferences alone shapes the SDP, not which
-// negotiated codec this side's own sender actually encodes with.
-tx.lock_negotiated_send_codec()?;
 ```
 
 `set_codec_preferences` reorders the transceiver's negotiable codecs so the
@@ -122,6 +117,13 @@ given ones sort first — a codec this build does not actually support (no
 hardware H.264, say) is silently skipped rather than rejected. Nothing else
 is dropped: unlisted codecs, and every retransmission/RED/FEC entry, keep
 their original relative order after the preferred ones.
+
+`set_local_description`/`set_remote_description` also make this
+transceiver's own sender actually *encode* with whichever preferred codec
+was negotiated, once negotiation completes — not just list it first in the
+SDP. SDP negotiation and a sender's codec selection are separate mechanisms
+in libwebrtc, and only the first is driven by preference order, so this is
+handled automatically rather than requiring a second call.
 
 ## Per-frame metadata
 
