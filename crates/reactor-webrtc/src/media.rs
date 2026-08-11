@@ -360,11 +360,19 @@ impl Track {
             receiver_meta: self.receiver_meta.clone(),
         });
         let ud = &*state as *const VideoSinkState as *mut c_void;
+        // Held across both the native registration and the Rust-side store: two
+        // concurrent callers must not interleave their FFI call with the other's
+        // store, or the native side can end up pointing at whichever Box the
+        // *other* caller's store just dropped — freed memory the callback thread
+        // then reads. Holding the lock over both serializes each caller's pair of
+        // steps, so the last one to run leaves a native pointer and a stored Box
+        // that always agree with each other.
+        let mut guard = self.video_sink.lock().expect("video_sink mutex poisoned");
         unsafe {
             reactor_webrtc_sys::reactor_webrtc_video_track_add_sink(self.raw, ud, video_sink_tramp);
         }
         // Drops the previous sink Box, if any, same as an `Option` field replace.
-        *self.video_sink.lock().expect("video_sink mutex poisoned") = Some(state);
+        *guard = Some(state);
     }
 
     /// Push interleaved i16 PCM to a local audio track created with
@@ -407,11 +415,14 @@ impl Track {
             cb: Mutex::new(Box::new(cb)),
         });
         let ud = &*state as *const AudioSinkState as *mut c_void;
+        // Same reasoning as `on_video_frame`: the lock spans both steps so the
+        // two can never interleave across callers.
+        let mut guard = self.audio_sink.lock().expect("audio_sink mutex poisoned");
         unsafe {
             reactor_webrtc_sys::reactor_webrtc_audio_track_add_sink(self.raw, ud, audio_sink_tramp);
         }
         // Drops the previous sink Box, if any, same as an `Option` field replace.
-        *self.audio_sink.lock().expect("audio_sink mutex poisoned") = Some(state);
+        *guard = Some(state);
     }
 }
 

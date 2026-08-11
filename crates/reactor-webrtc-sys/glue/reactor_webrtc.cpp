@@ -1345,6 +1345,15 @@ void reactor_webrtc_factory_push_audio_frame(void* factory, const int16_t* pcm,
 
 // Attach a frame sink to a (received) audio track. `on_audio(userdata,
 // sample_rate, channels, frames)` fires per 10ms block until destroyed.
+//
+// Removes any previously registered sink from the track *before* destroying
+// it: AddSink for a new pointer does not implicitly detach a different one
+// already registered, so replacing `h->audio_sink` first and adding the new
+// sink after would leave the broadcaster holding a dangling pointer to the
+// just-freed old `AudioFrameSink` — a use-after-free the next time it fires,
+// reachable even from one caller re-attaching sequentially, no concurrency
+// required. `RemoveSink` shares the broadcaster's own lock with delivery, so
+// it also waits out any delivery already in progress on the old sink.
 void reactor_webrtc_audio_track_add_sink(
     void* track, void* userdata,
     void (*on_audio)(void*, const int16_t*, int, int, int)) {
@@ -1359,8 +1368,9 @@ void reactor_webrtc_audio_track_add_sink(
               h->track->kind().c_str());
     return;
   }
-  h->audio_sink = std::make_unique<AudioFrameSink>(userdata, on_audio);
   auto* at = static_cast<webrtc::AudioTrackInterface*>(h->track.get());
+  if (h->audio_sink) at->RemoveSink(h->audio_sink.get());
+  h->audio_sink = std::make_unique<AudioFrameSink>(userdata, on_audio);
   at->AddSink(h->audio_sink.get());
   if (audio_debug())
     fprintf(stderr,
@@ -1370,14 +1380,21 @@ void reactor_webrtc_audio_track_add_sink(
 
 // Attach a frame sink to a (video) track. `on_frame(userdata, width, height)`
 // fires per decoded frame. The sink lives until the track handle is destroyed.
+//
+// Same ordering requirement as the audio sink above: `AddOrUpdateSink` only
+// updates in place when the pointer already registered is the *same*
+// pointer; for a fresh `FrameSink` it is added alongside whatever is already
+// there. Detach the old one first, or replacing `h->sink` destroys a
+// `FrameSink` the broadcaster still holds and calls into.
 void reactor_webrtc_video_track_add_sink(
     void* track, void* userdata,
     void (*on_frame)(void*, const uint8_t*, int, int)) {
   auto* h = reinterpret_cast<ReactorMediaStreamTrack*>(track);
   if (!h || !h->track || h->track->kind() != "video") return;
+  auto* vt = static_cast<webrtc::VideoTrackInterface*>(h->track.get());
+  if (h->sink) vt->RemoveSink(h->sink.get());
   h->sink = std::make_unique<FrameSink>(userdata, on_frame);
-  static_cast<webrtc::VideoTrackInterface*>(h->track.get())
-      ->AddOrUpdateSink(h->sink.get(), webrtc::VideoSinkWants());
+  vt->AddOrUpdateSink(h->sink.get(), webrtc::VideoSinkWants());
 }
 
 // Kind of a track handle: 0 = audio, 1 = video, -1 = unknown.
