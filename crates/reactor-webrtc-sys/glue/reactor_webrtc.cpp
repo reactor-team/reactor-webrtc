@@ -169,6 +169,14 @@ struct ReactorRtcConfig {
 
 namespace {
 
+// The MediaStream every local track we publish belongs to, signalled as the
+// msid stream id. The remote libwebrtc derives each receive stream's sync group
+// from that id: streams sharing one id have their audio and video aligned
+// against each other's RTCP sender reports, while a track published with no
+// stream ("a=msid:-") is played out as it arrives. Publishing every sender
+// under one id is what keeps an audio track in sync with its video.
+constexpr const char* kReactorStreamId = "reactor-stream";
+
 // Opt-in audio path tracing (REACTOR_WEBRTC_AUDIO_DEBUG=1) → stderr. Off by
 // default. Used to pinpoint capture (push) vs playout-pump vs sink delivery.
 bool audio_debug() {
@@ -1267,7 +1275,7 @@ int reactor_webrtc_peer_connection_add_track(void* pc, void* track) {
   auto* rpc = reinterpret_cast<ReactorPeerConnection*>(pc);
   auto* h = reinterpret_cast<ReactorMediaStreamTrack*>(track);
   if (!rpc || !rpc->pc || !h || !h->track) return 0;
-  return rpc->pc->AddTrack(h->track, {"reactor-stream"}).ok() ? 1 : 0;
+  return rpc->pc->AddTrack(h->track, {kReactorStreamId}).ok() ? 1 : 0;
 }
 
 // Create a local audio track. Its samples come from the factory's ADM (push
@@ -1437,12 +1445,29 @@ int reactor_webrtc_rtp_transceiver_mid(void* transceiver, char* out, int cap) {
 
 // Attach (or clear, with null) a local track on the transceiver's sender.
 // Returns 1 on success, 0 on failure.
+//
+// An attached track joins kReactorStreamId, matching what AddTrack publishes,
+// so a sender wired up through a transceiver signals a real msid instead of
+// "a=msid:-". The next create_offer/create_answer carries it. SetStreams shares
+// SetTrack's signaling-thread contract, so it adds no threading obligation of
+// its own.
 int reactor_webrtc_rtp_transceiver_set_track(void* transceiver, void* track) {
   auto* h = reinterpret_cast<ReactorTransceiver*>(transceiver);
   if (!h || !h->tc) return 0;
   auto* t = reinterpret_cast<ReactorMediaStreamTrack*>(track);
   webrtc::MediaStreamTrackInterface* raw = (t && t->track) ? t->track.get() : nullptr;
-  return h->tc->sender()->SetTrack(raw) ? 1 : 0;
+  auto sender = h->tc->sender();
+  if (!sender || !sender->SetTrack(raw)) return 0;
+  if (raw) {
+    // Only when it would change something: SetStreams signals
+    // negotiation-needed, and a replaceTrack on an established connection
+    // already carries the id its predecessor was published under.
+    const std::vector<std::string> ids = sender->stream_ids();
+    if (ids.size() != 1 || ids[0] != kReactorStreamId) {
+      sender->SetStreams({kReactorStreamId});
+    }
+  }
+  return 1;
 }
 
 // Set the transceiver's direction. direction: 0=sendrecv, 1=sendonly,
