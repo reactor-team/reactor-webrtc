@@ -215,6 +215,20 @@ class TestTransceiverDirection:
                 assert (a == b) == (i == j)
 
 
+class TestVideoCodec:
+    def test_all_variants_distinct(self):
+        variants = [
+            rw.VideoCodec.Vp8,
+            rw.VideoCodec.Vp9,
+            rw.VideoCodec.Av1,
+            rw.VideoCodec.H264,
+            rw.VideoCodec.H265,
+        ]
+        for i, a in enumerate(variants):
+            for j, b in enumerate(variants):
+                assert (a == b) == (i == j)
+
+
 class TestPeerConnectionFactory:
     def test_duplicate_factory_raises(self, factory):
         # The session-scoped factory fixture keeps one factory alive; a second

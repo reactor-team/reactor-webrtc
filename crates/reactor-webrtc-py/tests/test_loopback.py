@@ -199,6 +199,36 @@ class TestPeerConnection:
         await negotiate(p1, p2)
         assert t.mid() is not None  # SDP exchange assigns the mid
 
+    async def test_set_codec_preferences_reorders_video_codecs(self, factory):
+        p = make_peer(factory)
+        t = p.pc.add_transceiver(rw.MediaKind.Video, rw.TransceiverDirection.SendRecv)
+
+        def first_video_codec(sdp: str) -> str:
+            video_line = next(l for l in sdp.splitlines() if l.startswith("m=video"))
+            first_pt = video_line.split()[3]
+            rtpmap = next(
+                l for l in sdp.splitlines() if l.startswith(f"a=rtpmap:{first_pt} ")
+            )
+            return rtpmap.split(" ", 1)[1].split("/")[0]
+
+        default_first = first_video_codec((await p.pc.create_offer()).sdp)
+        preferred = (
+            rw.VideoCodec.Vp8 if default_first.upper() == "VP9" else rw.VideoCodec.Vp9
+        )
+        preferred_name = "VP8" if preferred == rw.VideoCodec.Vp8 else "VP9"
+
+        t.set_codec_preferences([preferred])
+        reordered_sdp = (await p.pc.create_offer()).sdp
+        assert first_video_codec(reordered_sdp) == preferred_name
+        # Reordered, not dropped: the old default is still offered somewhere.
+        assert f" {default_first}/" in reordered_sdp
+
+    def test_set_codec_preferences_rejects_audio_transceiver(self, factory):
+        p = make_peer(factory)
+        t = p.pc.add_transceiver(rw.MediaKind.Audio, rw.TransceiverDirection.SendRecv)
+        with pytest.raises(RuntimeError, match="set_codec_preferences"):
+            t.set_codec_preferences([rw.VideoCodec.Vp8])
+
     def test_add_video_track(self, factory):
         p = make_peer(factory)
         track = factory.create_video_track("cam")
@@ -542,7 +572,7 @@ class TestFrameMetadata:
             return rw.FrameAction.Forward
 
         inspect_tf = rw.FrameTransform(inspect_recv)
-        for t in p2.pc.transceivers():
+        for t in await p2.pc.transceivers():
             if t.kind() == rw.MediaKind.Video:
                 t.set_receiver_transform(inspect_tf)
                 break

@@ -675,6 +675,29 @@ impl From<TransceiverDirection> for rw::TransceiverDirection {
     }
 }
 
+/// A negotiable video codec, for [`Transceiver.set_codec_preferences`].
+#[pyclass(eq, eq_int)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum VideoCodec {
+    Vp8,
+    Vp9,
+    Av1,
+    H264,
+    H265,
+}
+
+impl From<VideoCodec> for rw::VideoCodec {
+    fn from(c: VideoCodec) -> Self {
+        match c {
+            VideoCodec::Vp8 => rw::VideoCodec::Vp8,
+            VideoCodec::Vp9 => rw::VideoCodec::Vp9,
+            VideoCodec::Av1 => rw::VideoCodec::Av1,
+            VideoCodec::H264 => rw::VideoCodec::H264,
+            VideoCodec::H265 => rw::VideoCodec::H265,
+        }
+    }
+}
+
 // ── Stats types ───────────────────────────────────────────────────────────────
 
 /// ICE candidate-pair state (`RTCIceCandidatePairStats::state`).
@@ -1374,6 +1397,33 @@ impl Transceiver {
         .map_err(err)
     }
 
+    /// Reorder this video transceiver's codec preferences: `codecs`, most
+    /// preferred first, sort ahead of every other codec the endpoint
+    /// supports; nothing is dropped. Must be called before
+    /// `create_answer()`/`create_offer()` for the change to appear in the
+    /// SDP. Raises if this transceiver carries audio, not video.
+    fn set_codec_preferences(&self, py: Python, codecs: Vec<VideoCodec>) -> PyResult<()> {
+        let native: Vec<rw::VideoCodec> = codecs.into_iter().map(rw::VideoCodec::from).collect();
+        py.allow_threads(|| self.inner.set_codec_preferences(&native))
+            .map_err(err)
+    }
+
+    /// Make this transceiver's sender actually encode with the codec
+    /// `set_codec_preferences` put first, instead of whatever it would
+    /// otherwise pick (e.g. the remote offer's own codec order — what a
+    /// fresh answerer's sender follows by default). `set_codec_preferences`
+    /// only controls SDP negotiation; it does not by itself change which
+    /// negotiated codec an existing sender encodes with.
+    ///
+    /// Call this only after negotiation has completed — after
+    /// `set_local_description` — once the sender's parameters reflect the
+    /// negotiated codec list. Raises if called before that, or if this
+    /// transceiver has no sender.
+    fn lock_negotiated_send_codec(&self, py: Python) -> PyResult<()> {
+        py.allow_threads(|| self.inner.lock_negotiated_send_codec())
+            .map_err(err)
+    }
+
     /// Attach a `FrameTransform` to the sender path of this transceiver.
     /// The transform runs after the encoder, before RTP packetization.
     fn set_sender_transform(&self, py: Python, transform: &FrameTransform) -> PyResult<()> {
@@ -1620,9 +1670,10 @@ impl PeerConnectionObserver {
 /// An RTCPeerConnection.
 ///
 /// Signaling methods (`create_offer`, `create_answer`, `set_local_description`,
-/// `set_remote_description`, `add_ice_candidate`, `get_stats`) are natively
-/// awaitable — `await` them directly from an async context, no executor
-/// wrapping needed. Every other method is a fast synchronous call.
+/// `set_remote_description`, `add_ice_candidate`, `get_stats`, `set_bitrate`,
+/// `transceivers`) are natively awaitable — `await` them directly from an
+/// async context, no executor wrapping needed. Every other method is a fast
+/// synchronous call.
 #[pyclass]
 pub struct PeerConnection {
     inner: Option<Arc<rw::PeerConnection>>,
@@ -1770,14 +1821,20 @@ impl PeerConnection {
     /// All transceivers on this peer connection, in offer m-section order after
     /// `set_remote_description`. Use this (together with `Transceiver.set_track`)
     /// to attach local tracks to the transceivers auto-created from the remote
-    /// offer's recvonly m-sections.
-    fn transceivers(&self, py: Python) -> Vec<Transceiver> {
-        py.allow_threads(|| self.pc().transceivers())
-            .into_iter()
-            .map(|t| Transceiver {
-                inner: ManuallyDrop::new(t),
-            })
-            .collect()
+    /// offer's recvonly m-sections. Natively awaitable.
+    fn transceivers<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(self.pc());
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let ts = tokio::task::spawn_blocking(move || inner.transceivers())
+                .await
+                .map_err(join_err)?;
+            Ok(ts
+                .into_iter()
+                .map(|t| Transceiver {
+                    inner: ManuallyDrop::new(t),
+                })
+                .collect::<Vec<_>>())
+        })
     }
 
     /// Collect a stats snapshot from the WebRTC engine. Natively awaitable.
@@ -1993,6 +2050,7 @@ fn reactor_webrtc(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<DataChannelState>()?;
     m.add_class::<MediaKind>()?;
     m.add_class::<TransceiverDirection>()?;
+    m.add_class::<VideoCodec>()?;
     m.add_class::<IceCandidatePairState>()?;
     m.add_class::<InboundRtpStats>()?;
     m.add_class::<OutboundRtpStats>()?;

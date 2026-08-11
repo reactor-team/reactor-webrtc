@@ -516,6 +516,30 @@ extern "C" {
         transceiver: *mut RtpTransceiver,
         direction: c_int,
     ) -> c_int;
+    /// Reorder a video transceiver's codec preferences: entries in
+    /// `codec_names` (libwebrtc codec names such as `"VP8"`/`"VP9"`/`"AV1"`/
+    /// `"H264"`/`"H265"`, most preferred first) sort ahead of every other
+    /// codec, which keeps its original relative order. Nothing is dropped.
+    /// Takes effect on the next create_offer()/create_answer() for this
+    /// transceiver. Returns 1 on success, 0 on failure (not a video
+    /// transceiver, or libwebrtc rejected the result).
+    pub fn reactor_webrtc_rtp_transceiver_set_video_codec_preferences(
+        transceiver: *mut RtpTransceiver,
+        codec_names: *const *const c_char,
+        codecs_len: c_int,
+    ) -> c_int;
+    /// Make this transceiver's sender actually encode with the codec
+    /// [`reactor_webrtc_rtp_transceiver_set_video_codec_preferences`] put
+    /// first, instead of whatever it would otherwise pick (e.g. the remote
+    /// offer's own codec order). `set_video_codec_preferences` only controls
+    /// SDP negotiation — it does not by itself change which negotiated codec
+    /// an existing sender encodes with. Call this only after negotiation has
+    /// completed (`set_local_description`), once the sender's parameters
+    /// reflect the negotiated codec list. Returns 1 on success, 0 on failure
+    /// (no sender, no negotiated codecs yet, or libwebrtc rejected it).
+    pub fn reactor_webrtc_rtp_transceiver_lock_negotiated_send_codec(
+        transceiver: *mut RtpTransceiver,
+    ) -> c_int;
     /// Identity of the transceiver itself, as an opaque value — **not** an owning
     /// handle. Stable for the transceiver's life, unlike the handle pointer, which
     /// is a fresh allocation per `transceivers()` call. Usable as a key before any

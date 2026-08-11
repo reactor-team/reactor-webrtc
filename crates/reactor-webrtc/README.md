@@ -49,7 +49,7 @@ pc.set_local_description(&offer)?;
 | `DataChannel` | Reliable/unreliable messaging over SCTP |
 | `Track` | Local (push frames) or remote (attach a sink) media track |
 | `EncodedVideoTrack` | Push pre-encoded video frames (H.264, VP8, VP9, …) |
-| `Transceiver` | RTP send/recv direction + MID |
+| `Transceiver` | RTP send/recv direction + MID; `set_codec_preferences`/`lock_negotiated_send_codec` for video codec choice |
 | `StatsReport` | `inbound_rtp`, `outbound_rtp`, `candidate_pairs` |
 | `SessionDescription` | SDP offer or answer; `ice_ufrags`, `with_ice_credentials`, `declares_frame_metadata`, `with_frame_metadata` |
 | `FrameMetadataGate` | What the remote declared about per-frame metadata |
@@ -100,6 +100,28 @@ Returns an error if a value falls outside RFC 8445's ranges (ufrag 4–256
 characters, password 22–256) or contains anything outside `ice-char`
 (`ALPHA / DIGIT / "+" / "/"`). That last check is also what stops a newline in a
 credential from injecting an SDP line.
+
+## Codec preferences
+
+```rust
+let tx = pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendOnly)?;
+tx.set_track(&video_track)?;
+tx.set_codec_preferences(&[VideoCodec::Vp9, VideoCodec::Vp8])?;
+
+let answer = pc.create_answer()?;
+pc.set_local_description(&answer)?;
+
+// Only after set_local_description does the sender's negotiated codec list
+// exist to lock onto — set_codec_preferences alone shapes the SDP, not which
+// negotiated codec this side's own sender actually encodes with.
+tx.lock_negotiated_send_codec()?;
+```
+
+`set_codec_preferences` reorders the transceiver's negotiable codecs so the
+given ones sort first — a codec this build does not actually support (no
+hardware H.264, say) is silently skipped rather than rejected. Nothing else
+is dropped: unlisted codecs, and every retransmission/RED/FEC entry, keep
+their original relative order after the preferred ones.
 
 ## Per-frame metadata
 

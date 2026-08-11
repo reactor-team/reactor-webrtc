@@ -140,7 +140,7 @@ class TestEncodedFrameMetadata:
         # Attach receiver FrameTransform to inspect encoded bytes before decode.
         recv_tf = rw.FrameTransform(recv_check)
         recv_tf_ref.append(recv_tf)
-        for t in p2.pc.transceivers():
+        for t in await p2.pc.transceivers():
             if t.kind() == rw.MediaKind.Video:
                 t.set_receiver_transform(recv_tf)
                 break

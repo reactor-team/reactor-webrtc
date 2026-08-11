@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use reactor_webrtc_sys::ReactorStatEntry;
 
-use crate::encoded::FrameTransform;
+use crate::encoded::{FrameTransform, VideoCodec};
 use crate::media::{MediaKind, Track};
 use crate::observer::ObserverState;
 use crate::{Error, FactoryHandle, Result};
@@ -428,6 +428,73 @@ impl Transceiver {
             Ok(())
         } else {
             Err(Error::Webrtc("transceiver set_direction failed".into()))
+        }
+    }
+
+    /// Reorder this video transceiver's codec preferences: `codecs`, most
+    /// preferred first, sort ahead of every other codec the endpoint
+    /// supports. Mirrors [`RTCRtpTransceiver.setCodecPreferences`](
+    /// https://w3c.github.io/webrtc-pc/#dom-rtcrtptransceiver-setcodecpreferences).
+    ///
+    /// Nothing is dropped: a codec left out of `codecs`, and every
+    /// retransmission/RED/FEC entry, keeps its original relative order after
+    /// the preferred ones — retransmission stays associated with its codec,
+    /// and the peer that doesn't support a preferred codec still gets an
+    /// offer/answer it can negotiate against. A codec named in `codecs` that
+    /// this endpoint does not actually support is silently ignored rather
+    /// than treated as an error.
+    ///
+    /// Takes effect on the next [`PeerConnection::create_offer`] or
+    /// [`PeerConnection::create_answer`] for this transceiver's m-section —
+    /// call it before negotiating. Returns an error if this transceiver
+    /// carries audio, not video.
+    pub fn set_codec_preferences(&self, codecs: &[VideoCodec]) -> Result<()> {
+        let names: Vec<CString> = codecs
+            .iter()
+            .map(|c| CString::new(c.name()).expect("codec name is a static ASCII string"))
+            .collect();
+        let ptrs: Vec<*const c_char> = names.iter().map(|n| n.as_ptr()).collect();
+        let ok = unsafe {
+            reactor_webrtc_sys::reactor_webrtc_rtp_transceiver_set_video_codec_preferences(
+                self.raw,
+                ptrs.as_ptr(),
+                ptrs.len() as c_int,
+            )
+        };
+        if ok == 1 {
+            Ok(())
+        } else {
+            Err(Error::Webrtc(
+                "transceiver set_codec_preferences failed (not a video transceiver?)".into(),
+            ))
+        }
+    }
+
+    /// Make this transceiver's sender actually encode with the codec
+    /// [`set_codec_preferences`](Self::set_codec_preferences) put first,
+    /// instead of whatever it would otherwise pick — such as the remote
+    /// offer's own codec order, which is what a fresh answerer's sender
+    /// follows by default. `set_codec_preferences` only controls SDP
+    /// negotiation (what gets offered/answered, and in what order); it does
+    /// not by itself change which of the negotiated codecs an existing
+    /// sender encodes with — that is libwebrtc's separate "codec switching"
+    /// mechanism (an encoding's `codec` parameter).
+    ///
+    /// Call this only after negotiation has completed — after
+    /// [`PeerConnection::set_local_description`] — once the sender's
+    /// parameters reflect the negotiated codec list. Calling it before that
+    /// returns an error, since there is nothing negotiated yet to lock onto.
+    pub fn lock_negotiated_send_codec(&self) -> Result<()> {
+        let ok = unsafe {
+            reactor_webrtc_sys::reactor_webrtc_rtp_transceiver_lock_negotiated_send_codec(self.raw)
+        };
+        if ok == 1 {
+            Ok(())
+        } else {
+            Err(Error::Webrtc(
+                "transceiver lock_negotiated_send_codec failed (no sender, or negotiation not complete yet?)"
+                    .into(),
+            ))
         }
     }
 

@@ -513,6 +513,11 @@ struct ReactorDataChannel {
 // A transceiver handle (the `RtpTransceiver` in the Rust API).
 struct ReactorTransceiver {
   webrtc::scoped_refptr<webrtc::RtpTransceiverInterface> tc;
+  // Kept alive (ref-counted) so codec-preference queries can reach
+  // GetRtpSenderCapabilities/GetRtpReceiverCapabilities from the transceiver
+  // handle alone, independent of whether the owning ReactorPeerConnection has
+  // since been destroyed.
+  webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> factory;
 };
 
 // Owns the three WebRTC threads alongside the factory. The threads must outlive
@@ -592,6 +597,11 @@ class ReactorPcObserver : public webrtc::PeerConnectionObserver {
 struct ReactorPeerConnection {
   std::unique_ptr<ReactorPcObserver> observer;
   webrtc::scoped_refptr<webrtc::PeerConnectionInterface> pc;
+  // The factory this connection was created from. GetRtpSenderCapabilities /
+  // GetRtpReceiverCapabilities (codec-preference queries) live on the factory,
+  // not the connection, so transceiver handles need it too — see
+  // ReactorTransceiver::factory.
+  webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> factory;
 };
 
 // Forwards CreateOffer/CreateAnswer results to C callbacks.
@@ -956,6 +966,7 @@ void* reactor_webrtc_peer_connection_create(void* factory,
   }
 
   auto rpc = std::make_unique<ReactorPeerConnection>();
+  rpc->factory = rf->factory;
   ReactorPcCallbacks cb{};
   if (callbacks) cb = *callbacks;
   rpc->observer = std::make_unique<ReactorPcObserver>(cb);
@@ -1394,7 +1405,7 @@ void* reactor_webrtc_peer_connection_add_transceiver(void* pc, int media_kind,
   init.direction = static_cast<webrtc::RtpTransceiverDirection>(direction);
   auto result = rpc->pc->AddTransceiver(mt, init);
   if (!result.ok()) return nullptr;
-  return new ReactorTransceiver{result.MoveValue()};
+  return new ReactorTransceiver{result.MoveValue(), rpc->factory};
 }
 
 // Number of transceivers on the peer connection (post-negotiation this
@@ -1412,7 +1423,7 @@ void* reactor_webrtc_peer_connection_get_transceiver(void* pc, int index) {
   if (!rpc || !rpc->pc || index < 0) return nullptr;
   auto tcs = rpc->pc->GetTransceivers();
   if (static_cast<size_t>(index) >= tcs.size()) return nullptr;
-  return new ReactorTransceiver{tcs[static_cast<size_t>(index)]};
+  return new ReactorTransceiver{tcs[static_cast<size_t>(index)], rpc->factory};
 }
 
 // Media kind of a transceiver: 0 = audio, 1 = video, -1 = unknown.
@@ -1478,6 +1489,92 @@ int reactor_webrtc_rtp_transceiver_set_direction(void* transceiver, int directio
   auto dir = static_cast<webrtc::RtpTransceiverDirection>(direction);
   auto err = h->tc->SetDirectionWithError(dir);
   return err.ok() ? 1 : 0;
+}
+
+// Reorder this video transceiver's codec preferences so entries matching
+// `codec_names` (libwebrtc codec names such as "VP8"/"VP9"/"AV1"/"H264"/
+// "H265", most preferred first) sort ahead of every other codec. Nothing is
+// dropped: codecs not named in the list, and every retransmission/RED/FEC
+// entry, keep their original relative order after the preferred ones — so
+// retransmission stays associated with its codec and negotiation never
+// loses a capability the endpoint actually has. Takes effect on the next
+// create_offer()/create_answer() for this transceiver's m-section. Returns
+// 1 on success, 0 on failure (not a video transceiver, or libwebrtc
+// rejected the result).
+int reactor_webrtc_rtp_transceiver_set_video_codec_preferences(
+    void* transceiver, const char* const* codec_names, int codecs_len) {
+  auto* h = reinterpret_cast<ReactorTransceiver*>(transceiver);
+  if (!h || !h->tc || !h->factory) return 0;
+  if (h->tc->media_type() != webrtc::MediaType::VIDEO) return 0;
+
+  // Sender capabilities alone, not a union with GetRtpReceiverCapabilities:
+  // the two lists can carry the *same* codec with different
+  // `scalability_modes` (an encode-only concept), which compare unequal under
+  // RtpCodecCapability::operator==. Unioning them would let one codec's
+  // sender and receiver variants both through, and libwebrtc can assign them
+  // the same payload type — a real "Duplicate payload type in codec list"
+  // negotiation failure, not just a cosmetic one.
+  webrtc::RtpCapabilities caps =
+      h->factory->GetRtpSenderCapabilities(webrtc::MediaType::VIDEO);
+
+  std::vector<webrtc::RtpCodecCapability> ordered;
+  ordered.reserve(caps.codecs.size());
+  std::vector<bool> used(caps.codecs.size(), false);
+  for (int i = 0; i < codecs_len && codec_names; ++i) {
+    const char* name = codec_names[i];
+    if (!name) continue;
+    for (size_t j = 0; j < caps.codecs.size(); ++j) {
+      if (!used[j] && caps.codecs[j].name == name) {
+        ordered.push_back(caps.codecs[j]);
+        used[j] = true;
+      }
+    }
+  }
+  for (size_t j = 0; j < caps.codecs.size(); ++j) {
+    if (!used[j]) ordered.push_back(caps.codecs[j]);
+  }
+
+  return h->tc->SetCodecPreferences(ordered).ok() ? 1 : 0;
+}
+
+// SetCodecPreferences only controls SDP negotiation — what gets offered/
+// answered, and in what order. It does *not* determine which of the
+// negotiated codecs this transceiver's own sender actually encodes with;
+// that is a separate, later decision (libwebrtc's "codec switching":
+// RtpParameters::encodings[].codec). Call this once negotiation has
+// completed (after set_local_description) to make the sender's first
+// negotiated codec — the one set_codec_preferences put first — the one it
+// actually uses, instead of whatever it would otherwise have picked (e.g.
+// the remote offer's own original order). Returns 1 on success, 0 on
+// failure (no sender, no negotiated codecs yet, or libwebrtc rejected it).
+int reactor_webrtc_rtp_transceiver_lock_negotiated_send_codec(void* transceiver) {
+  auto* h = reinterpret_cast<ReactorTransceiver*>(transceiver);
+  if (!h || !h->tc) return 0;
+
+  // codec_preferences() is what set_codec_preferences configured — the
+  // source of truth for "most preferred", in name-only terms (it is a
+  // capability, not a negotiated payload type). RtpParameters::codecs (from
+  // GetParameters() below) is NOT in this order — empirically it stays in a
+  // fixed, implementation-determined order regardless of codec_preferences(),
+  // so codecs[0] cannot be assumed to be the preferred one. Matching by name
+  // against the actual negotiated list is what makes this correct.
+  auto preferences = h->tc->codec_preferences();
+  if (preferences.empty()) return 0;
+  const std::string& want = preferences[0].name;
+
+  auto sender = h->tc->sender();
+  if (!sender) return 0;
+
+  webrtc::RtpParameters params = sender->GetParameters();
+  if (params.encodings.empty()) return 0;
+
+  for (auto& c : params.codecs) {
+    if (c.name == want) {
+      params.encodings[0].codec = webrtc::RtpCodec(c);
+      return sender->SetParameters(params).ok() ? 1 : 0;
+    }
+  }
+  return 0;  // the preferred codec was not actually negotiated for this sender
 }
 
 // Identity of the *transceiver* itself, as an opaque value — not an owning
