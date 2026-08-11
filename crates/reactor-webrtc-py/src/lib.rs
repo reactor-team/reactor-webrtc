@@ -1390,12 +1390,16 @@ impl Transceiver {
             // The borrow guard carries a GIL token, so the native reference has
             // to be taken out of it before the GIL is released.
             let native: &rw::Track = &t.inner;
-            return py.allow_threads(|| self.tc().set_track(native)).map_err(err);
+            return py
+                .allow_threads(|| self.tc().set_track(native))
+                .map_err(err);
         }
         if let Ok(enc) = track.downcast::<EncodedVideoTrack>() {
             let enc = enc.borrow();
             let native: &rw::Track = enc.inner.track();
-            return py.allow_threads(|| self.tc().set_track(native)).map_err(err);
+            return py
+                .allow_threads(|| self.tc().set_track(native))
+                .map_err(err);
         }
         Err(PyTypeError::new_err(
             "track must be a Track or EncodedVideoTrack",
