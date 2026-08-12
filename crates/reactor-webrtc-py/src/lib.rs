@@ -1361,23 +1361,25 @@ impl Drop for Transceiver {
 impl Transceiver {
     /// Borrows the native transceiver. `inner` is only ever `None` after this
     /// object's own `Drop` has run, so every live call through Python sees `Some`.
-    fn tc(&self) -> &Arc<rw::Transceiver> {
+    fn tc(&self) -> PyResult<&Arc<rw::Transceiver>> {
         self.inner
             .as_ref()
-            .expect("Transceiver used after being dropped")
+            .ok_or_else(|| PyRuntimeError::new_err("Transceiver used after being dropped"))
     }
 }
 
 #[pymethods]
 impl Transceiver {
     /// The `mid`, set after `set_local_description`.
-    fn mid(&self, py: Python) -> Option<String> {
-        py.allow_threads(|| self.tc().mid())
+    fn mid(&self, py: Python) -> PyResult<Option<String>> {
+        let native = Arc::clone(self.tc()?);
+        Ok(py.allow_threads(|| native.mid()))
     }
 
     /// Media kind (Audio or Video).
-    fn kind(&self, py: Python) -> MediaKind {
-        MediaKind::from(py.allow_threads(|| self.tc().kind()))
+    fn kind(&self, py: Python) -> PyResult<MediaKind> {
+        let native = Arc::clone(self.tc()?);
+        Ok(MediaKind::from(py.allow_threads(|| native.kind())))
     }
 
     /// Attach a local track to the sender slot. Accepts either a `Track` or an
@@ -1385,21 +1387,18 @@ impl Transceiver {
     fn set_track(&self, py: Python, track: &Bound<'_, PyAny>) -> PyResult<()> {
         // Reaches the sender through several signaling-thread proxy calls, so the
         // GIL has to be free for the duration.
+        let inner = Arc::clone(self.tc()?);
         if let Ok(t) = track.downcast::<Track>() {
             let t = t.borrow();
             // The borrow guard carries a GIL token, so the native reference has
             // to be taken out of it before the GIL is released.
             let native: &rw::Track = &t.inner;
-            return py
-                .allow_threads(|| self.tc().set_track(native))
-                .map_err(err);
+            return py.allow_threads(|| inner.set_track(native)).map_err(err);
         }
         if let Ok(enc) = track.downcast::<EncodedVideoTrack>() {
             let enc = enc.borrow();
             let native: &rw::Track = enc.inner.track();
-            return py
-                .allow_threads(|| self.tc().set_track(native))
-                .map_err(err);
+            return py.allow_threads(|| inner.set_track(native)).map_err(err);
         }
         Err(PyTypeError::new_err(
             "track must be a Track or EncodedVideoTrack",
@@ -1414,7 +1413,7 @@ impl Transceiver {
         py: Python<'py>,
         direction: TransceiverDirection,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let inner = Arc::clone(self.tc());
+        let inner = Arc::clone(self.tc()?);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             tokio::task::spawn_blocking(move || {
                 inner.set_direction(rw::TransceiverDirection::from(direction))
@@ -1444,7 +1443,7 @@ impl Transceiver {
         codecs: Vec<VideoCodec>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let native: Vec<rw::VideoCodec> = codecs.into_iter().map(rw::VideoCodec::from).collect();
-        let inner = Arc::clone(self.tc());
+        let inner = Arc::clone(self.tc()?);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             tokio::task::spawn_blocking(move || inner.set_codec_preferences(&native))
                 .await
@@ -1456,14 +1455,16 @@ impl Transceiver {
     /// Attach a `FrameTransform` to the sender path of this transceiver.
     /// The transform runs after the encoder, before RTP packetization.
     fn set_sender_transform(&self, py: Python, transform: &FrameTransform) -> PyResult<()> {
-        py.allow_threads(|| self.tc().set_sender_transform(&transform.inner))
+        let native = Arc::clone(self.tc()?);
+        py.allow_threads(|| native.set_sender_transform(&transform.inner))
             .map_err(err)
     }
 
     /// Attach a `FrameTransform` to the receiver path of this transceiver.
     /// The transform runs after RTP depacketization, before the decoder.
     fn set_receiver_transform(&self, py: Python, transform: &FrameTransform) -> PyResult<()> {
-        py.allow_threads(|| self.tc().set_receiver_transform(&transform.inner))
+        let native = Arc::clone(self.tc()?);
+        py.allow_threads(|| native.set_receiver_transform(&transform.inner))
             .map_err(err)
     }
 }
