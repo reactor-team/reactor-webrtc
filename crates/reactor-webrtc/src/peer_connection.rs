@@ -434,7 +434,17 @@ impl Transceiver {
     /// Reorder this video transceiver's codec preferences: `codecs`, most
     /// preferred first, sort ahead of every other codec the endpoint
     /// supports. Mirrors [`RTCRtpTransceiver.setCodecPreferences`](
-    /// https://w3c.github.io/webrtc-pc/#dom-rtcrtptransceiver-setcodecpreferences).
+    /// https://w3c.github.io/webrtc-pc/#dom-rtcrtptransceiver-setcodecpreferences),
+    /// plus one behavior the browser API does not need: once negotiation
+    /// completes, [`PeerConnection::set_local_description`] and
+    /// [`PeerConnection::set_remote_description`] also make this
+    /// transceiver's own sender actually *encode* with whichever preferred
+    /// codec was negotiated, not just list it first in the SDP. Without
+    /// that, a fresh sender follows the remote offer's own codec order
+    /// regardless of what got negotiated — libwebrtc's SDP negotiation and
+    /// its sender codec selection are two separate mechanisms, and only the
+    /// first one is driven by preference order. See
+    /// [`try_lock_negotiated_send_codec`](Self::try_lock_negotiated_send_codec).
     ///
     /// Nothing is dropped: a codec left out of `codecs`, and every
     /// retransmission/RED/FEC entry, keeps its original relative order after
@@ -470,32 +480,27 @@ impl Transceiver {
         }
     }
 
-    /// Make this transceiver's sender actually encode with the codec
-    /// [`set_codec_preferences`](Self::set_codec_preferences) put first,
-    /// instead of whatever it would otherwise pick — such as the remote
-    /// offer's own codec order, which is what a fresh answerer's sender
-    /// follows by default. `set_codec_preferences` only controls SDP
-    /// negotiation (what gets offered/answered, and in what order); it does
-    /// not by itself change which of the negotiated codecs an existing
-    /// sender encodes with — that is libwebrtc's separate "codec switching"
-    /// mechanism (an encoding's `codec` parameter).
+    /// Best-effort counterpart to [`set_codec_preferences`](Self::set_codec_preferences):
+    /// make this transceiver's sender actually encode with the codec
+    /// `set_codec_preferences` put first, instead of whatever it would
+    /// otherwise pick (e.g. the remote offer's own codec order).
+    /// `set_codec_preferences` only controls SDP negotiation; it does not by
+    /// itself change which negotiated codec an existing sender encodes
+    /// with — that is libwebrtc's separate "codec switching" mechanism.
     ///
-    /// Call this only after negotiation has completed — after
-    /// [`PeerConnection::set_local_description`] — once the sender's
-    /// parameters reflect the negotiated codec list. Calling it before that
-    /// returns an error, since there is nothing negotiated yet to lock onto.
-    pub fn lock_negotiated_send_codec(&self) -> Result<()> {
+    /// Not public: [`PeerConnection::set_local_description`] and
+    /// [`PeerConnection::set_remote_description`] call this on every video
+    /// transceiver after applying the description, so callers only ever
+    /// need `set_codec_preferences`. Returns `false` rather than erroring
+    /// when there is nothing to do yet — no preference was set, there is no
+    /// sender, or negotiation has not completed on this side yet — since
+    /// whichever of the two description calls comes second on either role
+    /// (offerer or answerer) is the one that finds a completed negotiation.
+    pub(crate) fn try_lock_negotiated_send_codec(&self) -> bool {
         let ok = unsafe {
             reactor_webrtc_sys::reactor_webrtc_rtp_transceiver_lock_negotiated_send_codec(self.raw)
         };
-        if ok == 1 {
-            Ok(())
-        } else {
-            Err(Error::Webrtc(
-                "transceiver lock_negotiated_send_codec failed (no sender, or negotiation not complete yet?)"
-                    .into(),
-            ))
-        }
+        ok == 1
     }
 
     /// Attach an encoded-frame transform to this transceiver's **sender**
@@ -1148,6 +1153,7 @@ impl PeerConnection {
     pub fn set_local_description(&self, sdp: &SessionDescription) -> Result<()> {
         self.set_description(sdp, true)?;
         self.install_frame_metadata_transforms();
+        self.lock_negotiated_send_codecs();
         Ok(())
     }
 
@@ -1170,6 +1176,7 @@ impl PeerConnection {
         self.frame_metadata_gate
             .set(self.frame_metadata_enabled && sdp.declares_frame_metadata());
         self.install_frame_metadata_transforms();
+        self.lock_negotiated_send_codecs();
         Ok(())
     }
 
@@ -1260,6 +1267,31 @@ impl PeerConnection {
                     }
                 }
             }
+        }
+    }
+
+    /// Best-effort: apply [`Transceiver::try_lock_negotiated_send_codec`] to
+    /// every video transceiver.
+    ///
+    /// Idempotent, and run from both `set_local_description` and
+    /// `set_remote_description` for the same reason
+    /// [`install_frame_metadata_transforms`](Self::install_frame_metadata_transforms)
+    /// is: whichever of the two completes negotiation on this side is the one
+    /// that finds a sender with a negotiated codec list to lock onto — the
+    /// answerer's own sender is ready after its `set_local_description`, the
+    /// offerer's only after the answer arrives via `set_remote_description`.
+    ///
+    /// Silent about failures on purpose, same as the metadata install: a
+    /// transceiver with no preference set, no sender, or nothing negotiated
+    /// yet on this call is not the caller's problem, and none of it should
+    /// fail applying a description. Calling this again after the codec is
+    /// already locked just re-confirms the same match.
+    fn lock_negotiated_send_codecs(&self) {
+        for tc in self.transceivers() {
+            if tc.kind() != MediaKind::Video {
+                continue;
+            }
+            tc.try_lock_negotiated_send_codec();
         }
     }
 

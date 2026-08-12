@@ -1558,9 +1558,15 @@ int reactor_webrtc_rtp_transceiver_lock_negotiated_send_codec(void* transceiver)
   // fixed, implementation-determined order regardless of codec_preferences(),
   // so codecs[0] cannot be assumed to be the preferred one. Matching by name
   // against the actual negotiated list is what makes this correct.
+  //
+  // Walk the whole preference order, not just the first entry: the most
+  // preferred codec can be configured but not actually negotiated with this
+  // peer (unsupported on their end, dropped during offer/answer), in which
+  // case the next-preferred one that *did* get negotiated is still a better
+  // choice than silently giving up and leaving the sender on whatever
+  // codec it would otherwise have picked.
   auto preferences = h->tc->codec_preferences();
   if (preferences.empty()) return 0;
-  const std::string& want = preferences[0].name;
 
   auto sender = h->tc->sender();
   if (!sender) return 0;
@@ -1568,13 +1574,15 @@ int reactor_webrtc_rtp_transceiver_lock_negotiated_send_codec(void* transceiver)
   webrtc::RtpParameters params = sender->GetParameters();
   if (params.encodings.empty()) return 0;
 
-  for (auto& c : params.codecs) {
-    if (c.name == want) {
-      params.encodings[0].codec = webrtc::RtpCodec(c);
-      return sender->SetParameters(params).ok() ? 1 : 0;
+  for (auto& pref : preferences) {
+    for (auto& c : params.codecs) {
+      if (c.name == pref.name) {
+        params.encodings[0].codec = webrtc::RtpCodec(c);
+        return sender->SetParameters(params).ok() ? 1 : 0;
+      }
     }
   }
-  return 0;  // the preferred codec was not actually negotiated for this sender
+  return 0;  // none of the preferred codecs were actually negotiated for this sender
 }
 
 // Identity of the *transceiver* itself, as an opaque value — not an owning

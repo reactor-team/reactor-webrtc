@@ -1190,7 +1190,7 @@ impl EncodedVideoTrack {
             .map_err(err)?;
         py.allow_threads(|| t.set_track(track)).map_err(err)?;
         Ok(Transceiver {
-            inner: ManuallyDrop::new(t),
+            inner: Some(Arc::new(t)),
         })
     }
 }
@@ -1336,28 +1336,50 @@ impl FrameTransform {
 /// An RTP transceiver (one m-section in the SDP).
 #[pyclass]
 pub struct Transceiver {
-    inner: ManuallyDrop<rw::Transceiver>,
+    // Arc, not ManuallyDrop, so set_direction/set_codec_preferences can clone
+    // a handle into a spawn_blocking future (which must be 'static) while
+    // this Python object keeps its own handle. set_track stays on plain
+    // allow_threads: it also needs Track's/EncodedVideoTrack's own inner
+    // Arc-wrapped the same way to be awaitable
+    // safely, which is out of scope here.
+    inner: Option<Arc<rw::Transceiver>>,
 }
 
 impl Drop for Transceiver {
     fn drop(&mut self) {
         // Holds native sender and receiver references; releasing them dispatches
-        // to the signaling thread, which may be inside Python.
-        let inner = unsafe { ManuallyDrop::take(&mut self.inner) };
+        // to the signaling thread, which may be inside Python. Taking the Arc out
+        // and dropping it with the GIL released is correct whether or not this is
+        // the last handle: on a refcount-only decrement it is just cheap, and on
+        // the real native release it is what avoids deadlocking a callback that
+        // re-enters Python.
+        let inner = self.inner.take();
         Python::with_gil(|py| py.allow_threads(|| drop(inner)));
+    }
+}
+
+impl Transceiver {
+    /// Borrows the native transceiver. `inner` is only ever `None` after this
+    /// object's own `Drop` has run, so every live call through Python sees `Some`.
+    fn tc(&self) -> PyResult<&Arc<rw::Transceiver>> {
+        self.inner
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Transceiver used after being dropped"))
     }
 }
 
 #[pymethods]
 impl Transceiver {
     /// The `mid`, set after `set_local_description`.
-    fn mid(&self, py: Python) -> Option<String> {
-        py.allow_threads(|| self.inner.mid())
+    fn mid(&self, py: Python) -> PyResult<Option<String>> {
+        let native = Arc::clone(self.tc()?);
+        Ok(py.allow_threads(|| native.mid()))
     }
 
     /// Media kind (Audio or Video).
-    fn kind(&self, py: Python) -> MediaKind {
-        MediaKind::from(py.allow_threads(|| self.inner.kind()))
+    fn kind(&self, py: Python) -> PyResult<MediaKind> {
+        let native = Arc::clone(self.tc()?);
+        Ok(MediaKind::from(py.allow_threads(|| native.kind())))
     }
 
     /// Attach a local track to the sender slot. Accepts either a `Track` or an
@@ -1365,21 +1387,18 @@ impl Transceiver {
     fn set_track(&self, py: Python, track: &Bound<'_, PyAny>) -> PyResult<()> {
         // Reaches the sender through several signaling-thread proxy calls, so the
         // GIL has to be free for the duration.
+        let inner = Arc::clone(self.tc()?);
         if let Ok(t) = track.downcast::<Track>() {
             let t = t.borrow();
             // The borrow guard carries a GIL token, so the native reference has
             // to be taken out of it before the GIL is released.
             let native: &rw::Track = &t.inner;
-            return py
-                .allow_threads(|| self.inner.set_track(native))
-                .map_err(err);
+            return py.allow_threads(|| inner.set_track(native)).map_err(err);
         }
         if let Ok(enc) = track.downcast::<EncodedVideoTrack>() {
             let enc = enc.borrow();
             let native: &rw::Track = enc.inner.track();
-            return py
-                .allow_threads(|| self.inner.set_track(native))
-                .map_err(err);
+            return py.allow_threads(|| inner.set_track(native)).map_err(err);
         }
         Err(PyTypeError::new_err(
             "track must be a Track or EncodedVideoTrack",
@@ -1388,13 +1407,21 @@ impl Transceiver {
 
     /// Set the transceiver direction (SendOnly, RecvOnly, SendRecv, Inactive).
     /// Must be called before `create_answer()`/`create_offer()` for the change
-    /// to appear in the SDP.
-    fn set_direction(&self, py: Python, direction: TransceiverDirection) -> PyResult<()> {
-        py.allow_threads(|| {
-            self.inner
-                .set_direction(rw::TransceiverDirection::from(direction))
+    /// to appear in the SDP. Natively awaitable.
+    fn set_direction<'py>(
+        &self,
+        py: Python<'py>,
+        direction: TransceiverDirection,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(self.tc()?);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            tokio::task::spawn_blocking(move || {
+                inner.set_direction(rw::TransceiverDirection::from(direction))
+            })
+            .await
+            .map_err(join_err)?
+            .map_err(err)
         })
-        .map_err(err)
     }
 
     /// Reorder this video transceiver's codec preferences: `codecs`, most
@@ -1402,39 +1429,42 @@ impl Transceiver {
     /// supports; nothing is dropped. Must be called before
     /// `create_answer()`/`create_offer()` for the change to appear in the
     /// SDP. Raises if this transceiver carries audio, not video.
-    fn set_codec_preferences(&self, py: Python, codecs: Vec<VideoCodec>) -> PyResult<()> {
-        let native: Vec<rw::VideoCodec> = codecs.into_iter().map(rw::VideoCodec::from).collect();
-        py.allow_threads(|| self.inner.set_codec_preferences(&native))
-            .map_err(err)
-    }
-
-    /// Make this transceiver's sender actually encode with the codec
-    /// `set_codec_preferences` put first, instead of whatever it would
-    /// otherwise pick (e.g. the remote offer's own codec order — what a
-    /// fresh answerer's sender follows by default). `set_codec_preferences`
-    /// only controls SDP negotiation; it does not by itself change which
-    /// negotiated codec an existing sender encodes with.
     ///
-    /// Call this only after negotiation has completed — after
-    /// `set_local_description` — once the sender's parameters reflect the
-    /// negotiated codec list. Raises if called before that, or if this
-    /// transceiver has no sender.
-    fn lock_negotiated_send_codec(&self, py: Python) -> PyResult<()> {
-        py.allow_threads(|| self.inner.lock_negotiated_send_codec())
-            .map_err(err)
+    /// Once negotiation completes, `PeerConnection.set_local_description`/
+    /// `set_remote_description` also make this transceiver's own sender
+    /// actually *encode* with whichever preferred codec was negotiated —
+    /// SDP negotiation and a sender's codec selection are separate
+    /// mechanisms in libwebrtc, and only the first is driven by preference
+    /// order, so this is handled automatically rather than requiring a
+    /// second call. Natively awaitable.
+    fn set_codec_preferences<'py>(
+        &self,
+        py: Python<'py>,
+        codecs: Vec<VideoCodec>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let native: Vec<rw::VideoCodec> = codecs.into_iter().map(rw::VideoCodec::from).collect();
+        let inner = Arc::clone(self.tc()?);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            tokio::task::spawn_blocking(move || inner.set_codec_preferences(&native))
+                .await
+                .map_err(join_err)?
+                .map_err(err)
+        })
     }
 
     /// Attach a `FrameTransform` to the sender path of this transceiver.
     /// The transform runs after the encoder, before RTP packetization.
     fn set_sender_transform(&self, py: Python, transform: &FrameTransform) -> PyResult<()> {
-        py.allow_threads(|| self.inner.set_sender_transform(&transform.inner))
+        let native = Arc::clone(self.tc()?);
+        py.allow_threads(|| native.set_sender_transform(&transform.inner))
             .map_err(err)
     }
 
     /// Attach a `FrameTransform` to the receiver path of this transceiver.
     /// The transform runs after RTP depacketization, before the decoder.
     fn set_receiver_transform(&self, py: Python, transform: &FrameTransform) -> PyResult<()> {
-        py.allow_threads(|| self.inner.set_receiver_transform(&transform.inner))
+        let native = Arc::clone(self.tc()?);
+        py.allow_threads(|| native.set_receiver_transform(&transform.inner))
             .map_err(err)
     }
 }
@@ -1806,7 +1836,7 @@ impl PeerConnection {
                 .add_transceiver(rust_kind, rw::TransceiverDirection::from(direction))
         })
         .map(|t| Transceiver {
-            inner: ManuallyDrop::new(t),
+            inner: Some(Arc::new(t)),
         })
         .map_err(err)
     }
@@ -1831,7 +1861,7 @@ impl PeerConnection {
             Ok(ts
                 .into_iter()
                 .map(|t| Transceiver {
-                    inner: ManuallyDrop::new(t),
+                    inner: Some(Arc::new(t)),
                 })
                 .collect::<Vec<_>>())
         })
