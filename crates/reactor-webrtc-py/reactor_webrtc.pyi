@@ -192,6 +192,20 @@ class StatsReport:
 
 # ── Frame metadata ────────────────────────────────────────────────────────────
 
+def time_micros() -> int:
+    """Read the engine's monotonic clock, in microseconds.
+
+    The epoch the `capture_time_us` arguments of `Track.push_video_frame` and
+    `Track.push_pcm` are expressed in. Read it once per unit of produced media
+    and stamp every track with that one value: audio and video are synchronised
+    by sharing a capture time, not by reaching the encoder at the same moment.
+
+        now = reactor_webrtc.time_micros()
+        video.push_video_frame(bgra, w, h, capture_time_us=now)
+        audio.push_pcm(pcm, 48_000, 1, capture_time_us=now)
+    """
+    ...
+
 FRAME_METADATA_ATTRIBUTE: str
 """The SDP attribute peers declare frame-metadata support with.
 
@@ -297,13 +311,20 @@ class Track:
         width: int,
         height: int,
         user_data: Optional[bytes] = None,
+        capture_time_us: Optional[int] = None,
     ) -> None:
         """Push a raw BGRA video frame into a local video track.
 
         Pass `user_data` (bytes) to embed per-frame metadata in the encoded
         packet trailer. Nothing else has to be arranged: the trailer is appended
         once the peer has declared that it strips them, and `user_data` is
-        silently dropped while it has not (see `FrameMetadataGate`)."""
+        silently dropped while it has not (see `FrameMetadataGate`).
+
+        Pass `capture_time_us` (from `time_micros()`) to say when the frame was
+        captured, instead of letting it inherit the moment it reached the
+        encoder. Stamping this frame and the audio produced with it from one
+        `time_micros()` read is what lets the receiver play them together.
+        Independent of `user_data`: a frame can carry either, both, or neither."""
         ...
     def on_video_frame(
         self,
@@ -324,11 +345,23 @@ class Track:
         Note: all-zero frames (empty jitter buffer from peers with no incoming
         RTP) are suppressed and will not trigger this callback."""
         ...
-    def push_pcm(self, pcm: bytes, sample_rate: int, channels: int) -> None:
+    def push_pcm(
+        self,
+        pcm: bytes,
+        sample_rate: int,
+        channels: int,
+        capture_time_us: Optional[int] = None,
+    ) -> None:
         """Push interleaved signed 16-bit little-endian PCM to a local audio track
         created with `PeerConnectionFactory.create_audio_track_with_local_source`.
         `pcm` must have even byte length and `len(pcm) // 2` must be a multiple of
-        `channels`. No-op for ADM-backed or remote tracks."""
+        `channels`. No-op for ADM-backed or remote tracks.
+
+        Pass `capture_time_us` (from `time_micros()`) to say when the audio was
+        captured. A track's RTP timestamp otherwise counts only the samples it
+        has been handed, which says how much audio exists but not when it
+        happened; giving this the same value as the video captured alongside it
+        is what lets the receiver play the two together."""
         ...
     def on_audio_frame(
         self,

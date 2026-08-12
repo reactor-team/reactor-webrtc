@@ -47,7 +47,7 @@ pc.set_local_description(&offer)?;
 | `PeerConnection` | Offer/answer, ICE, tracks, data channels, stats |
 | `PeerConnectionObserver` | Callbacks: state change, ICE candidate, track, data channel |
 | `DataChannel` | Reliable/unreliable messaging over SCTP |
-| `Track` | Local (push frames) or remote (attach a sink) media track |
+| `Track` | Local (push frames) or remote (attach a sink) media track; the `_at` push methods take a capture timestamp |
 | `EncodedVideoTrack` | Push pre-encoded video frames (H.264, VP8, VP9, …) |
 | `Transceiver` | RTP send/recv direction + MID; `set_codec_preferences` for video codec choice |
 | `StatsReport` | `inbound_rtp`, `outbound_rtp`, `candidate_pairs` |
@@ -62,7 +62,8 @@ pc.set_local_description(&offer)?;
 the connection is created — also covered in
 [`docs/configuration.md`](../../docs/configuration.md). For per-frame
 metadata and custom encoded-frame transforms, see
-[`docs/frame-metadata.md`](../../docs/frame-metadata.md).
+[`docs/frame-metadata.md`](../../docs/frame-metadata.md). For synchronising
+synthetic audio and video, see [`docs/av-sync.md`](../../docs/av-sync.md).
 
 ## Choosing your own ICE credentials
 
@@ -212,6 +213,15 @@ factory.push_audio_frame(&pcm_i16, 48000, 1);
 
 // Desktop client: real mic + AEC3 + noise suppression + AGC
 let factory = PeerConnectionFactory::with_platform_adm()?;
+
+// Per-peer track, fed directly. An audio track's RTP timestamp counts the
+// samples it has been handed, so it says how much audio exists but not when
+// it happened — stamp it and the video with one clock read to keep them
+// together. See docs/av-sync.md.
+let audio = factory.create_audio_track_with_local_source("mic")?;
+let now = reactor_webrtc::time_micros();
+video.push_video_frame_at(&bgra, w, h, now);
+audio.push_pcm_at(&pcm_i16, 48000, 1, now)?;
 ```
 
 ## Pre-encoded video

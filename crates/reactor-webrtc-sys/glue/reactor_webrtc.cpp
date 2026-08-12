@@ -425,13 +425,20 @@ class LocalAudioSource
   }
 
   // Deliver PCM directly to the registered sinks on the calling thread.
+  // A positive capture_time_ms reaches the encoder as the frame's absolute
+  // capture time, which is what lets a caller align this audio with video it
+  // captured at the same instant. Non-positive means "unknown": the send
+  // channel then times the frame by when it arrived, as it does for a live
+  // microphone.
   void PushPcm(const int16_t* pcm, int samples_per_channel,
-               int sample_rate, int channels) {
+               int sample_rate, int channels, int64_t capture_time_ms) {
+    std::optional<int64_t> capture;
+    if (capture_time_ms > 0) capture = capture_time_ms;
     std::lock_guard<std::mutex> lock(sinks_mutex_);
     for (auto* sink : sinks_) {
       sink->OnData(pcm, /*bits_per_sample=*/16, sample_rate,
                    static_cast<size_t>(channels),
-                   static_cast<size_t>(samples_per_channel));
+                   static_cast<size_t>(samples_per_channel), capture);
     }
   }
 
@@ -1319,16 +1326,30 @@ void* reactor_webrtc_audio_track_create_with_local_source(void* factory,
   return handle.release();
 }
 
+// Like reactor_webrtc_audio_track_push_pcm but stamps the frame with a
+// caller-supplied absolute capture time (ms, same epoch as
+// reactor_webrtc_time_micros), so audio and video captured together can be
+// timestamped together. Pass 0 to leave the capture time unknown.
+void reactor_webrtc_audio_track_push_pcm_ts(void* track, const int16_t* pcm,
+                                            int samples_per_channel,
+                                            int sample_rate, int channels,
+                                            int64_t capture_time_ms) {
+  auto* h = reinterpret_cast<ReactorMediaStreamTrack*>(track);
+  if (!h || !h->audio_source || !pcm || samples_per_channel <= 0 || channels <= 0)
+    return;
+  h->audio_source->PushPcm(pcm, samples_per_channel, sample_rate, channels,
+                           capture_time_ms);
+}
+
 // Push interleaved int16 PCM directly to a local audio track that was created
 // with reactor_webrtc_audio_track_create_with_local_source. No-op on tracks
 // backed by the factory ADM.
 void reactor_webrtc_audio_track_push_pcm(void* track, const int16_t* pcm,
                                          int samples_per_channel,
                                          int sample_rate, int channels) {
-  auto* h = reinterpret_cast<ReactorMediaStreamTrack*>(track);
-  if (!h || !h->audio_source || !pcm || samples_per_channel <= 0 || channels <= 0)
-    return;
-  h->audio_source->PushPcm(pcm, samples_per_channel, sample_rate, channels);
+  reactor_webrtc_audio_track_push_pcm_ts(track, pcm, samples_per_channel,
+                                         sample_rate, channels,
+                                         /*capture_time_ms=*/0);
 }
 
 // Deliver interleaved int16 PCM to the factory's ADM (shared by all local audio

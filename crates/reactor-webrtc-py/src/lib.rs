@@ -990,7 +990,13 @@ impl Track {
     /// Nothing else has to be arranged: the trailer is appended once the peer has
     /// declared that it strips them, and `user_data` is silently dropped while it
     /// has not. See `PeerConnection.frame_metadata_gate()`.
-    #[pyo3(signature = (bgra, width, height, user_data=None))]
+    ///
+    /// Pass `capture_time_us` (from `time_micros()`) to say when the frame was
+    /// captured, instead of letting it inherit the moment it reached the
+    /// encoder. Stamping a video frame and the audio produced with it from one
+    /// `time_micros()` read is what lets the receiver play them together.
+    /// Independent of `user_data`: a frame can carry either, both, or neither.
+    #[pyo3(signature = (bgra, width, height, user_data=None, capture_time_us=None))]
     fn push_video_frame(
         &self,
         py: Python,
@@ -998,6 +1004,7 @@ impl Track {
         width: u32,
         height: u32,
         user_data: Option<&[u8]>,
+        capture_time_us: Option<i64>,
     ) -> PyResult<()> {
         let expected = (width as usize)
             .checked_mul(height as usize)
@@ -1015,14 +1022,23 @@ impl Track {
         }
         let native = Arc::clone(self.native()?);
         let owned = bgra.to_vec();
-        match user_data {
-            Some(ud) => {
+        match (user_data, capture_time_us) {
+            (Some(ud), Some(us)) => {
+                let ud = ud.to_vec();
+                py.allow_threads(|| {
+                    native.push_video_frame_with_metadata_at(&owned, width, height, &ud, us)
+                });
+            }
+            (Some(ud), None) => {
                 let ud = ud.to_vec();
                 py.allow_threads(|| {
                     native.push_video_frame_with_metadata(&owned, width, height, &ud)
                 });
             }
-            None => {
+            (None, Some(us)) => {
+                py.allow_threads(|| native.push_video_frame_at(&owned, width, height, us));
+            }
+            (None, None) => {
                 py.allow_threads(|| native.push_video_frame(&owned, width, height));
             }
         }
@@ -1073,7 +1089,21 @@ impl Track {
     /// created with `factory.create_audio_track_with_local_source()`. `pcm`
     /// must have even byte length (2 bytes per i16 sample). No-op for ADM-
     /// backed or remote tracks.
-    fn push_pcm(&self, py: Python, pcm: &[u8], sample_rate: u32, channels: u32) -> PyResult<()> {
+    ///
+    /// Pass `capture_time_us` (from `time_micros()`) to say when the audio was
+    /// captured. A track's RTP timestamp otherwise counts only the samples it
+    /// has been handed, which says how much audio exists but not when it
+    /// happened; giving this the same value as the video captured alongside it
+    /// is what lets the receiver play the two together.
+    #[pyo3(signature = (pcm, sample_rate, channels, capture_time_us=None))]
+    fn push_pcm(
+        &self,
+        py: Python,
+        pcm: &[u8],
+        sample_rate: u32,
+        channels: u32,
+        capture_time_us: Option<i64>,
+    ) -> PyResult<()> {
         if !pcm.len().is_multiple_of(2) {
             return Err(PyRuntimeError::new_err("pcm byte length must be even"));
         }
@@ -1082,8 +1112,11 @@ impl Track {
             .map(|c| i16::from_le_bytes([c[0], c[1]]))
             .collect();
         let native = Arc::clone(self.native()?);
-        py.allow_threads(|| native.push_pcm(&samples, sample_rate, channels))
-            .map_err(err)
+        py.allow_threads(|| match capture_time_us {
+            Some(us) => native.push_pcm_at(&samples, sample_rate, channels, us),
+            None => native.push_pcm(&samples, sample_rate, channels),
+        })
+        .map_err(err)
     }
 
     /// Register `callback(pcm: bytes, sample_rate, channels, frames)` for
@@ -2101,6 +2134,17 @@ impl PeerConnectionFactory {
 
 // ── Module ────────────────────────────────────────────────────────────────────
 
+/// Read the engine's monotonic clock, in microseconds.
+///
+/// The epoch the `capture_time_us` arguments of `Track.push_video_frame` and
+/// `Track.push_pcm` are expressed in. Read it once per unit of produced media
+/// and stamp every track with that one value: audio and video are synchronised
+/// by sharing a capture time, not by reaching the encoder at the same moment.
+#[pyfunction]
+fn time_micros() -> i64 {
+    rw::time_micros()
+}
+
 #[pymodule]
 fn reactor_webrtc(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Backs the awaitables PeerConnection's signaling methods return. Must be
@@ -2140,6 +2184,8 @@ fn reactor_webrtc(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PeerConnectionObserver>()?;
     m.add_class::<PeerConnection>()?;
     m.add_class::<PeerConnectionFactory>()?;
+
+    m.add_function(wrap_pyfunction!(time_micros, m)?)?;
 
     // The SDP attribute peers declare frame-metadata support with, and the trailer
     // version this wheel speaks. Exposed so that a caller inspecting or building SDP
