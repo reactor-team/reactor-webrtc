@@ -92,7 +92,7 @@ CASES = {
     "set_track": (
         'sender = pc.add_transceiver(rw.MediaKind.Video, rw.TransceiverDirection.SendOnly); '
         'cam = factory.create_video_track("cam")',
-        "sender.set_track(cam)",
+        "await sender.set_track(cam)",
     ),
     "on_message": (
         'channel = pc.create_data_channel("probe-messages")',

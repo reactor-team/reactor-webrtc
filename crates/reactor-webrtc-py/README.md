@@ -82,7 +82,7 @@ video.push_encoded_frame(
 
 ```python
 tx = pc.add_transceiver(rw.MediaKind.Video, rw.TransceiverDirection.SendOnly)
-tx.set_track(video_track)
+await tx.set_track(video_track)
 await tx.set_codec_preferences([rw.VideoCodec.Vp9, rw.VideoCodec.Vp8])
 
 answer = await pc.create_answer()
@@ -247,13 +247,13 @@ newline in a credential from injecting an SDP line.
 `await` them directly, no `asyncio.to_thread()`/executor wrapping needed.
 They still take a few milliseconds to resolve while the WebRTC engine
 responds, but that wait happens off the event loop thread, so it never
-blocks other coroutines. On `Transceiver`, `set_direction` and
-`set_codec_preferences` are the same way.
+blocks other coroutines. On `Transceiver`, `set_direction`, `set_track`,
+and `set_codec_preferences` are the same way.
 
 Every other method (`add_track`, `add_transceiver`, `create_data_channel`,
-`Transceiver.set_track`/`set_sender_transform`/`set_receiver_transform`, and
-everything on `Track`/`DataChannel`) is a fast synchronous call with no
-native round-trip, and stays a plain function call — no `await`.
+`Transceiver.set_sender_transform`/`set_receiver_transform`, and everything
+on `Track`/`DataChannel`) is a fast synchronous call with no native
+round-trip, and stays a plain function call — no `await`.
 
 Callbacks fire on WebRTC internal threads with the GIL acquired; keep them
 fast.

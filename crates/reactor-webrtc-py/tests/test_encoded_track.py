@@ -130,7 +130,7 @@ class TestEncodedFrameMetadata:
         p2 = make_peer(factory, on_track=on_track)
 
         tx1 = p1.pc.add_transceiver(rw.MediaKind.Video, rw.TransceiverDirection.SendOnly)
-        tx1.set_track(enc_track)
+        await tx1.set_track(enc_track)
 
         ok = await connect(p1, p2)
         assert ok, "peers did not connect within timeout"
@@ -192,7 +192,7 @@ class TestEncodedFrameMetadata:
         p4 = make_peer(factory, on_track=on_track)
 
         tx3 = p3.pc.add_transceiver(rw.MediaKind.Video, rw.TransceiverDirection.SendOnly)
-        tx3.set_track(enc_track)
+        await tx3.set_track(enc_track)
 
         # The strip transform is installed by set_remote_description; nothing to
         # attach here.
