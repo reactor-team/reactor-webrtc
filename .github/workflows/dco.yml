@@ -1,0 +1,77 @@
+# Verify that every commit on a pull request carries a valid
+# Signed-off-by trailer matching the commit's author. Enforces the
+# Developer Certificate of Origin (DCO).
+
+name: DCO
+
+on:
+  pull_request:
+
+# PR-only workflow: a new push supersedes the old run entirely.
+concurrency:
+  group: dco-${{ github.head_ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  dco-check:
+    name: Signed-off-by check
+    runs-on: ubuntu-latest
+    # Dependabot PRs are machine-generated; skip the whole job rather than
+    # exempting commits inline (the inline check can be spoofed via git config).
+    if: github.event.pull_request.user.login != 'dependabot[bot]'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Verify Signed-off-by on every commit
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          range="${BASE_SHA}..${HEAD_SHA}"
+          # Skip merge commits — they carry no authored content and cannot be
+          # signed off after the fact without rebasing.
+          commits=$(git rev-list --no-merges "$range")
+
+          if [[ -z "$commits" ]]; then
+            echo "No commits to check."
+            exit 0
+          fi
+
+          failed=0
+          while IFS= read -r sha; do
+            author_name=$(git show -s --format='%an' "$sha")
+            subject=$(git show -s --format='%s' "$sha")
+            body=$(git show -s --format='%B' "$sha")
+
+            # Accept any well-formed "Signed-off-by: <author_name> <any-email>"
+            # trailer. The email is intentionally not pinned to the commit's
+            # author email so contributors who use a personal git identity but
+            # a work sign-off address (or vice-versa) aren't rejected.
+            if ! grep -qiF "Signed-off-by: ${author_name} <" <<< "$body"; then
+              echo "::error::Commit $sha (\"$subject\") is missing a Signed-off-by trailer for \"${author_name}\"."
+              echo "  expected a line like: Signed-off-by: ${author_name} <you@example.com>"
+              echo "  actual trailers:"
+              echo "$body" | grep -i '^signed-off-by:' || echo "    (none)"
+              echo ""
+              failed=1
+            fi
+          done <<< "$commits"
+
+          if (( failed != 0 )); then
+            echo ""
+            echo "DCO check failed. Every commit on the PR must end with:"
+            echo "  Signed-off-by: Your Name <you@example.com>"
+            echo ""
+            echo "Run 'git commit -s' (or 'git rebase --signoff main') and force-push."
+            exit 1
+          fi
+
+          echo "All commits carry a valid Signed-off-by trailer."

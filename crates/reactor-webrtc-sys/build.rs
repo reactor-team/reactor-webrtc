@@ -28,13 +28,13 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 // ── Prebuilt location ─────────────────────────────────────────────────────────
-const PREBUILT_REPO: &str = "reactor-team/reactor-webrtc";
+// The repo is public, so release assets download anonymously — no token needed.
 const PREBUILT_BASE: &str = "https://github.com/reactor-team/reactor-webrtc/releases/download";
 
 // Fallback tag used when WEBRTC_VERSION is not accessible (e.g. builds from a
 // published crate on crates.io). Patched automatically by publish.yml before
 // cargo publish — never edit this line manually.
-const PREBUILT_TAG_FALLBACK: &str = "webrtc-7907-a5ddff60-p2";
+const PREBUILT_TAG_FALLBACK: &str = "webrtc-7907-a5ddff60-p4";
 
 fn main() {
     println!("cargo:rerun-if-env-changed=REACTOR_WEBRTC_LIB_DIR");
@@ -45,6 +45,16 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(have_libwebrtc)");
 
     if let Ok(dir) = env::var("REACTOR_WEBRTC_LIB_DIR") {
+        // Watch the key prebuilt files so a restored Rust build cache does not
+        // silently keep stale link directives when the prebuilt layout changes
+        // (e.g. libc++.a appears for the first time after a p4 rebuild).
+        // Cargo only reruns build scripts on env-var changes; watching the files
+        // directly handles the case where REACTOR_WEBRTC_LIB_DIR stays the same
+        // but its contents are updated.
+        let lib = Path::new(&dir).join("lib");
+        for name in &["libwebrtc.a", "libc++.a", "libc++abi.a", "build_profile"] {
+            println!("cargo:rerun-if-changed={}", lib.join(name).display());
+        }
         link(Path::new(&dir));
         return;
     }
@@ -58,33 +68,31 @@ fn main() {
 
     // Mode 3: auto-detect the correct prebuilt from WEBRTC_VERSION (or the
     // baked-in fallback tag) and the current Cargo target triple.
-    //
-    // Private repos: github.com/releases/download/... rejects Bearer auth;
-    // must use the GitHub API asset URL instead. When a token is present we
-    // resolve the API URL first; without a token we fall back to the direct
-    // URL (works once the repo is public).
     if let Some(platform) = prebuilt_platform() {
         let tag = prebuilt_tag();
         let asset = format!("reactor-webrtc-{platform}-release.tar.zst");
         let sha_asset = format!("{asset}.sha256");
 
-        let (url, sha_url) = if let Ok(token) = env::var("REACTOR_WEBRTC_PREBUILT_TOKEN") {
-            let u = resolve_github_asset_url(&tag, &asset, &token)
-                .unwrap_or_else(|| format!("{PREBUILT_BASE}/{tag}/{asset}"));
-            let su = resolve_github_asset_url(&tag, &sha_asset, &token)
-                .unwrap_or_else(|| format!("{PREBUILT_BASE}/{tag}/{sha_asset}"));
-            (u, su)
-        } else {
-            (
-                format!("{PREBUILT_BASE}/{tag}/{asset}"),
-                format!("{PREBUILT_BASE}/{tag}/{sha_asset}"),
-            )
-        };
+        let url = format!("{PREBUILT_BASE}/{tag}/{asset}");
+        let sha_url = format!("{PREBUILT_BASE}/{tag}/{sha_asset}");
 
+        // Treat the SHA file as an availability probe: if it doesn't resolve
+        // (404 = release not yet published, network error, etc.) don't attempt
+        // the download. This allows `cargo clippy` / `cargo fmt` to run in
+        // API/check-only mode on PRs that bump REACTOR_PATCH_LEVEL before the
+        // new prebuilt has been published. Explicit downloads via
+        // REACTOR_WEBRTC_PREBUILT_URL bypass this check.
         let sha256 = fetch_sha256(&sha_url);
-        let dir = download_prebuilt(&url, sha256.as_deref());
-        link(&dir);
-        return;
+        if let Some(sha) = sha256 {
+            let dir = download_prebuilt(&url, Some(&sha));
+            link(&dir);
+            return;
+        }
+        println!(
+            "cargo:warning=reactor-webrtc-sys: checksum for {tag}/{sha_asset} not \
+             reachable (release not yet published?). \
+             API/check only — set REACTOR_WEBRTC_LIB_DIR to link a local build."
+        );
     }
 
     println!(
@@ -291,9 +299,12 @@ fn link_system_deps(lib_dir: &Path) {
         "android" => {
             // WebRTC for Android links the bundled libc++ (ABI namespace __Cr)
             // and the same NDK system libraries as a normal WebRTC Android build.
-            println!("cargo:rustc-link-lib=static=c++");
+            // +whole-archive forces GNU ld to load all archive members (the
+            // bundled libc++.a has internal circular deps that a single-pass
+            // scan misses); --gc-sections trims the unused code afterward.
+            println!("cargo:rustc-link-lib=static:+whole-archive=c++");
             if lib_dir.join("libc++abi.a").is_file() {
-                println!("cargo:rustc-link-lib=static=c++abi");
+                println!("cargo:rustc-link-lib=static:+whole-archive=c++abi");
             }
             if lib_dir.join("libunwind.a").is_file() {
                 println!("cargo:rustc-link-lib=static=unwind");
@@ -319,15 +330,33 @@ fn link_system_deps(lib_dir: &Path) {
             // (shipped by package.sh). Link them after webrtc so its symbols
             // resolve, and do NOT link the system stdc++. Fall back to the system
             // stdc++ only for an older/bare layout without the bundled archives.
-            if lib_dir.join("libc++.a").is_file() {
-                println!("cargo:rustc-link-lib=static=c++");
+            //
+            // +whole-archive forces GNU ld to load all archive members. The
+            // bundled libc++.a is a fat archive whose member ORDER differs from
+            // the x64 side-effect archive: circular refs (e.g. ostream.o →
+            // ios.o → ostream.o) break GNU ld's single-pass scan, leaving
+            // std::__Cr::* symbols undefined. +whole-archive bypasses that
+            // ordering issue; --gc-sections (already in the rustc link flags)
+            // then strips unused code so binary size stays reasonable.
+            let has_cxx = lib_dir.join("libc++.a").is_file();
+            println!(
+                "cargo:warning=reactor-webrtc-sys: libc++.a at {} → {}",
+                lib_dir.join("libc++.a").display(),
+                if has_cxx { "found" } else { "absent" }
+            );
+            if has_cxx {
+                println!("cargo:rustc-link-lib=static:+whole-archive=c++");
                 if lib_dir.join("libc++abi.a").is_file() {
-                    println!("cargo:rustc-link-lib=static=c++abi");
+                    println!("cargo:rustc-link-lib=static:+whole-archive=c++abi");
                 }
                 if lib_dir.join("libunwind.a").is_file() {
                     println!("cargo:rustc-link-lib=static=unwind");
                 }
             } else {
+                println!(
+                    "cargo:warning=reactor-webrtc-sys: bundled libc++.a absent — \
+                     falling back to system stdc++ (std::__Cr::* symbols will be unresolved)"
+                );
                 println!("cargo:rustc-link-lib=dylib=stdc++");
             }
             // Desktop capture (and its libX11 dep) is disabled in the build
@@ -443,59 +472,17 @@ fn prebuilt_platform() -> Option<&'static str> {
     }
 }
 
-/// Query the GitHub Releases API to obtain the API asset URL for `asset_name`
-/// in the given `tag`. Returns None on any failure (network, 404, parse).
-///
-/// The direct download URL (github.com/releases/download/…) drops Bearer auth
-/// on the cross-host redirect to S3, so private repos always return 404 that
-/// way. The API URL (api.github.com/repos/…/releases/assets/<id>) with
-/// `Accept: application/octet-stream` issues a pre-signed redirect that works.
-fn resolve_github_asset_url(tag: &str, asset_name: &str, token: &str) -> Option<String> {
-    let api_url = format!("https://api.github.com/repos/{PREBUILT_REPO}/releases/tags/{tag}");
-    let tmp = PathBuf::from(env::var("OUT_DIR").unwrap()).join("release_meta.json");
-    let ok = std::process::Command::new("curl")
-        .args(["-fsSL", "--retry", "3", "-o"])
-        .arg(&tmp)
-        .arg(&api_url)
-        .arg("-H")
-        .arg(format!("Authorization: Bearer {token}"))
-        .arg("-H")
-        .arg("Accept: application/vnd.github.v3+json")
-        .arg("-H")
-        .arg("User-Agent: reactor-webrtc-build-rs/1.0")
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !ok {
-        return None;
-    }
-    let json = std::fs::read_to_string(&tmp).ok()?;
-    // GitHub asset JSON has "url" before "name" in each asset object.
-    // Search backward from the "name" match to find the matching "url".
-    let name_pat = format!("\"name\":\"{}\"", asset_name);
-    let pos = json.find(&name_pat)?;
-    let before = &json[..pos];
-    let url_key = "\"url\":\"";
-    let url_start = before.rfind(url_key)? + url_key.len();
-    let url_end = before[url_start..].find('"')? + url_start;
-    Some(before[url_start..url_end].to_string())
-}
-
 /// Download and parse the `.sha256` sidecar file for a prebuilt asset.
 /// Returns the hex digest on success, or `None` if the download fails.
 fn fetch_sha256(sha_url: &str) -> Option<String> {
     let tmp = PathBuf::from(env::var("OUT_DIR").unwrap()).join("prebuilt.sha256");
-    let mut cmd = std::process::Command::new("curl");
-    cmd.args(["-fsSL", "--retry", "3", "-o"])
+    let ok = std::process::Command::new("curl")
+        .args(["-fsSL", "--retry", "3", "-o"])
         .arg(&tmp)
-        .arg(sha_url);
-    if let Ok(token) = env::var("REACTOR_WEBRTC_PREBUILT_TOKEN") {
-        cmd.arg("-H")
-            .arg(format!("Authorization: Bearer {token}"))
-            .arg("-H")
-            .arg("Accept: application/octet-stream");
-    }
-    let ok = cmd.status().map(|s| s.success()).unwrap_or(false);
+        .arg(sha_url)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
     if !ok {
         return None;
     }
@@ -508,17 +495,36 @@ fn fetch_sha256(sha_url: &str) -> Option<String> {
 /// it into `OUT_DIR`. Returns the extracted root (packaged layout) for `link`.
 ///
 /// Shells out to `curl` + `tar`/`zstd` (no extra Rust build-deps, so dev-mode
-/// `cargo check` stays fast). For a private-repo release asset, set
-/// `REACTOR_WEBRTC_PREBUILT_TOKEN` (a `repo`-scoped token) — `curl` follows the
-/// GitHub redirect and drops the auth header on the cross-host hop.
+/// `cargo check` stays fast). Release assets are public, so the download needs
+/// no credentials.
 fn download_prebuilt(url: &str, sha256: Option<&str>) -> PathBuf {
     let out_root = PathBuf::from(env::var("OUT_DIR").unwrap());
     let out = out_root.join("libwebrtc");
     let archive = out_root.join("prebuilt.tar.zst");
 
-    // Cached from a previous build of this OUT_DIR.
-    if out.join("lib/libwebrtc.a").is_file() || out.join("lib/libwebrtc.lib").is_file() {
-        return out;
+    // Use the cached extraction only when the layout is present AND its SHA
+    // matches a sentinel written after the last successful download.  Without
+    // this check a restored Rust build cache (Swatinem/rust-cache restores the
+    // whole OUT_DIR) containing an older prebuilt (e.g. p3 without libc++.a)
+    // would be silently reused even though the caller supplied a different SHA
+    // (the p4 prebuilt).  The sentinel is written below after a verified
+    // extraction and is a no-op when no SHA is provided (Mode 1 / dev builds).
+    let lib_present =
+        out.join("lib/libwebrtc.a").is_file() || out.join("lib/libwebrtc.lib").is_file();
+    if lib_present {
+        let cache_valid = match sha256 {
+            None => true, // no checksum → trust whatever is there
+            Some(expected) => {
+                let sentinel = out.join(".sha256");
+                std::fs::read_to_string(&sentinel)
+                    .map(|s| s.trim().to_lowercase() == expected.trim().to_lowercase())
+                    .unwrap_or(false)
+            }
+        };
+        if cache_valid {
+            return out;
+        }
+        // SHA mismatch or missing sentinel → stale cache; re-download below.
     }
 
     // ── download ──────────────────────────────────────────────────────────
@@ -526,16 +532,6 @@ fn download_prebuilt(url: &str, sha256: Option<&str>) -> PathBuf {
     curl.args(["-fSL", "--retry", "3", "--retry-delay", "2", "-o"])
         .arg(&archive)
         .arg(url);
-    if let Ok(token) = env::var("REACTOR_WEBRTC_PREBUILT_TOKEN") {
-        // For a private GitHub release asset, point the URL at the API asset
-        // endpoint (…/releases/assets/<id>); `Accept: application/octet-stream`
-        // makes it 302 to the signed download (auth dropped on the cross-host
-        // hop). Harmless for plain CDN URLs.
-        curl.arg("-H")
-            .arg(format!("Authorization: Bearer {token}"))
-            .arg("-H")
-            .arg("Accept: application/octet-stream");
-    }
     run(&mut curl, "download prebuilt (curl)");
 
     // ── verify sha256 ─────────────────────────────────────────────────────
@@ -579,7 +575,89 @@ fn download_prebuilt(url: &str, sha256: Option<&str>) -> PathBuf {
              lib/libwebrtc.lib (bad archive layout?)"
         );
     }
+    verify_prebuilt_arch(&out.join("lib"));
+
+    // Write the SHA sentinel so subsequent runs with the same checksum can
+    // skip the download.  Silently ignore write errors (non-fatal).
+    if let Some(sha) = sha256 {
+        let _ = std::fs::write(out.join(".sha256"), sha.trim());
+    }
     out
+}
+
+/// Verify that `libwebrtc.a` was built for the current target architecture by
+/// inspecting the ELF `e_machine` field of the first object in the archive.
+/// Panics with a clear message when the prebuilt was built for the wrong arch
+/// (e.g. an x86_64 archive delivered as the linux-arm64 prebuilt), avoiding
+/// the cryptic "unknown architecture of input file" error from the linker.
+/// Only active on Linux; macOS/Windows use Mach-O/PE where the linker already
+/// rejects mismatches at load time with a descriptive error.
+fn verify_prebuilt_arch(lib_dir: &Path) {
+    if env::var("CARGO_CFG_TARGET_OS").unwrap_or_default() != "linux" {
+        return;
+    }
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let expected_machine: u16 = match target_arch.as_str() {
+        "x86_64" => 0x3E,  // EM_X86_64
+        "aarch64" => 0xB7, // EM_AARCH64
+        _ => return,
+    };
+
+    let lib = lib_dir.join("libwebrtc.a");
+    let data = match std::fs::read(&lib) {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+
+    // ar archive: 8-byte magic "!<arch>\n", then 60-byte member headers + content.
+    const AR_MAGIC: &[u8] = b"!<arch>\n";
+    if !data.starts_with(AR_MAGIC) {
+        return;
+    }
+
+    let mut pos = AR_MAGIC.len();
+    while pos + 60 <= data.len() {
+        let member_size: usize = std::str::from_utf8(&data[pos + 48..pos + 58])
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+        let content_start = pos + 60;
+        let content_end = data.len().min(content_start + member_size);
+        let content = &data[content_start..content_end];
+
+        // ELF: 4-byte magic + 12 bytes ident fields + 2-byte type + 2-byte machine.
+        if content.len() >= 20 && content.starts_with(b"\x7fELF") {
+            let machine = u16::from_le_bytes([content[18], content[19]]);
+            if machine != expected_machine {
+                let got = match machine {
+                    0x3E => "x86_64",
+                    0xB7 => "aarch64",
+                    0x28 => "arm",
+                    _ => "unknown",
+                };
+                panic!(
+                    "reactor-webrtc-sys: prebuilt architecture mismatch!\n  \
+                     Target:   {} (e_machine={:#06x})\n  \
+                     Prebuilt: {} (e_machine={:#06x})\n\n  \
+                     The archive at\n    {}\n  \
+                     was built for a different architecture than the current target.\n  \
+                     Rebuild the prebuilt for {} or update REACTOR_WEBRTC_PREBUILT_URL.",
+                    target_arch,
+                    expected_machine,
+                    got,
+                    machine,
+                    lib.display(),
+                    target_arch,
+                )
+            }
+            return; // arch matches
+        }
+
+        pos = content_start + member_size;
+        if !member_size.is_multiple_of(2) {
+            pos += 1;
+        }
+    }
 }
 
 /// Run a command, panicking with context on failure.
@@ -591,7 +669,27 @@ fn run(cmd: &mut std::process::Command, what: &str) {
     }
 }
 
-/// Compute a file's sha256 via `sha256sum` (Linux) or `shasum -a 256` (macOS).
+/// Extract a lowercase 64-char hex digest from a hashing tool's stdout.
+///
+/// GNU coreutils switches to an escaped output form when the file name contains
+/// a backslash or newline: the line is prefixed with `\` and the backslashes in
+/// the name are doubled. Every Windows path trips this (`D:\a\…`), so
+/// `sha256sum` there reports `\<digest> *<name>` — hence the `\` strip. Returns
+/// `None` if the output is not a well-formed digest, so callers fall through to
+/// the next tool instead of comparing against garbage.
+fn parse_digest(stdout: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(stdout);
+    let hex = text
+        .split_whitespace()
+        .next()?
+        .trim_start_matches('\\')
+        .to_lowercase();
+    (hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit())).then_some(hex)
+}
+
+/// Compute a file's sha256 via `sha256sum` (Linux, and Windows — it ships in
+/// Git-for-Windows' `usr/bin`, which is on the PATH of GitHub's `windows-latest`
+/// runners, where our Windows wheels are built) or `shasum -a 256` (macOS).
 fn sha256_file(path: &Path) -> String {
     for (bin, args) in [("sha256sum", &[][..]), ("shasum", &["-a", "256"][..])] {
         if let Ok(out) = std::process::Command::new(bin)
@@ -600,11 +698,8 @@ fn sha256_file(path: &Path) -> String {
             .output()
         {
             if out.status.success() {
-                if let Some(hex) = String::from_utf8_lossy(&out.stdout)
-                    .split_whitespace()
-                    .next()
-                {
-                    return hex.to_lowercase();
+                if let Some(hex) = parse_digest(&out.stdout) {
+                    return hex;
                 }
             }
         }

@@ -1,0 +1,143 @@
+# mise is the task runner + toolchain manager. Monorepo mode: tasks are
+# addressable as //:verb (root), //crates/reactor-webrtc-py:verb, and
+# //webrtc-build:verb. Run `mise run <task>` or `make <target>` (a thin shim
+# forwards to mise). `mise install` installs the pinned toolchain; `mise lock`
+# refreshes the committed mise.lock.
+min_version = "2026.6.12"
+monorepo_root = true
+
+[monorepo]
+# Each config_root must contain a mise.toml. The root carries the Cargo-workspace
+# tasks; the two modules carry the Python wheel and the libwebrtc build pipeline.
+config_roots = ["crates/reactor-webrtc-py", "webrtc-build"]
+
+[tools]
+# THE ONLY [tools] TABLE IN THE REPO. Every entry is exact-pinned + locked; no
+# `latest` (it floats) - the sole exception is rustup (see note).
+#
+# cargo-binstall (aqua-backed prebuilt) MUST be present so the cargo: backend
+# installs cargo-nextest as a prebuilt binary instead of compiling it from
+# source (minutes on a cold CI runner).
+"aqua:cargo-bins/cargo-binstall" = "1.21.0"
+"cargo:cargo-nextest" = "0.9.140"   # test runner; installed fast via cargo-binstall
+# maturin ships prebuilt release binaries; the bare name resolves to the github:
+# backend, which locks a per-platform URL+checksum (fully reproducible under
+# MISE_LOCKED) - faster and better-pinned than cargo:maturin + binstall.
+maturin = "1.14.1"
+uv = "0.11.31"
+ruff = "0.15.22"
+shellcheck = "0.11.0"
+# hk drives the git hooks (pre-commit/pre-push/post-checkout). It reads hk.pkl
+# with its built-in pkl evaluator, so no separate pkl tool is needed.
+hk = "1.52.0"
+# EXCEPTION: rustup may be "latest". It is the installer, not the compiler - the
+# toolchain (channel/components/targets) is pinned by rust-toolchain.toml, and CI
+# never uses mise's rustup (MISE_DISABLE_TOOLS + actions-rust-lang/setup-rust-
+# toolchain). A floating rustup binary does not float the build; `mise lock` still
+# pins a concrete rustup version. The lock-drift check allows a "latest" spec.
+"aqua:rust-lang/rustup" = "latest"
+
+[settings]
+experimental = true
+lockfile = true
+# Host platforms that run `mise install` (CI runners + dev machines), NOT the
+# libwebrtc cross-compile targets. CI is linux-x64 only; macos-arm64 + linux-arm64
+# cover Apple-Silicon + ARM-Linux/Docker-on-Mac dev. macos-x64 added for the
+# mac-x64 wheel CI runner (macos-15-intel). Deliberately excluded: windows-x64
+# (its wheel/lib build uses maturin-action/build.ps1, never mise), linux-x64-musl
+# (glibc manylinux wheel, not an Alpine service). See docs before adding: a
+# platform here forces a locked entry for every tool on that platform.
+lockfile_platforms = ["macos-arm64", "macos-x64", "linux-x64", "linux-arm64"]
+# Rust version comes from rust-toolchain.toml (idiomatic), not a [tools] pin -
+# mirrors reactor's /.go-version pattern.
+idiomatic_version_file_enable_tools = ["rust"]
+# Content-hash freshness for sources/outputs: mtime is unreliable across git
+# checkouts/clones (build & wheel tasks depend on this being accurate).
+task.source_freshness_hash_contents = true
+
+[env]
+# Homed at this root config so config_root resolves to the repo root for every
+# inheriting module; the Makefile shim reads it to compute a module's // address.
+REPO_ROOT = "{{ env.REPO_ROOT | default(value=config_root) }}"
+
+# --- root aggregators + Cargo-workspace one-liners -------------------------
+# One-liners live inline; anything with logic is a file-task under mise-tasks/.
+
+[tasks.fmt]
+description = "[Format] Format all Rust code"
+run = "cargo fmt --all"
+
+[tasks."fmt:check"]
+description = "[Format] Check Rust formatting"
+run = "cargo fmt --all -- --check"
+
+[tasks.check]
+# build.rs auto-detects: with nothing set it downloads the libwebrtc prebuilt
+# (headers + lib) for the sys crate's C++ glue, so the first run needs network
+# (the release assets are public — no credentials required).
+description = "[Build] cargo check the workspace (auto-fetches the libwebrtc prebuilt)"
+run = "cargo check --workspace"
+
+[tasks.clippy]
+description = "[Quality] Clippy with warnings denied"
+run = "cargo clippy --workspace -- -D warnings"
+
+[tasks.test]
+description = "[Testing] Workspace tests via nextest + doctests (requires a prebuilt libwebrtc)"
+# Needs a native lib: set REACTOR_WEBRTC_LIB_DIR to a staged build, or
+# REACTOR_WEBRTC_PREBUILT_URL/_SHA256 to a published prebuilt (see README).
+# Split into per-crate tasks so CI can gate reactor-webrtc's build+check on
+# reactor-webrtc-sys's passing first, matching the crate dependency order.
+depends = ["test:sys", "test:webrtc"]
+
+[tasks."test:sys"]
+description = "[Testing] reactor-webrtc-sys tests via nextest + doctests (requires a prebuilt libwebrtc)"
+# reactor-webrtc-sys's only test (link.rs) just checks the FFI glue links
+# correctly - no network/ICE involved, so it runs fine on every platform.
+run = [
+  "cargo nextest run -p reactor-webrtc-sys --no-tests=pass",
+  "cargo test -p reactor-webrtc-sys --doc",
+]
+
+[tasks."test:webrtc"]
+description = "[Testing] reactor-webrtc tests via nextest + doctests (requires a prebuilt libwebrtc)"
+# nextest runs the unit/integration tests (fast, per-test process isolation) but
+# does NOT run doctests, so `cargo test --doc` covers reactor-webrtc's doc
+# examples. reactor-webrtc-py has no Rust tests (it is covered by pytest).
+run = [
+  "cargo nextest run -p reactor-webrtc --no-tests=pass",
+  "cargo test -p reactor-webrtc --doc",
+]
+
+[tasks.lint]
+description = "[Quality] Run all linters"
+depends = ["fmt:check", "clippy", "lint:shell", "lint:mise-lock", "lint:mise-tools-root"]
+
+# The mise antidrift lints run as plain python3 (tomllib is stdlib on >=3.11);
+# lint:mise-lock parses only mise.lock, taking declared tools + platforms from
+# `mise ls -J` / `mise settings`. lint:shell stays a file-task (it needs bash).
+[tasks."lint:mise-lock"]
+description = "[Quality] Verify mise.lock covers every declared tool + lockfile platform"
+run = "python3 scripts/check-mise-lock.py"
+
+[tasks."lint:mise-tools-root"]
+description = "[Quality] Enforce a single root [tools] table (no module-declared tools)"
+run = "python3 scripts/check-mise-tools-root.py"
+
+[tasks.ci]
+# No `check` here: clippy IS cargo check plus lints, so listing both compiles
+# the workspace twice (different rustc wrappers = disjoint fingerprints).
+description = "[Quality] Everything the CI lint job runs (fmt-check + clippy + repo lints)"
+depends = ["lint"]
+
+[tasks.install-hooks]
+description = "[Setup] Install git hooks via hk (works from the main repo and worktrees)"
+# hk writes `hook.hk-<event>.command` entries into the shared git config, so one
+# install covers the main checkout AND every worktree - no core.hooksPath pin
+# needed (unlike lefthook). --mise wraps the hooks in `mise x` so they run with
+# the pinned toolchain even for contributors who have not activated mise.
+run = "hk install --mise"
+
+[tasks.uninstall-hooks]
+description = "[Setup] Remove the hk-managed git hooks (main repo and worktrees)"
+run = "hk uninstall"

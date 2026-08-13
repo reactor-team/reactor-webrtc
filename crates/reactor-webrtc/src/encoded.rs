@@ -16,6 +16,13 @@
 //!   [`FrameAction::Forward`] lets the local decoder run as usual.
 //!
 //! The closure runs on a WebRTC thread and must not block it.
+//!
+//! libwebrtc allows one transformer per sender and one per receiver, so the crate
+//! owns those slots and composes: your callback runs alongside the per-frame
+//! metadata step ([`crate::metadata`]) rather than displacing it. Your callback goes
+//! first in both directions, which means it always sees exactly the bytes that
+//! traverse the network — before a trailer is appended on send, before one is
+//! stripped on receive. Returning [`FrameAction::Drop`] skips the metadata step too.
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
@@ -56,6 +63,9 @@ pub struct EncodedFrame<'a> {
     pub ssrc: u32,
     /// The frame's RTP timestamp.
     pub timestamp: u32,
+    /// Capture timestamp in milliseconds (monotonic, same epoch as
+    /// `webrtc::TimeMicros`). Zero when unavailable.
+    pub capture_time_ms: i64,
     /// e.g. `"video/VP8"`, `"audio/opus"`.
     pub mime_type: &'a str,
     /// The encoded payload.
@@ -79,7 +89,7 @@ impl EncodedFrame<'_> {
     }
 }
 
-type EncodedCb = Box<dyn for<'a> FnMut(&EncodedFrame<'a>) -> FrameAction + Send>;
+pub(crate) type EncodedCb = Box<dyn for<'a> FnMut(&EncodedFrame<'a>) -> FrameAction + Send>;
 
 // Heap-pinned callback state; owned by the *native* transformer (freed via
 // `free_state_tramp` when its last ref drops), so it outlives every callback
@@ -125,6 +135,7 @@ extern "C" fn encoded_tramp(
         payload_type: f.payload_type,
         ssrc: f.ssrc,
         timestamp: f.timestamp,
+        capture_time_ms: f.capture_time_ms,
         mime_type: mime,
         data,
         frame: f.frame,
@@ -144,23 +155,56 @@ extern "C" fn free_state_tramp(ud: *mut c_void) {
     drop(unsafe { Box::from_raw(ud as *mut TransformState) });
 }
 
-/// An encoded-frame transformer. Attach it to a transceiver's sender/receiver;
-/// see the [module docs](self). Dropping the handle releases the binding's
-/// reference — the native transformer (and the callback) live until every
-/// sender/receiver it's attached to also releases it.
+/// A callback over encoded frames, to be attached to a transceiver's
+/// sender/receiver; see the [module docs](self).
+///
+/// This is a *registration*, not a native object. Attaching it does not take
+/// libwebrtc's single `SetFrameTransformer` slot — the crate owns one transformer
+/// per sender and per receiver, and composes this callback with its own
+/// frame-metadata step (see [`crate::metadata`]). That is what lets a caller use
+/// encoded-frame access and per-frame metadata on the same transceiver, which a
+/// single slot cannot express.
+///
+/// Attaching the same `FrameTransform` to more than one sender/receiver shares one
+/// callback, serialised by its mutex.
+#[derive(Clone)]
 pub struct FrameTransform {
+    cb: Arc<Mutex<EncodedCb>>,
+}
+
+impl FrameTransform {
+    /// Create a transform running `cb` per encoded frame. The closure runs on a
+    /// WebRTC thread and must not block it.
+    pub fn new(cb: impl for<'a> FnMut(&EncodedFrame<'a>) -> FrameAction + Send + 'static) -> Self {
+        Self {
+            cb: Arc::new(Mutex::new(Box::new(cb))),
+        }
+    }
+
+    pub(crate) fn callback(&self) -> Arc<Mutex<EncodedCb>> {
+        Arc::clone(&self.cb)
+    }
+}
+
+/// The native transformer: one per sender/receiver, owned by the crate.
+///
+/// The composed root that [`FrameTransform`] callbacks and the frame-metadata step
+/// both run under. Dropping this handle releases the binding's reference; the
+/// native object and its callback state live until every sender/receiver it is
+/// attached to also releases it, which is why the install path can attach and drop.
+pub(crate) struct NativeTransform {
     raw: *mut reactor_webrtc_sys::FrameTransformer,
 }
 
 // SAFETY: the callback is Mutex-guarded and the native transformer is
 // internally thread-safe; the handle only owns a ref-counted pointer.
-unsafe impl Send for FrameTransform {}
-unsafe impl Sync for FrameTransform {}
+unsafe impl Send for NativeTransform {}
+unsafe impl Sync for NativeTransform {}
 
-impl FrameTransform {
-    /// Create a transformer running `cb` per encoded frame. The closure runs on
-    /// a WebRTC thread and must not block it.
-    pub fn new(cb: impl for<'a> FnMut(&EncodedFrame<'a>) -> FrameAction + Send + 'static) -> Self {
+impl NativeTransform {
+    pub(crate) fn new(
+        cb: impl for<'a> FnMut(&EncodedFrame<'a>) -> FrameAction + Send + 'static,
+    ) -> Self {
         // Leak the state; the native transformer owns it and frees it via
         // free_state_tramp when its last ref drops.
         let state = Box::into_raw(Box::new(TransformState {
@@ -185,7 +229,7 @@ impl FrameTransform {
     }
 }
 
-impl Drop for FrameTransform {
+impl Drop for NativeTransform {
     fn drop(&mut self) {
         if !self.raw.is_null() {
             unsafe { reactor_webrtc_sys::reactor_webrtc_frame_transformer_destroy(self.raw) }
@@ -217,6 +261,21 @@ impl VideoCodec {
             4 => Some(Self::H264),
             5 => Some(Self::H265),
             _ => None,
+        }
+    }
+
+    /// The name libwebrtc's codec capabilities carry for this codec (e.g.
+    /// `RtpCodecCapability::name`) — what
+    /// [`Transceiver::set_codec_preferences`](crate::Transceiver::set_codec_preferences)
+    /// matches against, as a plain string rather than a wire-format integer
+    /// that both sides of the FFI boundary have to keep in sync by hand.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Vp8 => "VP8",
+            Self::Vp9 => "VP9",
+            Self::Av1 => "AV1",
+            Self::H264 => "H264",
+            Self::H265 => "H265",
         }
     }
 }
@@ -721,6 +780,30 @@ pub struct EncodedVideoTrack {
     dummy: Vec<u8>,
     width: u32,
     height: u32,
+    // FIFO metadata queue for push_encoded_frame_with_metadata: the sender
+    // FrameTransform pops one entry per encoded frame in push order. A FIFO rather
+    // than timestamp correlation because capture_time_ms is unreliable here —
+    // VideoStreamEncoder clamps future timestamps back to post_time, which can
+    // collide when two pushes land in the same millisecond.
+    sender_meta_fifo: Arc<FifoMeta>,
+}
+
+/// An [`EncodedVideoTrack`]'s outgoing metadata, in push order.
+///
+/// Registered in [`crate::sender_meta`] under the inner track's native identity,
+/// *replacing* the timestamp-keyed source that [`crate::Track`] registered for it:
+/// for a pre-encoded track, push order is the correlation that holds.
+#[derive(Default)]
+pub(crate) struct FifoMeta(Mutex<VecDeque<crate::metadata::FrameMetadata>>);
+
+impl crate::sender_meta::SenderMetaSource for FifoMeta {
+    fn take(&self, _frame: &EncodedFrame) -> Option<crate::metadata::FrameMetadata> {
+        // Pops whether or not the caller will use the result. The queue is filled
+        // by push_encoded_frame_with_metadata regardless of what the peer declared,
+        // so leaving entries in place would grow it for as long as the peer
+        // declines and then emit stale metadata if it ever accepted.
+        self.0.lock().ok()?.pop_front()
+    }
 }
 
 // SAFETY: the queue is Mutex-guarded and the dummy buffer is owned; both are
@@ -736,12 +819,19 @@ impl EncodedVideoTrack {
         height: u32,
     ) -> Self {
         let dummy = vec![0u8; (width * height * 4) as usize];
+        let sender_meta_fifo = Arc::new(FifoMeta::default());
+        // Overwrite the inner Track's timestamp-keyed registration: both describe
+        // the same native track, and for pre-encoded frames the FIFO is the one
+        // that correlates correctly.
+        let source: Arc<dyn crate::sender_meta::SenderMetaSource> = sender_meta_fifo.clone();
+        crate::sender_meta::register(track.native_id(), &source);
         Self {
             track,
             queue,
             dummy,
             width,
             height,
+            sender_meta_fifo,
         }
     }
 
@@ -769,6 +859,34 @@ impl EncodedVideoTrack {
         // Push a dummy raw frame to wake the WebRTC encoder thread.
         // The I420 data is thrown away in the encoder callback — the actual
         // encoded bytes come from the queue above.
+        self.track
+            .push_video_frame(&self.dummy, self.width, self.height);
+    }
+
+    /// Inject a pre-encoded frame with per-frame metadata embedded as a
+    /// protobuf trailer.
+    ///
+    /// `frame_id` and `timestamp` are computed internally; the caller
+    /// supplies only `user_data`. Requires
+    /// [`sender_metadata_transform`](Self::sender_metadata_transform) to be
+    /// called and the returned [`FrameTransform`](crate::FrameTransform) to
+    /// be attached to the sender transceiver before the first SDP exchange.
+    pub fn push_encoded_frame_with_metadata(&self, frame: EncodedVideoFrame, user_data: &[u8]) {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let meta = crate::metadata::FrameMetadata {
+            frame_id: self.track.next_frame_id(),
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros() as u64,
+            user_data: user_data.to_vec(),
+        };
+        // Enqueue metadata first so the FIFO entry is always present when the
+        // sender FrameTransform fires on the encoder thread.
+        if let Ok(mut fifo) = self.sender_meta_fifo.0.lock() {
+            fifo.push_back(meta);
+        }
+        self.queue.lock().unwrap().push_back(frame);
         self.track
             .push_video_frame(&self.dummy, self.width, self.height);
     }

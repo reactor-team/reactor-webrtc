@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+#MISE description="[Build] Build libwebrtc for a target: build <os> <arch> <profile>"
+set -euo pipefail
+exec "$REPO_ROOT/webrtc-build/build.sh" "$@"

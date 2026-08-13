@@ -63,7 +63,11 @@ pub struct ReactorEncodedFrame {
     pub is_key_frame: c_int,
     pub payload_type: u8,
     pub ssrc: u32,
+    /// RTP timestamp.
     pub timestamp: u32,
+    /// Capture timestamp in milliseconds (same monotonic epoch as `reactor_webrtc_time_micros`).
+    /// Zero when unavailable (e.g. receive side before the sender sets CaptureTime).
+    pub capture_time_ms: i64,
     pub data: *const u8,
     pub data_len: usize,
     pub mime_type: *const c_char,
@@ -194,6 +198,79 @@ pub struct PeerConnectionCallbacks {
     pub on_track: Option<extern "C" fn(userdata: *mut c_void, track: *mut MediaStreamTrack)>,
 }
 
+/// A single ICE (STUN/TURN) server.
+///
+/// `urls` points to an array of `urls_len` NUL-terminated C strings that share
+/// the credentials in this entry. `username` and `password` may be null, which
+/// the glue reads as an empty credential. libwebrtc rejects a `turn:`/`turns:`
+/// URL whose username or password is empty.
+///
+/// Every pointer is borrowed for the duration of the
+/// [`reactor_webrtc_peer_connection_create`] call. The glue copies what it
+/// needs, so the caller may free the strings once the call returns.
+/// Layout must match `ReactorIceServer` in the glue.
+#[repr(C)]
+pub struct ReactorIceServer {
+    pub urls: *const *const c_char,
+    pub urls_len: usize,
+    pub username: *const c_char,
+    pub password: *const c_char,
+}
+
+/// Peer-connection configuration.
+///
+/// `servers` points to an array of `servers_len` entries. Each entry keeps its
+/// own credentials, so several TURN servers with different credentials stay
+/// distinct.
+///
+/// Both policy fields use an explicit integer encoding that neither side
+/// derives from an enum declaration order:
+///
+/// | `ice_transport_type` | allowed candidates |
+/// |----------------------|--------------------|
+/// | `0`                  | all types          |
+/// | `1`                  | relay only         |
+/// | `2`                  | everything but host |
+/// | `3`                  | none               |
+///
+/// | `continual_gathering_policy` | behaviour |
+/// |------------------------------|-----------|
+/// | `0`                          | gather once |
+/// | `1`                          | gather continually |
+///
+/// An unknown value falls back to `0`. Layout must match `ReactorRtcConfig`
+/// in the glue.
+///
+/// | `bundle_policy` | behaviour |
+/// |-----------------|-----------|
+/// | `0`             | balanced (default) |
+/// | `1`             | max-bundle — all m-sections share one transport |
+/// | `2`             | max-compat |
+///
+/// | `tcp_candidate_policy` | behaviour |
+/// |------------------------|-----------|
+/// | `0`                    | TCP ICE candidates disabled (default) |
+/// | `1`                    | TCP ICE candidates enabled |
+#[repr(C)]
+pub struct ReactorRtcConfig {
+    pub servers: *const ReactorIceServer,
+    pub servers_len: usize,
+    pub ice_transport_type: c_int,
+    pub continual_gathering_policy: c_int,
+    /// UDP port range lower bound. `0` means "not specified" (libwebrtc default).
+    pub min_port: c_int,
+    /// UDP port range upper bound. `0` means "not specified" (libwebrtc default).
+    pub max_port: c_int,
+    /// Bundle policy. 0 = balanced, 1 = max-bundle, 2 = max-compat.
+    pub bundle_policy: c_int,
+    /// ICE connection-receiving timeout in ms. `<=0` keeps the libwebrtc default.
+    pub ice_connection_receiving_timeout_ms: c_int,
+    /// ICE check interval on well-connected paths in ms. `<=0` keeps the default.
+    pub ice_check_interval_strong_connectivity_ms: c_int,
+    /// TCP candidate policy. 0 = disabled (default), 1 = enabled.
+    pub tcp_candidate_policy: c_int,
+}
+
 extern "C" {
     /// ABI version of this native build. The safe crate asserts compatibility.
     pub fn reactor_webrtc_abi_version() -> u32;
@@ -255,14 +332,30 @@ extern "C" {
         apm_flags: c_int,
     ) -> *mut PeerConnectionFactory;
 
-    /// Create a peer connection. `config_json` carries ICE servers / policies
-    /// (may be null). `callbacks` may be null. Returns null on failure.
+    /// Create a peer connection. `config` carries the ICE servers and policies
+    /// (may be null for the defaults). `callbacks` may be null. Returns null on
+    /// failure, and then writes libwebrtc's reason into `err` as a
+    /// NUL-terminated string truncated to `err_cap` bytes. `err` may be null.
     pub fn reactor_webrtc_peer_connection_create(
         factory: *mut PeerConnectionFactory,
-        config_json: *const c_char,
+        config: *const ReactorRtcConfig,
         callbacks: *const PeerConnectionCallbacks,
+        err: *mut c_char,
+        err_cap: c_int,
     ) -> *mut PeerConnection;
     pub fn reactor_webrtc_peer_connection_destroy(pc: *mut PeerConnection);
+
+    /// Set aggregate bitrate limits. Pass `-1` for any field to keep the
+    /// libwebrtc default. All values are bits per second.
+    /// Returns 0 on success, -1 on error (reason written into `err`/`err_cap`).
+    pub fn reactor_webrtc_peer_connection_set_bitrate(
+        pc: *mut PeerConnection,
+        min_bps: c_int,
+        start_bps: c_int,
+        max_bps: c_int,
+        err: *mut c_char,
+        err_cap: c_int,
+    ) -> c_int;
 
     /// Create an SDP offer. Exactly one callback fires asynchronously on the
     /// signaling thread: `on_success(userdata, type, sdp)` or
@@ -371,6 +464,9 @@ extern "C" {
         factory: *mut PeerConnectionFactory,
         id: *const c_char,
     ) -> *mut MediaStreamTrack;
+    /// Returns the current monotonic clock in microseconds — the same epoch
+    /// used by `VideoFrame::set_timestamp_us` and `EncodedImage::CaptureTime`.
+    pub fn reactor_webrtc_time_micros() -> i64;
     /// Push a BGRA frame (`width * height * 4` bytes) into a local video track's
     /// source; converted to I420 and timestamped internally.
     pub fn reactor_webrtc_video_track_push_frame(
@@ -378,6 +474,15 @@ extern "C" {
         bgra: *const u8,
         width: c_int,
         height: c_int,
+    );
+    /// Like `reactor_webrtc_video_track_push_frame` but uses a caller-supplied
+    /// capture timestamp (microseconds, same epoch as `reactor_webrtc_time_micros`).
+    pub fn reactor_webrtc_video_track_push_frame_ts(
+        track: *mut MediaStreamTrack,
+        bgra: *const u8,
+        width: c_int,
+        height: c_int,
+        capture_time_us: i64,
     );
     /// Add a local audio or video track to the peer connection (creates a
     /// sendrecv transceiver). Returns 1 on success, 0 on failure.
@@ -440,6 +545,51 @@ extern "C" {
         transceiver: *mut RtpTransceiver,
         direction: c_int,
     ) -> c_int;
+    /// Reorder a video transceiver's codec preferences: entries in
+    /// `codec_names` (libwebrtc codec names such as `"VP8"`/`"VP9"`/`"AV1"`/
+    /// `"H264"`/`"H265"`, most preferred first) sort ahead of every other
+    /// codec, which keeps its original relative order. Nothing is dropped.
+    /// Takes effect on the next create_offer()/create_answer() for this
+    /// transceiver. Returns 1 on success, 0 on failure (not a video
+    /// transceiver, or libwebrtc rejected the result).
+    pub fn reactor_webrtc_rtp_transceiver_set_video_codec_preferences(
+        transceiver: *mut RtpTransceiver,
+        codec_names: *const *const c_char,
+        codecs_len: c_int,
+    ) -> c_int;
+    /// Make this transceiver's sender actually encode with the codec
+    /// [`reactor_webrtc_rtp_transceiver_set_video_codec_preferences`] put
+    /// first, instead of whatever it would otherwise pick (e.g. the remote
+    /// offer's own codec order). `set_video_codec_preferences` only controls
+    /// SDP negotiation — it does not by itself change which negotiated codec
+    /// an existing sender encodes with. Call this only after negotiation has
+    /// completed (`set_local_description`), once the sender's parameters
+    /// reflect the negotiated codec list. Returns 1 on success, 0 on failure
+    /// (no sender, no negotiated codecs yet, or libwebrtc rejected it).
+    pub fn reactor_webrtc_rtp_transceiver_lock_negotiated_send_codec(
+        transceiver: *mut RtpTransceiver,
+    ) -> c_int;
+    /// Identity of the transceiver itself, as an opaque value — **not** an owning
+    /// handle. Stable for the transceiver's life, unlike the handle pointer, which
+    /// is a fresh allocation per `transceivers()` call. Usable as a key before any
+    /// track is attached and before a mid is assigned.
+    pub fn reactor_webrtc_rtp_transceiver_id(transceiver: *mut RtpTransceiver) -> usize;
+    /// Identity of the track on this transceiver's sender, as an opaque value —
+    /// **not** an owning handle. The value is only ever compared, never
+    /// dereferenced or released, and no reference is taken. Returns 0 when the
+    /// sender has no track.
+    ///
+    /// Two Rust wrappers around the same native track share this value, which is
+    /// what makes it usable as a key for finding the wrapper's own state.
+    pub fn reactor_webrtc_rtp_transceiver_sender_track_id(
+        transceiver: *mut RtpTransceiver,
+    ) -> usize;
+    /// Identity of the track this transceiver's receiver delivers, on the same
+    /// non-owning terms as [`reactor_webrtc_rtp_transceiver_sender_track_id`].
+    /// Available once the remote description has been applied.
+    pub fn reactor_webrtc_rtp_transceiver_receiver_track_id(
+        transceiver: *mut RtpTransceiver,
+    ) -> usize;
     /// Release a transceiver handle.
     pub fn reactor_webrtc_rtp_transceiver_destroy(transceiver: *mut RtpTransceiver);
 
@@ -471,6 +621,11 @@ extern "C" {
     ) -> c_int;
     /// Release a transformer handle (the sender/receiver keep their own ref).
     pub fn reactor_webrtc_frame_transformer_destroy(transformer: *mut FrameTransformer);
+    /// Identity of the native track behind this handle, as an opaque value —
+    /// **not** an owning handle, on the same terms as
+    /// [`reactor_webrtc_rtp_transceiver_sender_track_id`], whose value this is
+    /// comparable with. Returns 0 for a handle with no track.
+    pub fn reactor_webrtc_media_stream_track_id(track: *mut MediaStreamTrack) -> usize;
     /// Destroy a track handle (detaches any sink, releases the track + source).
     pub fn reactor_webrtc_media_stream_track_destroy(track: *mut MediaStreamTrack);
 
@@ -482,6 +637,39 @@ extern "C" {
         factory: *mut PeerConnectionFactory,
         id: *const c_char,
     ) -> *mut MediaStreamTrack;
+    /// Create a local audio track with a per-track audio source, independent of
+    /// the factory ADM. Each call returns a track whose audio is fed exclusively
+    /// via [`reactor_webrtc_audio_track_push_pcm`], allowing different audio to
+    /// be delivered to different peer connections. Returns an owned
+    /// [`MediaStreamTrack`] handle or null.
+    pub fn reactor_webrtc_audio_track_create_with_local_source(
+        factory: *mut PeerConnectionFactory,
+        id: *const c_char,
+    ) -> *mut MediaStreamTrack;
+    /// Push interleaved i16 PCM directly to a local audio track that was created
+    /// with [`reactor_webrtc_audio_track_create_with_local_source`]. No-op for
+    /// tracks backed by the factory ADM. `samples_per_channel` is the frame
+    /// count (e.g. 480 for 10ms @ 48kHz).
+    pub fn reactor_webrtc_audio_track_push_pcm(
+        track: *mut MediaStreamTrack,
+        pcm: *const i16,
+        samples_per_channel: c_int,
+        sample_rate: c_int,
+        channels: c_int,
+    );
+    /// Like [`reactor_webrtc_audio_track_push_pcm`] but stamps the frame with a
+    /// caller-supplied absolute capture time (milliseconds, same epoch as
+    /// [`reactor_webrtc_time_micros`]), which reaches the encoder and lets the
+    /// receiver line this audio up with video captured at the same instant.
+    /// `0` leaves the capture time unknown.
+    pub fn reactor_webrtc_audio_track_push_pcm_ts(
+        track: *mut MediaStreamTrack,
+        pcm: *const i16,
+        samples_per_channel: c_int,
+        sample_rate: c_int,
+        channels: c_int,
+        capture_time_ms: i64,
+    );
     /// Deliver interleaved i16 PCM to the factory's ADM (shared by all local
     /// audio tracks). `samples_per_channel` is the frame count (e.g. 480 for
     /// 10ms @ 48kHz).

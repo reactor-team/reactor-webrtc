@@ -111,14 +111,15 @@ gn_args() {
     linux)
       # Always use WebRTC's *bundled* clang + bundled libc++:
       #   • the bundled clang is a Chromium fork with flags no stock clang has
-      #     (-fno-lifetime-dse, --crel, …), so a host clang can't compile this;
+      #     (-fno-lifetime-dse, …), so a host clang can't compile this;
       #   • the pinned debian sysroot's libstdc++ is too old for WebRTC's C++20
       #     (std::make_unique_for_overwrite; ssl_stream_adapter.h's nullptr_t),
       #     so use the bundled (modern) libc++.
       # Self-contained via the sysroot. The bundled clang is published for x86_64
       # hosts only, so arm64 is cross-compiled from x86_64 (see the sysroot fetch
-      # above + the CI runner mapping). NOTE: linking a consumer's glue against
-      # this lib requires compiling that glue with libc++ too (follow-up).
+      # above + the CI runner mapping). CREL (-Wa,--crel) is disabled for arm64
+      # via patches/0003-disable-crel-for-arm64.patch so the produced libwebrtc.a
+      # is compatible with consumer GNU ld on arm64 hosts.
       # No screen/desktop capture in a calling SDK: disable both linux backends
       # (X11 + PipeWire) so the lib carries no libX11 dependency.
       args+=(
@@ -177,8 +178,9 @@ echo "==> resolved WebRTC commit: $RESOLVED  (lock this in WEBRTC_VERSION:WEBRTC
 # ── 3. apply our patch series ─────────────────────────────────────────────────
 cd "$SRC/src"
 git reset --hard "$RESOLVED" >/dev/null
-# Also reset third_party sub-repos that our patches touch (gclient sync already
-# pinned them; reset makes repeated builds idempotent).
+# Also reset sub-repos that our patches touch (gclient sync already pinned
+# them; reset makes repeated builds idempotent).
+[ -d build/.git ]              && git -C build              reset --hard >/dev/null 2>&1 || true
 [ -d third_party/jni_zero/.git ] && git -C third_party/jni_zero reset --hard >/dev/null 2>&1 || true
 shopt -s nullglob
 for p in "$HERE"/patches/*.patch; do
@@ -206,6 +208,23 @@ gn gen "$OUT" --args="$ARGS"
 # ── 5. build the monolithic static lib ────────────────────────────────────────
 echo "==> ninja -C $OUT ${NINJA_TARGET:-webrtc}"
 ninja -C "$OUT" "${NINJA_TARGET:-webrtc}"
+
+# For linux/arm64 cross-compile: explicitly build the arm64 libc++ / libc++abi
+# static libs.  Chromium's GN only adds common_deps (which contains libc++) as
+# an implicit dep of executable/shared_library targets — not static_library
+# targets.  In a cross-compile the arm64 default toolchain only builds the
+# webrtc static library (no arm64 executables), so libc++.a is never scheduled
+# for the arm64 toolchain.  For a native x64 build the host tools (executables)
+# share the default toolchain, which is why x64 libc++.a appears in obj/ as a
+# side-effect.  Build them explicitly here so package.sh can find and repack
+# them into the self-contained prebuilt.
+if [ "$GN_OS" = "linux" ] && \
+   [ "$CPU" != "$(uname -m | sed 's/x86_64/x64/;s/aarch64/arm64/')" ]; then
+  echo "==> building arm64 bundled libc++/libc++abi (cross-compile: not built automatically)"
+  ninja -C "$OUT" \
+    "obj/buildtools/third_party/libc++/libc++.a" \
+    "obj/buildtools/third_party/libc++abi/libc++abi.a"
+fi
 
 # ── 6. assemble: copy the static lib next to the build dir ────────────────────
 LIB="$OUT/obj/libwebrtc.a"

@@ -16,6 +16,7 @@
 // Android bootstrap (reactor_webrtc_android_init / _init_context): located at
 // the bottom of this file, guarded by #ifdef WEBRTC_ANDROID.
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -129,9 +130,52 @@ struct ReactorPcCallbacks {
   // receiver must free with reactor_webrtc_media_stream_track_destroy.
   void (*on_track)(void* userdata, void* track);
 };
+
+// A single ICE (STUN/TURN) server. `urls` holds `urls_len` NUL-terminated
+// strings that share the credentials in this entry. `username` and `password`
+// may be null, which reads as an empty credential. Every pointer is borrowed
+// for the duration of reactor_webrtc_peer_connection_create.
+struct ReactorIceServer {
+  const char* const* urls;
+  size_t             urls_len;
+  const char*        username;
+  const char*        password;
+};
+
+// Peer-connection configuration. Each entry of `servers` keeps its own
+// credentials, so several TURN servers with different credentials stay
+// distinct. The policy fields use an explicit integer encoding, independent of
+// the webrtc:: enum order:
+//   ice_transport_type:         0=all 1=relay 2=no-host 3=none
+//   continual_gathering_policy: 0=gather-once 1=gather-continually
+//   bundle_policy:              0=balanced 1=max-bundle 2=max-compat
+//   tcp_candidate_policy:       0=disabled 1=enabled
+// An unknown value falls back to 0.
+struct ReactorRtcConfig {
+  const ReactorIceServer* servers;
+  size_t                  servers_len;
+  int                     ice_transport_type;
+  int                     continual_gathering_policy;
+  int                     min_port;  // 0 = not specified
+  int                     max_port;  // 0 = not specified
+  int                     bundle_policy;
+  // Milliseconds. <=0 keeps the libwebrtc default (~30 s in practice).
+  int                     ice_connection_receiving_timeout_ms;
+  // ICE check interval on a well-connected path in ms. <=0 = libwebrtc default.
+  int                     ice_check_interval_strong_connectivity_ms;
+  int                     tcp_candidate_policy;
+};
 }  // extern "C"
 
 namespace {
+
+// The MediaStream every local track we publish belongs to, signalled as the
+// msid stream id. The remote libwebrtc derives each receive stream's sync group
+// from that id: streams sharing one id have their audio and video aligned
+// against each other's RTCP sender reports, while a track published with no
+// stream ("a=msid:-") is played out as it arrives. Publishing every sender
+// under one id is what keeps an audio track in sync with its video.
+constexpr const char* kReactorStreamId = "reactor-stream";
 
 // Opt-in audio path tracing (REACTOR_WEBRTC_AUDIO_DEBUG=1) → stderr. Off by
 // default. Used to pinpoint capture (push) vs playout-pump vs sink delivery.
@@ -221,33 +265,57 @@ class FrameAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
     const uint32_t rate = 48000;
     const size_t channels = 2;
     const size_t frames = rate / 100;  // 10ms
+    const auto period = std::chrono::milliseconds(10);
     std::vector<int16_t> scratch(frames * channels);
     uint64_t pulls = 0, produced = 0;
+
+    // This pump is the clock for the whole receive path: libwebrtc feeds the
+    // sinks of remote audio tracks from the render pull, so its rate is the
+    // rate at which received audio reaches the application. It therefore runs
+    // on absolute deadlines. Sleeping for a fixed period *after* the pull would
+    // add the cost of every pull to every period, and the arrears compound into
+    // a permanently slow clock, starving every consumer downstream.
+    auto next = std::chrono::steady_clock::now();
+
     while (playing_.load()) {
+      size_t out = 0;
+      bool pulled = false;
       {
         std::lock_guard<std::mutex> lock(mutex_);
         if (transport_) {
-          size_t out = 0;
           int64_t elapsed = 0, ntp = 0;
           transport_->NeedMorePlayData(frames, sizeof(int16_t) * channels,
                                        channels, rate, scratch.data(), out,
                                        &elapsed, &ntp);
-          // out is just the requested frame count echoed back; measure the
-          // mixed peak to tell real incoming audio from silence.
-          int16_t peak = 0;
-          for (size_t i = 0; i < out * channels && i < scratch.size(); ++i) {
-            int16_t v = scratch[i] < 0 ? -scratch[i] : scratch[i];
-            if (v > peak) peak = v;
-          }
-          if (peak > 0) ++produced;
-          if (audio_debug() && ++pulls % 200 == 1)
-            fprintf(stderr,
-                    "[reactor-webrtc] ADM playout pump: %llu pulls, %llu non-silent, "
-                    "last peak=%d (out=%zu)\n",
-                    (unsigned long long)pulls, (unsigned long long)produced, peak, out);
+          pulled = true;
         }
       }
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+      // scratch belongs to this thread, so the peak scan stays outside the lock
+      // and cannot delay a concurrent push into the device.
+      if (pulled) {
+        // out is just the requested frame count echoed back; measure the
+        // mixed peak to tell real incoming audio from silence.
+        int16_t peak = 0;
+        for (size_t i = 0; i < out * channels && i < scratch.size(); ++i) {
+          int16_t v = scratch[i] < 0 ? -scratch[i] : scratch[i];
+          if (v > peak) peak = v;
+        }
+        if (peak > 0) ++produced;
+        if (audio_debug() && ++pulls % 200 == 1)
+          fprintf(stderr,
+                  "[reactor-webrtc] ADM playout pump: %llu pulls, %llu non-silent, "
+                  "last peak=%d (out=%zu)\n",
+                  (unsigned long long)pulls, (unsigned long long)produced, peak, out);
+      }
+
+      next += period;
+      const auto now = std::chrono::steady_clock::now();
+      // A long stall (host suspend, scheduler starvation) is dropped rather
+      // than repaid as a burst of back-to-back pulls, which would flood the
+      // receive path with a spike of catch-up audio.
+      if (next < now) next = now;
+      std::this_thread::sleep_until(next);
     }
   }
 
@@ -267,6 +335,19 @@ class AudioFrameSink : public webrtc::AudioTrackSinkInterface {
       : userdata_(userdata), on_audio_(on_audio) {}
   void OnData(const void* audio_data, int /*bits_per_sample*/, int sample_rate,
               size_t number_of_channels, size_t number_of_frames) override {
+    // The playout pump fires this sink every 10 ms for every PeerConnection,
+    // even for peers that are not sending audio.  When no RTP has arrived the
+    // jitter buffer outputs all-zero frames (comfort noise / empty buffer).
+    // Forwarding those frames to the model as if they were real audio doubles
+    // (or multiplies) the effective audio input rate in multi-peer sessions,
+    // causing the model to emit audio faster than peers can play it back.
+    const int16_t* pcm = static_cast<const int16_t*>(audio_data);
+    const size_t total = number_of_frames * number_of_channels;
+    bool has_signal = false;
+    for (size_t i = 0; i < total && !has_signal; ++i)
+      if (pcm[i] != 0) has_signal = true;
+    if (!has_signal) return;
+
     if (audio_debug()) {
       static uint64_t n = 0;
       if (++n % 100 == 1)
@@ -274,7 +355,7 @@ class AudioFrameSink : public webrtc::AudioTrackSinkInterface {
                 (unsigned long long)n, sample_rate, number_of_channels, number_of_frames);
     }
     if (on_audio_)
-      on_audio_(userdata_, static_cast<const int16_t*>(audio_data), sample_rate,
+      on_audio_(userdata_, pcm, sample_rate,
                 static_cast<int>(number_of_channels),
                 static_cast<int>(number_of_frames));
   }
@@ -310,11 +391,68 @@ class FrameSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
   std::vector<uint8_t> bgra_;
 };
 
+// A per-track audio source that bypasses the shared ADM.  Each instance
+// maintains the sinks registered by the VoiceEngine send channel for a
+// specific peer connection and delivers PCM to those sinks directly, so
+// different audio can be routed to different peers independently.
+//
+// PushPcm() is called from each peer's dedicated _audio_feed_loop Python
+// thread.  Because each LocalAudioSource is owned by exactly one peer and
+// its _audio_feed_loop is the only caller, the ChannelSend's serialised-call
+// requirement is satisfied by construction — no PostTask to the shared worker
+// thread is needed.  Routing through the worker thread adds latency and
+// contention when multiple peers are active; calling directly keeps each
+// peer's audio path independent and low-latency.
+class LocalAudioSource
+    : public webrtc::Notifier<webrtc::AudioSourceInterface> {
+ public:
+  static webrtc::scoped_refptr<LocalAudioSource> Create() {
+    return webrtc::make_ref_counted<LocalAudioSource>();
+  }
+
+  webrtc::MediaSourceInterface::SourceState state() const override {
+    return kLive;
+  }
+  bool remote() const override { return false; }
+
+  void AddSink(webrtc::AudioTrackSinkInterface* sink) override {
+    std::lock_guard<std::mutex> lock(sinks_mutex_);
+    sinks_.push_back(sink);
+  }
+  void RemoveSink(webrtc::AudioTrackSinkInterface* sink) override {
+    std::lock_guard<std::mutex> lock(sinks_mutex_);
+    sinks_.erase(std::remove(sinks_.begin(), sinks_.end(), sink), sinks_.end());
+  }
+
+  // Deliver PCM directly to the registered sinks on the calling thread.
+  // A positive capture_time_ms reaches the encoder as the frame's absolute
+  // capture time, which is what lets a caller align this audio with video it
+  // captured at the same instant. Non-positive means "unknown": the send
+  // channel then times the frame by when it arrived, as it does for a live
+  // microphone.
+  void PushPcm(const int16_t* pcm, int samples_per_channel,
+               int sample_rate, int channels, int64_t capture_time_ms) {
+    std::optional<int64_t> capture;
+    if (capture_time_ms > 0) capture = capture_time_ms;
+    std::lock_guard<std::mutex> lock(sinks_mutex_);
+    for (auto* sink : sinks_) {
+      sink->OnData(pcm, /*bits_per_sample=*/16, sample_rate,
+                   static_cast<size_t>(channels),
+                   static_cast<size_t>(samples_per_channel), capture);
+    }
+  }
+
+ private:
+  std::mutex sinks_mutex_;
+  std::vector<webrtc::AudioTrackSinkInterface*> sinks_;
+};
+
 // A track handle (the `MediaStreamTrack` in the Rust API). For a local track
-// `source` is set and frames can be pushed; for a remote track (from OnTrack)
-// `source` is null and `sink` is attached to receive frames.
+// `source` or `audio_source` is set and frames can be pushed; for a remote
+// track (from OnTrack) both sources are null and `sink`/`audio_sink` are used.
 struct ReactorMediaStreamTrack {
-  webrtc::scoped_refptr<FrameSource> source;
+  webrtc::scoped_refptr<FrameSource> source;              // local video
+  webrtc::scoped_refptr<LocalAudioSource> audio_source;  // local audio (per-track)
   webrtc::scoped_refptr<webrtc::MediaStreamTrackInterface> track;
   std::unique_ptr<FrameSink> sink;
   std::unique_ptr<AudioFrameSink> audio_sink;
@@ -382,6 +520,11 @@ struct ReactorDataChannel {
 // A transceiver handle (the `RtpTransceiver` in the Rust API).
 struct ReactorTransceiver {
   webrtc::scoped_refptr<webrtc::RtpTransceiverInterface> tc;
+  // Kept alive (ref-counted) so codec-preference queries can reach
+  // GetRtpSenderCapabilities/GetRtpReceiverCapabilities from the transceiver
+  // handle alone, independent of whether the owning ReactorPeerConnection has
+  // since been destroyed.
+  webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> factory;
 };
 
 // Owns the three WebRTC threads alongside the factory. The threads must outlive
@@ -461,6 +604,11 @@ class ReactorPcObserver : public webrtc::PeerConnectionObserver {
 struct ReactorPeerConnection {
   std::unique_ptr<ReactorPcObserver> observer;
   webrtc::scoped_refptr<webrtc::PeerConnectionInterface> pc;
+  // The factory this connection was created from. GetRtpSenderCapabilities /
+  // GetRtpReceiverCapabilities (codec-preference queries) live on the factory,
+  // not the connection, so transceiver handles need it too — see
+  // ReactorTransceiver::factory.
+  webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> factory;
 };
 
 // Forwards CreateOffer/CreateAnswer results to C callbacks.
@@ -520,26 +668,81 @@ class SetRemoteDescObserver
   void (*on_complete_)(void*, const char*);
 };
 
-// Lenient ICE-server extraction: pull quoted stun:/turn[s]: URLs out of the
-// config JSON without a JSON dependency. TODO(M1): replace with the structured
-// config the safe crate will build.
-void parse_ice_servers(const char* config_json,
-                       webrtc::PeerConnectionInterface::RTCConfiguration& cfg) {
-  if (!config_json) return;
-  const std::string s(config_json);
-  size_t start = 0;
-  while ((start = s.find('"', start)) != std::string::npos) {
-    const size_t end = s.find('"', start + 1);
-    if (end == std::string::npos) break;
-    const std::string tok = s.substr(start + 1, end - start - 1);
-    if (tok.rfind("stun:", 0) == 0 || tok.rfind("stuns:", 0) == 0 ||
-        tok.rfind("turn:", 0) == 0 || tok.rfind("turns:", 0) == 0) {
-      webrtc::PeerConnectionInterface::IceServer srv;
-      srv.urls.push_back(tok);
-      cfg.servers.push_back(std::move(srv));
+// Copy a borrowed C string, mapping null to empty.
+std::string str_or_empty(const char* s) { return s ? std::string(s) : std::string(); }
+
+// Apply the caller's configuration to a libwebrtc RTCConfiguration. A null
+// `in` keeps the libwebrtc defaults. Credentials travel per server entry, so a
+// turn:/turns: URL reaches ice_server_parsing.cc with its username and
+// password attached.
+void apply_rtc_config(const ReactorRtcConfig* in,
+                      webrtc::PeerConnectionInterface::RTCConfiguration& cfg) {
+  if (!in) return;
+
+  for (size_t i = 0; i < in->servers_len; ++i) {
+    const ReactorIceServer& src = in->servers[i];
+    webrtc::PeerConnectionInterface::IceServer srv;
+    for (size_t u = 0; u < src.urls_len; ++u) {
+      if (src.urls && src.urls[u]) srv.urls.push_back(src.urls[u]);
     }
-    start = end + 1;
+    if (srv.urls.empty()) continue;
+    srv.username = str_or_empty(src.username);
+    srv.password = str_or_empty(src.password);
+    cfg.servers.push_back(std::move(srv));
   }
+
+  switch (in->ice_transport_type) {
+    case 1:  cfg.type = webrtc::PeerConnectionInterface::kRelay;  break;
+    case 2:  cfg.type = webrtc::PeerConnectionInterface::kNoHost; break;
+    case 3:  cfg.type = webrtc::PeerConnectionInterface::kNone;   break;
+    default: cfg.type = webrtc::PeerConnectionInterface::kAll;    break;
+  }
+
+  cfg.continual_gathering_policy =
+      in->continual_gathering_policy == 1
+          ? webrtc::PeerConnectionInterface::GATHER_CONTINUALLY
+          : webrtc::PeerConnectionInterface::GATHER_ONCE;
+
+  if (in->min_port > 0 && in->max_port > 0) {
+    cfg.set_min_port(in->min_port);
+    cfg.set_max_port(in->max_port);
+  }
+
+  switch (in->bundle_policy) {
+    case 1: cfg.bundle_policy =
+                webrtc::PeerConnectionInterface::kBundlePolicyMaxBundle; break;
+    case 2: cfg.bundle_policy =
+                webrtc::PeerConnectionInterface::kBundlePolicyMaxCompat; break;
+    default: break;  // 0 = balanced (libwebrtc default)
+  }
+
+  if (in->ice_connection_receiving_timeout_ms > 0)
+    cfg.ice_connection_receiving_timeout =
+        in->ice_connection_receiving_timeout_ms;
+
+  if (in->ice_check_interval_strong_connectivity_ms > 0)
+    cfg.ice_check_interval_strong_connectivity =
+        in->ice_check_interval_strong_connectivity_ms;
+
+  switch (in->tcp_candidate_policy) {
+    case 1: cfg.tcp_candidate_policy =
+                webrtc::PeerConnectionInterface::kTcpCandidatePolicyEnabled;
+            break;
+    default: break;  // 0 = disabled (libwebrtc default)
+  }
+}
+
+// Write a NUL-terminated copy of `msg` into `out`, truncated to `cap` bytes.
+// Does nothing when `out` is null or `cap` is not positive. Templated on the
+// message type: RTCError::message() returns const char* on some milestones and
+// a string_view on others, and both convert to std::string.
+template <typename S>
+static void write_error(char* out, int cap, const S& msg) {
+  if (!out || cap <= 0) return;
+  const std::string s(msg);
+  const size_t n = std::min(s.size(), static_cast<size_t>(cap) - 1);
+  std::memcpy(out, s.data(), n);
+  out[n] = '\0';
 }
 
 // Safely dereference any optional-like field (absl::optional<T>, std::optional<T>,
@@ -615,6 +818,16 @@ class StatsCallback : public webrtc::RTCStatsCollectorCallback {
     }
     if (callback_)
       callback_(userdata_, entries.data(), static_cast<int>(entries.size()));
+
+    // Matches the extra AddRef taken in reactor_webrtc_peer_connection_get_stats
+    // before this object was handed to GetStats(). GetStats() is proxied onto
+    // the signaling thread, and nothing in the public API guarantees the real
+    // PeerConnection::GetStats body (which takes its own ref) has run by the
+    // time GetStats() returns to the caller. Without this extra ref, the
+    // caller's local scoped_refptr can drop the last reference and delete
+    // `this` before the queued call ever reaches the signaling thread — a
+    // use-after-free that only shows up as a rare, timing-dependent segfault.
+    Release();
   }
 
  private:
@@ -649,7 +862,7 @@ static webrtc::scoped_refptr<webrtc::AudioProcessing> build_apm(int apm_flags) {
 extern "C" {
 
 // ABI version of this native build. The safe crate asserts compatibility.
-unsigned int reactor_webrtc_abi_version() { return 1; }
+unsigned int reactor_webrtc_abi_version() { return 2; }
 
 // Link/run self-test: build the builtin audio + video encoder factories and
 // enumerate the codecs they support. Writes a comma-separated, NUL-terminated
@@ -745,28 +958,37 @@ void reactor_webrtc_factory_destroy(void* factory) {
   delete reinterpret_cast<ReactorFactory*>(factory);
 }
 
-// Create a PeerConnection on `factory`. `config_json` may be null/empty;
-// recognized ICE-server URLs are applied. `callbacks` may be null. Returns an
-// opaque ReactorPeerConnection* (the `PeerConnection` handle), or nullptr.
+// Create a PeerConnection on `factory`. `config` may be null (libwebrtc
+// defaults). `callbacks` may be null. Returns an opaque ReactorPeerConnection*
+// (the `PeerConnection` handle), or nullptr. On failure the reason from
+// libwebrtc goes into `err` (NUL-terminated, truncated to `err_cap`).
 void* reactor_webrtc_peer_connection_create(void* factory,
-                                            const char* config_json,
-                                            const ReactorPcCallbacks* callbacks) {
+                                            const ReactorRtcConfig* config,
+                                            const ReactorPcCallbacks* callbacks,
+                                            char* err, int err_cap) {
   auto* rf = reinterpret_cast<ReactorFactory*>(factory);
-  if (!rf || !rf->factory) return nullptr;
+  if (!rf || !rf->factory) {
+    write_error(err, err_cap, "invalid peer connection factory");
+    return nullptr;
+  }
 
   auto rpc = std::make_unique<ReactorPeerConnection>();
+  rpc->factory = rf->factory;
   ReactorPcCallbacks cb{};
   if (callbacks) cb = *callbacks;
   rpc->observer = std::make_unique<ReactorPcObserver>(cb);
 
-  webrtc::PeerConnectionInterface::RTCConfiguration config;
-  config.sdp_semantics = webrtc::SdpSemantics::kUnifiedPlan;
-  parse_ice_servers(config_json, config);
+  webrtc::PeerConnectionInterface::RTCConfiguration rtc_config;
+  rtc_config.sdp_semantics = webrtc::SdpSemantics::kUnifiedPlan;
+  apply_rtc_config(config, rtc_config);
 
   webrtc::PeerConnectionDependencies deps(rpc->observer.get());
   auto result =
-      rf->factory->CreatePeerConnectionOrError(config, std::move(deps));
-  if (!result.ok()) return nullptr;
+      rf->factory->CreatePeerConnectionOrError(rtc_config, std::move(deps));
+  if (!result.ok()) {
+    write_error(err, err_cap, result.error().message());
+    return nullptr;
+  }
   rpc->pc = result.MoveValue();
   return rpc.release();
 }
@@ -776,6 +998,41 @@ void reactor_webrtc_peer_connection_destroy(void* pc) {
   auto* rpc = reinterpret_cast<ReactorPeerConnection*>(pc);
   if (rpc && rpc->pc) rpc->pc->Close();
   delete rpc;
+}
+
+// Set aggregate bitrate limits on the peer connection. Use -1 for any field
+// that should keep the libwebrtc default.
+//
+//   min_bps   — floor handed to the congestion controller; it will not drop
+//               below this even when the network estimate is very low.
+//   start_bps — initial encoder target; libwebrtc defaults to ~300 kbps,
+//               which causes a slow ramp-up; set to your expected steady-state
+//               for streaming (e.g. 4 000 000 for 4 Mbps targets).
+//   max_bps   — ceiling; the GCC algorithm will not allocate above this.
+//
+// All values are in bits per second.
+// Returns 0 on success, -1 on error (message written to err/err_cap).
+int reactor_webrtc_peer_connection_set_bitrate(void* pc,
+                                               int min_bps,
+                                               int start_bps,
+                                               int max_bps,
+                                               char* err,
+                                               int err_cap) {
+  auto* rpc = reinterpret_cast<ReactorPeerConnection*>(pc);
+  if (!rpc || !rpc->pc) {
+    write_error(err, err_cap, "no peer connection");
+    return -1;
+  }
+  webrtc::BitrateSettings s;
+  if (min_bps   > 0) s.min_bitrate_bps   = min_bps;
+  if (start_bps > 0) s.start_bitrate_bps = start_bps;
+  if (max_bps   > 0) s.max_bitrate_bps   = max_bps;
+  auto result = rpc->pc->SetBitrate(s);
+  if (!result.ok()) {
+    write_error(err, err_cap, result.message());
+    return -1;
+  }
+  return 0;
 }
 
 // Create an offer. The result is delivered asynchronously on the signaling
@@ -1000,8 +1257,15 @@ void* reactor_webrtc_video_track_create(void* factory, const char* id) {
 
 // Push a BGRA frame (width*height*4 bytes) into a local video track's source.
 // Converted to I420 and timestamped here.
-void reactor_webrtc_video_track_push_frame(void* track, const uint8_t* bgra,
-                                           int width, int height) {
+// Returns the current monotonic clock in microseconds — the same epoch used
+// by VideoFrame::set_timestamp_us and EncodedImage::CaptureTime().
+int64_t reactor_webrtc_time_micros() { return webrtc::TimeMicros(); }
+
+// Like reactor_webrtc_video_track_push_frame but uses a caller-supplied
+// capture timestamp so Rust can key per-frame metadata by that timestamp.
+void reactor_webrtc_video_track_push_frame_ts(void* track, const uint8_t* bgra,
+                                              int width, int height,
+                                              int64_t capture_time_us) {
   auto* h = reinterpret_cast<ReactorMediaStreamTrack*>(track);
   if (!h || !h->source || !bgra || width <= 0 || height <= 0) return;
   webrtc::scoped_refptr<webrtc::I420Buffer> buffer =
@@ -1012,9 +1276,15 @@ void reactor_webrtc_video_track_push_frame(void* track, const uint8_t* bgra,
                      buffer->MutableDataV(), buffer->StrideV(), width, height);
   webrtc::VideoFrame frame = webrtc::VideoFrame::Builder()
                                  .set_video_frame_buffer(buffer)
-                                 .set_timestamp_us(webrtc::TimeMicros())
+                                 .set_timestamp_us(capture_time_us)
                                  .build();
   h->source->PushFrame(frame);
+}
+
+void reactor_webrtc_video_track_push_frame(void* track, const uint8_t* bgra,
+                                           int width, int height) {
+  reactor_webrtc_video_track_push_frame_ts(track, bgra, width, height,
+                                           webrtc::TimeMicros());
 }
 
 // Add a (local) audio or video track to the peer connection, creating a
@@ -1023,7 +1293,7 @@ int reactor_webrtc_peer_connection_add_track(void* pc, void* track) {
   auto* rpc = reinterpret_cast<ReactorPeerConnection*>(pc);
   auto* h = reinterpret_cast<ReactorMediaStreamTrack*>(track);
   if (!rpc || !rpc->pc || !h || !h->track) return 0;
-  return rpc->pc->AddTrack(h->track, {"reactor-stream"}).ok() ? 1 : 0;
+  return rpc->pc->AddTrack(h->track, {kReactorStreamId}).ok() ? 1 : 0;
 }
 
 // Create a local audio track. Its samples come from the factory's ADM (push
@@ -1040,6 +1310,48 @@ void* reactor_webrtc_audio_track_create(void* factory, const char* id) {
   return handle.release();
 }
 
+// Create a local audio track backed by a per-track LocalAudioSource instead of
+// the factory-level ADM. Each call returns an independent source, so different
+// audio can be pushed to different peer connections. Feed via
+// reactor_webrtc_audio_track_push_pcm.
+void* reactor_webrtc_audio_track_create_with_local_source(void* factory,
+                                                          const char* id) {
+  auto* rf = reinterpret_cast<ReactorFactory*>(factory);
+  if (!rf || !rf->factory) return nullptr;
+  auto source = LocalAudioSource::Create();
+  auto handle = std::make_unique<ReactorMediaStreamTrack>();
+  handle->audio_source = source;
+  handle->track = rf->factory->CreateAudioTrack(id ? id : "", source.get());
+  if (!handle->track) return nullptr;
+  return handle.release();
+}
+
+// Like reactor_webrtc_audio_track_push_pcm but stamps the frame with a
+// caller-supplied absolute capture time (ms, same epoch as
+// reactor_webrtc_time_micros), so audio and video captured together can be
+// timestamped together. Pass 0 to leave the capture time unknown.
+void reactor_webrtc_audio_track_push_pcm_ts(void* track, const int16_t* pcm,
+                                            int samples_per_channel,
+                                            int sample_rate, int channels,
+                                            int64_t capture_time_ms) {
+  auto* h = reinterpret_cast<ReactorMediaStreamTrack*>(track);
+  if (!h || !h->audio_source || !pcm || samples_per_channel <= 0 || channels <= 0)
+    return;
+  h->audio_source->PushPcm(pcm, samples_per_channel, sample_rate, channels,
+                           capture_time_ms);
+}
+
+// Push interleaved int16 PCM directly to a local audio track that was created
+// with reactor_webrtc_audio_track_create_with_local_source. No-op on tracks
+// backed by the factory ADM.
+void reactor_webrtc_audio_track_push_pcm(void* track, const int16_t* pcm,
+                                         int samples_per_channel,
+                                         int sample_rate, int channels) {
+  reactor_webrtc_audio_track_push_pcm_ts(track, pcm, samples_per_channel,
+                                         sample_rate, channels,
+                                         /*capture_time_ms=*/0);
+}
+
 // Deliver interleaved int16 PCM to the factory's ADM (shared by all local audio
 // tracks). `samples_per_channel` is the frame count (e.g. 480 for 10ms@48kHz).
 void reactor_webrtc_factory_push_audio_frame(void* factory, const int16_t* pcm,
@@ -1054,6 +1366,15 @@ void reactor_webrtc_factory_push_audio_frame(void* factory, const int16_t* pcm,
 
 // Attach a frame sink to a (received) audio track. `on_audio(userdata,
 // sample_rate, channels, frames)` fires per 10ms block until destroyed.
+//
+// Removes any previously registered sink from the track *before* destroying
+// it: AddSink for a new pointer does not implicitly detach a different one
+// already registered, so replacing `h->audio_sink` first and adding the new
+// sink after would leave the broadcaster holding a dangling pointer to the
+// just-freed old `AudioFrameSink` — a use-after-free the next time it fires,
+// reachable even from one caller re-attaching sequentially, no concurrency
+// required. `RemoveSink` shares the broadcaster's own lock with delivery, so
+// it also waits out any delivery already in progress on the old sink.
 void reactor_webrtc_audio_track_add_sink(
     void* track, void* userdata,
     void (*on_audio)(void*, const int16_t*, int, int, int)) {
@@ -1068,8 +1389,9 @@ void reactor_webrtc_audio_track_add_sink(
               h->track->kind().c_str());
     return;
   }
-  h->audio_sink = std::make_unique<AudioFrameSink>(userdata, on_audio);
   auto* at = static_cast<webrtc::AudioTrackInterface*>(h->track.get());
+  if (h->audio_sink) at->RemoveSink(h->audio_sink.get());
+  h->audio_sink = std::make_unique<AudioFrameSink>(userdata, on_audio);
   at->AddSink(h->audio_sink.get());
   if (audio_debug())
     fprintf(stderr,
@@ -1079,14 +1401,21 @@ void reactor_webrtc_audio_track_add_sink(
 
 // Attach a frame sink to a (video) track. `on_frame(userdata, width, height)`
 // fires per decoded frame. The sink lives until the track handle is destroyed.
+//
+// Same ordering requirement as the audio sink above: `AddOrUpdateSink` only
+// updates in place when the pointer already registered is the *same*
+// pointer; for a fresh `FrameSink` it is added alongside whatever is already
+// there. Detach the old one first, or replacing `h->sink` destroys a
+// `FrameSink` the broadcaster still holds and calls into.
 void reactor_webrtc_video_track_add_sink(
     void* track, void* userdata,
     void (*on_frame)(void*, const uint8_t*, int, int)) {
   auto* h = reinterpret_cast<ReactorMediaStreamTrack*>(track);
   if (!h || !h->track || h->track->kind() != "video") return;
+  auto* vt = static_cast<webrtc::VideoTrackInterface*>(h->track.get());
+  if (h->sink) vt->RemoveSink(h->sink.get());
   h->sink = std::make_unique<FrameSink>(userdata, on_frame);
-  static_cast<webrtc::VideoTrackInterface*>(h->track.get())
-      ->AddOrUpdateSink(h->sink.get(), webrtc::VideoSinkWants());
+  vt->AddOrUpdateSink(h->sink.get(), webrtc::VideoSinkWants());
 }
 
 // Kind of a track handle: 0 = audio, 1 = video, -1 = unknown.
@@ -1114,7 +1443,7 @@ void* reactor_webrtc_peer_connection_add_transceiver(void* pc, int media_kind,
   init.direction = static_cast<webrtc::RtpTransceiverDirection>(direction);
   auto result = rpc->pc->AddTransceiver(mt, init);
   if (!result.ok()) return nullptr;
-  return new ReactorTransceiver{result.MoveValue()};
+  return new ReactorTransceiver{result.MoveValue(), rpc->factory};
 }
 
 // Number of transceivers on the peer connection (post-negotiation this
@@ -1132,7 +1461,7 @@ void* reactor_webrtc_peer_connection_get_transceiver(void* pc, int index) {
   if (!rpc || !rpc->pc || index < 0) return nullptr;
   auto tcs = rpc->pc->GetTransceivers();
   if (static_cast<size_t>(index) >= tcs.size()) return nullptr;
-  return new ReactorTransceiver{tcs[static_cast<size_t>(index)]};
+  return new ReactorTransceiver{tcs[static_cast<size_t>(index)], rpc->factory};
 }
 
 // Media kind of a transceiver: 0 = audio, 1 = video, -1 = unknown.
@@ -1165,12 +1494,29 @@ int reactor_webrtc_rtp_transceiver_mid(void* transceiver, char* out, int cap) {
 
 // Attach (or clear, with null) a local track on the transceiver's sender.
 // Returns 1 on success, 0 on failure.
+//
+// An attached track joins kReactorStreamId, matching what AddTrack publishes,
+// so a sender wired up through a transceiver signals a real msid instead of
+// "a=msid:-". The next create_offer/create_answer carries it. SetStreams shares
+// SetTrack's signaling-thread contract, so it adds no threading obligation of
+// its own.
 int reactor_webrtc_rtp_transceiver_set_track(void* transceiver, void* track) {
   auto* h = reinterpret_cast<ReactorTransceiver*>(transceiver);
   if (!h || !h->tc) return 0;
   auto* t = reinterpret_cast<ReactorMediaStreamTrack*>(track);
   webrtc::MediaStreamTrackInterface* raw = (t && t->track) ? t->track.get() : nullptr;
-  return h->tc->sender()->SetTrack(raw) ? 1 : 0;
+  auto sender = h->tc->sender();
+  if (!sender || !sender->SetTrack(raw)) return 0;
+  if (raw) {
+    // Only when it would change something: SetStreams signals
+    // negotiation-needed, and a replaceTrack on an established connection
+    // already carries the id its predecessor was published under.
+    const std::vector<std::string> ids = sender->stream_ids();
+    if (ids.size() != 1 || ids[0] != kReactorStreamId) {
+      sender->SetStreams({kReactorStreamId});
+    }
+  }
+  return 1;
 }
 
 // Set the transceiver's direction. direction: 0=sendrecv, 1=sendonly,
@@ -1181,6 +1527,144 @@ int reactor_webrtc_rtp_transceiver_set_direction(void* transceiver, int directio
   auto dir = static_cast<webrtc::RtpTransceiverDirection>(direction);
   auto err = h->tc->SetDirectionWithError(dir);
   return err.ok() ? 1 : 0;
+}
+
+// Reorder this video transceiver's codec preferences so entries matching
+// `codec_names` (libwebrtc codec names such as "VP8"/"VP9"/"AV1"/"H264"/
+// "H265", most preferred first) sort ahead of every other codec. Nothing is
+// dropped: codecs not named in the list, and every retransmission/RED/FEC
+// entry, keep their original relative order after the preferred ones — so
+// retransmission stays associated with its codec and negotiation never
+// loses a capability the endpoint actually has. Takes effect on the next
+// create_offer()/create_answer() for this transceiver's m-section. Returns
+// 1 on success, 0 on failure (not a video transceiver, or libwebrtc
+// rejected the result).
+int reactor_webrtc_rtp_transceiver_set_video_codec_preferences(
+    void* transceiver, const char* const* codec_names, int codecs_len) {
+  auto* h = reinterpret_cast<ReactorTransceiver*>(transceiver);
+  if (!h || !h->tc || !h->factory) return 0;
+  if (h->tc->media_type() != webrtc::MediaType::VIDEO) return 0;
+
+  // Sender capabilities alone, not a union with GetRtpReceiverCapabilities:
+  // the two lists can carry the *same* codec with different
+  // `scalability_modes` (an encode-only concept), which compare unequal under
+  // RtpCodecCapability::operator==. Unioning them would let one codec's
+  // sender and receiver variants both through, and libwebrtc can assign them
+  // the same payload type — a real "Duplicate payload type in codec list"
+  // negotiation failure, not just a cosmetic one.
+  webrtc::RtpCapabilities caps =
+      h->factory->GetRtpSenderCapabilities(webrtc::MediaType::VIDEO);
+
+  std::vector<webrtc::RtpCodecCapability> ordered;
+  ordered.reserve(caps.codecs.size());
+  std::vector<bool> used(caps.codecs.size(), false);
+  for (int i = 0; i < codecs_len && codec_names; ++i) {
+    const char* name = codec_names[i];
+    if (!name) continue;
+    for (size_t j = 0; j < caps.codecs.size(); ++j) {
+      if (!used[j] && caps.codecs[j].name == name) {
+        ordered.push_back(caps.codecs[j]);
+        used[j] = true;
+      }
+    }
+  }
+  for (size_t j = 0; j < caps.codecs.size(); ++j) {
+    if (!used[j]) ordered.push_back(caps.codecs[j]);
+  }
+
+  return h->tc->SetCodecPreferences(ordered).ok() ? 1 : 0;
+}
+
+// SetCodecPreferences only controls SDP negotiation — what gets offered/
+// answered, and in what order. It does *not* determine which of the
+// negotiated codecs this transceiver's own sender actually encodes with;
+// that is a separate, later decision (libwebrtc's "codec switching":
+// RtpParameters::encodings[].codec). Call this once negotiation has
+// completed (after set_local_description) to make the sender's first
+// negotiated codec — the one set_codec_preferences put first — the one it
+// actually uses, instead of whatever it would otherwise have picked (e.g.
+// the remote offer's own original order). Returns 1 on success, 0 on
+// failure (no sender, no negotiated codecs yet, or libwebrtc rejected it).
+int reactor_webrtc_rtp_transceiver_lock_negotiated_send_codec(void* transceiver) {
+  auto* h = reinterpret_cast<ReactorTransceiver*>(transceiver);
+  if (!h || !h->tc) return 0;
+
+  // codec_preferences() is what set_codec_preferences configured — the
+  // source of truth for "most preferred", in name-only terms (it is a
+  // capability, not a negotiated payload type). RtpParameters::codecs (from
+  // GetParameters() below) is NOT in this order — empirically it stays in a
+  // fixed, implementation-determined order regardless of codec_preferences(),
+  // so codecs[0] cannot be assumed to be the preferred one. Matching by name
+  // against the actual negotiated list is what makes this correct.
+  //
+  // Walk the whole preference order, not just the first entry: the most
+  // preferred codec can be configured but not actually negotiated with this
+  // peer (unsupported on their end, dropped during offer/answer), in which
+  // case the next-preferred one that *did* get negotiated is still a better
+  // choice than silently giving up and leaving the sender on whatever
+  // codec it would otherwise have picked.
+  auto preferences = h->tc->codec_preferences();
+  if (preferences.empty()) return 0;
+
+  auto sender = h->tc->sender();
+  if (!sender) return 0;
+
+  webrtc::RtpParameters params = sender->GetParameters();
+  if (params.encodings.empty()) return 0;
+
+  for (auto& pref : preferences) {
+    for (auto& c : params.codecs) {
+      if (c.name == pref.name) {
+        params.encodings[0].codec = webrtc::RtpCodec(c);
+        return sender->SetParameters(params).ok() ? 1 : 0;
+      }
+    }
+  }
+  return 0;  // none of the preferred codecs were actually negotiated for this sender
+}
+
+// Identity of the *transceiver* itself, as an opaque value — not an owning
+// handle.
+//
+// Unlike the ReactorTransceiver handle, which is a fresh heap object on every
+// transceivers() call, the native RtpTransceiverInterface behind it is stable for
+// the life of the transceiver. That makes this usable as a key from the moment the
+// transceiver exists — before any track is attached, and before the first SDP
+// exchange assigns a mid.
+uintptr_t reactor_webrtc_rtp_transceiver_id(void* transceiver) {
+  auto* h = reinterpret_cast<ReactorTransceiver*>(transceiver);
+  if (!h || !h->tc) return 0;
+  return reinterpret_cast<uintptr_t>(h->tc.get());
+}
+
+// Identity of the track currently attached to this transceiver's sender, as an
+// opaque value — NOT an owning handle.
+//
+// The pointer is only ever compared, never dereferenced or released, and no
+// reference is taken: the caller uses it to recognise which of its own tracks
+// this transceiver is sending. Returns 0 when the sender has no track.
+//
+// A `void*` rather than a ReactorMediaStreamTrack: the native
+// MediaStreamTrackInterface is what two Rust wrappers around the same track have
+// in common, which is exactly the identity being asked for. Wrapping it in a new
+// handle would produce an object with its own state and defeat the purpose.
+uintptr_t reactor_webrtc_rtp_transceiver_sender_track_id(void* transceiver) {
+  auto* h = reinterpret_cast<ReactorTransceiver*>(transceiver);
+  if (!h || !h->tc || !h->tc->sender()) return 0;
+  auto track = h->tc->sender()->track();
+  return reinterpret_cast<uintptr_t>(track.get());
+}
+
+// Identity of the track this transceiver's receiver delivers, on the same
+// non-owning terms as reactor_webrtc_rtp_transceiver_sender_track_id.
+//
+// Available once the remote description has been applied — the receiver's track
+// is created while applying it, which is the same point on_track fires.
+uintptr_t reactor_webrtc_rtp_transceiver_receiver_track_id(void* transceiver) {
+  auto* h = reinterpret_cast<ReactorTransceiver*>(transceiver);
+  if (!h || !h->tc || !h->tc->receiver()) return 0;
+  auto track = h->tc->receiver()->track();
+  return reinterpret_cast<uintptr_t>(track.get());
 }
 
 // Destroy a transceiver handle (releases our reference).
@@ -1203,16 +1687,17 @@ extern "C" {
 // Encoded frame handed to the callback. `data`/`mime_type` are valid only for
 // the duration of the call. `frame` is an opaque handle for set_data.
 struct ReactorEncodedFrame {
-  int direction;        // 0 = send (egress), 1 = receive (ingress)
-  int is_audio;         // 1 = audio, 0 = video
-  int is_key_frame;     // video only (0 for audio)
+  int direction;           // 0 = send (egress), 1 = receive (ingress)
+  int is_audio;            // 1 = audio, 0 = video
+  int is_key_frame;        // video only (0 for audio)
   uint8_t payload_type;
   uint32_t ssrc;
-  uint32_t timestamp;
-  const uint8_t* data;  // encoded payload
+  uint32_t timestamp;      // RTP timestamp
+  int64_t capture_time_ms; // capture timestamp in ms (same epoch as TimeMicros); 0 if unavailable
+  const uint8_t* data;     // encoded payload
   size_t data_len;
-  const char* mime_type;  // e.g. "video/VP8", "audio/opus"
-  void* frame;          // opaque -> reactor_webrtc_encoded_frame_set_data
+  const char* mime_type;   // e.g. "video/VP8", "audio/opus"
+  void* frame;             // opaque -> reactor_webrtc_encoded_frame_set_data
 };
 // Return 0 to emit the frame downstream (after any set_data), non-zero to drop
 // it (receive side: bypasses the decoder; send side: nothing is sent).
@@ -1748,6 +2233,8 @@ class ReactorFrameTransformer : public webrtc::FrameTransformerInterface {
                   webrtc::TransformableFrameInterface::Direction::kReceiver
               ? 1
               : 0;
+      auto ct = frame->CaptureTime();
+      int64_t capture_ms = ct.has_value() ? ct->ms() : 0;
       ReactorEncodedFrame ef{
           direction,
           is_audio,
@@ -1755,6 +2242,7 @@ class ReactorFrameTransformer : public webrtc::FrameTransformerInterface {
           frame->GetPayloadType(),
           frame->GetSsrc(),
           frame->GetTimestamp(),
+          capture_ms,
           data.data(),
           data.size(),
           mime.c_str(),
@@ -1821,6 +2309,16 @@ void reactor_webrtc_frame_transformer_destroy(void* transformer) {
   delete reinterpret_cast<ReactorTransformerHandle*>(transformer);
 }
 
+// Identity of the native track behind this handle, as an opaque value — not an
+// owning handle, on the same terms as
+// reactor_webrtc_rtp_transceiver_sender_track_id, whose value this is comparable
+// with. Returns 0 for a handle with no track.
+uintptr_t reactor_webrtc_media_stream_track_id(void* track) {
+  auto* h = reinterpret_cast<ReactorMediaStreamTrack*>(track);
+  if (!h) return 0;
+  return reinterpret_cast<uintptr_t>(h->track.get());
+}
+
 // Destroy a track handle (detaches any sink and releases the track + source).
 void reactor_webrtc_media_stream_track_destroy(void* track) {
   auto* h = reinterpret_cast<ReactorMediaStreamTrack*>(track);
@@ -1851,8 +2349,14 @@ void reactor_webrtc_peer_connection_get_stats(
     if (callback) callback(userdata, nullptr, 0);
     return;
   }
-  rpc->pc->GetStats(
-      webrtc::make_ref_counted<StatsCallback>(userdata, callback).get());
+  // Take an extra ref before GetStats() sees this object, released at the end
+  // of OnStatsDelivered — see the comment there for why. `cb` itself is a
+  // second, independent reference that still unwinds normally at the end of
+  // this function.
+  webrtc::scoped_refptr<StatsCallback> cb =
+      webrtc::make_ref_counted<StatsCallback>(userdata, callback);
+  cb->AddRef();
+  rpc->pc->GetStats(cb.get());
 }
 
 }  // extern "C"

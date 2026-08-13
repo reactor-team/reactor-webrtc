@@ -67,6 +67,11 @@ fn forward_ice(from: &Ice, to: &PeerConnection) {
     }
 }
 
+// On Windows, WebRTC gathers mDNS-obfuscated ICE candidates whose resolution
+// depends on a working mDNS responder.  GitHub's `windows-latest` runners do
+// not have one, so the loopback connection never establishes within the test
+// timeout.  Track separately; run locally with `-- --ignored` to verify.
+#[cfg_attr(target_os = "windows", ignore)]
 #[test]
 fn custom_encoder_receives_raw_frames() {
     // Count how many times the custom encoder callback fires.

@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+#MISE description="[Quality] Check reactor_webrtc.pyi is present (type stub for the wheel)"
+set -euo pipefail
+test -f "$REPO_ROOT/crates/reactor-webrtc-py/reactor_webrtc.pyi" \
+  || { echo "reactor_webrtc.pyi missing" >&2; exit 1; }
+echo "✓ reactor_webrtc.pyi present"

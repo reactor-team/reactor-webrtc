@@ -1,0 +1,16 @@
+diff --git a/build/config/compiler/BUILD.gn b/build/config/compiler/BUILD.gn
+index d76ab929f..88881274b 100644
+--- a/build/config/compiler/BUILD.gn
++++ b/build/config/compiler/BUILD.gn
+@@ -662,7 +662,10 @@ config("compiler") {
+     # TODO(crbug.com/376278218): This causes segfault on Linux ARM builds.
+     # It also causes segfault on Linux s390x:
+     # https://github.com/llvm/llvm-project/issues/149511
+-    if (is_linux && use_lld && current_cpu != "arm" && current_cpu != "s390x") {
++    # Reactor: also exclude arm64 — the prebuilt libwebrtc.a is consumed on
++    # arm64 hosts by GNU ld, which does not support CREL relocations yet.
++    if (is_linux && use_lld && current_cpu != "arm" && current_cpu != "arm64" &&
++        current_cpu != "s390x") {
+       cflags += [ "-Wa,--crel,--allow-experimental-crel" ]
+     }
+   }

@@ -12,8 +12,8 @@
 #   • macos-15 (Apple Silicon + Xcode 16) → mac arm64, mac x64, iOS device + sim.
 #       macos-15 ships MacOSX15.sdk; protobuf's `constinit fixed_address_empty_string`
 #       needs libc++'s constexpr allocator, absent from the MacOSX14.5.sdk on macos-14.
-#   • ubuntu-latest                    → linux x64, android (NDK via gclient).
-#   • ubuntu-24.04-arm                 → linux arm64 (native, runs tests).
+#   • ubuntu-latest / ubuntu-24.04     → linux x64, android (NDK via gclient).
+#   • ubuntu-24.04 (explicit x86_64)   → linux arm64 cross-compile.
 #   • windows-latest                   → win x64.
 name: webrtc-build
 
@@ -52,7 +52,10 @@ concurrency:
   # Key on the event too: a push (mac smoke) and a workflow_dispatch (chosen
   # targets) on the same ref must not cancel each other.
   group: webrtc-build-${{ github.ref }}-${{ github.event_name }}
-  cancel-in-progress: true
+  # PRs: halt the in-flight matrix and run only the newest push. Main merges
+  # and manual release dispatches must never be cancelled mid-build - they
+  # block instead, queueing behind the running build until it completes.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # Compute the build matrix (a job-level `if` can't gate matrix combinations).
@@ -70,9 +73,14 @@ jobs:
           ios_sim='{"os":"ios","arch":"arm64","runner":"macos-15","ios_env":"simulator"}'
           linux_x64='{"os":"linux","arch":"x64","runner":"ubuntu-latest"}'
           # linux/arm64 is cross-compiled from x86_64 (no linux-arm64 bundled clang).
-          linux_arm='{"os":"linux","arch":"arm64","runner":"ubuntu-latest"}'
+          # ubuntu-24.04 is explicit x86_64; ubuntu-latest maps to arm64 in this org.
+          linux_arm='{"os":"linux","arch":"arm64","runner":"ubuntu-24.04"}'
           android='{"os":"android","arch":"arm64","runner":"ubuntu-latest"}'
-          win='{"os":"win","arch":"x64","runner":"windows-latest"}'
+          # Windows must always use release profile: is_debug=true compiles with /MTd
+          # (debug static CRT), which references _calloc_dbg/_free_dbg from libucrtd.
+          # Rust's +crt-static links the release CRT (/MT) which lacks those symbols,
+          # causing LNK2019. Release builds use /MT throughout — no CRT mismatch.
+          win='{"os":"win","arch":"x64","runner":"windows-latest","profile":"release"}'
           # CI (push / pull_request) → full target matrix, debug profile.
           # workflow_dispatch → use the selected inputs.
           t="${{ github.event.inputs.targets }}"
@@ -90,6 +98,7 @@ jobs:
             win)      inc="$win" ;;
             full)     inc="$mac_arm,$mac_x64,$ios_dev,$ios_sim,$linux_x64,$linux_arm,$android,$win" ;;
             linux-x64) inc="$linux_x64" ;;
+            linux-arm) inc="$linux_arm" ;;
             *)        inc="$mac_arm" ;;
           esac
           echo "matrix={\"include\":[$inc]}" >> "$GITHUB_OUTPUT"
@@ -107,10 +116,11 @@ jobs:
       run:
         shell: bash   # the webrtc-build/*.sh scripts are bash; windows-latest needs Git Bash
     env:
-      PROFILE: ${{ needs.setup.outputs.profile }}
+      # matrix.profile overrides the global profile (e.g. win always uses release).
+      PROFILE: ${{ matrix.profile || needs.setup.outputs.profile }}
       IOS_ENV: ${{ matrix.ios_env }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Free disk space (Linux)
         if: runner.os == 'Linux'
@@ -160,32 +170,9 @@ jobs:
           git config --global core.autocrlf false
           ./webrtc-build/build.ps1 -Arch ${{ matrix.arch }} -Profile $env:PROFILE
 
-      # linux glue compiles against the bundled libc++ (ABI namespace __Cr) whose
-      # headers need a recent clang (stock clang-18 is too old); install it.
-      - name: Test deps (linux)
-        if: matrix.os == 'linux' && matrix.arch == 'x64'
-        run: |
-          set -euo pipefail
-          sudo apt-get update && sudo apt-get install -y --no-install-recommends wget lsb-release software-properties-common gnupg
-          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh && chmod +x /tmp/llvm.sh
-          sudo /tmp/llvm.sh 21 || sudo /tmp/llvm.sh 20 || sudo /tmp/llvm.sh
-          ver=21; command -v clang++-21 >/dev/null || ver=20; command -v clang++-$ver >/dev/null || ver=$(ls /usr/bin/clang++-* | grep -oE '[0-9]+' | sort -n | tail -1)
-          echo "CXX=clang++-$ver" >> "$GITHUB_ENV"; echo "CC=clang-$ver" >> "$GITHUB_ENV"
-
-      # Run the lib-linked FFI/integration tests where the target runs natively:
-      # macOS arm64 and linux x64. (iOS/android/windows are cross or non-native;
-      # linux/arm64 is cross-built on x86_64.)
-      - name: Test (native targets)
-        if: (matrix.os == 'mac' && matrix.arch == 'arm64') || (matrix.os == 'linux' && matrix.arch == 'x64')
-        run: |
-          SLUG="${{ matrix.os }}-${{ matrix.arch }}-${PROFILE}"
-          export REACTOR_WEBRTC_LIB_DIR="$PWD/webrtc-build/out/$SLUG/dist"
-          [ "${{ runner.os }}" = "macOS" ] && export MACOSX_DEPLOYMENT_TARGET=13.0
-          cargo test --workspace
-
       - name: Upload prebuilt
         if: success()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: prebuilt-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ios_env && format('-{0}', matrix.ios_env) || '' }}
           path: |
@@ -196,17 +183,334 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # ── Post-build: cargo test, wheel build, python tests ─────────────────────────
+  # These jobs run on every CI trigger using the artifact uploaded by the build
+  # job above — no download from GitHub Releases required.  Each job downloads
+  # the relevant prebuilt artifact from the current workflow run, extracts it to
+  # `prebuilt/`, and sets REACTOR_WEBRTC_LIB_DIR so build.rs uses it directly.
+  #
+  # linux/arm64 is cross-compiled on ubuntu-24.04 (x86_64) in the build job,
+  # but tests must run on the native ubuntu-24.04-arm runner.
+  # win/x64 tests were previously skipped in the build job; they run here.
+
+  sys:
+    name: reactor-webrtc-sys build + check (${{ matrix.os }}-${{ matrix.arch }})
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: x64
+            runner: ubuntu-latest
+          - os: linux
+            arch: arm64
+            runner: ubuntu-24.04-arm
+          - os: mac
+            arch: arm64
+            runner: macos-15
+          - os: mac
+            arch: x64
+            runner: macos-15-intel
+          - os: win
+            arch: x64
+            runner: windows-latest
+            rustflags: "-C target-feature=+crt-static"
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      MISE_VERSION: "2026.6.14"
+      MISE_LOCKED: "1"
+      MISE_DISABLE_TOOLS: "rust,rustup,aqua:rust-lang/rustup"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download prebuilt artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: prebuilt-${{ matrix.os }}-${{ matrix.arch }}
+          path: dl
+
+      - name: Extract prebuilt
+        run: |
+          command -v zstd >/dev/null 2>&1 || sudo apt-get install -y --no-install-recommends zstd || brew install zstd || true
+          mkdir -p prebuilt
+          zstd -dc dl/*.tar.zst | tar -x -C prebuilt
+          echo "REACTOR_WEBRTC_LIB_DIR=$GITHUB_WORKSPACE/prebuilt" >> "$GITHUB_ENV"
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache-on-failure: true
+
+      - name: Install clang-21 (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/llvm.asc
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang-21
+          echo "CXX=clang++-21" >> "$GITHUB_ENV"
+
+      # hk ships no x86_64-apple-darwin binary; disable it so mise install
+      # doesn't error under MISE_LOCKED=1 (hk is only needed for git hooks).
+      - name: Disable hk on mac-x64
+        if: matrix.os == 'mac' && matrix.arch == 'x64'
+        run: echo "MISE_DISABLE_TOOLS=${{ env.MISE_DISABLE_TOOLS }},hk" >> "$GITHUB_ENV"
+
+      - uses: jdx/mise-action@v4
+        with:
+          version: ${{ env.MISE_VERSION }}
+
+      # GitHub Windows runners have no usable non-loopback network interface
+      # for WebRTC ICE — skip cargo tests on Windows entirely.
+      - run: mise run test:sys
+        if: runner.os != 'Windows'
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+          MACOSX_DEPLOYMENT_TARGET: "13.0"
+
+  webrtc:
+    name: reactor-webrtc build + check (${{ matrix.os }}-${{ matrix.arch }})
+    needs: sys
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: x64
+            runner: ubuntu-latest
+          - os: linux
+            arch: arm64
+            runner: ubuntu-24.04-arm
+          - os: mac
+            arch: arm64
+            runner: macos-15
+          - os: mac
+            arch: x64
+            runner: macos-15-intel
+          - os: win
+            arch: x64
+            runner: windows-latest
+            rustflags: "-C target-feature=+crt-static"
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      MISE_VERSION: "2026.6.14"
+      MISE_LOCKED: "1"
+      MISE_DISABLE_TOOLS: "rust,rustup,aqua:rust-lang/rustup"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download prebuilt artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: prebuilt-${{ matrix.os }}-${{ matrix.arch }}
+          path: dl
+
+      - name: Extract prebuilt
+        run: |
+          command -v zstd >/dev/null 2>&1 || sudo apt-get install -y --no-install-recommends zstd || brew install zstd || true
+          mkdir -p prebuilt
+          zstd -dc dl/*.tar.zst | tar -x -C prebuilt
+          echo "REACTOR_WEBRTC_LIB_DIR=$GITHUB_WORKSPACE/prebuilt" >> "$GITHUB_ENV"
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache-on-failure: true
+
+      - name: Install clang-21 (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/llvm.asc
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang-21
+          echo "CXX=clang++-21" >> "$GITHUB_ENV"
+
+      # hk ships no x86_64-apple-darwin binary; disable it so mise install
+      # doesn't error under MISE_LOCKED=1 (hk is only needed for git hooks).
+      - name: Disable hk on mac-x64
+        if: matrix.os == 'mac' && matrix.arch == 'x64'
+        run: echo "MISE_DISABLE_TOOLS=${{ env.MISE_DISABLE_TOOLS }},hk" >> "$GITHUB_ENV"
+
+      - uses: jdx/mise-action@v4
+        with:
+          version: ${{ env.MISE_VERSION }}
+
+      # GitHub Windows runners have no usable non-loopback network interface
+      # for WebRTC ICE — skip cargo tests on Windows entirely.
+      - run: mise run test:webrtc
+        if: runner.os != 'Windows'
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+          MACOSX_DEPLOYMENT_TARGET: "13.0"
+
+  build-wheel:
+    name: build wheel (${{ matrix.os }}-${{ matrix.arch }})
+    needs: [build, webrtc]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: x64
+            runner: ubuntu-latest
+          - os: linux
+            arch: arm64
+            runner: ubuntu-24.04-arm
+          - os: mac
+            arch: arm64
+            runner: macos-15
+          - os: mac
+            arch: x64
+            runner: macos-15-intel
+          - os: win
+            arch: x64
+            runner: windows-latest
+            rustflags: "-C target-feature=+crt-static"
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      MISE_VERSION: "2026.6.14"
+      MISE_LOCKED: "1"
+      MISE_DISABLE_TOOLS: "rust,rustup,aqua:rust-lang/rustup"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download prebuilt artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: prebuilt-${{ matrix.os }}-${{ matrix.arch }}
+          path: dl
+
+      - name: Extract prebuilt
+        run: |
+          command -v zstd >/dev/null 2>&1 || sudo apt-get install -y --no-install-recommends zstd || brew install zstd || true
+          mkdir -p prebuilt
+          zstd -dc dl/*.tar.zst | tar -x -C prebuilt
+          echo "REACTOR_WEBRTC_LIB_DIR=$GITHUB_WORKSPACE/prebuilt" >> "$GITHUB_ENV"
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache-on-failure: true
+
+      - name: Install clang-21 (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/llvm.asc
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang-21
+          echo "CXX=clang++-21" >> "$GITHUB_ENV"
+
+      # hk ships no x86_64-apple-darwin binary; disable it so mise install
+      # doesn't error under MISE_LOCKED=1 (hk is only needed for git hooks).
+      - name: Disable hk on mac-x64
+        if: matrix.os == 'mac' && matrix.arch == 'x64'
+        run: echo "MISE_DISABLE_TOOLS=${{ env.MISE_DISABLE_TOOLS }},hk" >> "$GITHUB_ENV"
+
+      - uses: jdx/mise-action@v4
+        with:
+          version: ${{ env.MISE_VERSION }}
+
+      - name: Build wheel (non-Windows)
+        if: runner.os != 'Windows'
+        run: mise run //crates/reactor-webrtc-py:build
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+          MACOSX_DEPLOYMENT_TARGET: "13.0"
+
+      - name: Build wheel (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # maturin is a native Windows binary: it must spawn cargo via
+          # CreateProcess, which uses the Windows PATH — not MSYS2/bash PATH.
+          # Setting CARGO in the same PowerShell process guarantees maturin
+          # inherits a Windows-native path that CreateProcess can actually use.
+          $cargo = (Get-Command cargo -ErrorAction Stop).Source
+          Write-Host "cargo: $cargo"
+          $env:CARGO = $cargo
+          maturin build --release `
+            --manifest-path "$env:GITHUB_WORKSPACE\crates\reactor-webrtc-py\Cargo.toml"
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+          MACOSX_DEPLOYMENT_TARGET: "13.0"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheel-${{ matrix.os }}-${{ matrix.arch }}
+          path: target/wheels/reactor_webrtc-*.whl
+          if-no-files-found: error
+
+  test-py:
+    name: pytest (${{ matrix.os }}-${{ matrix.arch }})
+    needs: build-wheel
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: x64
+            runner: ubuntu-latest
+          - os: linux
+            arch: arm64
+            runner: ubuntu-24.04-arm
+          - os: mac
+            arch: arm64
+            runner: macos-15
+          - os: mac
+            arch: x64
+            runner: macos-15-intel
+          - os: win
+            arch: x64
+            runner: windows-latest
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      MISE_VERSION: "2026.6.14"
+      MISE_LOCKED: "1"
+      MISE_DISABLE_TOOLS: "rust,rustup,aqua:rust-lang/rustup"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: wheel-${{ matrix.os }}-${{ matrix.arch }}
+          path: target/wheels
+      # hk ships no x86_64-apple-darwin binary; disable it so mise install
+      # doesn't error under MISE_LOCKED=1 (hk is only needed for git hooks).
+      - name: Disable hk on mac-x64
+        if: matrix.os == 'mac' && matrix.arch == 'x64'
+        run: echo "MISE_DISABLE_TOOLS=${{ env.MISE_DISABLE_TOOLS }},hk" >> "$GITHUB_ENV"
+      - uses: jdx/mise-action@v4
+        with:
+          version: ${{ env.MISE_VERSION }}
+      - run: mise run //crates/reactor-webrtc-py:test
+
   # Publish the per-target prebuilts as a GitHub Release (opt-in via dispatch).
   publish:
-    needs: build
+    needs: [build, sys, webrtc, build-wheel, test-py]
     if: github.event_name == 'workflow_dispatch' && inputs.publish
     runs-on: ubuntu-latest
+    # Cutting a release ships prebuilt native binaries that downstream packages
+    # link against, so the publish is gated on the `release` environment: its
+    # required reviewers put a human approval between a dispatch and a public
+    # release, rather than letting anyone with write publish unilaterally.
+    environment: release
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Download all prebuilts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: webrtc-build/dist
           merge-multiple: true

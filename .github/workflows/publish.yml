@@ -1,13 +1,23 @@
 name: Publish
 
-# Triggered by a semver tag (v0.1.0, v1.2.3, …) or manually for a dry run.
-# Each crate carries its own version in its Cargo.toml — bump only the crates
-# that changed before tagging. The publish steps skip crates whose current
-# version is already on crates.io, so unchanged crates are never re-published.
+# Triggered automatically on every push to main. reactor-webrtc-sys,
+# reactor-webrtc, and reactor-webrtc-py are released in lockstep — always the
+# same version, set once in [workspace.package].version (root Cargo.toml) —
+# so `detect-versions` only needs to diff that one field against the
+# previous commit to know whether this push is a release.
+#
+# The single release tag (vX.Y.Z, covering all three) is created only at the
+# very end of the chain, in publish-python, and only once crates.io + PyPI
+# have both actually succeeded — so a tag existing always means the full
+# release is really out, never a partial one.
+#
+# workflow_dispatch remains for manual dry runs (or a manual real re-publish
+# for partial-release recovery) — it always attempts everything, relying on
+# the same-version-already-published skip checks below. Manual runs never
+# create tags; tag creation only happens on the automatic push-triggered path.
 on:
   push:
-    tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+'
+    branches: [main]
   workflow_dispatch:
     inputs:
       dry_run:
@@ -15,18 +25,69 @@ on:
         type: boolean
         default: true
 
-# Prevent two publish runs from racing on the same tag.
+# Prevent two publish runs from racing on main.
 concurrency:
   group: publish-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
+  # ── 0. Detect whether this push bumped the (lockstep) version ───────────
+  detect-versions:
+    name: Detect version bump
+    runs-on: ubuntu-latest
+    outputs:
+      bumped: ${{ steps.diff.outputs.bumped }}
+      version: ${{ steps.diff.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Diff the workspace version against the previous commit on main
+        id: diff
+        run: |
+          version_at() {
+            git show "$1:Cargo.toml" 2>/dev/null \
+              | awk '/^\[workspace\.package\]/{f=1;next} /^\[/{f=0} f' \
+              | grep -m1 '^version' | sed -E 's/version[[:space:]]*=[[:space:]]*"([^"]+)"/\1/'
+          }
+
+          if [ "${{ github.event_name }}" != "push" ]; then
+            echo "bumped=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          BEFORE="${{ github.event.before }}"
+          AFTER="${{ github.sha }}"
+
+          if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            echo "::warning::No previous commit to diff against (new branch or force-push) — skipping bump detection."
+            echo "bumped=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          OLD_VER=$(version_at "$BEFORE")
+          NEW_VER=$(version_at "$AFTER")
+          if [ -n "$NEW_VER" ] && [ "$OLD_VER" != "$NEW_VER" ]; then
+            echo "::notice::Version bump: ${OLD_VER:-<none>} -> ${NEW_VER}"
+            echo "bumped=true" >> "$GITHUB_OUTPUT"
+            echo "version=${NEW_VER}" >> "$GITHUB_OUTPUT"
+          else
+            echo "bumped=false" >> "$GITHUB_OUTPUT"
+          fi
+
   # ── 1. Rust crates → crates.io ──────────────────────────────────────────
   publish-crates:
     name: Publish crates to crates.io
+    needs: detect-versions
+    if: github.event_name == 'workflow_dispatch' || needs.detect-versions.outputs.bumped == 'true'
     runs-on: ubuntu-latest
+    environment: crates-io
+    permissions:
+      contents: read   # actions/checkout
+      id-token: write  # OIDC trusted publishing — no API token required
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
 
       # Bake the current libwebrtc release tag into build.rs so that the
@@ -43,9 +104,20 @@ jobs:
             crates/reactor-webrtc-sys/build.rs
           grep PREBUILT_TAG_FALLBACK crates/reactor-webrtc-sys/build.rs
 
-      # Publish sys first (webrtc depends on it), then webrtc.
-      # Each step queries crates.io first and skips if the version is already
-      # published — safe to re-run and handles partial-release recovery.
+      # Exchange the GitHub OIDC JWT for a short-lived crates.io publish token.
+      # Set up at: https://crates.io/crates/reactor-webrtc-sys/settings/trusted-publishing
+      #            https://crates.io/crates/reactor-webrtc/settings/trusted-publishing
+      # Publisher: reactor-team/reactor-webrtc, workflow: publish.yml, environment: crates-io
+      - name: Authenticate to crates.io
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      # Publish sys first (webrtc depends on it), then webrtc. Each step
+      # queries crates.io first and skips if the version is already
+      # published — safe to re-run and handles partial-release recovery
+      # (crates.io has no cross-package transaction, so a prior run can fail
+      # after publishing sys but before webrtc; re-running heals that).
       - name: Publish crates
         if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
         run: |
@@ -64,7 +136,7 @@ jobs:
           if already_published reactor-webrtc-sys "$SYS_VER"; then
             echo "::notice::reactor-webrtc-sys@${SYS_VER} already on crates.io — skipping"
           else
-            cargo publish -p reactor-webrtc-sys --no-verify
+            cargo publish -p reactor-webrtc-sys --no-verify --allow-dirty
             echo "Waiting 45 s for crates.io index…"
             sleep 45
           fi
@@ -72,10 +144,10 @@ jobs:
           if already_published reactor-webrtc "$WRT_VER"; then
             echo "::notice::reactor-webrtc@${WRT_VER} already on crates.io — skipping"
           else
-            cargo publish -p reactor-webrtc --no-verify
+            cargo publish -p reactor-webrtc --no-verify --allow-dirty
           fi
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
       - name: Dry-run summary (crates)
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
@@ -90,6 +162,8 @@ jobs:
   # no manual ordering needed within the build step.
   build-wheels:
     name: Build wheel · ${{ matrix.platform }}
+    needs: detect-versions
+    if: github.event_name == 'workflow_dispatch' || needs.detect-versions.outputs.bumped == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -109,6 +183,11 @@ jobs:
             target: aarch64-apple-darwin
             manylinux: "off"
 
+          - platform: mac-x64
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+            manylinux: "off"
+
           - platform: win-x64
             os: windows-latest
             target: x86_64-pc-windows-msvc
@@ -118,10 +197,13 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      # Derive the libwebrtc release tag from WEBRTC_VERSION and look up the
-      # matching prebuilt asset URLs (archive + sha256 sidecar) via the GitHub API.
+      # Derive the libwebrtc release tag from WEBRTC_VERSION and build the
+      # matching prebuilt asset URL. The repo is public, so the release download
+      # URLs are fetchable anonymously — no token anywhere in the build.
+      # Fetching the .sha256 sidecar here doubles as an existence check: curl -f
+      # fails the step if the release or the asset is missing.
       - name: Resolve libwebrtc prebuilt URL
         id: prebuilt
         shell: bash
@@ -131,19 +213,19 @@ jobs:
           COMMIT_SHORT=${WEBRTC_COMMIT:0:8}
           TAG="webrtc-${MILESTONE}-${COMMIT_SHORT}-p${REACTOR_PATCH_LEVEL}"
           ASSET="reactor-webrtc-${{ matrix.platform }}-release.tar.zst"
-          SHA_ASSET="${ASSET}.sha256"
-          echo "Looking up assets in release '${TAG}'..."
-          RELEASE=$(gh api "repos/${{ github.repository }}/releases/tags/${TAG}")
-          URL=$(echo "$RELEASE" | jq -r ".assets[] | select(.name == \"${ASSET}\") | .url")
-          SHA_URL=$(echo "$RELEASE" | jq -r ".assets[] | select(.name == \"${SHA_ASSET}\") | .url")
-          if [ -z "$URL" ]; then
-            echo "::error::Asset '${ASSET}' not found in release '${TAG}'"
+          BASE="https://github.com/${{ github.repository }}/releases/download/${TAG}"
+          echo "Resolving '${ASSET}' in release '${TAG}'..."
+          SHA256=$(curl -fsSL --retry 3 "${BASE}/${ASSET}.sha256" | awk '{print $1}')
+          if [ -z "$SHA256" ]; then
+            echo "::error::Empty sha256 sidecar for '${ASSET}' in release '${TAG}'"
             exit 1
           fi
-          echo "url=${URL}" >> "$GITHUB_OUTPUT"
-          echo "sha_url=${SHA_URL}" >> "$GITHUB_OUTPUT"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          echo "url=${BASE}/${ASSET}" >> "$GITHUB_OUTPUT"
+          echo "sha256=${SHA256}" >> "$GITHUB_OUTPUT"
+
+      - name: Set macOS deployment target (mac-x64)
+        if: matrix.platform == 'mac-x64'
+        run: echo "MACOSX_DEPLOYMENT_TARGET=13.0" >> "$GITHUB_ENV"
 
       - uses: PyO3/maturin-action@v1
         with:
@@ -155,10 +237,10 @@ jobs:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
           # For Linux manylinux builds, maturin runs inside a Docker container
-          # and step-level env vars are not forwarded. Set PREBUILT_URL and
-          # PREBUILT_TOKEN via before-script-linux so build.rs downloads and
-          # extracts the prebuilt directly inside the container (avoiding any
-          # host→container path-mapping issues with the 697MB extracted tree).
+          # and step-level env vars are not forwarded. Set PREBUILT_URL/SHA256
+          # via before-script-linux so build.rs downloads and extracts the
+          # prebuilt directly inside the container (avoiding any host→container
+          # path-mapping issues with the 697MB extracted tree).
           before-script-linux: |
             dnf install -y clang lld zstd
             export CXX=clang++
@@ -173,33 +255,54 @@ jobs:
             fi
             export RUSTFLAGS="-C link-arg=-fuse-ld=lld"
             export REACTOR_WEBRTC_PREBUILT_URL="${{ steps.prebuilt.outputs.url }}"
-            export REACTOR_WEBRTC_PREBUILT_TOKEN="${{ secrets.GITHUB_TOKEN }}"
+            export REACTOR_WEBRTC_PREBUILT_SHA256="${{ steps.prebuilt.outputs.sha256 }}"
         env:
           # mac/windows: maturin runs natively and inherits step-level env vars.
-          # linux: PREBUILT_URL/TOKEN are set in before-script-linux above instead.
+          # linux: PREBUILT_URL/SHA256 are set in before-script-linux above instead.
           REACTOR_WEBRTC_PREBUILT_URL: ${{ steps.prebuilt.outputs.url }}
-          REACTOR_WEBRTC_PREBUILT_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REACTOR_WEBRTC_PREBUILT_SHA256: ${{ steps.prebuilt.outputs.sha256 }}
           # win-x64 only: libwebrtc.lib uses /MT; Rust must match (see matrix.rustflags).
           # Linux overrides RUSTFLAGS inside before-script-linux; mac has no RUSTFLAGS.
           RUSTFLAGS: ${{ matrix.rustflags }}
 
-      - uses: actions/upload-artifact@v4
+      # Import the just-built wheel natively on the target runner.  Running this
+      # before upload catches broken binaries (missing symbols, wrong libc++
+      # linkage) before they reach PyPI — the exact failure mode of REA-4690,
+      # where the linux-aarch64 wheel silently shipped with an unresolved __Cr
+      # symbol that was never executed in CI.
+      - name: Smoke-test wheel import
+        shell: bash
+        run: |
+          pip install --no-index --find-links dist/ reactor_webrtc
+          python -c "import reactor_webrtc; print('reactor_webrtc imported ok')"
+
+      - uses: actions/upload-artifact@v7
         with:
           name: wheel-${{ matrix.platform }}
           path: dist/*.whl
           if-no-files-found: error
 
-  # publish-python runs only after BOTH build-wheels AND publish-crates succeed,
-  # ensuring we never publish to PyPI if the crates release failed.
+  # publish-python runs only after build-wheels succeeds and publish-crates
+  # succeeded — never after either has failed. It's the last stage in the
+  # chain, so it's also the one that tags the release (only once crates.io
+  # AND PyPI have both actually shipped).
   publish-python:
     name: Publish Python package to PyPI
-    needs: [build-wheels, publish-crates]
+    needs: [detect-versions, build-wheels, publish-crates]
+    if: |
+      always() &&
+      needs.build-wheels.result == 'success' &&
+      needs.publish-crates.result == 'success' &&
+      (github.event_name == 'workflow_dispatch' || needs.detect-versions.outputs.bumped == 'true')
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
+      contents: write  # pushing the release tag
       id-token: write  # OIDC trusted publishing — no API token required
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
         with:
           pattern: wheel-*
           merge-multiple: true
@@ -208,8 +311,25 @@ jobs:
       - name: List wheels
         run: ls -lh dist/
 
-      - name: Publish to PyPI
+      # PyPI rejects re-uploading an existing version outright, so — unlike
+      # the crates.io side — check first rather than let the publish step fail.
+      - name: Check if already published
+        id: check
         if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+        run: |
+          VERSION="${{ needs.detect-versions.outputs.version }}"
+          if [ -z "$VERSION" ]; then
+            VERSION=$(basename "$(ls dist/*.whl | head -1)" | sed -E 's/^reactor_webrtc-([0-9.]+)-.*/\1/')
+          fi
+          if curl -sf -o /dev/null "https://pypi.org/pypi/reactor-webrtc/${VERSION}/json"; then
+            echo "::notice::reactor-webrtc@${VERSION} already on PyPI — skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish to PyPI
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) && steps.check.outputs.skip != 'true' }}
         uses: pypa/gh-action-pypi-publish@release/v1
         # No token needed — uses OIDC trusted publishing configured on PyPI.
         # Set up at: https://pypi.org/manage/project/reactor-webrtc/settings/publishing/
@@ -220,3 +340,24 @@ jobs:
         run: |
           echo "DRY RUN — wheels that would be published:"
           ls -1 dist/
+
+      # Only the automatic push-triggered path tags, and only here — the
+      # last stage in the chain — after crates.io (needs.publish-crates ==
+      # success, checked above) and PyPI (this job reaching this step at
+      # all) have both actually shipped. A tag existing always means the
+      # full release — all three packages — is really out, never a partial
+      # one. Manual workflow_dispatch runs (dry run or real recovery
+      # publish) never create tags.
+      - name: Tag release
+        if: ${{ github.event_name == 'push' && needs.detect-versions.outputs.bumped == 'true' }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          TAG="v${{ needs.detect-versions.outputs.version }}"
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" > /dev/null 2>&1; then
+            echo "::notice::Tag ${TAG} already exists — skipping"
+          else
+            git tag "${TAG}"
+            git push origin "${TAG}"
+          fi

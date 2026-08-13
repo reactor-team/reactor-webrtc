@@ -1,8 +1,12 @@
 //! PyO3 bindings for `reactor-webrtc`.
 //!
-//! Imported from Python as `import reactor_webrtc`. All blocking operations
-//! release the GIL (`py.allow_threads`) so callbacks that re-acquire it can
-//! fire without deadlocking.
+//! Imported from Python as `import reactor_webrtc`. `PeerConnection`'s
+//! signaling methods (`create_offer`, `create_answer`, `set_local_description`,
+//! `set_remote_description`, `add_ice_candidate`, `get_stats`) are natively
+//! awaitable, backed by a small tokio runtime (see the `#[pymodule]` init)
+//! that runs the blocking libwebrtc round-trip via `spawn_blocking`. Every
+//! other blocking operation releases the GIL (`py.allow_threads`) so
+//! callbacks that re-acquire it can fire without deadlocking.
 //!
 //! Build with Maturin:
 //!
@@ -19,11 +23,12 @@
 // function named `reactor_webrtc` that this file also defines.
 use ::reactor_webrtc as rw;
 
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 // Process-wide guard: libwebrtc starts global threads on factory creation and
 // joins them on destruction.  Creating a second factory before the first is
@@ -48,6 +53,11 @@ fn err(e: rw::Error) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
 }
 
+/// Maps a `spawn_blocking` `JoinError` (task panic) to a `PyErr`.
+fn join_err(e: tokio::task::JoinError) -> PyErr {
+    PyRuntimeError::new_err(format!("task join: {e}"))
+}
+
 fn sdp_type_to_str(kind: rw::SdpType) -> &'static str {
     match kind {
         rw::SdpType::Offer => "offer",
@@ -67,9 +77,54 @@ fn parse_sdp_type(s: &str) -> Option<rw::SdpType> {
     }
 }
 
+const ICE_TRANSPORT_TYPES: &str = "all, relay, no_host, none";
+const GATHERING_POLICIES: &str = "once, continually";
+
+fn ice_transport_type_to_str(t: rw::IceTransportsType) -> &'static str {
+    match t {
+        rw::IceTransportsType::All => "all",
+        rw::IceTransportsType::Relay => "relay",
+        rw::IceTransportsType::NoHost => "no_host",
+        rw::IceTransportsType::None => "none",
+    }
+}
+
+fn parse_ice_transport_type(s: &str) -> PyResult<rw::IceTransportsType> {
+    match s {
+        "all" => Ok(rw::IceTransportsType::All),
+        "relay" => Ok(rw::IceTransportsType::Relay),
+        "no_host" => Ok(rw::IceTransportsType::NoHost),
+        "none" => Ok(rw::IceTransportsType::None),
+        other => Err(PyValueError::new_err(format!(
+            "unknown ice_transport_type {other:?}; use one of: {ICE_TRANSPORT_TYPES}"
+        ))),
+    }
+}
+
+fn gathering_policy_to_str(p: rw::ContinualGatheringPolicy) -> &'static str {
+    match p {
+        rw::ContinualGatheringPolicy::GatherOnce => "once",
+        rw::ContinualGatheringPolicy::GatherContinually => "continually",
+    }
+}
+
+fn parse_gathering_policy(s: &str) -> PyResult<rw::ContinualGatheringPolicy> {
+    match s {
+        "once" => Ok(rw::ContinualGatheringPolicy::GatherOnce),
+        "continually" => Ok(rw::ContinualGatheringPolicy::GatherContinually),
+        other => Err(PyValueError::new_err(format!(
+            "unknown continual_gathering_policy {other:?}; use one of: {GATHERING_POLICIES}"
+        ))),
+    }
+}
+
 // ── Config ────────────────────────────────────────────────────────────────────
 
 /// A single STUN/TURN server entry.
+///
+/// All URLs in one entry share `username` and `password`. A `turn:` or `turns:`
+/// URL needs both credentials: libwebrtc rejects the whole configuration when
+/// either one is empty.
 #[pyclass(get_all, set_all)]
 #[derive(Clone, Default)]
 pub struct IceServer {
@@ -105,18 +160,69 @@ impl From<&IceServer> for rw::IceServer {
 }
 
 /// Peer-connection ICE + transport configuration.
+///
+/// `ice_transport_type` restricts which candidate types ICE may use
+/// (`all`, `relay`, `no_host`, `none`). `continual_gathering_policy` selects
+/// whether ICE gathers once or keeps gathering (`once`, `continually`).
+/// `min_port` and `max_port` bound the UDP port range ICE may allocate;
+/// `0` (the default) leaves the OS-assigned ephemeral range unchanged.
 #[pyclass]
 #[derive(Clone)]
 pub struct RtcConfiguration {
     pub ice_servers: Vec<IceServer>,
+    ice_transport_type: rw::IceTransportsType,
+    continual_gathering_policy: rw::ContinualGatheringPolicy,
+    pub min_port: u16,
+    pub max_port: u16,
+    bundle_policy: rw::BundlePolicy,
+    pub ice_connection_receiving_timeout_ms: i32,
+    pub ice_check_interval_strong_connectivity_ms: i32,
+    tcp_candidate_policy: rw::TcpCandidatePolicy,
+    /// Whether this connection takes part in per-frame metadata. `True` by
+    /// default; see the class docstring in the stub.
+    pub frame_metadata: bool,
 }
 
 #[pymethods]
 impl RtcConfiguration {
     #[new]
-    #[pyo3(signature = (ice_servers=vec![]))]
-    fn new(ice_servers: Vec<IceServer>) -> Self {
-        Self { ice_servers }
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        ice_servers=vec![],
+        ice_transport_type="all",
+        continual_gathering_policy="once",
+        min_port=0,
+        max_port=0,
+        bundle_policy=BundlePolicy::Balanced,
+        ice_connection_receiving_timeout_ms=0,
+        ice_check_interval_strong_connectivity_ms=0,
+        tcp_candidate_policy=TcpCandidatePolicy::Disabled,
+        frame_metadata=true,
+    ))]
+    fn new(
+        ice_servers: Vec<IceServer>,
+        ice_transport_type: &str,
+        continual_gathering_policy: &str,
+        min_port: u16,
+        max_port: u16,
+        bundle_policy: BundlePolicy,
+        ice_connection_receiving_timeout_ms: i32,
+        ice_check_interval_strong_connectivity_ms: i32,
+        tcp_candidate_policy: TcpCandidatePolicy,
+        frame_metadata: bool,
+    ) -> PyResult<Self> {
+        Ok(Self {
+            ice_servers,
+            ice_transport_type: parse_ice_transport_type(ice_transport_type)?,
+            continual_gathering_policy: parse_gathering_policy(continual_gathering_policy)?,
+            min_port,
+            max_port,
+            bundle_policy: rw::BundlePolicy::from(bundle_policy),
+            ice_connection_receiving_timeout_ms,
+            ice_check_interval_strong_connectivity_ms,
+            tcp_candidate_policy: rw::TcpCandidatePolicy::from(tcp_candidate_policy),
+            frame_metadata,
+        })
     }
     #[getter]
     fn ice_servers(&self) -> Vec<IceServer> {
@@ -126,13 +232,119 @@ impl RtcConfiguration {
     fn set_ice_servers(&mut self, servers: Vec<IceServer>) {
         self.ice_servers = servers;
     }
+    #[getter]
+    fn ice_transport_type(&self) -> &'static str {
+        ice_transport_type_to_str(self.ice_transport_type)
+    }
+    #[setter]
+    fn set_ice_transport_type(&mut self, value: &str) -> PyResult<()> {
+        self.ice_transport_type = parse_ice_transport_type(value)?;
+        Ok(())
+    }
+    #[getter]
+    fn continual_gathering_policy(&self) -> &'static str {
+        gathering_policy_to_str(self.continual_gathering_policy)
+    }
+    #[setter]
+    fn set_continual_gathering_policy(&mut self, value: &str) -> PyResult<()> {
+        self.continual_gathering_policy = parse_gathering_policy(value)?;
+        Ok(())
+    }
+    #[getter]
+    fn min_port(&self) -> u16 {
+        self.min_port
+    }
+    #[setter]
+    fn set_min_port(&mut self, value: u16) {
+        self.min_port = value;
+    }
+    #[getter]
+    fn max_port(&self) -> u16 {
+        self.max_port
+    }
+    #[setter]
+    fn set_max_port(&mut self, value: u16) {
+        self.max_port = value;
+    }
+
+    #[getter]
+    fn bundle_policy(&self) -> BundlePolicy {
+        BundlePolicy::from(self.bundle_policy)
+    }
+    #[setter]
+    fn set_bundle_policy(&mut self, value: BundlePolicy) {
+        self.bundle_policy = rw::BundlePolicy::from(value);
+    }
+
+    #[getter]
+    fn ice_connection_receiving_timeout_ms(&self) -> i32 {
+        self.ice_connection_receiving_timeout_ms
+    }
+    #[setter]
+    fn set_ice_connection_receiving_timeout_ms(&mut self, value: i32) {
+        self.ice_connection_receiving_timeout_ms = value;
+    }
+
+    #[getter]
+    fn ice_check_interval_strong_connectivity_ms(&self) -> i32 {
+        self.ice_check_interval_strong_connectivity_ms
+    }
+    #[setter]
+    fn set_ice_check_interval_strong_connectivity_ms(&mut self, value: i32) {
+        self.ice_check_interval_strong_connectivity_ms = value;
+    }
+
+    #[getter]
+    fn tcp_candidate_policy(&self) -> TcpCandidatePolicy {
+        TcpCandidatePolicy::from(self.tcp_candidate_policy)
+    }
+    #[setter]
+    fn set_tcp_candidate_policy(&mut self, value: TcpCandidatePolicy) {
+        self.tcp_candidate_policy = rw::TcpCandidatePolicy::from(value);
+    }
+
+    #[getter]
+    fn frame_metadata(&self) -> bool {
+        self.frame_metadata
+    }
+    #[setter]
+    fn set_frame_metadata(&mut self, value: bool) {
+        self.frame_metadata = value;
+    }
 }
 
 impl From<&RtcConfiguration> for rw::RtcConfiguration {
     fn from(c: &RtcConfiguration) -> Self {
         rw::RtcConfiguration {
             ice_servers: c.ice_servers.iter().map(Into::into).collect(),
-            ..Default::default()
+            ice_transport_type: c.ice_transport_type,
+            continual_gathering_policy: c.continual_gathering_policy,
+            min_port: if c.min_port > 0 {
+                Some(c.min_port)
+            } else {
+                None
+            },
+            max_port: if c.max_port > 0 {
+                Some(c.max_port)
+            } else {
+                None
+            },
+            bundle_policy: c.bundle_policy,
+            ice_connection_receiving_timeout_ms: if c.ice_connection_receiving_timeout_ms > 0 {
+                Some(c.ice_connection_receiving_timeout_ms)
+            } else {
+                None
+            },
+            ice_check_interval_strong_connectivity_ms: if c
+                .ice_check_interval_strong_connectivity_ms
+                > 0
+            {
+                Some(c.ice_check_interval_strong_connectivity_ms)
+            } else {
+                None
+            },
+            tcp_candidate_policy: c.tcp_candidate_policy,
+            frame_metadata: c.frame_metadata,
         }
     }
 }
@@ -200,6 +412,82 @@ impl SessionDescription {
     }
     fn __repr__(&self) -> String {
         format!("SessionDescription(kind={:?})", self.kind)
+    }
+
+    /// The `ice-ufrag` values this description carries, in document order.
+    ///
+    /// One per m-section: bundled sections repeat the same value, while a
+    /// non-BUNDLE description has a distinct ufrag per transport.
+    fn ice_ufrags(&self) -> Vec<String> {
+        self.as_rust_for_reading()
+            .ice_ufrags()
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Return a copy with every `ice-ufrag` and `ice-pwd` replaced.
+    ///
+    /// libwebrtc generates ICE credentials itself and exposes no setter, so an
+    /// application that needs to *choose* its ufrag — routing through an edge
+    /// relay that demultiplexes on it, for instance — substitutes them in the
+    /// description instead. That works because the local description is what
+    /// libwebrtc reads the transport's ICE parameters from.
+    ///
+    /// Call it on the result of `create_offer`/`create_answer` and **before**
+    /// `set_local_description`: setting the local description is what creates the
+    /// transport and starts gathering, so substituting afterwards acts on nothing.
+    ///
+    /// Raises if either value is outside RFC 8445's length range (ufrag 4..=256,
+    /// password 22..=256) or contains a character outside `ice-char`.
+    fn with_ice_credentials(&self, ufrag: &str, pwd: &str) -> PyResult<Self> {
+        let out = to_rust_sdp(self)?
+            .with_ice_credentials(ufrag, pwd)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(out.into())
+    }
+
+    /// Whether this description declares frame-metadata support.
+    ///
+    /// True when it carries a session-level `a=x-reactor-frame-metadata:<version>`
+    /// at a version this build understands. A peer speaking a different trailer
+    /// format therefore reads as unsupported rather than as a partial match.
+    ///
+    /// `set_remote_description` arms the connection's `FrameMetadataGate` from
+    /// exactly this.
+    fn declares_frame_metadata(&self) -> bool {
+        self.as_rust_for_reading().declares_frame_metadata()
+    }
+
+    /// Return a copy declaring frame-metadata support, as a session-level attribute.
+    ///
+    /// `create_offer` already applies this to every offer and `create_answer`
+    /// mirrors the offer, so callers using this library's signalling path never need
+    /// it. Public for callers that assemble or rewrite SDP themselves. Idempotent.
+    fn with_frame_metadata(&self) -> Self {
+        // Preserves `kind` verbatim instead of validating it: declaring the
+        // capability does not depend on the SDP type, so an unfamiliar `kind` is not
+        // a reason to raise here. Same reasoning as `as_rust_for_reading`.
+        Self {
+            kind: self.kind.clone(),
+            sdp: self.as_rust_for_reading().with_frame_metadata().sdp,
+        }
+    }
+}
+
+impl SessionDescription {
+    /// The SDP as a Rust description, for read-only queries that do not depend
+    /// on `kind`.
+    ///
+    /// Reading through `to_rust_sdp` instead would turn an unrelated "unknown SDP
+    /// kind" into an empty/`None` answer — indistinguishable from a description
+    /// that genuinely carries nothing. Python can set `kind` to any string, so
+    /// that mistake is one typo away.
+    fn as_rust_for_reading(&self) -> rw::SessionDescription {
+        rw::SessionDescription {
+            kind: rw::SdpType::Offer,
+            sdp: self.sdp.clone(),
+        }
     }
 }
 
@@ -287,6 +575,66 @@ impl From<rw::DataChannelState> for DataChannelState {
     }
 }
 
+/// How m-sections are bundled onto a single transport.
+#[pyclass(eq, eq_int)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum BundlePolicy {
+    /// One transport per m-section that needs one (libwebrtc default).
+    Balanced = 0,
+    /// All m-sections share one transport — recommended for streaming.
+    MaxBundle = 1,
+    /// One transport per m-section (maximises legacy stack compatibility).
+    MaxCompat = 2,
+}
+
+impl From<BundlePolicy> for rw::BundlePolicy {
+    fn from(p: BundlePolicy) -> Self {
+        match p {
+            BundlePolicy::Balanced => rw::BundlePolicy::Balanced,
+            BundlePolicy::MaxBundle => rw::BundlePolicy::MaxBundle,
+            BundlePolicy::MaxCompat => rw::BundlePolicy::MaxCompat,
+        }
+    }
+}
+
+impl From<rw::BundlePolicy> for BundlePolicy {
+    fn from(p: rw::BundlePolicy) -> Self {
+        match p {
+            rw::BundlePolicy::Balanced => BundlePolicy::Balanced,
+            rw::BundlePolicy::MaxBundle => BundlePolicy::MaxBundle,
+            rw::BundlePolicy::MaxCompat => BundlePolicy::MaxCompat,
+        }
+    }
+}
+
+/// Whether libwebrtc gathers TCP ICE candidates.
+#[pyclass(eq, eq_int)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TcpCandidatePolicy {
+    /// TCP candidates are not gathered (libwebrtc default).
+    Disabled = 0,
+    /// TCP candidates are gathered alongside UDP.
+    Enabled = 1,
+}
+
+impl From<TcpCandidatePolicy> for rw::TcpCandidatePolicy {
+    fn from(p: TcpCandidatePolicy) -> Self {
+        match p {
+            TcpCandidatePolicy::Disabled => rw::TcpCandidatePolicy::Disabled,
+            TcpCandidatePolicy::Enabled => rw::TcpCandidatePolicy::Enabled,
+        }
+    }
+}
+
+impl From<rw::TcpCandidatePolicy> for TcpCandidatePolicy {
+    fn from(p: rw::TcpCandidatePolicy) -> Self {
+        match p {
+            rw::TcpCandidatePolicy::Disabled => TcpCandidatePolicy::Disabled,
+            rw::TcpCandidatePolicy::Enabled => TcpCandidatePolicy::Enabled,
+        }
+    }
+}
+
 /// Audio vs. video.
 #[pyclass(eq, eq_int)]
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -323,6 +671,29 @@ impl From<TransceiverDirection> for rw::TransceiverDirection {
             TransceiverDirection::SendOnly => rw::TransceiverDirection::SendOnly,
             TransceiverDirection::RecvOnly => rw::TransceiverDirection::RecvOnly,
             TransceiverDirection::Inactive => rw::TransceiverDirection::Inactive,
+        }
+    }
+}
+
+/// A negotiable video codec, for [`Transceiver.set_codec_preferences`].
+#[pyclass(eq, eq_int)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum VideoCodec {
+    Vp8,
+    Vp9,
+    Av1,
+    H264,
+    H265,
+}
+
+impl From<VideoCodec> for rw::VideoCodec {
+    fn from(c: VideoCodec) -> Self {
+        match c {
+            VideoCodec::Vp8 => rw::VideoCodec::Vp8,
+            VideoCodec::Vp9 => rw::VideoCodec::Vp9,
+            VideoCodec::Av1 => rw::VideoCodec::Av1,
+            VideoCodec::H264 => rw::VideoCodec::H264,
+            VideoCodec::H265 => rw::VideoCodec::H265,
         }
     }
 }
@@ -480,6 +851,109 @@ impl From<rw::StatsReport> for StatsReport {
     }
 }
 
+// ── FrameMetadata ─────────────────────────────────────────────────────────────
+
+/// Whether the remote peer has declared that it strips metadata trailers.
+///
+/// Obtained from `PeerConnection.frame_metadata_gate()`. It starts closed and is
+/// armed by `set_remote_description`, which opens it when the remote description
+/// declares `FRAME_METADATA_ATTRIBUTE`. The library consults the gate internally
+/// when appending trailers; callers do not need to check it before pushing
+/// `user_data`.
+#[pyclass]
+#[derive(Clone, Default)]
+pub struct FrameMetadataGate {
+    inner: rw::FrameMetadataGate,
+}
+
+#[pymethods]
+impl FrameMetadataGate {
+    /// A closed gate, not attached to any peer connection.
+    ///
+    /// Useful in tests and for a sender that negotiated support out of band.
+    /// Production code takes one from `PeerConnection.frame_metadata_gate()` so
+    /// that `set_remote_description` arms it.
+    #[new]
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether trailers may be appended.
+    fn is_open(&self) -> bool {
+        self.inner.is_open()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "FrameMetadataGate({})",
+            if self.inner.is_open() {
+                "open"
+            } else {
+                "closed"
+            }
+        )
+    }
+}
+
+/// Metadata attached to a video frame via the packet trailer.
+///
+/// All fields default to zero / empty when not set by the sender.
+#[pyclass]
+#[derive(Clone, Default)]
+pub struct FrameMetadata {
+    /// Application-level frame counter (0 = unset).
+    #[pyo3(get, set)]
+    pub frame_id: u64,
+    /// Wall-clock timestamp in microseconds (0 = unset).
+    #[pyo3(get, set)]
+    pub timestamp: u64,
+    /// Arbitrary application payload (bytes).
+    pub user_data: Vec<u8>,
+}
+
+#[pymethods]
+impl FrameMetadata {
+    #[new]
+    #[pyo3(signature = (frame_id=0, timestamp=0, user_data=vec![]))]
+    fn new(frame_id: u64, timestamp: u64, user_data: Vec<u8>) -> Self {
+        Self {
+            frame_id,
+            timestamp,
+            user_data,
+        }
+    }
+    /// Returns `user_data` as Python `bytes`.
+    #[getter]
+    fn user_data<'py>(&self, py: Python<'py>) -> pyo3::Bound<'py, PyBytes> {
+        PyBytes::new_bound(py, &self.user_data)
+    }
+
+    /// Sets `user_data` from Python `bytes` or any buffer.
+    #[setter]
+    fn set_user_data(&mut self, data: Vec<u8>) {
+        self.user_data = data;
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "FrameMetadata(frame_id={}, timestamp={}, user_data={} bytes)",
+            self.frame_id,
+            self.timestamp,
+            self.user_data.len()
+        )
+    }
+}
+
+impl From<rw::FrameMetadata> for FrameMetadata {
+    fn from(m: rw::FrameMetadata) -> Self {
+        Self {
+            frame_id: m.frame_id,
+            timestamp: m.timestamp,
+            user_data: m.user_data,
+        }
+    }
+}
+
 // ── Track ─────────────────────────────────────────────────────────────────────
 
 /// A media track — local (push frames) or remote (attach a sink).
@@ -488,17 +962,50 @@ impl From<rw::StatsReport> for StatsReport {
 /// Audio frames are interleaved signed 16-bit little-endian PCM bytes.
 #[pyclass]
 pub struct Track {
-    inner: rw::Track,
+    // Arc, not ManuallyDrop, so Transceiver.set_track can clone a handle into a
+    // spawn_blocking future while this Python object keeps its own handle.
+    inner: Option<Arc<rw::Track>>,
+}
+
+impl Track {
+    /// Borrows the native track. `inner` is only ever `None` after this
+    /// object's own `Drop` has run, so every live call through Python sees `Some`.
+    fn native(&self) -> PyResult<&Arc<rw::Track>> {
+        self.inner
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Track used after being dropped"))
+    }
 }
 
 #[pymethods]
 impl Track {
-    fn kind(&self) -> MediaKind {
-        MediaKind::from(self.inner.kind())
+    fn kind(&self) -> PyResult<MediaKind> {
+        Ok(MediaKind::from(self.native()?.kind()))
     }
 
     /// Push a raw BGRA video frame into a local video track.
-    fn push_video_frame(&self, py: Python, bgra: &[u8], width: u32, height: u32) -> PyResult<()> {
+    ///
+    /// Pass `user_data` (bytes) to embed per-frame metadata in the encoded
+    /// packet trailer. `frame_id` and `timestamp` are computed automatically.
+    /// Nothing else has to be arranged: the trailer is appended once the peer has
+    /// declared that it strips them, and `user_data` is silently dropped while it
+    /// has not. See `PeerConnection.frame_metadata_gate()`.
+    ///
+    /// Pass `capture_time_us` (from `time_micros()`) to say when the frame was
+    /// captured, instead of letting it inherit the moment it reached the
+    /// encoder. Stamping a video frame and the audio produced with it from one
+    /// `time_micros()` read is what lets the receiver play them together.
+    /// Independent of `user_data`: a frame can carry either, both, or neither.
+    #[pyo3(signature = (bgra, width, height, user_data=None, capture_time_us=None))]
+    fn push_video_frame(
+        &self,
+        py: Python,
+        bgra: &[u8],
+        width: u32,
+        height: u32,
+        user_data: Option<&[u8]>,
+        capture_time_us: Option<i64>,
+    ) -> PyResult<()> {
         let expected = (width as usize)
             .checked_mul(height as usize)
             .and_then(|n| n.checked_mul(4))
@@ -513,39 +1020,141 @@ impl Track {
                 bgra.len()
             )));
         }
+        let native = Arc::clone(self.native()?);
         let owned = bgra.to_vec();
-        py.allow_threads(|| self.inner.push_video_frame(&owned, width, height));
+        match (user_data, capture_time_us) {
+            (Some(ud), Some(us)) => {
+                let ud = ud.to_vec();
+                py.allow_threads(|| {
+                    native.push_video_frame_with_metadata_at(&owned, width, height, &ud, us)
+                });
+            }
+            (Some(ud), None) => {
+                let ud = ud.to_vec();
+                py.allow_threads(|| {
+                    native.push_video_frame_with_metadata(&owned, width, height, &ud)
+                });
+            }
+            (None, Some(us)) => {
+                py.allow_threads(|| native.push_video_frame_at(&owned, width, height, us));
+            }
+            (None, None) => {
+                py.allow_threads(|| native.push_video_frame(&owned, width, height));
+            }
+        }
         Ok(())
     }
 
-    /// Register `callback(bgra: bytes, width: int, height: int)` for decoded
-    /// video frames from a remote track. Fires on a WebRTC thread.
-    fn on_video_frame(&mut self, callback: PyObject) {
-        self.inner.on_video_frame(move |frame| {
-            Python::with_gil(|py| {
-                let bytes = PyBytes::new_bound(py, frame.bgra);
-                let _ = callback.call1(py, (bytes, frame.width, frame.height));
+    /// Register a callback for decoded video frames from a remote track.
+    ///
+    /// Signature: `callback(bgra: bytes, width: int, height: int, metadata: FrameMetadata | None)`
+    ///
+    /// For backward compatibility with 3-argument callbacks
+    /// `callback(bgra, width, height)`, the 4-argument call is retried as a
+    /// 3-argument call on `TypeError` when `metadata` is `None`.
+    fn on_video_frame(&mut self, py: Python, callback: PyObject) -> PyResult<()> {
+        let native = Arc::clone(self.native()?);
+        // Attaching a sink dispatches synchronously to the worker thread, which
+        // is also where another track's frame callback re-enters Python. The GIL
+        // has to be free across the dispatch or the two deadlock.
+        py.allow_threads(|| {
+            native.on_video_frame(move |frame| {
+                Python::with_gil(|py| {
+                    let bytes = PyBytes::new_bound(py, frame.bgra);
+                    let meta = frame.metadata.map(|m| {
+                        Py::new(py, FrameMetadata::from(m))
+                            .map(|p| p.into_any())
+                            .unwrap_or_else(|_| py.None())
+                    });
+                    match meta {
+                        Some(m) => {
+                            let _ = callback.call1(py, (bytes, frame.width, frame.height, m));
+                        }
+                        None => {
+                            // Try 4-arg (with None); fall back to legacy 3-arg on TypeError.
+                            let result = callback
+                                .call1(py, (bytes.clone(), frame.width, frame.height, py.None()));
+                            if result.is_err() {
+                                let _ = callback.call1(py, (bytes, frame.width, frame.height));
+                            }
+                        }
+                    }
+                });
             });
         });
+        Ok(())
+    }
+
+    /// Push interleaved signed 16-bit little-endian PCM to a local audio track
+    /// created with `factory.create_audio_track_with_local_source()`. `pcm`
+    /// must have even byte length (2 bytes per i16 sample). No-op for ADM-
+    /// backed or remote tracks.
+    ///
+    /// Pass `capture_time_us` (from `time_micros()`) to say when the audio was
+    /// captured. A track's RTP timestamp otherwise counts only the samples it
+    /// has been handed, which says how much audio exists but not when it
+    /// happened; giving this the same value as the video captured alongside it
+    /// is what lets the receiver play the two together.
+    #[pyo3(signature = (pcm, sample_rate, channels, capture_time_us=None))]
+    fn push_pcm(
+        &self,
+        py: Python,
+        pcm: &[u8],
+        sample_rate: u32,
+        channels: u32,
+        capture_time_us: Option<i64>,
+    ) -> PyResult<()> {
+        if !pcm.len().is_multiple_of(2) {
+            return Err(PyRuntimeError::new_err("pcm byte length must be even"));
+        }
+        let samples: Vec<i16> = pcm
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let native = Arc::clone(self.native()?);
+        py.allow_threads(|| match capture_time_us {
+            Some(us) => native.push_pcm_at(&samples, sample_rate, channels, us),
+            None => native.push_pcm(&samples, sample_rate, channels),
+        })
+        .map_err(err)
     }
 
     /// Register `callback(pcm: bytes, sample_rate, channels, frames)` for
     /// decoded audio from a remote track. `pcm` is i16 little-endian.
-    fn on_audio_frame(&mut self, callback: PyObject) {
-        self.inner.on_audio_frame(move |frame| {
-            Python::with_gil(|py| {
-                let raw: Vec<u8> = frame.pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
-                let bytes = PyBytes::new_bound(py, &raw);
-                let _ =
-                    callback.call1(py, (bytes, frame.sample_rate, frame.channels, frame.frames));
+    fn on_audio_frame(&mut self, py: Python, callback: PyObject) -> PyResult<()> {
+        let native = Arc::clone(self.native()?);
+        // Same worker-thread dispatch as `on_video_frame`.
+        py.allow_threads(|| {
+            native.on_audio_frame(move |frame| {
+                Python::with_gil(|py| {
+                    let raw: Vec<u8> = frame.pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
+                    let bytes = PyBytes::new_bound(py, &raw);
+                    let _ = callback
+                        .call1(py, (bytes, frame.sample_rate, frame.channels, frame.frames));
+                });
             });
         });
+        Ok(())
     }
 }
 
 impl Track {
     fn from_rust(track: rw::Track) -> Self {
-        Self { inner: track }
+        Self {
+            inner: Some(Arc::new(track)),
+        }
+    }
+}
+
+impl Drop for Track {
+    fn drop(&mut self) {
+        // Releasing the native track dispatches to the thread that owns it,
+        // where a frame or candidate callback may be inside Python. Release the
+        // GIL so that callback can finish and the dispatch can be serviced. Taking
+        // the Arc out and dropping it with the GIL released is correct whether or
+        // not this is the last handle, same reasoning as Transceiver's Drop.
+        let inner = self.inner.take();
+        Python::with_gil(|py| py.allow_threads(|| drop(inner)));
     }
 }
 
@@ -558,39 +1167,73 @@ impl Track {
 /// or `add_transceiver` to wire it into a `PeerConnection`.
 #[pyclass]
 pub struct EncodedVideoTrack {
-    inner: rw::EncodedVideoTrack,
+    // Arc, not ManuallyDrop, for the same reason as `Track`.
+    inner: Option<Arc<rw::EncodedVideoTrack>>,
+}
+
+impl EncodedVideoTrack {
+    /// Borrows the native track, on the same terms as `Track::native`.
+    fn native(&self) -> PyResult<&Arc<rw::EncodedVideoTrack>> {
+        self.inner
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("EncodedVideoTrack used after being dropped"))
+    }
+}
+
+impl Drop for EncodedVideoTrack {
+    fn drop(&mut self) {
+        // Wraps a native track; same dispatch-on-release as `Track`.
+        let inner = self.inner.take();
+        Python::with_gil(|py| py.allow_threads(|| drop(inner)));
+    }
 }
 
 #[pymethods]
 impl EncodedVideoTrack {
     /// Push a compressed video frame.
     ///
+    /// Push a compressed video frame.
+    ///
     /// `data` — Annex-B H.264 or VP8/VP9 payload.
     /// Pass `width=0`, `height=0`, `rtp_timestamp=0` to inherit from the
     /// track's configured resolution.
-    #[pyo3(signature = (data, is_key_frame=false, width=0, height=0, rtp_timestamp=0))]
+    /// Pass `user_data` (bytes) to embed per-frame metadata in the encoded
+    /// packet trailer (same mechanism as `Track.push_video_frame`). Metadata
+    /// is only sent when the peer has negotiated support; otherwise `user_data`
+    /// is silently dropped.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (data, is_key_frame=false, width=0, height=0, rtp_timestamp=0, user_data=None))]
     fn push_encoded_frame(
         &self,
+        py: Python,
         data: &[u8],
         is_key_frame: bool,
         width: u32,
         height: u32,
         rtp_timestamp: u32,
-    ) {
-        self.inner.push_encoded_frame(rw::EncodedVideoFrame {
+        user_data: Option<&[u8]>,
+    ) -> PyResult<()> {
+        let native = Arc::clone(self.native()?);
+        let frame = rw::EncodedVideoFrame {
             data: data.to_vec(),
             is_key_frame,
             width,
             height,
             rtp_timestamp,
+        };
+        py.allow_threads(|| match user_data {
+            Some(ud) => native.push_encoded_frame_with_metadata(frame, ud),
+            None => native.push_encoded_frame(frame),
         });
+        Ok(())
     }
 
     /// Add this track to a peer connection via `add_track` (creates a sendrecv
     /// transceiver automatically).
     fn add_to_peer_connection(&self, py: Python, pc: &PeerConnection) -> PyResult<()> {
-        let track = self.inner.track();
-        py.allow_threads(|| pc.inner.add_track(track)).map_err(err)
+        let native = Arc::clone(self.native()?);
+        py.allow_threads(|| pc.pc().add_track(native.track()))
+            .map_err(err)
     }
 
     /// Add a transceiver of the given `direction` for this track. Returns the
@@ -601,17 +1244,156 @@ impl EncodedVideoTrack {
         pc: &PeerConnection,
         direction: TransceiverDirection,
     ) -> PyResult<Transceiver> {
-        let track = self.inner.track();
+        let native = Arc::clone(self.native()?);
+        let track = native.track();
         let t = py
             .allow_threads(|| {
-                pc.inner.add_transceiver(
+                pc.pc().add_transceiver(
                     rw::MediaKind::Video,
                     rw::TransceiverDirection::from(direction),
                 )
             })
             .map_err(err)?;
         py.allow_threads(|| t.set_track(track)).map_err(err)?;
-        Ok(Transceiver { inner: t })
+        Ok(Transceiver {
+            inner: Some(Arc::new(t)),
+        })
+    }
+}
+
+// ── FrameAction ───────────────────────────────────────────────────────────────
+
+/// What a FrameTransform callback should do with the frame.
+#[pyclass(eq, eq_int)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FrameAction {
+    /// Forward the frame downstream (send it / hand it to the decoder).
+    Forward = 0,
+    /// Drop the frame: on receive this bypasses the decoder; on send nothing
+    /// is transmitted.
+    Drop = 1,
+}
+
+impl From<rw::FrameAction> for FrameAction {
+    fn from(a: rw::FrameAction) -> Self {
+        match a {
+            rw::FrameAction::Forward => Self::Forward,
+            rw::FrameAction::Drop => Self::Drop,
+        }
+    }
+}
+
+impl From<FrameAction> for rw::FrameAction {
+    fn from(a: FrameAction) -> Self {
+        match a {
+            FrameAction::Forward => Self::Forward,
+            FrameAction::Drop => Self::Drop,
+        }
+    }
+}
+
+// ── EncodedFrame ──────────────────────────────────────────────────────────────
+
+/// A snapshot of an encoded frame passed to a `FrameTransform` callback.
+///
+/// `data` is a Python `bytes` object. Call `replace_data(new_bytes)` inside
+/// the callback to substitute the payload; the new bytes are forwarded
+/// downstream when the callback returns `FrameAction.Forward`.
+#[pyclass]
+pub struct EncodedFrame {
+    data: Vec<u8>,
+    is_key_frame: bool,
+    ssrc: u32,
+    timestamp: u32,
+    capture_time_ms: i64,
+    // Replacement written by replace_data(); read back by the transform
+    // closure after the Python callback returns.
+    replacement: Arc<Mutex<Option<Vec<u8>>>>,
+}
+
+#[pymethods]
+impl EncodedFrame {
+    #[getter]
+    fn data<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new_bound(py, &self.data)
+    }
+    #[getter]
+    fn is_key_frame(&self) -> bool {
+        self.is_key_frame
+    }
+    #[getter]
+    fn ssrc(&self) -> u32 {
+        self.ssrc
+    }
+    #[getter]
+    fn timestamp(&self) -> u32 {
+        self.timestamp
+    }
+    #[getter]
+    fn capture_time_ms(&self) -> i64 {
+        self.capture_time_ms
+    }
+    /// Replace this frame's encoded payload. Must be called inside the
+    /// FrameTransform callback.
+    fn replace_data(&self, new_data: Vec<u8>) {
+        if let Ok(mut g) = self.replacement.lock() {
+            *g = Some(new_data);
+        }
+    }
+}
+
+// ── FrameTransform ────────────────────────────────────────────────────────────
+
+/// An encoded-frame transformer. Attach to a transceiver's sender or receiver
+/// via `Transceiver.set_sender_transform` / `set_receiver_transform`.
+///
+/// Create from a Python callable with `FrameTransform(callback)` and attach
+/// via `Transceiver.set_sender_transform()` / `set_receiver_transform()`.
+#[pyclass]
+pub struct FrameTransform {
+    inner: rw::FrameTransform,
+}
+
+#[pymethods]
+impl FrameTransform {
+    /// Create a transform from a Python callable.
+    ///
+    /// Signature: `callback(frame: EncodedFrame) -> FrameAction`
+    ///
+    /// The callback runs on a WebRTC thread; acquire the GIL automatically.
+    /// Call `frame.replace_data(bytes)` inside the callback to substitute the
+    /// encoded payload before returning `FrameAction.Forward`.
+    #[new]
+    fn new(cb: PyObject) -> Self {
+        let inner = rw::FrameTransform::new(move |frame| {
+            Python::with_gil(|py| {
+                let replacement = Arc::new(Mutex::new(None::<Vec<u8>>));
+                let py_frame = match Py::new(
+                    py,
+                    EncodedFrame {
+                        data: frame.data.to_vec(),
+                        is_key_frame: frame.is_key_frame,
+                        ssrc: frame.ssrc,
+                        timestamp: frame.timestamp,
+                        capture_time_ms: frame.capture_time_ms,
+                        replacement: replacement.clone(),
+                    },
+                ) {
+                    Ok(f) => f,
+                    Err(_) => return rw::FrameAction::Forward,
+                };
+                let action = cb
+                    .call1(py, (py_frame,))
+                    .ok()
+                    .and_then(|r| r.extract::<FrameAction>(py).ok())
+                    .unwrap_or(FrameAction::Forward);
+                if let Some(new_data) = replacement.lock().ok().and_then(|mut g| g.take()) {
+                    frame.replace_data(&new_data);
+                }
+                rw::FrameAction::from(action)
+            })
+        });
+        Self { inner }
     }
 }
 
@@ -686,36 +1468,144 @@ impl EncodedAudioTrack {
 /// An RTP transceiver (one m-section in the SDP).
 #[pyclass]
 pub struct Transceiver {
-    inner: rw::Transceiver,
+    // Arc, not ManuallyDrop, so set_direction/set_codec_preferences can clone
+    // a handle into a spawn_blocking future (which must be 'static) while
+    // this Python object keeps its own handle. set_track stays on plain
+    // allow_threads: it also needs Track's/EncodedVideoTrack's own inner
+    // Arc-wrapped the same way to be awaitable
+    // safely, which is out of scope here.
+    inner: Option<Arc<rw::Transceiver>>,
+}
+
+impl Drop for Transceiver {
+    fn drop(&mut self) {
+        // Holds native sender and receiver references; releasing them dispatches
+        // to the signaling thread, which may be inside Python. Taking the Arc out
+        // and dropping it with the GIL released is correct whether or not this is
+        // the last handle: on a refcount-only decrement it is just cheap, and on
+        // the real native release it is what avoids deadlocking a callback that
+        // re-enters Python.
+        let inner = self.inner.take();
+        Python::with_gil(|py| py.allow_threads(|| drop(inner)));
+    }
+}
+
+impl Transceiver {
+    /// Borrows the native transceiver. `inner` is only ever `None` after this
+    /// object's own `Drop` has run, so every live call through Python sees `Some`.
+    fn tc(&self) -> PyResult<&Arc<rw::Transceiver>> {
+        self.inner
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Transceiver used after being dropped"))
+    }
 }
 
 #[pymethods]
 impl Transceiver {
     /// The `mid`, set after `set_local_description`.
-    fn mid(&self, py: Python) -> Option<String> {
-        py.allow_threads(|| self.inner.mid())
+    fn mid(&self, py: Python) -> PyResult<Option<String>> {
+        let native = Arc::clone(self.tc()?);
+        Ok(py.allow_threads(|| native.mid()))
     }
 
     /// Media kind (Audio or Video).
-    fn kind(&self, py: Python) -> MediaKind {
-        MediaKind::from(py.allow_threads(|| self.inner.kind()))
+    fn kind(&self, py: Python) -> PyResult<MediaKind> {
+        let native = Arc::clone(self.tc()?);
+        Ok(MediaKind::from(py.allow_threads(|| native.kind())))
     }
 
-    /// Attach a local track to the sender slot.
-    fn set_track(&self, py: Python, track: &Track) -> PyResult<()> {
-        py.allow_threads(|| self.inner.set_track(&track.inner))
-            .map_err(err)
+    /// Attach a local track to the sender slot. Accepts either a `Track` or an
+    /// `EncodedVideoTrack`. Natively awaitable.
+    fn set_track<'py>(
+        &self,
+        py: Python<'py>,
+        track: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(self.tc()?);
+        if let Ok(t) = track.downcast::<Track>() {
+            let native = Arc::clone(t.borrow().native()?);
+            return pyo3_async_runtimes::tokio::future_into_py(py, async move {
+                tokio::task::spawn_blocking(move || inner.set_track(&native))
+                    .await
+                    .map_err(join_err)?
+                    .map_err(err)
+            });
+        }
+        if let Ok(enc) = track.downcast::<EncodedVideoTrack>() {
+            let native = Arc::clone(enc.borrow().native()?);
+            return pyo3_async_runtimes::tokio::future_into_py(py, async move {
+                tokio::task::spawn_blocking(move || inner.set_track(native.track()))
+                    .await
+                    .map_err(join_err)?
+                    .map_err(err)
+            });
+        }
+        Err(PyTypeError::new_err(
+            "track must be a Track or EncodedVideoTrack",
+        ))
     }
 
     /// Set the transceiver direction (SendOnly, RecvOnly, SendRecv, Inactive).
     /// Must be called before `create_answer()`/`create_offer()` for the change
-    /// to appear in the SDP.
-    fn set_direction(&self, py: Python, direction: TransceiverDirection) -> PyResult<()> {
-        py.allow_threads(|| {
-            self.inner
-                .set_direction(rw::TransceiverDirection::from(direction))
+    /// to appear in the SDP. Natively awaitable.
+    fn set_direction<'py>(
+        &self,
+        py: Python<'py>,
+        direction: TransceiverDirection,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(self.tc()?);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            tokio::task::spawn_blocking(move || {
+                inner.set_direction(rw::TransceiverDirection::from(direction))
+            })
+            .await
+            .map_err(join_err)?
+            .map_err(err)
         })
-        .map_err(err)
+    }
+
+    /// Reorder this video transceiver's codec preferences: `codecs`, most
+    /// preferred first, sort ahead of every other codec the endpoint
+    /// supports; nothing is dropped. Must be called before
+    /// `create_answer()`/`create_offer()` for the change to appear in the
+    /// SDP. Raises if this transceiver carries audio, not video.
+    ///
+    /// Once negotiation completes, `PeerConnection.set_local_description`/
+    /// `set_remote_description` also make this transceiver's own sender
+    /// actually *encode* with whichever preferred codec was negotiated —
+    /// SDP negotiation and a sender's codec selection are separate
+    /// mechanisms in libwebrtc, and only the first is driven by preference
+    /// order, so this is handled automatically rather than requiring a
+    /// second call. Natively awaitable.
+    fn set_codec_preferences<'py>(
+        &self,
+        py: Python<'py>,
+        codecs: Vec<VideoCodec>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let native: Vec<rw::VideoCodec> = codecs.into_iter().map(rw::VideoCodec::from).collect();
+        let inner = Arc::clone(self.tc()?);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            tokio::task::spawn_blocking(move || inner.set_codec_preferences(&native))
+                .await
+                .map_err(join_err)?
+                .map_err(err)
+        })
+    }
+
+    /// Attach a `FrameTransform` to the sender path of this transceiver.
+    /// The transform runs after the encoder, before RTP packetization.
+    fn set_sender_transform(&self, py: Python, transform: &FrameTransform) -> PyResult<()> {
+        let native = Arc::clone(self.tc()?);
+        py.allow_threads(|| native.set_sender_transform(&transform.inner))
+            .map_err(err)
+    }
+
+    /// Attach a `FrameTransform` to the receiver path of this transceiver.
+    /// The transform runs after RTP depacketization, before the decoder.
+    fn set_receiver_transform(&self, py: Python, transform: &FrameTransform) -> PyResult<()> {
+        let native = Arc::clone(self.tc()?);
+        py.allow_threads(|| native.set_receiver_transform(&transform.inner))
+            .map_err(err)
     }
 }
 
@@ -756,38 +1646,48 @@ impl DataChannel {
     }
 
     /// Register `callback(data: bytes, binary: bool)` for incoming messages.
-    fn on_message(&mut self, callback: PyObject) {
-        self.inner.on_message(move |data, binary| {
-            Python::with_gil(|py| {
-                let bytes = PyBytes::new_bound(py, data);
-                let _ = callback.call1(py, (bytes, binary));
+    fn on_message(&mut self, py: Python, callback: PyObject) {
+        // Registering re-registers the native observer, which dispatches to the
+        // thread that delivers messages into Python. The GIL has to be free.
+        py.allow_threads(|| {
+            self.inner.on_message(move |data, binary| {
+                Python::with_gil(|py| {
+                    let bytes = PyBytes::new_bound(py, data);
+                    let _ = callback.call1(py, (bytes, binary));
+                });
             });
         });
     }
 
     /// Register `callback(state: DataChannelState)` for state transitions.
-    fn on_state_change(&mut self, callback: PyObject) {
-        self.inner.on_state_change(move |s| {
-            Python::with_gil(|py| {
-                let _ = callback.call1(py, (DataChannelState::from(s),));
+    fn on_state_change(&mut self, py: Python, callback: PyObject) {
+        py.allow_threads(|| {
+            self.inner.on_state_change(move |s| {
+                Python::with_gil(|py| {
+                    let _ = callback.call1(py, (DataChannelState::from(s),));
+                });
             });
         });
     }
 
     /// Fire `callback()` once when the channel opens.
-    fn on_open(&mut self, callback: PyObject) {
-        self.inner.on_open(move || {
-            Python::with_gil(|py| {
-                let _ = callback.call0(py);
+    fn on_open(&mut self, py: Python, callback: PyObject) {
+        py.allow_threads(|| {
+            self.inner.on_open(move || {
+                Python::with_gil(|py| {
+                    let _ = callback.call0(py);
+                });
             });
         });
     }
 
     /// Fire `callback()` once when the channel closes.
-    fn on_close(&mut self, callback: PyObject) {
-        self.inner.on_close(move || {
-            Python::with_gil(|py| {
-                let _ = callback.call0(py);
+    fn on_close(&mut self, py: Python, callback: PyObject) {
+        py.allow_threads(|| {
+            self.inner.on_close(move || {
+                Python::with_gil(|py| {
+                    let _ = callback.call0(py);
+                });
             });
         });
     }
@@ -939,12 +1839,14 @@ impl PeerConnectionObserver {
 
 /// An RTCPeerConnection.
 ///
-/// Signaling methods (`create_offer`, `create_answer`, etc.) block for up to
-/// ~5 ms while the WebRTC engine responds. Wrap in `asyncio.to_thread()` when
-/// calling from an async context.
+/// Signaling methods (`create_offer`, `create_answer`, `set_local_description`,
+/// `set_remote_description`, `add_ice_candidate`, `get_stats`, `set_bitrate`,
+/// `transceivers`) are natively awaitable — `await` them directly from an
+/// async context, no executor wrapping needed. Every other method is a fast
+/// synchronous call.
 #[pyclass]
 pub struct PeerConnection {
-    inner: ManuallyDrop<rw::PeerConnection>,
+    inner: Option<Arc<rw::PeerConnection>>,
 }
 
 impl Drop for PeerConnection {
@@ -952,41 +1854,111 @@ impl Drop for PeerConnection {
         // pc->Close() dispatches synchronously to the signaling thread, which fires
         // on_connection_state_change(Closed) and tries Python::with_gil. If the GIL
         // is held by the Python GC thread that invoked this drop, both threads deadlock.
-        // Release the GIL first so those callbacks can complete.
-        let inner = unsafe { ManuallyDrop::take(&mut self.inner) };
+        // Release the GIL first so those callbacks can complete. Harmless when an
+        // in-flight signaling call still holds another Arc clone — this then just
+        // decrements the refcount; the real close happens when that clone drops
+        // later, off the GIL entirely, on a tokio blocking-pool thread.
+        let inner = self.inner.take();
         Python::with_gil(|py| py.allow_threads(|| drop(inner)));
+    }
+}
+
+impl PeerConnection {
+    /// Borrows the native connection. `inner` is only ever `None` after this
+    /// object's own `Drop` has run — which means it no longer exists to call
+    /// a method on, so every live call through Python sees `Some`.
+    fn pc(&self) -> &Arc<rw::PeerConnection> {
+        self.inner
+            .as_ref()
+            .expect("PeerConnection used after being dropped")
     }
 }
 
 #[pymethods]
 impl PeerConnection {
-    fn create_offer(&self, py: Python) -> PyResult<SessionDescription> {
-        py.allow_threads(|| self.inner.create_offer())
-            .map(SessionDescription::from)
-            .map_err(err)
+    fn create_offer<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(self.pc());
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            tokio::task::spawn_blocking(move || inner.create_offer())
+                .await
+                .map_err(join_err)?
+                .map(SessionDescription::from)
+                .map_err(err)
+        })
     }
-    fn create_answer(&self, py: Python) -> PyResult<SessionDescription> {
-        py.allow_threads(|| self.inner.create_answer())
-            .map(SessionDescription::from)
-            .map_err(err)
+    fn create_answer<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(self.pc());
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            tokio::task::spawn_blocking(move || inner.create_answer())
+                .await
+                .map_err(join_err)?
+                .map(SessionDescription::from)
+                .map_err(err)
+        })
     }
-    fn set_local_description(&self, py: Python, sdp: &SessionDescription) -> PyResult<()> {
+    fn set_local_description<'py>(
+        &self,
+        py: Python<'py>,
+        sdp: &SessionDescription,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(self.pc());
         let rust = to_rust_sdp(sdp)?;
-        py.allow_threads(|| self.inner.set_local_description(&rust))
-            .map_err(err)
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            tokio::task::spawn_blocking(move || inner.set_local_description(&rust))
+                .await
+                .map_err(join_err)?
+                .map_err(err)
+        })
     }
-    fn set_remote_description(&self, py: Python, sdp: &SessionDescription) -> PyResult<()> {
+    /// Apply the remote description, and arm this connection's
+    /// `FrameMetadataGate` from it.
+    ///
+    /// The gate opens when `sdp` declares `FRAME_METADATA_ATTRIBUTE` and closes
+    /// when it does not, on every call — so a renegotiation in which the peer
+    /// drops support closes it again.
+    fn set_remote_description<'py>(
+        &self,
+        py: Python<'py>,
+        sdp: &SessionDescription,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(self.pc());
         let rust = to_rust_sdp(sdp)?;
-        py.allow_threads(|| self.inner.set_remote_description(&rust))
-            .map_err(err)
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            tokio::task::spawn_blocking(move || inner.set_remote_description(&rust))
+                .await
+                .map_err(join_err)?
+                .map_err(err)
+        })
     }
-    fn add_ice_candidate(&self, py: Python, candidate: &IceCandidate) -> PyResult<()> {
+
+    /// A handle to this connection's frame-metadata gate.
+    ///
+    /// Cheap and shareable. It stays closed until `set_remote_description` sees
+    /// a remote description that declares support. Reading it is diagnostic —
+    /// the library consults it internally when answering and when appending
+    /// trailers, so callers do not need to check it before pushing `user_data`.
+    fn frame_metadata_gate(&self) -> FrameMetadataGate {
+        FrameMetadataGate {
+            inner: self.pc().frame_metadata_gate(),
+        }
+    }
+    fn add_ice_candidate<'py>(
+        &self,
+        py: Python<'py>,
+        candidate: &IceCandidate,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(self.pc());
         let rust = rw::IceCandidate::from(candidate);
-        py.allow_threads(|| self.inner.add_ice_candidate(&rust))
-            .map_err(err)
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            tokio::task::spawn_blocking(move || inner.add_ice_candidate(&rust))
+                .await
+                .map_err(join_err)?
+                .map_err(err)
+        })
     }
     fn add_track(&self, py: Python, track: &Track) -> PyResult<()> {
-        py.allow_threads(|| self.inner.add_track(&track.inner))
+        let native = Arc::clone(track.native()?);
+        py.allow_threads(|| self.pc().add_track(&native))
             .map_err(err)
     }
     fn add_transceiver(
@@ -1001,14 +1973,16 @@ impl PeerConnection {
             MediaKind::Unknown => return Err(PyRuntimeError::new_err("need Audio or Video")),
         };
         py.allow_threads(|| {
-            self.inner
+            self.pc()
                 .add_transceiver(rust_kind, rw::TransceiverDirection::from(direction))
         })
-        .map(|t| Transceiver { inner: t })
+        .map(|t| Transceiver {
+            inner: Some(Arc::new(t)),
+        })
         .map_err(err)
     }
     fn create_data_channel(&self, py: Python, label: &str) -> PyResult<DataChannel> {
-        py.allow_threads(|| self.inner.create_data_channel(label))
+        py.allow_threads(|| self.pc().create_data_channel(label))
             .map(|inner| DataChannel {
                 inner: ManuallyDrop::new(inner),
             })
@@ -1018,21 +1992,55 @@ impl PeerConnection {
     /// All transceivers on this peer connection, in offer m-section order after
     /// `set_remote_description`. Use this (together with `Transceiver.set_track`)
     /// to attach local tracks to the transceivers auto-created from the remote
-    /// offer's recvonly m-sections.
-    fn transceivers(&self, py: Python) -> Vec<Transceiver> {
-        py.allow_threads(|| self.inner.transceivers())
-            .into_iter()
-            .map(|t| Transceiver { inner: t })
-            .collect()
+    /// offer's recvonly m-sections. Natively awaitable.
+    fn transceivers<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(self.pc());
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let ts = tokio::task::spawn_blocking(move || inner.transceivers())
+                .await
+                .map_err(join_err)?;
+            Ok(ts
+                .into_iter()
+                .map(|t| Transceiver {
+                    inner: Some(Arc::new(t)),
+                })
+                .collect::<Vec<_>>())
+        })
     }
 
-    /// Collect a stats snapshot from the WebRTC engine. Blocks until the report
-    /// arrives (typically <5 ms). Returns a `StatsReport` with inbound/outbound
-    /// RTP streams and ICE candidate-pair metrics.
-    fn get_stats(&self, py: Python) -> PyResult<StatsReport> {
-        py.allow_threads(|| self.inner.get_stats())
-            .map(StatsReport::from)
-            .map_err(err)
+    /// Collect a stats snapshot from the WebRTC engine. Natively awaitable.
+    /// Returns a `StatsReport` with inbound/outbound RTP streams and ICE
+    /// candidate-pair metrics.
+    fn get_stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(self.pc());
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            tokio::task::spawn_blocking(move || inner.get_stats())
+                .await
+                .map_err(join_err)?
+                .map(StatsReport::from)
+                .map_err(err)
+        })
+    }
+
+    /// Adjust the bandwidth estimate limits and starting point. Natively awaitable.
+    ///
+    /// Pass `None` to leave a value at its libwebrtc default. A value of 0 is
+    /// treated as `None` (unset). Units are bits-per-second.
+    #[pyo3(signature = (min_bps=None, start_bps=None, max_bps=None))]
+    fn set_bitrate<'py>(
+        &self,
+        py: Python<'py>,
+        min_bps: Option<i32>,
+        start_bps: Option<i32>,
+        max_bps: Option<i32>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(self.pc());
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            tokio::task::spawn_blocking(move || inner.set_bitrate(min_bps, start_bps, max_bps))
+                .await
+                .map_err(join_err)?
+                .map_err(err)
+        })
     }
 }
 
@@ -1102,26 +2110,38 @@ impl PeerConnectionFactory {
     ) -> PyResult<PeerConnection> {
         let rust_config = rw::RtcConfiguration::from(config);
         let rust_obs = observer.build_rust_observer(py);
-        self.inner
-            .create_peer_connection(&rust_config, rust_obs)
+        // Creating a peer connection dispatches synchronously to the signaling
+        // thread, which is also where another connection's observer callbacks
+        // (an ICE candidate, say) re-enter Python. Holding the GIL across the
+        // dispatch deadlocks the two: this thread waits for the signaling
+        // thread, which waits for the GIL.
+        py.allow_threads(|| self.inner.create_peer_connection(&rust_config, rust_obs))
             .map(|inner| PeerConnection {
-                inner: ManuallyDrop::new(inner),
+                inner: Some(Arc::new(inner)),
             })
             .map_err(err)
     }
 
     /// Create a local video track (push frames via `Track.push_video_frame`).
-    fn create_video_track(&self, id: &str) -> PyResult<Track> {
-        self.inner
-            .create_video_track(id)
+    fn create_video_track(&self, py: Python, id: &str) -> PyResult<Track> {
+        py.allow_threads(|| self.inner.create_video_track(id))
             .map(Track::from_rust)
             .map_err(err)
     }
 
     /// Create a local audio track. Feed samples via `push_audio_frame`.
-    fn create_audio_track(&self, id: &str) -> PyResult<Track> {
-        self.inner
-            .create_audio_track(id)
+    fn create_audio_track(&self, py: Python, id: &str) -> PyResult<Track> {
+        py.allow_threads(|| self.inner.create_audio_track(id))
+            .map(Track::from_rust)
+            .map_err(err)
+    }
+
+    /// Create a local audio track with a per-track audio source.
+    /// Feed samples via `track.push_pcm(pcm_bytes, sample_rate, channels)`.
+    /// Each call returns an independent track — different audio can be pushed
+    /// to different peer connections.
+    fn create_audio_track_with_local_source(&self, py: Python, id: &str) -> PyResult<Track> {
+        py.allow_threads(|| self.inner.create_audio_track_with_local_source(id))
             .map(Track::from_rust)
             .map_err(err)
     }
@@ -1159,7 +2179,14 @@ impl PeerConnectionFactory {
     ) -> PyResult<(Self, EncodedVideoTrack)> {
         claim_factory()?;
         rw::PeerConnectionFactory::with_encoded_video_track(track_id, width, height)
-            .map(|(f, t)| (Self { inner: f }, EncodedVideoTrack { inner: t }))
+            .map(|(f, t)| {
+                (
+                    Self { inner: f },
+                    EncodedVideoTrack {
+                        inner: Some(Arc::new(t)),
+                    },
+                )
+            })
             .map_err(|e| {
                 FACTORY_LIVE.store(false, Ordering::SeqCst);
                 err(e)
@@ -1198,9 +2225,30 @@ impl PeerConnectionFactory {
 
 // ── Module ────────────────────────────────────────────────────────────────────
 
+/// Read the engine's monotonic clock, in microseconds.
+///
+/// The epoch the `capture_time_us` arguments of `Track.push_video_frame` and
+/// `Track.push_pcm` are expressed in. Read it once per unit of produced media
+/// and stamp every track with that one value: audio and video are synchronised
+/// by sharing a capture time, not by reaching the encoder at the same moment.
+#[pyfunction]
+fn time_micros() -> i64 {
+    rw::time_micros()
+}
+
 #[pymodule]
 fn reactor_webrtc(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Backs the awaitables PeerConnection's signaling methods return. Must be
+    // multi_thread: nothing in this extension module ever calls block_on, so a
+    // current_thread runtime would never be driven and spawned futures would
+    // hang. One worker is enough — it only polls spawn_blocking join handles.
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.worker_threads(1);
+    pyo3_async_runtimes::tokio::init(builder);
+
     m.add_class::<IceServer>()?;
+    m.add_class::<BundlePolicy>()?;
+    m.add_class::<TcpCandidatePolicy>()?;
     m.add_class::<RtcConfiguration>()?;
     m.add_class::<IceCandidate>()?;
     m.add_class::<SessionDescription>()?;
@@ -1209,11 +2257,17 @@ fn reactor_webrtc(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<DataChannelState>()?;
     m.add_class::<MediaKind>()?;
     m.add_class::<TransceiverDirection>()?;
+    m.add_class::<VideoCodec>()?;
     m.add_class::<IceCandidatePairState>()?;
     m.add_class::<InboundRtpStats>()?;
     m.add_class::<OutboundRtpStats>()?;
     m.add_class::<IceCandidatePairStats>()?;
     m.add_class::<StatsReport>()?;
+    m.add_class::<FrameMetadata>()?;
+    m.add_class::<FrameMetadataGate>()?;
+    m.add_class::<FrameAction>()?;
+    m.add_class::<EncodedFrame>()?;
+    m.add_class::<FrameTransform>()?;
     m.add_class::<Track>()?;
     m.add_class::<EncodedVideoTrack>()?;
     m.add_class::<EncodedAudioTrack>()?;
@@ -1222,5 +2276,13 @@ fn reactor_webrtc(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PeerConnectionObserver>()?;
     m.add_class::<PeerConnection>()?;
     m.add_class::<PeerConnectionFactory>()?;
+
+    m.add_function(wrap_pyfunction!(time_micros, m)?)?;
+
+    // The SDP attribute peers declare frame-metadata support with, and the trailer
+    // version this wheel speaks. Exposed so that a caller inspecting or building SDP
+    // by hand does not have to hardcode either.
+    m.add("FRAME_METADATA_ATTRIBUTE", rw::FRAME_METADATA_ATTRIBUTE)?;
+    m.add("FRAME_METADATA_VERSION", rw::FRAME_METADATA_VERSION)?;
     Ok(())
 }

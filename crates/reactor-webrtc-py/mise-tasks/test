@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+#MISE description="[Testing] Install the built wheel and run the pytest suite"
+set -euo pipefail
+shopt -s nullglob
+# Newest by mtime, not the first glob match: target/wheels accumulates every
+# version ever built locally, and lexical order puts the *oldest* first
+# (reactor_webrtc-0.0.0-... sorts before 0.6.0). Picking wheels[0] silently tests
+# a stale artifact, which fails in ways that look like real regressions.
+newest=""
+for w in "$REPO_ROOT"/target/wheels/reactor_webrtc-*.whl; do
+  if [ -z "$newest" ] || [ "$w" -nt "$newest" ]; then newest="$w"; fi
+done
+WHEEL="$newest"
+if [ -z "$WHEEL" ]; then
+  echo "no wheel found in target/wheels - run //crates/reactor-webrtc-py:build first" >&2
+  exit 1
+fi
+echo "testing wheel: $(basename "$WHEEL")"
+# venv under target/ (already gitignored), so the test leaves no untracked files.
+VENV="$REPO_ROOT/target/py-test-venv"
+uv venv --python 3.12 --allow-existing "$VENV"
+# --reinstall: a venv left over from a previous run already has some version of
+# the wheel, and uv would keep it when the version string has not changed.
+VIRTUAL_ENV="$VENV" uv pip install --reinstall pytest pytest-asyncio "$WHEEL"
+# One pytest process per test file: PeerConnectionFactory is a process-wide
+# singleton (one factory per process), and test_loopback.py and
+# test_encoded_track.py each create their own session-scoped factory.
+for f in "$REPO_ROOT"/crates/reactor-webrtc-py/tests/test_*.py; do
+  VIRTUAL_ENV="$VENV" uv run --no-project -- pytest "$f" -v
+done

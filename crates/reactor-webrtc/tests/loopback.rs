@@ -51,7 +51,7 @@ fn make_peer(
         })
         .on_track({
             let s = shared.clone();
-            move |kind, mut track| {
+            move |kind, track| {
                 match kind {
                     MediaKind::Video => {
                         let s = s.clone();
@@ -98,6 +98,10 @@ fn safe_loopback_exchanges_media() {
 
     let (pc1, s1) = make_peer(&factory, &config);
     let (pc2, s2) = make_peer(&factory, &config);
+
+    // Verify that set_bitrate is accepted at any point after PC creation.
+    pc1.set_bitrate(Some(100_000), Some(500_000), Some(2_000_000))
+        .expect("set_bitrate");
 
     // pc1 sends a video + an audio track.
     let video = factory

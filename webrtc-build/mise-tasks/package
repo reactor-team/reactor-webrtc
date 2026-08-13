@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+#MISE description="[Build] Package + checksum + SBOM a built target: package <os> <arch> <profile>"
+set -euo pipefail
+exec "$REPO_ROOT/webrtc-build/package.sh" "$@"

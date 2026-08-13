@@ -33,3 +33,9 @@ module-name = "reactor_webrtc"
 # Embed libwebrtc statically — the prebuilt archive linked at build time.
 # maturin build --release produces a self-contained .so / .dylib wheel.
 features = []
+
+[tool.pytest.ini_options]
+# PeerConnection's signaling methods are natively awaitable; this lets test
+# files mix plain `def test_...` and `async def test_...` without per-test
+# @pytest.mark.asyncio decorators.
+asyncio_mode = "auto"
