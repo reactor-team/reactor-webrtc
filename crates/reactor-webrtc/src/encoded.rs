@@ -607,6 +607,152 @@ impl CustomVideoEncoder {
     }
 }
 
+// ── Push-based encoded audio track ───────────────────────────────────────────
+
+/// A single pre-encoded Opus packet delivered by [`EncodedAudioTrack::push_encoded_frame`].
+pub struct EncodedAudioFrame {
+    /// Raw Opus packet bytes — one packet corresponds to one encode interval
+    /// (typically 20ms at 48kHz).
+    pub data: Vec<u8>,
+    /// RTP timestamp for this packet. Pass `0` to let the audio engine assign it
+    /// from the ADM cadence; pass a non-zero value to override.
+    pub rtp_timestamp: u32,
+}
+
+// Heap-pinned state that owns the queue shared with the custom audio encoder.
+// Leaked into a raw pointer and passed to the C++ factory as `userdata`; freed
+// via `free_audio_encoder_state_tramp` when all encoder instances are released.
+pub(crate) struct AudioEncoderState {
+    pub(crate) queue: Arc<Mutex<VecDeque<EncodedAudioFrame>>>,
+}
+
+pub(crate) extern "C" fn audio_encode_tramp(
+    ud: *mut c_void,
+    rtp_timestamp: u32,
+    out: *mut reactor_webrtc_sys::ReactorEncodedAudioOutput,
+) {
+    let st = unsafe { &*(ud as *const AudioEncoderState) };
+    let frame = st.queue.lock().unwrap().pop_front();
+
+    match frame {
+        None => {
+            // Nothing queued — let the C++ encoder return an empty EncodedInfo
+            // (no packet is emitted). Leave *out zeroed.
+        }
+        Some(enc) => {
+            // Move the Vec bytes out, shrink to fit so capacity == len, then
+            // forget the Vec and let the C++ side call free_audio_data to
+            // reclaim the allocation after it appends the bytes to the buffer.
+            let mut v = enc.data;
+            v.shrink_to_fit();
+            let ptr = v.as_ptr();
+            let len = v.len();
+            std::mem::forget(v);
+            unsafe {
+                let o = &mut *out;
+                o.data = ptr;
+                o.len = len;
+                o.rtp_timestamp = enc.rtp_timestamp;
+                o.free_data = Some(free_audio_data);
+            }
+        }
+    }
+}
+
+/// Called by C++ after `Buffer::AppendData` has copied the bytes.
+extern "C" fn free_audio_data(data: *const u8, len: usize) {
+    // Reconstruct the Vec we leaked in audio_encode_tramp and drop it.
+    // SAFETY: this pointer+len was produced by a Vec with capacity==len
+    // (we called shrink_to_fit before forgetting it).
+    unsafe { drop(Vec::from_raw_parts(data as *mut u8, len, len)) };
+}
+
+pub(crate) extern "C" fn free_audio_encoder_state_tramp(ud: *mut c_void) {
+    drop(unsafe { Box::from_raw(ud as *mut AudioEncoderState) });
+}
+
+/// An audio track that accepts **pre-encoded** Opus frames directly, bypassing
+/// the libwebrtc Opus encoder entirely.
+///
+/// Obtain one via [`PeerConnectionFactory::with_encoded_audio_track`], then:
+///
+/// 1. Create a send-direction transceiver and set its track to [`track()`].
+/// 2. Call [`push_encoded_frame`] whenever your encoder produces a packet.
+///
+/// Internally the factory replaces the builtin Opus encoder with a custom
+/// `AudioEncoder` whose `EncodeImpl` pops the next pre-encoded packet from the
+/// queue — no Opus math, zero encode CPU. Each `push_encoded_frame` pushes a
+/// 20ms silence block to the ADM to tick `EncodeImpl` once.
+///
+/// # Lifetime
+///
+/// The factory **must outlive** this handle. The typical pattern — keeping the
+/// `(factory, track)` pair returned by `with_encoded_audio_track` together and
+/// dropping the factory last — upholds this automatically.
+pub struct EncodedAudioTrack {
+    pub(crate) track: crate::media::Track,
+    // Shared queue: this side pushes; the audio_encode_tramp pops on the
+    // WebRTC audio thread.  Both share the same Arc created at factory time.
+    queue: Arc<Mutex<VecDeque<EncodedAudioFrame>>>,
+    // Raw factory pointer used to push silence PCM and tick EncodeImpl.
+    // SAFETY: the factory is created before this struct and must be dropped after
+    // it (upheld by the `(factory, track)` tuple contract).
+    factory_raw: *mut reactor_webrtc_sys::PeerConnectionFactory,
+}
+
+// SAFETY: queue is Mutex-guarded; factory_raw outlives this struct (see above);
+// Track is Send+Sync.
+unsafe impl Send for EncodedAudioTrack {}
+unsafe impl Sync for EncodedAudioTrack {}
+
+impl EncodedAudioTrack {
+    pub(crate) fn new(
+        track: crate::media::Track,
+        queue: Arc<Mutex<VecDeque<EncodedAudioFrame>>>,
+        factory_raw: *mut reactor_webrtc_sys::PeerConnectionFactory,
+    ) -> Self {
+        Self {
+            track,
+            queue,
+            factory_raw,
+        }
+    }
+
+    /// The underlying audio [`Track`](crate::media::Track). Pass to
+    /// [`Transceiver::set_track`](crate::Transceiver::set_track).
+    pub fn track(&self) -> &crate::media::Track {
+        &self.track
+    }
+
+    /// Inject a pre-encoded Opus packet into the WebRTC RTP stack.
+    ///
+    /// 1. Enqueues the packet for the custom audio encoder.
+    /// 2. Pushes a 20ms mono silence block (960 samples @ 48kHz) to the ADM so
+    ///    `EncodeImpl` fires and pops the packet from the queue — no Opus math
+    ///    is executed, only a cheap queue pop.
+    ///
+    /// Thread-safe — call from any thread, including a codec callback.
+    pub fn push_encoded_frame(&self, frame: EncodedAudioFrame) {
+        // Push first so the frame is always present when EncodeImpl fires.
+        self.queue.lock().unwrap().push_back(frame);
+        // 20ms @ 48kHz mono = 960 samples/channel — one push yields one
+        // EncodeImpl call which pops and forwards the pre-encoded packet.
+        const SAMPLE_RATE: c_int = 48_000;
+        const CHANNELS: c_int = 1;
+        const SAMPLES_PER_CHANNEL: c_int = SAMPLE_RATE / 50; // 960
+        let silence = [0i16; SAMPLES_PER_CHANNEL as usize];
+        unsafe {
+            reactor_webrtc_sys::reactor_webrtc_factory_push_audio_frame(
+                self.factory_raw,
+                silence.as_ptr(),
+                SAMPLES_PER_CHANNEL,
+                SAMPLE_RATE,
+                CHANNELS,
+            );
+        }
+    }
+}
+
 // ── Push-based encoded video track ───────────────────────────────────────────
 
 /// A video track that accepts **pre-encoded** frames directly, bypassing the

@@ -2017,6 +2017,147 @@ void* reactor_webrtc_factory_create_with_custom_video_encoder(
   return f.release();
 }
 
+// ── Custom audio encoder (pre-encoded Opus bypass) ───────────────────────────
+//
+// Replaces the builtin Opus encoder entirely. When WebRTC calls EncodeImpl()
+// the custom encoder pops a pre-encoded Opus packet from the Rust queue and
+// returns it directly — no Opus math, zero encode CPU.
+
+extern "C" {
+// Filled by the Rust callback to deliver a pre-encoded Opus packet.
+// Set data=nullptr (or len=0) to drop the frame (nothing is sent).
+// `free_data` is called after the bytes are appended to the audio buffer;
+// may be null if the buffer has static/encoder-callback lifetime.
+struct ReactorEncodedAudioOutput {
+  const uint8_t* data;
+  size_t         len;
+  uint32_t       rtp_timestamp;  // 0 = inherit rtp_timestamp from EncodeImpl
+  void           (*free_data)(const uint8_t*, size_t); // may be null
+};
+// Invoked by EncodeImpl: fill `*out` with one pre-encoded Opus packet, or set
+// `out->data = nullptr` to let the frame drop silently (encoder stays warm).
+typedef void (*reactor_audio_encode_cb)(void*                      userdata,
+                                        uint32_t                    rtp_timestamp,
+                                        ReactorEncodedAudioOutput*  out);
+}
+
+struct ReactorAudioEncoderState {
+  reactor_audio_encode_cb      cb;
+  void*                        userdata;
+  reactor_webrtc_userdata_free free_ud;
+
+  ReactorAudioEncoderState(reactor_audio_encode_cb c, void* u,
+                           reactor_webrtc_userdata_free f)
+      : cb(c), userdata(u), free_ud(f) {}
+  ~ReactorAudioEncoderState() { if (free_ud) free_ud(userdata); }
+  ReactorAudioEncoderState(const ReactorAudioEncoderState&) = delete;
+  ReactorAudioEncoderState(ReactorAudioEncoderState&&)      = delete;
+};
+
+class ReactorCustomAudioEncoder : public webrtc::AudioEncoder {
+  std::shared_ptr<ReactorAudioEncoderState> state_;
+  int payload_type_ = 111;
+
+ public:
+  ReactorCustomAudioEncoder(std::shared_ptr<ReactorAudioEncoderState> state,
+                             int payload_type)
+      : state_(std::move(state)), payload_type_(payload_type) {}
+
+  int SampleRateHz() const override { return 48000; }
+  size_t NumChannels() const override { return 1; }
+  int RtpTimestampRateHz() const override { return 48000; }
+  // 2 × 10ms = 20ms per packet (standard Opus frame).
+  size_t Num10MsFramesInNextPacket() const override { return 2; }
+  size_t Max10MsFramesInAPacket() const override { return 2; }
+  int GetTargetBitrate() const override { return 64000; }
+  void Reset() override {}
+
+  EncodedInfo EncodeImpl(uint32_t rtp_timestamp,
+                         std::span<const int16_t> /*audio*/,
+                         rtc::Buffer* encoded) override {
+    ReactorEncodedAudioOutput out{};
+    state_->cb(state_->userdata, rtp_timestamp, &out);
+
+    if (!out.data || out.len == 0) {
+      return EncodedInfo{};  // nothing sent
+    }
+
+    encoded->AppendData(out.data, out.len);
+    if (out.free_data) out.free_data(out.data, out.len);
+
+    EncodedInfo info;
+    info.encoded_bytes     = out.len;
+    info.encoded_timestamp = out.rtp_timestamp ? out.rtp_timestamp : rtp_timestamp;
+    info.payload_type      = payload_type_;
+    info.encoder_type      = CodecType::kOpus;
+    info.speech            = true;
+    return info;
+  }
+};
+
+class ReactorCustomAudioEncoderFactory : public webrtc::AudioEncoderFactory {
+  std::shared_ptr<ReactorAudioEncoderState> state_;
+
+ public:
+  explicit ReactorCustomAudioEncoderFactory(
+      std::shared_ptr<ReactorAudioEncoderState> s)
+      : state_(std::move(s)) {}
+
+  std::vector<webrtc::AudioCodecSpec> GetSupportedEncoders() override {
+    return {{webrtc::SdpAudioFormat("opus", 48000, 2),
+             webrtc::AudioCodecInfo(48000, 1, 64000)}};
+  }
+
+  std::optional<webrtc::AudioCodecInfo> QueryAudioEncoder(
+      const webrtc::SdpAudioFormat& format) override {
+    if (format.name == "opus") return webrtc::AudioCodecInfo(48000, 1, 64000);
+    return std::nullopt;
+  }
+
+  std::unique_ptr<webrtc::AudioEncoder> Create(
+      const webrtc::Environment& /*env*/,
+      const webrtc::SdpAudioFormat& /*format*/,
+      Options options) override {
+    return std::make_unique<ReactorCustomAudioEncoder>(state_, options.payload_type);
+  }
+};
+
+// Create a PeerConnectionFactory that replaces the builtin Opus encoder with a
+// custom one driven by `encode_fn`. `encode_fn` is called synchronously inside
+// AudioEncoder::EncodeImpl() — pop a pre-encoded Opus packet from a queue and
+// fill `*out`, or set `out->data = nullptr` to drop. `free_ud` is called once
+// when all encoder instances are released (same lifetime contract as the video
+// custom encoder).
+void* reactor_webrtc_factory_create_with_custom_audio_encoder(
+    reactor_audio_encode_cb encode_fn, void* userdata,
+    reactor_webrtc_userdata_free free_ud) {
+  auto state =
+      std::make_shared<ReactorAudioEncoderState>(encode_fn, userdata, free_ud);
+
+  auto f = std::make_unique<ReactorFactory>();
+  f->network_thread   = webrtc::Thread::CreateWithSocketServer();
+  f->worker_thread    = webrtc::Thread::Create();
+  f->signaling_thread = webrtc::Thread::Create();
+  if (!f->network_thread->Start() || !f->worker_thread->Start() ||
+      !f->signaling_thread->Start()) {
+    return nullptr;
+  }
+
+  // Always use the synthetic ADM so push_audio_frame() ticks EncodeImpl().
+  f->adm = webrtc::make_ref_counted<FrameAdm>();
+
+  f->factory = webrtc::CreatePeerConnectionFactory(
+      f->network_thread.get(), f->worker_thread.get(),
+      f->signaling_thread.get(), f->adm,
+      webrtc::make_ref_counted<ReactorCustomAudioEncoderFactory>(state),
+      webrtc::CreateBuiltinAudioDecoderFactory(),
+      webrtc::CreateBuiltinVideoEncoderFactory(),
+      std::make_unique<ReactorCustomDecoderFactory>(),
+      /*audio_mixer=*/nullptr, /*audio_processing=*/nullptr);
+  if (!f->factory) return nullptr;
+  return f.release();
+}
+
 // Replace the encoded payload of the frame currently in the callback. Copies.
 void reactor_webrtc_encoded_frame_set_data(void* frame, const uint8_t* data,
                                            size_t len) {
