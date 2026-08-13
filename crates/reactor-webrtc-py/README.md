@@ -59,7 +59,19 @@ factory = rw.PeerConnectionFactory(
     echo_canceller=True,
     noise_suppression=True,
 )
+
+# Per-peer track, fed directly: pass a capture time so the receiver can line
+# this audio up with the video produced alongside it.
+audio = factory.create_audio_track_with_local_source("mic")
+now = rw.time_micros()
+video.push_video_frame(bgra, 320, 240, capture_time_us=now)
+audio.push_pcm(pcm_bytes, 48000, 1, capture_time_us=now)
 ```
+
+An audio track's RTP timestamp counts the samples it has been handed, so it
+says how much audio exists but not when it happened — hence `capture_time_us`,
+and hence the rule that a producer owes the track a frame (silence, if it has
+nothing) on every tick. See [`docs/av-sync.md`](../../docs/av-sync.md).
 
 ## Pre-encoded video
 
@@ -129,12 +141,16 @@ for pair in report.candidate_pairs:
 | `SessionDescription` | SDP offer or answer (`kind`, `sdp`, `ice_ufrags`, `with_ice_credentials`, `declares_frame_metadata`, `with_frame_metadata`) |
 | `FrameMetadata` | Per-frame `frame_id`, `timestamp`, `user_data` |
 | `FrameMetadataGate` | What the remote declared about per-frame metadata |
-| `Track` | Local (push frames) or remote (attach sink) media track |
+| `Track` | Local (push frames) or remote (attach sink) media track; `push_video_frame` and `push_pcm` take an optional `capture_time_us` |
 | `EncodedVideoTrack` | Push pre-encoded video (H.264 Annex-B, VP8, VP9, …) |
 | `Transceiver` | RTP m-section: `mid`, `kind`, `set_track`, `set_direction`, `set_codec_preferences`, `set_sender_transform`, `set_receiver_transform` |
 | `DataChannel` | SCTP data channel: `send`, `on_message`, `on_open`, … |
 | `StatsReport` | `inbound_rtp`, `outbound_rtp`, `candidate_pairs` |
 | `FrameMetadata`, `FrameAction`, `EncodedFrame`, `FrameTransform` | Per-frame metadata trailers and custom encoded-frame transforms — see [`docs/frame-metadata.md`](../../docs/frame-metadata.md) |
+
+| Function | Description |
+|----------|-------------|
+| `time_micros()` | The engine's monotonic clock in µs — the epoch every `capture_time_us` is read in, see [`docs/av-sync.md`](../../docs/av-sync.md) |
 
 | Enum | Values |
 |------|--------|

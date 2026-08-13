@@ -13,7 +13,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/reactor-team/reactor-webrtc"
@@ -23,8 +23,8 @@ repository = "https://github.com/reactor-team/reactor-webrtc"
 # of sync with [workspace.package].version on every bump — see the
 # "Versioning and releases" section of CONTRIBUTING.md.
 [workspace.dependencies]
-reactor-webrtc-sys = { path = "crates/reactor-webrtc-sys", version = "0.9.0" }
-reactor-webrtc = { path = "crates/reactor-webrtc", version = "0.9.0" }
+reactor-webrtc-sys = { path = "crates/reactor-webrtc-sys", version = "0.10.0" }
+reactor-webrtc = { path = "crates/reactor-webrtc", version = "0.10.0" }
 
 # The pinned upstream WebRTC milestone is tracked in ./WEBRTC_VERSION and baked
 # into the prebuilt artifacts produced by ./webrtc-build.

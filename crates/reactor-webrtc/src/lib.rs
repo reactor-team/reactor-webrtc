@@ -77,6 +77,18 @@ pub fn native_abi_version() -> u32 {
     unsafe { reactor_webrtc_sys::reactor_webrtc_abi_version() }
 }
 
+/// The engine's monotonic clock, in microseconds.
+///
+/// The epoch [`Track::push_video_frame_at`], [`Track::push_video_frame_with_metadata_at`],
+/// and [`Track::push_pcm_at`] read their capture timestamps in. Read it once per
+/// unit of produced media and stamp every track with that one value: audio and
+/// video are synchronised by sharing a capture time, not by reaching the encoder
+/// at the same moment.
+pub fn time_micros() -> i64 {
+    // Safe: a pure clock read with no arguments.
+    unsafe { reactor_webrtc_sys::reactor_webrtc_time_micros() }
+}
+
 /// Errors surfaced by the WebRTC engine.
 #[derive(Debug, Clone)]
 pub enum Error {

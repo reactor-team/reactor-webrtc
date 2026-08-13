@@ -223,8 +223,8 @@ impl Track {
         self.kind
     }
 
-    /// Push a BGRA frame (`width*height*4` bytes) into a local video track.
-    /// No-op for non-video tracks.
+    /// Push a BGRA frame (`width*height*4` bytes) into a local video track,
+    /// captured now. No-op for non-video tracks.
     pub fn push_video_frame(&self, bgra: &[u8], width: u32, height: u32) {
         if self.kind != MediaKind::Video {
             return;
@@ -239,9 +239,25 @@ impl Track {
         }
     }
 
+    /// Push a BGRA frame captured at `capture_time_us` ([`time_micros`]'s
+    /// epoch) rather than now.
+    ///
+    /// Stamping video and audio produced together with one timestamp is what
+    /// lets the receiver play them together: the alternative is for each stream
+    /// to inherit the moment it happened to reach the encoder, which differ by
+    /// however deep the buffers between the producer and the wire are.
+    ///
+    /// No-op for non-video tracks.
+    pub fn push_video_frame_at(&self, bgra: &[u8], width: u32, height: u32, capture_time_us: i64) {
+        if self.kind != MediaKind::Video {
+            return;
+        }
+        self.push_video_frame_ts(bgra, width, height, capture_time_us);
+    }
+
     /// Push a BGRA frame with arbitrary `user_data` embedded in a protobuf
-    /// trailer. `frame_id` (monotonic counter) and `timestamp` (Unix epoch µs)
-    /// are computed internally.
+    /// trailer, captured now. `frame_id` (monotonic counter) and `timestamp`
+    /// (Unix epoch µs) are computed internally.
     ///
     /// Requires [`sender_metadata_transform`](Self::sender_metadata_transform)
     /// to be attached to the sender transceiver; otherwise the frame goes out
@@ -255,10 +271,45 @@ impl Track {
         height: u32,
         user_data: &[u8],
     ) {
+        self.push_metadata_frame(bgra, width, height, user_data, None);
+    }
+
+    /// Push a BGRA frame with a metadata trailer and a caller-supplied capture
+    /// time, in [`time_micros`]'s epoch.
+    ///
+    /// Carrying metadata and carrying a capture time are independent choices:
+    /// a frame the model annotated still has to line up with the audio produced
+    /// alongside it, so the trailer must not cost the caller its timestamp.
+    ///
+    /// The trailer is matched to its frame by capture millisecond, so two
+    /// frames stamped inside the same millisecond would collide. The second is
+    /// nudged to the following millisecond — far below the resolution any
+    /// synchronisation cares about, and only reachable above 1000 fps.
+    ///
+    /// No-op for non-video tracks.
+    pub fn push_video_frame_with_metadata_at(
+        &self,
+        bgra: &[u8],
+        width: u32,
+        height: u32,
+        user_data: &[u8],
+        capture_time_us: i64,
+    ) {
+        self.push_metadata_frame(bgra, width, height, user_data, Some(capture_time_us));
+    }
+
+    fn push_metadata_frame(
+        &self,
+        bgra: &[u8],
+        width: u32,
+        height: u32,
+        user_data: &[u8],
+        capture_time_us: Option<i64>,
+    ) {
         if self.kind != MediaKind::Video {
             return;
         }
-        let capture_us = self.alloc_send_capture_us();
+        let capture_us = self.alloc_send_capture_us(capture_time_us);
         let meta = crate::metadata::FrameMetadata {
             frame_id: self.next_frame_id(),
             timestamp: SystemTime::now()
@@ -274,25 +325,17 @@ impl Track {
     /// Return a strictly-increasing capture timestamp in microseconds for use
     /// as the sender-map key and `push_video_frame_ts` argument.
     ///
-    /// Two calls in the same millisecond would produce the same `capture_ms`
-    /// key, causing both frames to share the same metadata entry. This method
-    /// advances the counter by 1 ms if the real clock hasn't moved, guaranteeing
-    /// unique keys regardless of call frequency.
-    pub(crate) fn alloc_send_capture_us(&self) -> i64 {
-        let raw_ms = unsafe { reactor_webrtc_sys::reactor_webrtc_time_micros() } / 1000;
-        let mut prev = self.last_send_ms.load(Ordering::Relaxed);
-        loop {
-            let next = raw_ms.max(prev + 1);
-            match self.last_send_ms.compare_exchange_weak(
-                prev,
-                next,
-                Ordering::SeqCst,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return next * 1000,
-                Err(actual) => prev = actual,
-            }
-        }
+    /// `requested` is the caller's own capture time, or `None` to read the
+    /// clock. Either way two frames in the same millisecond would produce the
+    /// same `capture_ms` key and share one metadata entry, so the counter
+    /// advances by 1 ms when the source hasn't moved, guaranteeing unique keys
+    /// regardless of call frequency.
+    pub(crate) fn alloc_send_capture_us(&self, requested: Option<i64>) -> i64 {
+        let raw_ms = match requested {
+            Some(us) => us / 1000,
+            None => crate::time_micros() / 1000,
+        };
+        next_unique_capture_ms(&self.last_send_ms, raw_ms) * 1000
     }
 
     /// Advance the per-track frame counter and return the new value (1-based,
@@ -384,6 +427,35 @@ impl Track {
     /// is an error. Only one thread should call `push_pcm` at a time for a
     /// given track — concurrent callers produce interleaved, garbage audio.
     pub fn push_pcm(&self, pcm: &[i16], sample_rate: u32, channels: u32) -> Result<()> {
+        self.push_pcm_inner(pcm, sample_rate, channels, 0)
+    }
+
+    /// Push PCM captured at `capture_time_us` ([`time_micros`]'s epoch) rather
+    /// than whenever it reaches the encoder.
+    ///
+    /// A track's RTP timestamp otherwise counts only the samples handed to it,
+    /// which says how much audio exists but not when it was captured. Supplying
+    /// the same timestamp used for the video produced alongside it is what lets
+    /// the receiver play the two together.
+    ///
+    /// Same input rules as [`push_pcm`](Self::push_pcm).
+    pub fn push_pcm_at(
+        &self,
+        pcm: &[i16],
+        sample_rate: u32,
+        channels: u32,
+        capture_time_us: i64,
+    ) -> Result<()> {
+        self.push_pcm_inner(pcm, sample_rate, channels, capture_time_us / 1000)
+    }
+
+    fn push_pcm_inner(
+        &self,
+        pcm: &[i16],
+        sample_rate: u32,
+        channels: u32,
+        capture_time_ms: i64,
+    ) -> Result<()> {
         if channels == 0 {
             return Err(Error::Webrtc("channels must be at least 1".to_owned()));
         }
@@ -397,12 +469,13 @@ impl Track {
         let channels = channels as c_int;
         let samples_per_channel = (pcm.len() / channels as usize) as c_int;
         unsafe {
-            reactor_webrtc_sys::reactor_webrtc_audio_track_push_pcm(
+            reactor_webrtc_sys::reactor_webrtc_audio_track_push_pcm_ts(
                 self.raw,
                 pcm.as_ptr(),
                 samples_per_channel,
                 sample_rate as c_int,
                 channels,
+                capture_time_ms,
             );
         }
         Ok(())
@@ -438,5 +511,76 @@ impl Drop for Track {
         }
         // Detaches the C++ sink before the sink-state boxes are freed.
         unsafe { reactor_webrtc_sys::reactor_webrtc_media_stream_track_destroy(self.raw) }
+    }
+}
+
+/// Claim `raw_ms` as a capture millisecond, advancing past `last` when the
+/// source has not moved.
+///
+/// The sender metadata map is keyed by capture millisecond, so two frames
+/// claiming the same one would share a trailer. Nudging the second forward
+/// keeps keys unique whether the millisecond came from the clock or from a
+/// caller stamping its own capture time.
+fn next_unique_capture_ms(last: &AtomicI64, raw_ms: i64) -> i64 {
+    let mut prev = last.load(Ordering::Relaxed);
+    loop {
+        let next = raw_ms.max(prev + 1);
+        match last.compare_exchange_weak(prev, next, Ordering::SeqCst, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(actual) => prev = actual,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_caller_timestamp_is_used_as_given() {
+        let last = AtomicI64::new(0);
+        assert_eq!(next_unique_capture_ms(&last, 1_700), 1_700);
+    }
+
+    #[test]
+    fn a_second_frame_in_the_same_millisecond_is_nudged_forward() {
+        let last = AtomicI64::new(0);
+        assert_eq!(next_unique_capture_ms(&last, 1_700), 1_700);
+        assert_eq!(next_unique_capture_ms(&last, 1_700), 1_701);
+        assert_eq!(next_unique_capture_ms(&last, 1_700), 1_702);
+    }
+
+    #[test]
+    fn a_timestamp_past_the_nudge_wins() {
+        let last = AtomicI64::new(0);
+        next_unique_capture_ms(&last, 1_700);
+        next_unique_capture_ms(&last, 1_700);
+        // 40 ms later — a real frame interval — lands where the caller asked.
+        assert_eq!(next_unique_capture_ms(&last, 1_740), 1_740);
+    }
+
+    #[test]
+    fn keys_stay_unique_across_threads() {
+        let last = Arc::new(AtomicI64::new(0));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let last = Arc::clone(&last);
+            let seen = Arc::clone(&seen);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..100 {
+                    let ms = next_unique_capture_ms(&last, 5_000);
+                    seen.lock().unwrap().push(ms);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let mut all = seen.lock().unwrap().clone();
+        all.sort_unstable();
+        let before = all.len();
+        all.dedup();
+        assert_eq!(all.len(), before, "capture milliseconds collided");
     }
 }

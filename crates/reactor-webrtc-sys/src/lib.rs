@@ -628,6 +628,19 @@ extern "C" {
         sample_rate: c_int,
         channels: c_int,
     );
+    /// Like [`reactor_webrtc_audio_track_push_pcm`] but stamps the frame with a
+    /// caller-supplied absolute capture time (milliseconds, same epoch as
+    /// [`reactor_webrtc_time_micros`]), which reaches the encoder and lets the
+    /// receiver line this audio up with video captured at the same instant.
+    /// `0` leaves the capture time unknown.
+    pub fn reactor_webrtc_audio_track_push_pcm_ts(
+        track: *mut MediaStreamTrack,
+        pcm: *const i16,
+        samples_per_channel: c_int,
+        sample_rate: c_int,
+        channels: c_int,
+        capture_time_ms: i64,
+    );
     /// Deliver interleaved i16 PCM to the factory's ADM (shared by all local
     /// audio tracks). `samples_per_channel` is the frame count (e.g. 480 for
     /// 10ms @ 48kHz).
