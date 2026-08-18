@@ -142,6 +142,52 @@ arm64 without relocation errors from the linker.
 
 ---
 
+### 0004 — Apple VideoToolbox H.264
+
+`0004-webrtc-add-apple-videotoolbox-h264.patch` · touches `BUILD.gn` (+7 lines)
+
+**What.** Adds two deps to the `//:webrtc` umbrella target, for `is_mac ||
+is_ios`:
+
+```
+sdk:native_api
+sdk:videotoolbox_objc
+```
+
+**Why.** Despite docs claiming macOS/iOS get H.264 "via VideoToolbox instead",
+that was never actually true: the umbrella's only existing Apple-specific dep
+is `if (is_ios) { deps += [ "sdk:framework_objc" ] }` (added upstream, not by
+us), and `sdk:framework_objc` is an `apple_framework_bundle_with_umbrella_header`
+— a bundle target that contributes **no object files** to a
+`complete_static_lib`. Confirmed empirically: downloading both the current
+`mac-arm64` and `ios-arm64-device` prebuilts and running
+`nm libwebrtc.a | grep -i 'RTCVideoEncoderFactoryH264\|ObjCToNativeVideoEncoderFactory'`
+returns nothing on either, and `ar t libwebrtc.a | grep -i objc` has zero
+matches — the ObjC video-codec object files simply aren't in the archive on
+any Apple platform today, mac included (which had no Apple-specific dep at
+all before this patch).
+
+**How it works.** `sdk:videotoolbox_objc` (`rtc_library`) is the real
+VideoToolbox-backed `RTCVideoEncoderFactoryH264`/`RTCVideoDecoderFactoryH264`
+Objective-C classes. `sdk:native_api` (`rtc_library`) is the C++ bridge
+(`ObjCToNativeVideoEncoderFactory`/`ObjCToNativeVideoDecoderFactory` in
+`sdk/objc/native/api/video_{encoder,decoder}_factory.mm`) our glue needs to
+turn an `id<RTCVideoEncoderFactory>` into a native `webrtc::VideoEncoderFactory`.
+Both are plain `rtc_library()` targets (not bundles), so — like 0001's builtin
+factories — adding them to the umbrella's `deps` pulls their object files and
+transitive closure straight into `libwebrtc.a`.
+
+**Verify.** *Patch applies cleanly*: checked with `git apply --check` against
+the real pinned-commit `BUILD.gn` (fetched from
+`webrtc.googlesource.com` at `WEBRTC_COMMIT`), not yet against a live
+`gclient sync` checkout. *Symbols land*: not yet verified — needs a real
+`build.sh mac arm64` / `build.sh ios arm64` run (this repo's dev sandbox has
+no depot_tools/ninja toolchain); after that, `nm libwebrtc.a` should show
+`RTCVideoEncoderFactoryH264`/`ObjCToNativeVideoEncoderFactory` where it
+previously showed nothing (see "Why" above for the exact before-state).
+
+---
+
 ## Planned (not yet authored — need their target builds to validate)
 
 - **Symbol isolation** — keep WebRTC's C++ symbols from clashing when a consumer

@@ -1,0 +1,18 @@
+diff --git a/BUILD.gn b/BUILD.gn
+index bbe3542bad..3fdca9c1a2 100644
+--- a/BUILD.gn
++++ b/BUILD.gn
+@@ -598,6 +598,13 @@ if (!build_with_chromium) {
+       if (is_ios) {
+         deps += [ "sdk:framework_objc" ]
+       }
++      if (is_mac || is_ios) {
++        # Reactor: real VideoToolbox H.264. ":framework_objc" above is an
++        # apple_framework_bundle_with_umbrella_header (bundle target) and
++        # contributes no object files to this complete_static_lib -- these
++        # two plain rtc_library() targets do.
++        deps += [ "sdk:native_api", "sdk:videotoolbox_objc" ]
++      }
+     }
+   }
+ 
