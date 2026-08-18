@@ -272,7 +272,11 @@ fn compile_glue(include_dir: &Path, is_debug_prebuilt: bool) {
 /// alive for as long as the native factory wrapping them holds a reference —
 /// applying that flag to reactor_webrtc.cpp's plain-C++ translation unit as
 /// well would be needless (and `cc` sets flags per-Build, not per-file).
-fn compile_apple_hw_glue(include_dir: &Path, is_debug_prebuilt: bool, extra_defines: &[(&str, Option<&str>)]) {
+fn compile_apple_hw_glue(
+    include_dir: &Path,
+    is_debug_prebuilt: bool,
+    extra_defines: &[(&str, Option<&str>)],
+) {
     println!("cargo:rerun-if-changed=glue/apple_hw/apple_hw_codec.mm");
     println!("cargo:rerun-if-changed=glue/apple_hw/apple_hw_codec.h");
 
