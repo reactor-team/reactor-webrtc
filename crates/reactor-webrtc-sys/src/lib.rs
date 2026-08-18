@@ -282,6 +282,19 @@ extern "C" {
     pub fn reactor_webrtc_factory_create_with_adm(
         use_platform_adm: c_int,
     ) -> *mut PeerConnectionFactory;
+
+    /// Android only: create a factory with real H.264 encode/decode backed by
+    /// WebRTC's own MediaCodec-based Java factories (JNI-bridged in). VP8/VP9/
+    /// AV1 remain builtin. Requires [`reactor_webrtc_android_init`] (or
+    /// `_context`) to have run first. `apm_flags` is an OR of REACTOR_APM_*
+    /// bits. Never fails outright on a missing/unreachable Java class — H264
+    /// is simply not advertised in that case.
+    #[cfg(target_os = "android")]
+    pub fn reactor_webrtc_factory_create_with_android_hw_h264(
+        use_platform_adm: c_int,
+        apm_flags: c_int,
+    ) -> *mut PeerConnectionFactory;
+
     pub fn reactor_webrtc_factory_destroy(factory: *mut PeerConnectionFactory);
 
     /// Create a factory that routes all video encoding through `on_encode`.

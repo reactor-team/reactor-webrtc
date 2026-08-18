@@ -2233,7 +2233,9 @@ void reactor_webrtc_peer_connection_get_stats(
 
 #ifdef WEBRTC_ANDROID
 #include <jni.h>
+#include "android_hw/android_hw_codec.h"
 #include "sdk/android/native_api/base/init.h"
+#include "sdk/android/native_api/jni/jvm.h"
 
 extern "C" {
 
@@ -2244,6 +2246,47 @@ void reactor_webrtc_android_init(void* vm) {
 int reactor_webrtc_android_init_context(void* vm, void* /*context*/) {
   webrtc::InitAndroid(static_cast<JavaVM*>(vm));
   return 1;
+}
+
+// Create a factory with real H.264 encode/decode backed by WebRTC's own
+// MediaCodec-based Java factories, JNI-bridged in (see
+// glue/android_hw/android_hw_codec.h). VP8/VP9/AV1 stay on the builtin
+// factories; only H264 routes through the hardware path. Requires
+// reactor_webrtc_android_init[_context] to have run first (needs the JavaVM
+// to attach this thread). If the Java classes aren't reachable (e.g.
+// libwebrtc.jar isn't on the app's classpath), H264 is simply not advertised
+// in SDP rather than this constructor failing outright.
+void* reactor_webrtc_factory_create_with_android_hw_h264(int use_platform_adm,
+                                                           int apm_flags) {
+  JNIEnv* jni = webrtc::AttachCurrentThreadIfNeeded();
+
+  auto f = std::make_unique<ReactorFactory>();
+  f->network_thread   = webrtc::Thread::CreateWithSocketServer();
+  f->worker_thread    = webrtc::Thread::Create();
+  f->signaling_thread = webrtc::Thread::Create();
+  if (!f->network_thread->Start() || !f->worker_thread->Start() ||
+      !f->signaling_thread->Start()) {
+    return nullptr;
+  }
+
+  webrtc::scoped_refptr<webrtc::AudioDeviceModule> adm;
+  if (!use_platform_adm) {
+    f->adm = webrtc::make_ref_counted<FrameAdm>();
+    adm    = f->adm;
+  }
+
+  auto apm = build_apm(apm_flags);
+
+  f->factory = webrtc::CreatePeerConnectionFactory(
+      f->network_thread.get(), f->worker_thread.get(),
+      f->signaling_thread.get(), adm,
+      webrtc::CreateBuiltinAudioEncoderFactory(),
+      webrtc::CreateBuiltinAudioDecoderFactory(),
+      reactor::CreateAndroidHwVideoEncoderFactory(jni),
+      reactor::CreateAndroidHwVideoDecoderFactory(jni),
+      /*audio_mixer=*/nullptr, /*audio_processing=*/apm);
+  if (!f->factory) return nullptr;
+  return f.release();
 }
 
 }  // extern "C"
