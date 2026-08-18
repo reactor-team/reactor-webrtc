@@ -248,6 +248,43 @@ impl PeerConnectionFactory {
         )
     }
 
+    /// Create a factory with real H.264 encode/decode backed by Android's own
+    /// MediaCodec-based Java factories, JNI-bridged in. VP8/VP9/AV1 remain
+    /// builtin; only H264 routes through the hardware path.
+    ///
+    /// Requires [`crate::platform::android_init`] (or `_context`) to have run
+    /// first, so this thread can reach the app's class loader — enforced here
+    /// (returns `Err` rather than aborting if it hasn't). This never fails
+    /// because the Java classes themselves are unreachable (e.g.
+    /// `libwebrtc.jar` missing from the app's runtime classpath) — H264 is
+    /// simply not advertised in SDP in that case. Errors here mean either the
+    /// JavaVM was never handed over, or factory/thread construction itself
+    /// failed, same as [`Self::with_adm_apm`].
+    #[cfg(target_os = "android")]
+    pub fn with_android_hw_h264(mode: AdmMode, apm: ApmConfig) -> Result<Self> {
+        if !crate::platform::is_initialized() {
+            return Err(Error::Webrtc(
+                "with_android_hw_h264 requires platform::android_init (or _context) \
+                 to run first"
+                    .into(),
+            ));
+        }
+        let raw = unsafe {
+            reactor_webrtc_sys::reactor_webrtc_factory_create_with_android_hw_h264(
+                matches!(mode, AdmMode::Platform) as c_int,
+                apm.to_flags(),
+            )
+        };
+        if raw.is_null() {
+            return Err(Error::Webrtc(
+                "factory with android_hw_h264 returned null".into(),
+            ));
+        }
+        Ok(Self {
+            handle: Arc::new(FactoryHandle(raw)),
+        })
+    }
+
     /// Create a factory that replaces the builtin H.264 encoder with `encoder`.
     ///
     /// The encoder callback is invoked synchronously on the WebRTC encoder
