@@ -265,15 +265,14 @@ let factory = PeerConnectionFactory::with_android_hw_h264(
 ```
 
 This calls into WebRTC's own `MediaCodec`-based Java factories — no runtime
-download involved, the codec is already on the device (unlike Linux/Windows,
-which get H.264 by downloading Cisco's OpenH264 at runtime; see that crate
-feature's docs). The one requirement here is packaging: those Java classes
-live in `libwebrtc.jar`, and the native glue resolves them through the
-**app's** class loader (`webrtc::GetClass`), not the bootstrap loader — so the
-consuming app must add `libwebrtc.jar` as a runtime dependency (e.g. in its
-`build.gradle`) for `with_android_hw_h264` to actually find hardware H.264.
-If it's missing, this does not fail or panic: H.264 is simply not
-advertised in SDP, and the peer connection negotiates VP8/VP9/AV1 as usual.
+download involved, the codec is already on the device. The one requirement
+here is packaging: those Java classes live in `libwebrtc.jar`, and the native
+glue resolves them through the **app's** class loader (`webrtc::GetClass`),
+not the bootstrap loader — so the consuming app must add `libwebrtc.jar` as a
+runtime dependency (e.g. in its `build.gradle`) for `with_android_hw_h264` to
+actually find hardware H.264. If it's missing, this does not fail or panic:
+H.264 is simply not advertised in SDP, and the peer connection negotiates
+VP8/VP9/AV1 as usual.
 
 macOS and iOS get real H.264 the same way, via VideoToolbox — already wired
 into the default factory constructors (`new`/`with_adm_apm`/
