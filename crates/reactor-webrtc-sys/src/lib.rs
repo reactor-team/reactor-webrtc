@@ -9,6 +9,9 @@
 
 use std::os::raw::{c_char, c_int, c_void};
 
+#[cfg(feature = "openh264")]
+pub mod openh264;
+
 // ── Opaque handles (owned by the C++ side) ───────────────────────────────────
 
 #[repr(C)]
@@ -300,6 +303,19 @@ extern "C" {
         userdata: *mut c_void,
         free_ud: Option<extern "C" fn(userdata: *mut c_void)>,
         use_builtin: Option<extern "C" fn(userdata: *mut c_void, encoder_id: u64) -> c_int>,
+        apm_flags: c_int,
+    ) -> *mut PeerConnectionFactory;
+
+    /// Create a factory with real H.264 encode/decode backed by a dynamically
+    /// loaded OpenH264 shared library (`lib_path`, e.g. from
+    /// [`crate::openh264::ensure_available`]). VP8/VP9/AV1 remain builtin.
+    /// `lib_path` must be a NUL-terminated UTF-8/ANSI path. Returns null if the
+    /// library fails to `dlopen`/`LoadLibraryW`, or on any other factory
+    /// construction failure. `apm_flags` is an OR of REACTOR_APM_* bits.
+    #[cfg(feature = "openh264")]
+    pub fn reactor_webrtc_factory_create_with_openh264(
+        lib_path: *const c_char,
+        use_platform_adm: c_int,
         apm_flags: c_int,
     ) -> *mut PeerConnectionFactory;
 
