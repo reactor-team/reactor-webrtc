@@ -9,6 +9,7 @@
 #include "api/video_codecs/sdp_video_format.h"
 #include "rtc_base/logging.h"
 #include "sdk/android/native_api/codecs/wrapper.h"
+#include "sdk/android/native_api/jni/class_loader.h"
 
 namespace reactor {
 namespace {
@@ -23,12 +24,6 @@ constexpr char kEglBaseContextClass[] = "inc/reactor/org/webrtc/EglBase$Context"
 
 bool IsH264(const webrtc::SdpVideoFormat& format) {
   return format.name == "H264";
-}
-
-webrtc::SdpVideoFormat H264Format() {
-  return webrtc::SdpVideoFormat("H264", {{"level-asymmetry-allowed", "1"},
-                                          {"packetization-mode", "1"},
-                                          {"profile-level-id", "42e01f"}});
 }
 
 // Logs and clears a pending JNI exception (FindClass/GetMethodID/NewObject
@@ -53,7 +48,13 @@ class AndroidHwVideoEncoderFactory : public webrtc::VideoEncoderFactory {
 
   std::vector<webrtc::SdpVideoFormat> GetSupportedFormats() const override {
     std::vector<webrtc::SdpVideoFormat> formats = builtin_->GetSupportedFormats();
-    if (hw_) formats.push_back(H264Format());
+    if (hw_) {
+      // Only advertise the H264 profiles the device's MediaCodec allowlist
+      // actually reports as supported -- not every device does.
+      for (const auto& format : hw_->GetSupportedFormats()) {
+        if (IsH264(format)) formats.push_back(format);
+      }
+    }
     return formats;
   }
 
@@ -77,7 +78,13 @@ class AndroidHwVideoDecoderFactory : public webrtc::VideoDecoderFactory {
 
   std::vector<webrtc::SdpVideoFormat> GetSupportedFormats() const override {
     std::vector<webrtc::SdpVideoFormat> formats = builtin_->GetSupportedFormats();
-    if (hw_) formats.push_back(H264Format());
+    if (hw_) {
+      // Only advertise the H264 profiles the device's MediaCodec allowlist
+      // actually reports as supported -- not every device does.
+      for (const auto& format : hw_->GetSupportedFormats()) {
+        if (IsH264(format)) formats.push_back(format);
+      }
+    }
     return formats;
   }
 
@@ -99,43 +106,52 @@ class AndroidHwVideoDecoderFactory : public webrtc::VideoDecoderFactory {
 // both off (matches HardwareVideoDecoderFactory's own simplest ctor shape;
 // HardwareVideoEncoderFactory needs the 3-arg form specifically). Returns a
 // local ref, or null (with the JNI exception already cleared) on any failure.
+//
+// Uses webrtc::GetClass() rather than JNIEnv::FindClass() directly: this
+// constructor has no requirement to run on a Java-originated thread (it's
+// called from reactor_webrtc_factory_create_with_android_hw_h264 after
+// AttachCurrentThreadIfNeeded), and on a thread attached from native code
+// FindClass only consults the bootstrap class loader, which cannot resolve
+// app-provided libwebrtc.jar classes. GetClass() goes through the app class
+// loader webrtc::InitClassLoader() cached at reactor_webrtc_android_init()
+// time instead.
 jobject NewEncoderFactory(JNIEnv* jni) {
-  jclass klass = jni->FindClass(kHwEncoderFactoryClass);
-  if (ClearPendingException(jni, "FindClass(HardwareVideoEncoderFactory)") || !klass) {
+  webrtc::ScopedJavaLocalRef<jclass> klass =
+      webrtc::GetClass(jni, kHwEncoderFactoryClass);
+  if (ClearPendingException(jni, "GetClass(HardwareVideoEncoderFactory)") ||
+      !klass.obj()) {
     return nullptr;
   }
   std::string sig = "(L" + std::string(kEglBaseContextClass) + ";ZZ)V";
-  jmethodID ctor = jni->GetMethodID(klass, "<init>", sig.c_str());
+  jmethodID ctor = jni->GetMethodID(klass.obj(), "<init>", sig.c_str());
   if (ClearPendingException(jni, "GetMethodID(HardwareVideoEncoderFactory.<init>)") ||
       !ctor) {
-    jni->DeleteLocalRef(klass);
     return nullptr;
   }
-  jobject obj = jni->NewObject(klass, ctor, /*sharedContext=*/nullptr,
+  jobject obj = jni->NewObject(klass.obj(), ctor, /*sharedContext=*/nullptr,
                                 /*enableIntelVp8Encoder=*/JNI_FALSE,
                                 /*enableH264HighProfile=*/JNI_FALSE);
   ClearPendingException(jni, "NewObject(HardwareVideoEncoderFactory)");
-  jni->DeleteLocalRef(klass);
   return obj;
 }
 
 // Same idea for the decoder, which has a simpler single-arg ctor
 // (EglBase.Context) -- null again for the same reason.
 jobject NewDecoderFactory(JNIEnv* jni) {
-  jclass klass = jni->FindClass(kHwDecoderFactoryClass);
-  if (ClearPendingException(jni, "FindClass(HardwareVideoDecoderFactory)") || !klass) {
+  webrtc::ScopedJavaLocalRef<jclass> klass =
+      webrtc::GetClass(jni, kHwDecoderFactoryClass);
+  if (ClearPendingException(jni, "GetClass(HardwareVideoDecoderFactory)") ||
+      !klass.obj()) {
     return nullptr;
   }
   std::string sig = "(L" + std::string(kEglBaseContextClass) + ";)V";
-  jmethodID ctor = jni->GetMethodID(klass, "<init>", sig.c_str());
+  jmethodID ctor = jni->GetMethodID(klass.obj(), "<init>", sig.c_str());
   if (ClearPendingException(jni, "GetMethodID(HardwareVideoDecoderFactory.<init>)") ||
       !ctor) {
-    jni->DeleteLocalRef(klass);
     return nullptr;
   }
-  jobject obj = jni->NewObject(klass, ctor, /*sharedContext=*/nullptr);
+  jobject obj = jni->NewObject(klass.obj(), ctor, /*sharedContext=*/nullptr);
   ClearPendingException(jni, "NewObject(HardwareVideoDecoderFactory)");
-  jni->DeleteLocalRef(klass);
   return obj;
 }
 
