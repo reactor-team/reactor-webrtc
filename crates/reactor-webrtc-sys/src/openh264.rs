@@ -8,9 +8,10 @@
 //! build compiled from OpenH264's source by anyone else (confirmed against
 //! `openh264.org/BINARY_LICENSE.txt` and its FAQ). So this module downloads
 //! Cisco's official prebuilt library the same way Firefox/Chrome do, verifies
-//! it against a hash pinned in this source (not the live `.sha1` sidecar —
-//! that would just be trusting the same CDN response twice), and hands the
-//! resulting file path to the C++ glue, which `dlopen`s it.
+//! it against a hash pinned in this source (not the CDN's own
+//! `.signed.md5.txt` sidecar — that would just be trusting the same CDN
+//! response twice), and hands the resulting file path to the C++ glue, which
+//! `dlopen`s it.
 //!
 //! **License obligation on the integrating application**: per Cisco's binary
 //! license, [`OPENH264_ATTRIBUTION`] must be shown in the app's
@@ -91,16 +92,23 @@ struct Target {
     /// Exact filename Cisco publishes under `CISCO_CDN_BASE`, e.g.
     /// `libopenh264-2.6.0-linux64.8.so.bz2`.
     archive_name: &'static str,
-    /// Expected SHA-1 of the *compressed* `.bz2`, lowercase hex — matches
-    /// what Cisco publishes as `<archive_name>.sha1`.
+    /// Expected SHA-1 of the *compressed* `.bz2`, lowercase hex — computed by
+    /// us from a verified download, not copied from a Cisco-published SHA-1
+    /// (Cisco doesn't publish one).
     ///
-    /// NOTE: this sandbox's network egress is blocked by Cisco's CDN (403 on
-    /// every request, including the `.sha1` sidecars, likely datacenter-IP
-    /// filtering) — these could not be fetched from here. **Fill in real
-    /// values from a machine with normal network access** before shipping:
-    /// `curl -fsSL {CISCO_CDN_BASE}/<archive_name>.sha1`. Left empty
-    /// deliberately (not guessed) — `ensure_available` refuses to download
-    /// with a missing hash rather than skip verification.
+    /// Cisco's actual sidecar is `<archive_name>.signed.md5.txt` (e.g.
+    /// `libopenh264-2.6.0-linux64.8.so.signed.md5.txt`), an MD5 digest inside
+    /// a signed blob — not `.sha1` as an earlier version of this comment
+    /// assumed. We used that sidecar only as a sanity check on the download,
+    /// then hashed the verified `.bz2` ourselves with SHA-1, so verification
+    /// here doesn't depend on Cisco ever publishing SHA-1/SHA-256.
+    ///
+    /// `https://ciscobinary.openh264.org` 403s on some networks (looked like
+    /// datacenter-IP filtering on the HTTPS vhost specifically); plain
+    /// `http://` — what `CISCO_CDN_BASE` already uses — is reachable. To
+    /// re-pin on a version bump: fetch `<archive_name>.signed.md5.txt`,
+    /// confirm it matches `md5 <archive_name>.bz2`, then
+    /// `shasum -a 1 <archive_name>.bz2`.
     sha1: &'static str,
 }
 
@@ -111,19 +119,19 @@ fn target_for(os: &str, arch: &str) -> Result<Target, OpenH264Error> {
     let t = match (os, arch) {
         ("linux", "x86_64") => Target {
             archive_name: "libopenh264-2.6.0-linux64.8.so.bz2",
-            sha1: "",
+            sha1: "1ae7464e33a249c1cd0b6998d09f9ada5937b64d",
         },
         ("linux", "aarch64") => Target {
             archive_name: "libopenh264-2.6.0-linux-arm64.8.so.bz2",
-            sha1: "",
+            sha1: "16727ec3b37dbea3c8616418ba0c4bc87e0eb4aa",
         },
         ("windows", "x86_64") => Target {
             archive_name: "openh264-2.6.0-win64.dll.bz2",
-            sha1: "",
+            sha1: "78661d7bf890e3c526acae6904679afd05941fbe",
         },
         ("windows", "aarch64") => Target {
             archive_name: "openh264-2.6.0-win-arm64.dll.bz2",
-            sha1: "",
+            sha1: "34c17127d00ea0be6f3b96b8e91c667357bef800",
         },
         _ => {
             return Err(OpenH264Error::UnsupportedPlatform {
@@ -314,15 +322,23 @@ mod tests {
     }
 
     #[test]
-    fn ensure_available_refuses_missing_pinned_hash() {
-        // Every in-scope target currently has an empty `sha1` placeholder
-        // (see the doc comment on `Target::sha1`) until real values are
-        // pinned from a machine with unfiltered network access — confirm
-        // that shows up as a clear error, not a silent skip of verification.
-        if matches!(std::env::consts::OS, "linux" | "windows") {
-            let err =
-                ensure_available(Some(Path::new("/tmp/reactor-webrtc-test-unused"))).unwrap_err();
-            assert!(matches!(err, OpenH264Error::MissingExpectedHash { .. }));
+    fn all_in_scope_targets_have_pinned_hashes() {
+        // `ensure_available` refuses to download with a missing hash (see
+        // `OpenH264Error::MissingExpectedHash`) rather than skip
+        // verification — confirm every in-scope target is actually pinned,
+        // not left as the empty placeholder this table started from.
+        for (os, arch) in [
+            ("linux", "x86_64"),
+            ("linux", "aarch64"),
+            ("windows", "x86_64"),
+            ("windows", "aarch64"),
+        ] {
+            let t = target_for(os, arch).unwrap_or_else(|e| panic!("{os}/{arch}: {e}"));
+            assert_eq!(t.sha1.len(), 40, "{os}/{arch}: sha1 not pinned");
+            assert!(
+                t.sha1.chars().all(|c| c.is_ascii_hexdigit()),
+                "{os}/{arch}: sha1 is not hex"
+            );
         }
     }
 }
