@@ -243,14 +243,50 @@ video.push_encoded_frame(EncodedVideoFrame {
 });
 ```
 
+## H.264 on Android
+
+The builtin codec factories (`PeerConnectionFactory::new`/`with_adm_apm`/
+`with_platform_adm`) support VP8, VP9, and AV1 — no H.264 (`libwebrtc.a` is
+built with `rtc_use_h264=false` everywhere). On Android, real H.264 is
+available through the device's own MediaCodec hardware encoder/decoder,
+JNI-bridged in:
+
+```rust
+use reactor_webrtc::{platform, AdmMode, ApmConfig, PeerConnectionFactory};
+
+// Once, e.g. from JNI_OnLoad — hands libwebrtc the JavaVM so it can attach
+// this and later threads through the app's own class loader.
+unsafe { platform::android_init(vm) };
+
+let factory = PeerConnectionFactory::with_android_hw_h264(
+    AdmMode::Synthetic,
+    ApmConfig::default(),
+)?;
+```
+
+This calls into WebRTC's own `MediaCodec`-based Java factories — no runtime
+download involved, the codec is already on the device (unlike Linux/Windows,
+which get H.264 by downloading Cisco's OpenH264 at runtime; see that crate
+feature's docs). The one requirement here is packaging: those Java classes
+live in `libwebrtc.jar`, and the native glue resolves them through the
+**app's** class loader (`webrtc::GetClass`), not the bootstrap loader — so the
+consuming app must add `libwebrtc.jar` as a runtime dependency (e.g. in its
+`build.gradle`) for `with_android_hw_h264` to actually find hardware H.264.
+If it's missing, this does not fail or panic: H.264 is simply not
+advertised in SDP, and the peer connection negotiates VP8/VP9/AV1 as usual.
+
+macOS and iOS get real H.264 the same way, via VideoToolbox — already wired
+into the default factory constructors (`new`/`with_adm_apm`/
+`with_platform_adm`), no separate call needed there.
+
 ## Target support
 
 | Platform | Architecture | Notes |
 |----------|-------------|-------|
-| macOS | arm64, x64 | VideoToolbox H.264 |
-| iOS | arm64 (device + simulator) | |
+| macOS | arm64, x64 | VideoToolbox H.264, in the default factory |
+| iOS | arm64 (device + simulator) | VideoToolbox H.264, in the default factory |
 | Linux | x64, arm64 | bundled libc++ (ABI `__Cr`) |
-| Android | arm64 | NDK + bundled libc++ |
+| Android | arm64 | NDK + bundled libc++; MediaCodec H.264 via `with_android_hw_h264` (needs `libwebrtc.jar` on the app's classpath) |
 | Windows | x64 | MSVC STL |
 
 ## License
