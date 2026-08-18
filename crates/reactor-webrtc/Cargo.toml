@@ -13,6 +13,12 @@ build = "build.rs"
 [lib]
 doctest = false
 
+[features]
+# Real H.264 via a dynamically loaded OpenH264 (Cisco's prebuilt binary,
+# downloaded at runtime — see the `openh264` module and PeerConnectionFactory
+# ::with_openh264). See reactor-webrtc-sys's Cargo.toml for why this is opt-in.
+openh264 = ["reactor-webrtc-sys/openh264"]
+
 [dependencies]
 reactor-webrtc-sys = { workspace = true }
 prost = "0.13"
