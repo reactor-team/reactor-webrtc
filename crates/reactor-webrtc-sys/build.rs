@@ -287,6 +287,14 @@ fn compile_apple_hw_glue(
         .include(include_dir)
         .include(include_dir.join("third_party/abseil-cpp"))
         .include(include_dir.join("third_party/libyuv/include"))
+        // The objc SDK headers use two different quoted-include conventions
+        // for the same files under sdk/objc/base/ — some as a bare filename
+        // ("RTCVideoDecoderFactory.h", e.g. RTCVideoDecoderFactoryH264.h) and
+        // others as "base/<file>.h" (e.g. sdk/objc/native/api/video_decoder_
+        // factory.h) — matching how WebRTC's own gn build adds both
+        // sdk/objc/base and sdk/objc to the header search path.
+        .include(include_dir.join("sdk/objc/base"))
+        .include(include_dir.join("sdk/objc"))
         .std("c++20")
         .flag("-fobjc-arc")
         .define("WEBRTC_POSIX", None)
