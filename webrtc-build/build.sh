@@ -209,6 +209,30 @@ gn gen "$OUT" --args="$ARGS"
 echo "==> ninja -C $OUT ${NINJA_TARGET:-webrtc}"
 ninja -C "$OUT" "${NINJA_TARGET:-webrtc}"
 
+# ── 5a. Android JNI-registration investigation (temporary diagnostic) ────────
+# On-device testing of android-h264 (PRs #59-61) found that a real app crashes
+# at startup inside webrtc::InitAndroid() -> jni_zero::InitVM(): it looks up a
+# generated Java "registration" class (jni_zero's GEN_JNI equivalent) that our
+# build never produces. Confirmed by grepping the full ninja build log from the
+# run that published webrtc-7907-a5ddff60-p4/android-arm64: zero mentions of
+# "registration" anywhere in ~4400 build steps. That codegen is normally
+# triggered by Chromium's own APK-assembly GN templates (android_apk /
+# instrumentation_test_apk), which this build never invokes — we only ask ninja
+# for the plain "webrtc" / libjingle_peerconnection_so targets directly.
+#
+# This step doesn't fix anything yet. It lists whatever *jni_registration*
+# targets GN's dependency graph actually knows about for this target set (if
+# any exist standalone, independent of an apk wrapper), then tries to build the
+# most likely candidate by name directly, to see what ninja actually says.
+# Remove once we've used the CI log to figure out the real fix.
+if [ "$GN_OS" = "android" ]; then
+  echo "==> [investigation] listing *jni_registration* targets known to GN"
+  ninja -C "$OUT" -t targets all 2>/dev/null | grep -i jni_registration || echo "   (none found)"
+
+  echo "==> [investigation] attempting to build sdk/android:libjingle_peerconnection_so__jni_registration directly"
+  ninja -C "$OUT" "sdk/android:libjingle_peerconnection_so__jni_registration" 2>&1 | tail -40 || true
+fi
+
 # For linux/arm64 cross-compile: explicitly build the arm64 libc++ / libc++abi
 # static libs.  Chromium's GN only adds common_deps (which contains libc++) as
 # an implicit dep of executable/shared_library targets — not static_library
