@@ -246,10 +246,17 @@ video.push_encoded_frame(EncodedVideoFrame {
 ## H.264
 
 The builtin codec factories (`PeerConnectionFactory::new`/`with_adm_apm`/
-`with_platform_adm`) support VP8, VP9, and AV1 — H.264 is not among them on
-any platform (`libwebrtc.a` is built with `rtc_use_h264=false` everywhere;
-platform hardware H.264 wiring is tracked separately and not yet in this
-crate). Two ways to get real H.264 today:
+`with_platform_adm`) don't compile H.264 from source — `libwebrtc.a` is built
+with `rtc_use_h264=false` everywhere. H.264 sits under the MPEG LA patent
+pool, and shipping our own from-source implementation would make every
+consumer of this crate responsible for that licensing. Instead, real H.264
+support comes from codecs that already carry their own coverage: the OS's own
+hardware encoder/decoder (macOS/iOS via VideoToolbox — wired into the default
+factory constructors; Android via MediaCodec, through
+`with_android_hw_h264`), or Cisco's specific prebuilt OpenH264 binary, whose
+own MPEG LA arrangement covers *that* binary and not a build from source.
+
+Two more ways to get real H.264, available on any platform:
 
 - **Bring your own encoder**: [`PeerConnectionFactory::with_custom_video_encoder`]
   / [`PeerConnectionFactory::with_encoded_video_track`] if you already have
@@ -266,22 +273,18 @@ crate). Two ways to get real H.264 today:
   let factory = PeerConnectionFactory::with_openh264(&lib_path, AdmMode::Synthetic, ApmConfig::default())?;
   ```
   This downloads Cisco's official prebuilt OpenH264 shared library at
-  runtime and `dlopen`s it — the same approach Firefox and Chrome use, and
-  the reason it's not compiled into `libwebrtc.a`: Cisco's MPEG LA patent
-  arrangement covers *their* compiled binary specifically, not a build from
-  source. See `reactor-webrtc-sys`'s `openh264` module docs for the full
-  rationale, the exact platforms covered (Linux/Windows x64/arm64), and why
-  macOS/iOS/Android are out of scope here (they get real hardware H.264
-  instead — separate, in-progress work).
+  runtime and `dlopen`s it — the same approach Firefox and Chrome use. See
+  `reactor-webrtc-sys`'s `openh264` module docs for the exact platforms
+  covered (Linux/Windows x64/arm64).
 
 ## Target support
 
 | Platform | Architecture | Notes |
 |----------|-------------|-------|
-| macOS | arm64, x64 | no H.264 yet (planned: VideoToolbox) |
-| iOS | arm64 (device + simulator) | no H.264 yet (planned: VideoToolbox) |
+| macOS | arm64, x64 | VideoToolbox H.264, in the default factory |
+| iOS | arm64 (device + simulator) | VideoToolbox H.264, in the default factory |
 | Linux | x64, arm64 | bundled libc++ (ABI `__Cr`); H.264 via `openh264` feature |
-| Android | arm64 | NDK + bundled libc++; no H.264 yet (planned: MediaCodec) |
+| Android | arm64 | NDK + bundled libc++; MediaCodec H.264 via `with_android_hw_h264` (needs `libwebrtc.jar` on the app's classpath) |
 | Windows | x64 | MSVC STL; H.264 via `openh264` feature |
 
 ## License
