@@ -56,7 +56,7 @@ match the stdlib the consumer's glue is compiled/linked with:
 
 | OS | `use_custom_libcxx` | stdlib the glue links | key extra args |
 |----|--------------------|-----------------------|----------------|
-| macOS | `false` | platform libc++ (Xcode) | `rtc_use_h264=false` (VideoToolbox) |
+| macOS | `false` | platform libc++ (Xcode) | `rtc_use_h264=false` (VideoToolbox HW is the intended path; not yet wired into the glue — see `crates/reactor-webrtc/README.md` → "Target support") |
 | iOS | `false` | platform libc++ | `ios_enable_code_signing=false`, `target_environment=device\|simulator`, `rtc_use_h264=false` |
 | Linux | **`true`** | **bundled libc++ (`__Cr`)** | bundled clang, `use_sysroot=true`, `rtc_use_x11=false`, `rtc_use_pipewire=false` |
 | Android | **`true`** | **bundled libc++ (`__Cr`)** | NDK, `android_static_analysis=off`, `rtc_use_h264=false` |

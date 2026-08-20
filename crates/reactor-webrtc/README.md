@@ -243,15 +243,49 @@ video.push_encoded_frame(EncodedVideoFrame {
 });
 ```
 
+## H.264
+
+The builtin codec factories (`PeerConnectionFactory::new`/`with_adm_apm`/
+`with_platform_adm`) don't compile H.264 from source — `libwebrtc.a` is built
+with `rtc_use_h264=false` everywhere. H.264 sits under the MPEG LA patent
+pool, and shipping our own from-source implementation would make every
+consumer of this crate responsible for that licensing. Instead, real H.264
+support comes from codecs that already carry their own coverage: the OS's own
+hardware encoder/decoder (macOS/iOS via VideoToolbox — wired into the default
+factory constructors; Android via MediaCodec, through
+`with_android_hw_h264`), or Cisco's specific prebuilt OpenH264 binary, whose
+own MPEG LA arrangement covers *that* binary and not a build from source.
+
+Two more ways to get real H.264, available on any platform:
+
+- **Bring your own encoder**: [`PeerConnectionFactory::with_custom_video_encoder`]
+  / [`PeerConnectionFactory::with_encoded_video_track`] if you already have
+  H.264 bytes from somewhere (hardware encoder, another library).
+- **OpenH264, on Linux/Windows**: enable the `openh264` crate feature, then
+  ```rust
+  use reactor_webrtc::{openh264, AdmMode, ApmConfig, PeerConnectionFactory};
+
+  // Required by Cisco's binary license — show this in your app's
+  // licensing/EULA surface.
+  println!("{}", openh264::OPENH264_ATTRIBUTION);
+
+  let lib_path = openh264::ensure_available(None)?; // downloads on first run
+  let factory = PeerConnectionFactory::with_openh264(&lib_path, AdmMode::Synthetic, ApmConfig::default())?;
+  ```
+  This downloads Cisco's official prebuilt OpenH264 shared library at
+  runtime and `dlopen`s it — the same approach Firefox and Chrome use. See
+  `reactor-webrtc-sys`'s `openh264` module docs for the exact platforms
+  covered (Linux/Windows x64/arm64).
+
 ## Target support
 
 | Platform | Architecture | Notes |
 |----------|-------------|-------|
-| macOS | arm64, x64 | VideoToolbox H.264 |
-| iOS | arm64 (device + simulator) | |
-| Linux | x64, arm64 | bundled libc++ (ABI `__Cr`) |
-| Android | arm64 | NDK + bundled libc++ |
-| Windows | x64 | MSVC STL |
+| macOS | arm64, x64 | VideoToolbox H.264, in the default factory |
+| iOS | arm64 (device + simulator) | VideoToolbox H.264, in the default factory |
+| Linux | x64, arm64 | bundled libc++ (ABI `__Cr`); H.264 via `openh264` feature |
+| Android | arm64 | NDK + bundled libc++; MediaCodec H.264 via `with_android_hw_h264` (needs `libwebrtc.jar` on the app's classpath) |
+| Windows | x64 | MSVC STL; H.264 via `openh264` feature |
 
 ## License
 
@@ -259,3 +293,9 @@ Apache-2.0 — see [LICENSE](../../LICENSE).
 
 Upstream WebRTC is BSD-3-Clause + the WebRTC patent grant; attribution recorded
 in the SBOM published with every prebuilt release.
+
+The optional `openh264` feature downloads Cisco's prebuilt OpenH264 binary
+(BSD-2-Clause + a separate Cisco binary license covering the AVC/H.264
+patent pool for that specific binary) at runtime — see the `openh264` module
+docs and the "H.264" section above for the attribution your application must
+display.

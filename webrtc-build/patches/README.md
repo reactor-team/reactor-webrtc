@@ -54,8 +54,13 @@ the members have back-references the linker won't otherwise revisit — with a
 final `-dead_strip`/`--gc-sections` to drop what the FFI doesn't use.
 
 **Verify.** The `reactor-webrtc-sys` lib-link test prints the live factory codec
-list, e.g. `opus, G722, PCMU, PCMA, VP8, AV1, VP9`. (H.264 is intentionally off —
-`rtc_use_h264=false`; macOS/iOS use hardware H.264 via VideoToolbox instead.)
+list, e.g. `opus, G722, PCMU, PCMA, VP8, AV1, VP9`. (H.264 is intentionally off
+here — `rtc_use_h264=false`, since macOS/iOS have hardware H.264 available via
+VideoToolbox instead of a software codec compiled into `libwebrtc.a`. That HW
+path isn't wired into the glue yet, though — see `crates/reactor-webrtc/README.md`
+→ "Target support" for the current, real per-platform H.264 status, and
+`crates/reactor-webrtc-sys/src/openh264.rs` for the software path Linux/Windows
+get instead.)
 
 ---
 
