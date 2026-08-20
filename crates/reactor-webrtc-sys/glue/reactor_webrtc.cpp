@@ -71,6 +71,13 @@
 #include "api/video_codecs/builtin_video_decoder_factory.h"
 #include "api/video_codecs/builtin_video_encoder_factory.h"
 #include "api/video_codecs/video_encoder_factory.h"
+#if defined(WEBRTC_MAC)
+// Real VideoToolbox H.264 -- see
+// webrtc-build/patches/0004-webrtc-add-apple-videotoolbox-h264.patch for the
+// umbrella deps this needs. WEBRTC_MAC is defined for both macOS and iOS
+// (mirrors the patch's `is_mac || is_ios` condition).
+#include "apple_hw/apple_hw_codec.h"
+#endif
 #include "media/base/video_broadcaster.h"
 #include "modules/audio_device/include/audio_device_default.h"
 #include "modules/video_coding/codecs/interface/common_constants.h"
@@ -927,13 +934,24 @@ void* reactor_webrtc_factory_create_with_adm_apm(int use_platform_adm,
 
   auto apm = build_apm(apm_flags);
 
+#if defined(WEBRTC_MAC)
+  std::unique_ptr<webrtc::VideoEncoderFactory> video_encoder_factory =
+      reactor::CreateAppleHwVideoEncoderFactory();
+  std::unique_ptr<webrtc::VideoDecoderFactory> video_decoder_factory =
+      reactor::CreateAppleHwVideoDecoderFactory();
+#else
+  std::unique_ptr<webrtc::VideoEncoderFactory> video_encoder_factory =
+      webrtc::CreateBuiltinVideoEncoderFactory();
+  std::unique_ptr<webrtc::VideoDecoderFactory> video_decoder_factory =
+      webrtc::CreateBuiltinVideoDecoderFactory();
+#endif
+
   f->factory = webrtc::CreatePeerConnectionFactory(
       f->network_thread.get(), f->worker_thread.get(),
       f->signaling_thread.get(), adm,
       webrtc::CreateBuiltinAudioEncoderFactory(),
       webrtc::CreateBuiltinAudioDecoderFactory(),
-      webrtc::CreateBuiltinVideoEncoderFactory(),
-      webrtc::CreateBuiltinVideoDecoderFactory(),
+      std::move(video_encoder_factory), std::move(video_decoder_factory),
       /*audio_mixer=*/nullptr, /*audio_processing=*/apm);
   if (!f->factory) {
     return nullptr;
@@ -1949,11 +1967,19 @@ class ReactorNullVideoDecoder : public webrtc::VideoDecoder {
   }
 };
 
-// Wraps the builtin video decoder factory and adds null decoders for H264 and
+// Wraps the builtin video decoder factory and adds decoders for H264 and
 // H265, which this libwebrtc build (compiled without WEBRTC_USE_H264) does not
-// include. VP8, VP9, and AV1 are handled by the builtin factory as usual.
+// include in the builtin factory. VP8, VP9, and AV1 are handled by the
+// builtin factory as usual. On macOS/iOS, H264 decodes for real via
+// VideoToolbox (see apple_hw/apple_hw_codec.h); everywhere else -- and H265
+// everywhere, VideoToolbox H265 decode isn't wired here -- falls back to a
+// null decoder that still claims support (so SDP negotiation succeeds with
+// peers that only offer those codecs) but discards every received frame.
 class ReactorCustomDecoderFactory : public webrtc::VideoDecoderFactory {
   std::unique_ptr<webrtc::VideoDecoderFactory> builtin_;
+#if defined(WEBRTC_MAC)
+  std::unique_ptr<webrtc::VideoDecoderFactory> apple_h264_;
+#endif
 
   static bool IsBuiltinCodec(const webrtc::SdpVideoFormat& f) {
     return f.name == "VP8" || f.name == "VP9" || f.name == "AV1";
@@ -1961,7 +1987,13 @@ class ReactorCustomDecoderFactory : public webrtc::VideoDecoderFactory {
 
  public:
   ReactorCustomDecoderFactory()
-      : builtin_(webrtc::CreateBuiltinVideoDecoderFactory()) {}
+      : builtin_(webrtc::CreateBuiltinVideoDecoderFactory())
+#if defined(WEBRTC_MAC)
+        ,
+        apple_h264_(reactor::CreateAppleHwVideoDecoderFactory())
+#endif
+  {
+  }
 
   std::vector<webrtc::SdpVideoFormat> GetSupportedFormats() const override {
     auto formats = builtin_->GetSupportedFormats();
@@ -1977,6 +2009,9 @@ class ReactorCustomDecoderFactory : public webrtc::VideoDecoderFactory {
       const webrtc::Environment& env,
       const webrtc::SdpVideoFormat& format) override {
     if (IsBuiltinCodec(format)) return builtin_->Create(env, format);
+#if defined(WEBRTC_MAC)
+    if (format.name == "H264") return apple_h264_->Create(env, format);
+#endif
     return std::make_unique<ReactorNullVideoDecoder>("ReactorNull_" + format.name);
   }
 };

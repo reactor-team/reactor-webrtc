@@ -180,12 +180,14 @@ fn compile_glue(include_dir: &Path, is_debug_prebuilt: bool) {
             build
                 .define("WEBRTC_POSIX", None)
                 .define("WEBRTC_MAC", None);
+            compile_apple_hw_glue(include_dir, is_debug_prebuilt, &[]);
         }
         "ios" => {
             build
                 .define("WEBRTC_POSIX", None)
                 .define("WEBRTC_MAC", None)
                 .define("WEBRTC_IOS", None);
+            compile_apple_hw_glue(include_dir, is_debug_prebuilt, &[("WEBRTC_IOS", None)]);
         }
         "android" => {
             build
@@ -260,6 +262,52 @@ fn compile_glue(include_dir: &Path, is_debug_prebuilt: bool) {
     }
 
     build.compile("reactor_webrtc_glue");
+}
+
+/// Compile `glue/apple_hw/apple_hw_codec.mm` (real VideoToolbox H.264 via the
+/// RTC_OBJC_TYPE bridging classes) as its own static lib, separate from
+/// `compile_glue`'s `cc::Build`: Objective-C++ needs `-fobjc-arc` (WebRTC's
+/// own gn build enables ARC for all its objc/objc++ sources) so the alloc'd
+/// RTCVideoEncoderFactoryH264/RTCVideoDecoderFactoryH264 instances are kept
+/// alive for as long as the native factory wrapping them holds a reference —
+/// applying that flag to reactor_webrtc.cpp's plain-C++ translation unit as
+/// well would be needless (and `cc` sets flags per-Build, not per-file).
+fn compile_apple_hw_glue(
+    include_dir: &Path,
+    is_debug_prebuilt: bool,
+    extra_defines: &[(&str, Option<&str>)],
+) {
+    println!("cargo:rerun-if-changed=glue/apple_hw/apple_hw_codec.mm");
+    println!("cargo:rerun-if-changed=glue/apple_hw/apple_hw_codec.h");
+
+    let mut build = cc::Build::new();
+    build
+        .cpp(true)
+        .file("glue/apple_hw/apple_hw_codec.mm")
+        .include(include_dir)
+        .include(include_dir.join("third_party/abseil-cpp"))
+        .include(include_dir.join("third_party/libyuv/include"))
+        // The objc SDK headers use two different quoted-include conventions
+        // for the same files under sdk/objc/base/ — some as a bare filename
+        // ("RTCVideoDecoderFactory.h", e.g. RTCVideoDecoderFactoryH264.h) and
+        // others as "base/<file>.h" (e.g. sdk/objc/native/api/video_decoder_
+        // factory.h) — matching how WebRTC's own gn build adds both
+        // sdk/objc/base and sdk/objc to the header search path.
+        .include(include_dir.join("sdk/objc/base"))
+        .include(include_dir.join("sdk/objc"))
+        .std("c++20")
+        .flag("-fobjc-arc")
+        .define("WEBRTC_POSIX", None)
+        .define("WEBRTC_MAC", None)
+        .warnings(false);
+    for (name, value) in extra_defines {
+        build.define(name, *value);
+    }
+    if !is_debug_prebuilt {
+        build.define("NDEBUG", None);
+    }
+
+    build.compile("reactor_apple_hw_glue");
 }
 
 /// Per-target system libraries/frameworks libwebrtc needs at final link.
