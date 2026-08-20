@@ -15,11 +15,22 @@ build = "build.rs"
 [lib]
 doctest = false
 
+[features]
+# Runtime-downloaded OpenH264 (Cisco's prebuilt binary, dynamically loaded —
+# see reactor-webrtc-sys/README.md "OpenH264" section). Off by default: pulls
+# in an HTTP client + hashing + decompression + cache-dir crates that a
+# consumer who doesn't want H.264 shouldn't have to build.
+openh264 = ["dep:ureq", "dep:sha1", "dep:bzip2", "dep:dirs"]
+
 [dependencies]
+# openh264 feature: download (ureq), verify (sha1, matching Cisco's published
+# .sha1 sidecars), decompress (bzip2 — Cisco ships .bz2, and stock Windows has
+# no system libbz2 to shell out to), and cache (dirs) the prebuilt library.
+ureq = { version = "2", optional = true, default-features = false, features = ["tls"] }
+sha1 = { version = "0.10", optional = true }
+bzip2 = { version = "0.4", optional = true }
+dirs = { version = "5", optional = true }
 
 [build-dependencies]
 # Compiles the C++ glue (glue/*.cpp) against the WebRTC headers.
 cc = "1"
-# Real prebuilt download + checksum verification will use these (wired later):
-# sha2 = "0.10"
-# ureq = { version = "2", default-features = false, features = ["tls"] }
