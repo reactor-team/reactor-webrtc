@@ -192,6 +192,13 @@ fn compile_glue(include_dir: &Path, is_debug_prebuilt: bool) {
                 .define("WEBRTC_POSIX", None)
                 .define("WEBRTC_LINUX", None)
                 .define("WEBRTC_ANDROID", None);
+            // Real H.264 via WebRTC's own MediaCodec-backed Java factories,
+            // JNI-bridged in (see glue/android_hw/android_hw_codec.h). Unlike
+            // the OpenH264 track this needs no opt-in Cargo feature -- it's
+            // Android-only code already, and needs no extra runtime deps.
+            println!("cargo:rerun-if-changed=glue/android_hw/android_hw_codec.cc");
+            println!("cargo:rerun-if-changed=glue/android_hw/android_hw_codec.h");
+            build.file("glue/android_hw/android_hw_codec.cc");
         }
         "linux" => {
             build
