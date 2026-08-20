@@ -161,6 +161,19 @@ fn compile_glue(include_dir: &Path, is_debug_prebuilt: bool) {
         .std("c++20")
         .warnings(false);
 
+    // Real H.264 via a dynamically loaded OpenH264 (see src/openh264.rs for
+    // why it's dlopen'd rather than compiled in). Opt-in: only compiled when
+    // the `openh264` Cargo feature is enabled, so consumers who don't want it
+    // don't pay for the extra translation unit. REACTOR_WEBRTC_OPENH264 gates
+    // the corresponding FFI entry point + #include in reactor_webrtc.cpp.
+    if env::var_os("CARGO_FEATURE_OPENH264").is_some() {
+        println!("cargo:rerun-if-changed=glue/openh264/openh264_codec.cc");
+        println!("cargo:rerun-if-changed=glue/openh264/openh264_codec.h");
+        build
+            .file("glue/openh264/openh264_codec.cc")
+            .define("REACTOR_WEBRTC_OPENH264", None);
+    }
+
     // WebRTC headers branch on these platform macros (mirrors gn's defines).
     match env::var("CARGO_CFG_TARGET_OS").unwrap_or_default().as_str() {
         "macos" => {

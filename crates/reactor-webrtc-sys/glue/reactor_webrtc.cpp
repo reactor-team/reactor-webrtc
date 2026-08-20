@@ -83,6 +83,10 @@
 #include "third_party/libyuv/include/libyuv/convert.h"
 #include "third_party/libyuv/include/libyuv/convert_argb.h"
 
+#ifdef REACTOR_WEBRTC_OPENH264
+#include "openh264/openh264_codec.h"
+#endif
+
 // ── C ABI types (must match crates/reactor-webrtc-sys/src/lib.rs) ─────────────
 
 extern "C" {
@@ -2016,6 +2020,50 @@ void* reactor_webrtc_factory_create_with_custom_video_encoder(
   if (!f->factory) return nullptr;
   return f.release();
 }
+
+#ifdef REACTOR_WEBRTC_OPENH264
+// Create a factory with real H.264 encode/decode backed by a dynamically
+// loaded OpenH264 shared library at `lib_path` (see
+// crates/reactor-webrtc-sys/src/openh264.rs::ensure_available). VP8/VP9/AV1
+// stay on the builtin factories; only H264 routes through OpenH264. If the
+// library fails to load, H264 is simply not advertised in SDP (see
+// glue/openh264/openh264_codec.h) rather than the factory constructor
+// failing outright.
+void* reactor_webrtc_factory_create_with_openh264(const char* lib_path,
+                                                   int use_platform_adm,
+                                                   int apm_flags) {
+  auto lib = reactor::OpenH264Library::Open(lib_path ? lib_path : "");
+  std::shared_ptr<reactor::OpenH264Library> shared_lib(lib.release());
+
+  auto f = std::make_unique<ReactorFactory>();
+  f->network_thread   = webrtc::Thread::CreateWithSocketServer();
+  f->worker_thread    = webrtc::Thread::Create();
+  f->signaling_thread = webrtc::Thread::Create();
+  if (!f->network_thread->Start() || !f->worker_thread->Start() ||
+      !f->signaling_thread->Start()) {
+    return nullptr;
+  }
+
+  webrtc::scoped_refptr<webrtc::AudioDeviceModule> adm;
+  if (!use_platform_adm) {
+    f->adm = webrtc::make_ref_counted<FrameAdm>();
+    adm    = f->adm;
+  }
+
+  auto apm = build_apm(apm_flags);
+
+  f->factory = webrtc::CreatePeerConnectionFactory(
+      f->network_thread.get(), f->worker_thread.get(),
+      f->signaling_thread.get(), adm,
+      webrtc::CreateBuiltinAudioEncoderFactory(),
+      webrtc::CreateBuiltinAudioDecoderFactory(),
+      reactor::CreateOpenH264VideoEncoderFactory(shared_lib),
+      reactor::CreateOpenH264VideoDecoderFactory(shared_lib),
+      /*audio_mixer=*/nullptr, /*audio_processing=*/apm);
+  if (!f->factory) return nullptr;
+  return f.release();
+}
+#endif  // REACTOR_WEBRTC_OPENH264
 
 // Replace the encoded payload of the frame currently in the callback. Copies.
 void reactor_webrtc_encoded_frame_set_data(void* frame, const uint8_t* data,

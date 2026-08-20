@@ -234,6 +234,68 @@ fn links_and_runs_libwebrtc() {
     }
 }
 
+#[cfg(feature = "openh264")]
+#[test]
+fn openh264_factory_degrades_without_a_library() {
+    // No real OpenH264 .so/.dylib/.dll is available in this environment (it's
+    // fetched at runtime by `openh264::ensure_available`, which needs real
+    // network access and isn't part of this link test). Feed a bogus path and
+    // confirm the factory still comes up — OpenH264VideoEncoderFactory/
+    // DecoderFactory (glue/openh264/openh264_codec.cc) are supposed to
+    // degrade to "H264 not advertised, everything else builtin" rather than
+    // fail construction — proving the FFI wiring itself (not the codec) is
+    // sound. A real end-to-end OpenH264 encode/decode loopback needs Part 1's
+    // verification step 1 (a real downloaded library) run manually.
+    unsafe {
+        let bad_path = CString::new("/nonexistent/libopenh264.so").unwrap();
+        let factory = reactor_webrtc_sys::reactor_webrtc_factory_create_with_openh264(
+            bad_path.as_ptr(),
+            0,
+            0,
+        );
+        assert!(
+            !factory.is_null(),
+            "factory creation should degrade, not fail, when OpenH264 can't load"
+        );
+        let pc = create_pc(factory, ptr::null(), ptr::null())
+            .expect("peer connection creation (openh264 factory, library absent)");
+
+        // A track is needed so the offer actually enumerates a video m-line
+        // (and therefore its codec list) — otherwise "no h264 in the SDP"
+        // would trivially hold for the wrong reason (no video section at all).
+        let vid_id = CString::new("reactor-video").unwrap();
+        let vtrack = reactor_webrtc_video_track_create(factory, vid_id.as_ptr());
+        assert!(!vtrack.is_null(), "video track creation failed");
+        assert_eq!(
+            reactor_webrtc_peer_connection_add_track(pc, vtrack),
+            1,
+            "add video failed"
+        );
+
+        let (_, sdp) =
+            run_sdp(|ud| reactor_webrtc_peer_connection_create_offer(pc, ud, sdp_ok, sdp_err))
+                .expect("create offer");
+        assert!(
+            sdp.contains("m=video"),
+            "offer should include a video m-line, got: {sdp}"
+        );
+        let lower = sdp.to_lowercase();
+        assert!(
+            lower.contains("vp8"),
+            "expected VP8 still negotiable, got: {sdp}"
+        );
+        assert!(
+            !lower.contains("h264"),
+            "H264 should not be negotiable when the library failed to load, got: {sdp}"
+        );
+
+        reactor_webrtc_media_stream_track_destroy(vtrack);
+        reactor_webrtc_peer_connection_destroy(pc);
+        reactor_webrtc_factory_destroy(factory);
+        println!("openh264 factory degrade-without-library path OK");
+    }
+}
+
 #[test]
 #[ignore = "platform ADM aborts (RTC_CHECK) without an OS audio device; run with --ignored where audio exists"]
 fn platform_adm_factory_lifecycle() {
