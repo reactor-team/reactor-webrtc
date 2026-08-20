@@ -69,6 +69,10 @@ pub use peer_connection::{
     IceGatheringState, InboundRtpStats, OutboundRtpStats, PeerConnection, PeerConnectionState,
     SdpType, SessionDescription, StatsReport, Transceiver, TransceiverDirection,
 };
+/// Runtime download/verification/caching of Cisco's OpenH264 shared library,
+/// and the required attribution string — see [`PeerConnectionFactory::with_openh264`].
+#[cfg(feature = "openh264")]
+pub use reactor_webrtc_sys::openh264;
 
 /// The ABI version of the linked native build. Used to assert that the safe
 /// crate and the prebuilt `libwebrtc` agree.
@@ -281,6 +285,44 @@ impl PeerConnectionFactory {
             return Err(Error::Webrtc(
                 "factory with custom encoder returned null".into(),
             ));
+        }
+        Ok(Self {
+            handle: Arc::new(FactoryHandle(raw)),
+        })
+    }
+
+    /// Create a factory with real H.264 encode/decode backed by a
+    /// dynamically loaded OpenH264 shared library — see
+    /// [`crate::openh264::ensure_available`] to obtain `lib_path`. VP8/VP9/AV1
+    /// remain builtin; only H264 is affected.
+    ///
+    /// This never fails because OpenH264 itself couldn't be loaded: if
+    /// `lib_path` doesn't `dlopen`/`LoadLibraryW`, the factory still
+    /// constructs, H264 is simply not advertised in SDP (peers negotiate
+    /// VP8/VP9/AV1 as usual). Errors here mean factory/thread construction
+    /// itself failed, same as [`Self::with_adm_apm`].
+    ///
+    /// Requires the `openh264` crate feature. Cisco's binary license
+    /// conditions the royalty carve-out on showing
+    /// [`crate::openh264::OPENH264_ATTRIBUTION`] in your app's
+    /// licensing/EULA surface — see that constant's doc comment.
+    #[cfg(feature = "openh264")]
+    pub fn with_openh264(
+        lib_path: &std::path::Path,
+        mode: AdmMode,
+        apm: ApmConfig,
+    ) -> Result<Self> {
+        let lib_path = CString::new(lib_path.to_string_lossy().into_owned())
+            .map_err(|_| Error::Webrtc("lib_path contains a NUL byte".into()))?;
+        let raw = unsafe {
+            reactor_webrtc_sys::reactor_webrtc_factory_create_with_openh264(
+                lib_path.as_ptr(),
+                matches!(mode, AdmMode::Platform) as c_int,
+                apm.to_flags(),
+            )
+        };
+        if raw.is_null() {
+            return Err(Error::Webrtc("factory with openh264 returned null".into()));
         }
         Ok(Self {
             handle: Arc::new(FactoryHandle(raw)),
