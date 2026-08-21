@@ -904,9 +904,14 @@ pub struct FrameMetadata {
     /// Application-level frame counter (0 = unset).
     #[pyo3(get, set)]
     pub frame_id: u64,
-    /// Wall-clock timestamp in microseconds (0 = unset).
+    /// When the frame was captured, in microseconds (0 = unset).
+    ///
+    /// The value the sender declared, untouched — read from the sender's own
+    /// clock, so differences between stamps from one sender are all a receiver
+    /// can take from it. A sender that declares none gets `time_micros()` read
+    /// on its behalf.
     #[pyo3(get, set)]
-    pub timestamp: u64,
+    pub capture_time_us: u64,
     /// Arbitrary application payload (bytes).
     pub user_data: Vec<u8>,
 }
@@ -914,11 +919,11 @@ pub struct FrameMetadata {
 #[pymethods]
 impl FrameMetadata {
     #[new]
-    #[pyo3(signature = (frame_id=0, timestamp=0, user_data=vec![]))]
-    fn new(frame_id: u64, timestamp: u64, user_data: Vec<u8>) -> Self {
+    #[pyo3(signature = (frame_id=0, capture_time_us=0, user_data=vec![]))]
+    fn new(frame_id: u64, capture_time_us: u64, user_data: Vec<u8>) -> Self {
         Self {
             frame_id,
-            timestamp,
+            capture_time_us,
             user_data,
         }
     }
@@ -936,9 +941,9 @@ impl FrameMetadata {
 
     fn __repr__(&self) -> String {
         format!(
-            "FrameMetadata(frame_id={}, timestamp={}, user_data={} bytes)",
+            "FrameMetadata(frame_id={}, capture_time_us={}, user_data={} bytes)",
             self.frame_id,
-            self.timestamp,
+            self.capture_time_us,
             self.user_data.len()
         )
     }
@@ -948,7 +953,7 @@ impl From<rw::FrameMetadata> for FrameMetadata {
     fn from(m: rw::FrameMetadata) -> Self {
         Self {
             frame_id: m.frame_id,
-            timestamp: m.timestamp,
+            capture_time_us: m.capture_time_us,
             user_data: m.user_data,
         }
     }
@@ -986,16 +991,20 @@ impl Track {
     /// Push a raw BGRA video frame into a local video track.
     ///
     /// Pass `user_data` (bytes) to embed per-frame metadata in the encoded
-    /// packet trailer. `frame_id` and `timestamp` are computed automatically.
-    /// Nothing else has to be arranged: the trailer is appended once the peer has
-    /// declared that it strips them, and `user_data` is silently dropped while it
-    /// has not. See `PeerConnection.frame_metadata_gate()`.
+    /// packet trailer. `frame_id` is computed automatically. Nothing else has to
+    /// be arranged: the trailer is appended once the peer has declared that it
+    /// strips them, and `user_data` is silently dropped while it has not. See
+    /// `PeerConnection.frame_metadata_gate()`.
     ///
     /// Pass `capture_time_us` (from `time_micros()`) to say when the frame was
     /// captured, instead of letting it inherit the moment it reached the
     /// encoder. Stamping a video frame and the audio produced with it from one
-    /// `time_micros()` read is what lets the receiver play them together.
-    /// Independent of `user_data`: a frame can carry either, both, or neither.
+    /// `time_micros()` read is what lets the receiver play them together, and the
+    /// trailer carries the same value exactly, so the far end reads the number
+    /// this caller put on the frame — several tracks stamped with one read arrive
+    /// carrying that one stamp. Without it the frame is stamped from a
+    /// `time_micros()` read taken here. Independent of `user_data`: a frame can
+    /// carry either, both, or neither.
     #[pyo3(signature = (bgra, width, height, user_data=None, capture_time_us=None))]
     fn push_video_frame(
         &self,

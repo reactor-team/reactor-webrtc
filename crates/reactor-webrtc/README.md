@@ -142,7 +142,7 @@ track.push_video_frame_with_metadata(&bgra, w, h, b"anything you like");
 
 track.on_video_frame(|frame| {
     if let Some(meta) = frame.metadata {
-        // meta.user_data, meta.frame_id, meta.timestamp
+        // meta.user_data, meta.frame_id, meta.capture_time_us
     }
 });
 ```

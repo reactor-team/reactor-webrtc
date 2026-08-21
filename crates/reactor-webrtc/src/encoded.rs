@@ -720,19 +720,19 @@ impl EncodedVideoTrack {
     /// Inject a pre-encoded frame with per-frame metadata embedded as a
     /// protobuf trailer.
     ///
-    /// `frame_id` and `timestamp` are computed internally; the caller
-    /// supplies only `user_data`. Requires
+    /// `frame_id` and `capture_time_us` are filled in internally, the latter from
+    /// [`time_micros`](crate::time_micros); the caller supplies only `user_data`.
+    /// A capture time cannot be declared here the way it can on a raw
+    /// [`Track`](crate::Track): these frames arrive already encoded and the
+    /// encoder clamps future capture timestamps, which is why this path
+    /// correlates its metadata by FIFO order instead. Requires
     /// [`sender_metadata_transform`](Self::sender_metadata_transform) to be
     /// called and the returned [`FrameTransform`](crate::FrameTransform) to
     /// be attached to the sender transceiver before the first SDP exchange.
     pub fn push_encoded_frame_with_metadata(&self, frame: EncodedVideoFrame, user_data: &[u8]) {
-        use std::time::{SystemTime, UNIX_EPOCH};
         let meta = crate::metadata::FrameMetadata {
             frame_id: self.track.next_frame_id(),
-            timestamp: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_micros() as u64,
+            capture_time_us: crate::time_micros().max(0) as u64,
             user_data: user_data.to_vec(),
         };
         // Enqueue metadata first so the FIFO entry is always present when the

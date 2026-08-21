@@ -14,7 +14,6 @@ use std::ffi::c_void;
 use std::os::raw::c_int;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 const SENDER_META_CAP: usize = 300;
 
@@ -256,8 +255,10 @@ impl Track {
     }
 
     /// Push a BGRA frame with arbitrary `user_data` embedded in a protobuf
-    /// trailer, captured now. `frame_id` (monotonic counter) and `timestamp`
-    /// (Unix epoch µs) are computed internally.
+    /// trailer, captured now. `frame_id` (monotonic counter) and
+    /// `capture_time_us` ([`time_micros`] read here) are filled in internally;
+    /// [`push_video_frame_with_metadata_at`](Self::push_video_frame_with_metadata_at)
+    /// is the same push with the capture time declared by the caller.
     ///
     /// Requires [`sender_metadata_transform`](Self::sender_metadata_transform)
     /// to be attached to the sender transceiver; otherwise the frame goes out
@@ -277,14 +278,21 @@ impl Track {
     /// Push a BGRA frame with a metadata trailer and a caller-supplied capture
     /// time, in [`time_micros`]'s epoch.
     ///
-    /// Carrying metadata and carrying a capture time are independent choices:
-    /// a frame the model annotated still has to line up with the audio produced
-    /// alongside it, so the trailer must not cost the caller its timestamp.
+    /// `capture_time_us` does two jobs, and they want different things from it.
+    /// The trailer carries it **exactly**, so the receiver reads the number the
+    /// caller put on the frame — that is the caller's own timeline, and rounding
+    /// it would be this library editing a value it does not own. Playout
+    /// synchronisation gets it too, so a frame the model annotated still lines up
+    /// with the audio produced alongside it: the trailer must not cost the caller
+    /// its timestamp.
     ///
-    /// The trailer is matched to its frame by capture millisecond, so two
-    /// frames stamped inside the same millisecond would collide. The second is
-    /// nudged to the following millisecond — far below the resolution any
-    /// synchronisation cares about, and only reachable above 1000 fps.
+    /// Synchronisation is where the rounding lives. The trailer is matched to its
+    /// frame by capture millisecond, so two frames stamped inside the same
+    /// millisecond would collide; the second is nudged to the following one —
+    /// far below the resolution any synchronisation cares about, and only
+    /// reachable above 1000 fps. Neither the truncation nor the nudge reaches the
+    /// trailer, so the value delivered is the value passed, and several tracks
+    /// pushed with one stamp deliver that one stamp.
     ///
     /// No-op for non-video tracks.
     pub fn push_video_frame_with_metadata_at(
@@ -309,13 +317,19 @@ impl Track {
         if self.kind != MediaKind::Video {
             return;
         }
-        let capture_us = self.alloc_send_capture_us(capture_time_us);
+        // One reading, two uses. The trailer carries it exactly as it is, because
+        // that is the caller's own timeline and rounding it would be this library
+        // editing a number it does not own. The join key and the capture
+        // timestamp libwebrtc gets are derived from the same value, and the
+        // millisecond truncation and uniqueness nudge they need stop there.
+        let declared = capture_time_us.unwrap_or_else(crate::time_micros);
+        let capture_us = self.alloc_send_capture_us(Some(declared));
         let meta = crate::metadata::FrameMetadata {
             frame_id: self.next_frame_id(),
-            timestamp: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_micros() as u64,
+            // The wire field is unsigned and 0 is its "unset", so a negative
+            // reading has nowhere to land and says nothing instead of a wrapped
+            // number that would read as 584 thousand years from now.
+            capture_time_us: declared.max(0) as u64,
             user_data: user_data.to_vec(),
         };
         self.insert_sender_meta(capture_us / 1000, meta);

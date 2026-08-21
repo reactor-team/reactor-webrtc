@@ -30,7 +30,10 @@ track.push_video_frame_with_metadata(&bgra, width, height, b"anything you like")
 
 track.on_video_frame(|frame| {
     if let Some(metadata) = &frame.metadata {
-        println!("{} {} {:?}", metadata.frame_id, metadata.timestamp, metadata.user_data);
+        println!(
+            "{} {} {:?}",
+            metadata.frame_id, metadata.capture_time_us, metadata.user_data
+        );
     }
 });
 ```
@@ -45,7 +48,7 @@ track.push_video_frame(bgra, width, height, user_data=b"anything you like")
 
 def on_frame(bgra, width, height, metadata):
     if metadata is not None:
-        print(metadata.frame_id, metadata.timestamp, metadata.user_data)
+        print(metadata.frame_id, metadata.capture_time_us, metadata.user_data)
 
 track.on_video_frame(on_frame)
 ```
@@ -55,6 +58,20 @@ track.on_video_frame(on_frame)
 `EncodedVideoTrack` takes the same `user_data` argument on
 `push_encoded_frame_with_metadata` (Rust) / `push_encoded_frame(...,
 user_data=...)` (Python).
+
+Beside your bytes the trailer carries two fields the library fills in:
+`frame_id`, a per-track counter, and `capture_time_us`, when the frame was
+captured. A push that declares a capture time (`push_video_frame_with_metadata_at`
+in Rust, `capture_time_us=` in Python — see [A/V sync](av-sync.md)) is carried
+across **exactly**, so the receiver reads the number the sender put on the frame;
+several tracks stamped from one clock read therefore arrive carrying that one
+stamp, which is what makes a multi-camera capture readable as a single moment. A
+push that declares none is stamped with a `time_micros()` reading taken for it.
+
+The stamp comes off the sender's clock, and what that clock is measuring is the
+sender's business. Differences between stamps from one sender are meaningful;
+subtracting one from a local reading measures the offset between two clocks as
+much as anything about the frame.
 
 `metadata`/`frame.metadata` is `None` whenever the far peer hasn't agreed to
 strip the trailer (see below), or the sender didn't include one for that

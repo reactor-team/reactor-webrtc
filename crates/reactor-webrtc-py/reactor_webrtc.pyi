@@ -253,15 +253,21 @@ class FrameMetadataGate:
 class FrameMetadata:
     """Metadata attached to a video frame via the RTP packet trailer.
 
-    All fields are zero / empty when not set by the sender."""
+    All fields are zero / empty when not set by the sender.
+
+    `capture_time_us` is when the sender says the frame was captured: the value it
+    passed to `push_video_frame`, untouched, or a `time_micros()` read taken on
+    its behalf when it passed none. It comes off the sender's clock, so
+    differences between stamps from one sender are what it supports — not a
+    comparison against a local reading."""
 
     frame_id: int
-    timestamp: int
+    capture_time_us: int
     user_data: bytes
     def __init__(
         self,
         frame_id: int = 0,
-        timestamp: int = 0,
+        capture_time_us: int = 0,
         user_data: bytes = b"",
     ) -> None: ...
 

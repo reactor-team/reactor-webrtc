@@ -94,9 +94,18 @@ pub struct FrameMetadata {
     /// Application-level frame counter (0 = unset).
     #[prost(uint64, tag = "1")]
     pub frame_id: u64,
-    /// Wall-clock timestamp in microseconds (0 = unset).
+    /// When the frame was captured, in microseconds (0 = unset).
+    ///
+    /// The value the sender declared, carried across untouched: the clock it was
+    /// read from is the sender's business, so a receiver can take differences
+    /// between stamps from one sender and nothing else. A sender that declares
+    /// none gets [`time_micros`](crate::time_micros) read on its behalf, which is
+    /// the same clock the capture-time arguments are documented in.
+    ///
+    /// A reading before that clock's own origin has no representation here and
+    /// arrives as unset.
     #[prost(uint64, tag = "2")]
-    pub timestamp: u64,
+    pub capture_time_us: u64,
     /// Arbitrary application payload.
     #[prost(bytes = "vec", tag = "3")]
     pub user_data: Vec<u8>,
@@ -148,13 +157,13 @@ mod tests {
     fn round_trip_all_fields() {
         let meta = FrameMetadata {
             frame_id: 42,
-            timestamp: 1_000_000,
+            capture_time_us: 1_000_000,
             user_data: b"hello".to_vec(),
         };
         let frame = make_frame(b"VIDEO", &meta);
         let (decoded, payload) = decode_and_strip_trailer(&frame).expect("should decode");
         assert_eq!(decoded.frame_id, 42);
-        assert_eq!(decoded.timestamp, 1_000_000);
+        assert_eq!(decoded.capture_time_us, 1_000_000);
         assert_eq!(decoded.user_data, b"hello");
         assert_eq!(payload, b"VIDEO");
     }
@@ -165,7 +174,7 @@ mod tests {
         let frame = make_frame(b"FRAME", &meta);
         let (decoded, payload) = decode_and_strip_trailer(&frame).expect("should decode");
         assert_eq!(decoded.frame_id, 0);
-        assert_eq!(decoded.timestamp, 0);
+        assert_eq!(decoded.capture_time_us, 0);
         assert!(decoded.user_data.is_empty());
         assert_eq!(payload, b"FRAME");
     }
@@ -188,13 +197,13 @@ mod tests {
     fn round_trip_empty_payload() {
         let meta = FrameMetadata {
             frame_id: 1,
-            timestamp: 2,
+            capture_time_us: 2,
             ..Default::default()
         };
         let frame = make_frame(b"", &meta);
         let (decoded, payload) = decode_and_strip_trailer(&frame).expect("should decode");
         assert_eq!(decoded.frame_id, 1);
-        assert_eq!(decoded.timestamp, 2);
+        assert_eq!(decoded.capture_time_us, 2);
         assert!(payload.is_empty());
     }
 

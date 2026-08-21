@@ -111,6 +111,15 @@ doing the work.
 timestamps *are* capture times, at 90 kHz. `push_video_frame_at` therefore
 changes what goes on the wire unconditionally.
 
+A frame that also carries [per-frame metadata](frame-metadata.md) carries the
+capture time a second way, and the two differ in what they preserve. The RTP
+timestamp is truncated to the millisecond and nudged forward when two frames of
+one track share a millisecond, because it doubles as the key that pairs a frame
+with its trailer. The trailer's own `capture_time_us` field is the value as
+passed, so a receiver that needs the sender's exact number reads it there — and
+several tracks stamped from one clock read all deliver that one number, which the
+per-track RTP nudge cannot promise.
+
 **Audio** does not. The RTP timestamp stays the sample counter, and the capture
 time reaches the wire only through the `abs-capture-time` RTP header extension.
 libwebrtc registers that extension as a capability on both engines but leaves it

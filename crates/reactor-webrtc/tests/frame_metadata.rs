@@ -145,7 +145,7 @@ fn varying_bgra(seed: u8) -> Vec<u8> {
 /// Sender pushes frames with `user_data`; receiver transform strips the
 /// trailer and delivers `FrameMetadata` via `VideoFrame::metadata`.
 /// Verifies `user_data`, monotonically-increasing `frame_id`, and a non-zero
-/// `timestamp`.
+/// `capture_time_us`.
 #[test]
 fn frame_metadata_roundtrip() {
     let factory = PeerConnectionFactory::new().expect("factory");
@@ -222,8 +222,8 @@ fn frame_metadata_roundtrip() {
         );
         assert!(meta.frame_id > 0, "frame_id must be non-zero (sample {i})");
         assert!(
-            meta.timestamp > 0,
-            "timestamp must be non-zero (sample {i})"
+            meta.capture_time_us > 0,
+            "capture_time_us must be non-zero (sample {i})"
         );
     }
 
@@ -389,8 +389,8 @@ fn encoded_frame_metadata_roundtrip() {
         );
         assert!(meta.frame_id > 0, "frame_id must be non-zero (sample {i})");
         assert!(
-            meta.timestamp > 0,
-            "timestamp must be non-zero (sample {i})"
+            meta.capture_time_us > 0,
+            "capture_time_us must be non-zero (sample {i})"
         );
     }
 

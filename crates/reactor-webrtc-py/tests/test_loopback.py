@@ -539,7 +539,154 @@ class TestFrameMetadata:
         meta = received_meta[0]
         assert bytes(meta.user_data) == user_data, f"user_data mismatch: {meta.user_data!r}"
         assert meta.frame_id > 0, "frame_id must be non-zero"
-        assert meta.timestamp > 0, "timestamp must be non-zero"
+        assert meta.capture_time_us > 0, "capture_time_us must be non-zero"
+
+    async def test_a_declared_capture_time_arrives_exactly(self, factory):
+        """The stamp the caller puts on a frame is the stamp the receiver reads.
+
+        Not "close to": the value is a point on the caller's own timeline, and a
+        receiver comparing two of them can only do so if neither was rounded or
+        rebased on the way through.
+        """
+        recv_track_ref: list = []
+        received_meta: list[rw.FrameMetadata] = []
+
+        def on_track(kind, track):
+            if kind == rw.MediaKind.Video:
+                recv_track_ref.append(track)
+                track.on_video_frame(
+                    lambda bgra, w, h, meta: received_meta.append(meta)
+                    if meta is not None
+                    else None
+                )
+
+        p1 = make_peer(factory)
+        p2 = make_peer(factory, on_track=on_track)
+
+        video = factory.create_video_track("stamped-video")
+        tx1 = p1.pc.add_transceiver(rw.MediaKind.Video, rw.TransceiverDirection.SendOnly)
+        await tx1.set_track(video)
+        assert await connect(p1, p2), "peers did not connect within timeout"
+
+        # Stamps a 30 fps source would produce, spaced on the clock the capture
+        # time is read in — a value from outside that clock's range is a capture
+        # time libwebrtc's own pipeline has to reconcile, and dropped frames are
+        # not what this test is about. The scale is what makes the assertion
+        # sharp: these are microseconds since the engine started, so a delivered
+        # value from any other clock cannot land in the set by accident.
+        base = rw.time_micros()
+        pushed = {base + i * 33_333 for i in range(90)}
+        bgra = bytes(320 * 240 * 4)
+        for i in range(90):
+            if received_meta:
+                break
+            video.push_video_frame(
+                bgra, 320, 240, user_data=b"stamped", capture_time_us=base + i * 33_333
+            )
+            await asyncio.sleep(0.033)
+
+        assert await wait_for(lambda: len(received_meta) > 0), "no metadata received"
+        delivered = received_meta[0].capture_time_us
+        assert delivered in pushed, f"{delivered} is not one of the stamps pushed"
+
+    async def test_two_tracks_stamped_together_deliver_one_stamp(self, factory):
+        """One capture, two tracks: the receiver has to read them as one moment.
+
+        Without the caller's value reaching the trailer each track carries the
+        instant its own push happened to land, and a tick of several views arrives
+        looking like several ticks.
+        """
+        recv_track_refs: list = []
+        # One bucket per inbound track, in arrival order — the receive side has no
+        # name to key on, and which of the two is which does not matter here.
+        seen: list[list[rw.FrameMetadata]] = []
+
+        def on_track(kind, track):
+            if kind != rw.MediaKind.Video:
+                return
+            recv_track_refs.append(track)
+            bucket: list[rw.FrameMetadata] = []
+            seen.append(bucket)
+            track.on_video_frame(
+                lambda bgra, w, h, meta: bucket.append(meta) if meta is not None else None
+            )
+
+        p1 = make_peer(factory)
+        p2 = make_peer(factory, on_track=on_track)
+
+        left = factory.create_video_track("left-view")
+        right = factory.create_video_track("right-view")
+        for track in (left, right):
+            tx = p1.pc.add_transceiver(rw.MediaKind.Video, rw.TransceiverDirection.SendOnly)
+            await tx.set_track(track)
+        assert await connect(p1, p2), "peers did not connect within timeout"
+
+        def stamps(index: int) -> set[int]:
+            return {meta.capture_time_us for meta in seen[index]} if len(seen) > index else set()
+
+        def a_tick_arrived_whole() -> bool:
+            """Some tick delivered its one stamp on both tracks.
+
+            The property, stated as the wait condition rather than checked after a
+            fixed number of frames: which tick survives encoding on each track is
+            not something a test gets to choose.
+            """
+            return bool(stamps(0) & stamps(1))
+
+        bgra = bytes(320 * 240 * 4)
+        # One clock read per tick, both tracks stamped from it — the pattern a
+        # multi-camera client uses. Ticks advance so the pipeline sees a moving
+        # source; what cannot happen under the old per-push instants is two tracks
+        # ever agreeing on one value.
+        for _ in range(90):
+            if a_tick_arrived_whole():
+                break
+            stamp = rw.time_micros()
+            for name, track in (("left", left), ("right", right)):
+                track.push_video_frame(
+                    bgra, 320, 240, user_data=name.encode(), capture_time_us=stamp
+                )
+            await asyncio.sleep(0.033)
+
+        ok = await wait_for(a_tick_arrived_whole)
+        assert ok, (
+            "no tick arrived with one stamp on both tracks: "
+            f"{sorted(stamps(0))[:3]} vs {sorted(stamps(1))[:3]}"
+        )
+
+    async def test_an_undeclared_capture_time_is_filled_in(self, factory):
+        """No stamp passed is not "no stamp delivered": the library reads the clock
+        the capture-time arguments are documented in and puts that on the frame."""
+        recv_track_ref: list = []
+        received_meta: list[rw.FrameMetadata] = []
+
+        def on_track(kind, track):
+            if kind == rw.MediaKind.Video:
+                recv_track_ref.append(track)
+                track.on_video_frame(
+                    lambda bgra, w, h, meta: received_meta.append(meta)
+                    if meta is not None
+                    else None
+                )
+
+        p1 = make_peer(factory)
+        p2 = make_peer(factory, on_track=on_track)
+
+        video = factory.create_video_track("unstamped-video")
+        tx1 = p1.pc.add_transceiver(rw.MediaKind.Video, rw.TransceiverDirection.SendOnly)
+        await tx1.set_track(video)
+        assert await connect(p1, p2), "peers did not connect within timeout"
+
+        before = rw.time_micros()
+        bgra = bytes(320 * 240 * 4)
+        for _ in range(90):
+            if received_meta:
+                break
+            video.push_video_frame(bgra, 320, 240, user_data=b"unstamped")
+            await asyncio.sleep(0.033)
+
+        assert await wait_for(lambda: len(received_meta) > 0), "no metadata received"
+        assert before <= received_meta[0].capture_time_us <= rw.time_micros()
 
     async def test_legacy_peer_gets_no_trailer(self, factory):
         """Against a peer that never declares, no trailer reaches the wire at all.
