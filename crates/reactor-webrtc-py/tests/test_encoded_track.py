@@ -166,7 +166,7 @@ class TestEncodedFrameMetadata:
 
         Pushes dummy encoded bytes tagged with user_data; on the receiver uses
         receiver_metadata_transform + on_video_frame to collect FrameMetadata.
-        Asserts user_data roundtrip, non-zero frame_id, and non-zero timestamp.
+        Asserts user_data roundtrip, non-zero frame_id, and non-zero capture_time_us.
 
         NOTE: the decoder will likely fail to decode the dummy bytes, so
         on_video_frame may not fire.  The primary assertion is the trailer
@@ -212,4 +212,4 @@ class TestEncodedFrameMetadata:
             meta = received_meta[0]
             assert bytes(meta.user_data) == user_data, f"user_data mismatch: {meta.user_data!r}"
             assert meta.frame_id > 0, "frame_id must be non-zero"
-            assert meta.timestamp > 0, "timestamp must be non-zero"
+            assert meta.capture_time_us > 0, "capture_time_us must be non-zero"
