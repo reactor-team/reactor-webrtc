@@ -17,8 +17,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use reactor_webrtc::{
-    IceCandidate, MediaKind, PeerConnection, PeerConnectionFactory, PeerConnectionObserver,
-    PeerConnectionState, RtcConfiguration, Track,
+    IceCandidate, PeerConnection, PeerConnectionFactory, PeerConnectionObserver,
+    PeerConnectionState, RemoteTrack, RtcConfiguration,
 };
 
 #[derive(Default)]
@@ -28,7 +28,7 @@ struct Shared {
     video_frames: AtomicU32,
     audio_frames: AtomicU32,
     // Received remote tracks, kept alive (with their sinks) for the test.
-    recv: Mutex<Vec<Track>>,
+    recv: Mutex<Vec<RemoteTrack>>,
 }
 
 fn make_peer(
@@ -51,11 +51,11 @@ fn make_peer(
         })
         .on_track({
             let s = shared.clone();
-            move |kind, track| {
-                match kind {
-                    MediaKind::Video => {
+            move |track| {
+                match &track {
+                    RemoteTrack::Video(v) => {
                         let s = s.clone();
-                        track.on_video_frame(move |f| {
+                        v.on_frame(move |f| {
                             if f.bgra.len() == (f.width * f.height * 4) as usize
                                 && !f.bgra.is_empty()
                             {
@@ -63,15 +63,14 @@ fn make_peer(
                             }
                         });
                     }
-                    MediaKind::Audio => {
+                    RemoteTrack::Audio(a) => {
                         let s = s.clone();
-                        track.on_audio_frame(move |f| {
+                        a.on_frame(move |f| {
                             if !f.pcm.is_empty() {
                                 s.audio_frames.fetch_add(1, Ordering::SeqCst);
                             }
                         });
                     }
-                    MediaKind::Unknown => {}
                 }
                 s.recv.lock().unwrap().push(track);
             }
@@ -140,7 +139,9 @@ fn safe_loopback_exchanges_media() {
             while !stop.load(Ordering::SeqCst) {
                 factory.push_audio_frame(&pcm, rate, channels);
                 if i % 3 == 0 {
-                    video.push_video_frame(&bgra, w, h);
+                    video
+                        .push_frame(reactor_webrtc::VideoFrame::new(&bgra, w, h))
+                        .expect("push frame");
                 }
                 i = i.wrapping_add(1);
                 thread::sleep(Duration::from_millis(10));

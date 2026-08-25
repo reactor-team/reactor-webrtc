@@ -39,9 +39,8 @@ fn run() {
     use std::time::{Duration, Instant};
 
     use reactor_webrtc::{
-        AudioTrackOptions, AudioTrackSource, IceCandidate, MediaKind, PeerConnection,
-        PeerConnectionFactory, PeerConnectionObserver, PeerConnectionState, RtcConfiguration,
-        Track, TransceiverDirection,
+        AudioTrackOptions, AudioTrackSource, IceCandidate, PeerConnection, PeerConnectionFactory,
+        PeerConnectionObserver, PeerConnectionState, RemoteTrack, RtcConfiguration,
     };
 
     #[derive(Default)]
@@ -50,7 +49,7 @@ fn run() {
         connected: AtomicBool,
         mic_frames: AtomicU32,
         music_frames: AtomicU32,
-        recv: Mutex<Vec<Track>>,
+        recv: Mutex<Vec<RemoteTrack>>,
     }
 
     fn make_peer(
@@ -73,11 +72,11 @@ fn run() {
             })
             .on_track({
                 let s = s.clone();
-                move |kind, track| {
-                    if kind == MediaKind::Audio {
+                move |track| {
+                    if let RemoteTrack::Audio(audio_track) = &track {
                         let idx = s.recv.lock().unwrap().len();
                         let s = s.clone();
-                        track.on_audio_frame(move |f| {
+                        audio_track.on_frame(move |f| {
                             if f.pcm.is_empty() {
                                 return;
                             }
@@ -181,7 +180,7 @@ fn run() {
                     .map(|i| ((t + i as f32 / rate as f32 * 440.0).sin() * 6_000.0) as i16)
                     .collect();
                 music_pump
-                    .push_pcm(&music_pcm, rate, channels)
+                    .push_frame(reactor_webrtc::AudioFrame::new(&music_pcm, rate, channels))
                     .expect("push_pcm");
 
                 thread::sleep(Duration::from_millis(10));

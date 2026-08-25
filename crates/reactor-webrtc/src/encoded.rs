@@ -850,15 +850,15 @@ pub struct VideoTrackOptions {
 ///   libwebrtc only packetises.
 pub enum LocalVideoTrack {
     /// A raw (BGRA-in) video track.
-    Raw(crate::media::Track),
+    Raw(crate::media::VideoTrack),
     /// A pre-encoded (bytes-in) video track.
     Encoded(EncodedVideoTrack),
 }
 
 impl LocalVideoTrack {
-    /// The underlying [`Track`](crate::media::Track) handle — attach this to
-    /// a transceiver with [`Transceiver::set_track`](crate::Transceiver::set_track).
-    pub fn track(&self) -> &crate::media::Track {
+    /// The underlying video track handle — attach this to a transceiver with
+    /// [`Transceiver::set_track`](crate::Transceiver::set_track).
+    pub fn track(&self) -> &crate::media::VideoTrack {
         match self {
             Self::Raw(t) => t,
             Self::Encoded(e) => e.track(),
@@ -873,9 +873,9 @@ impl LocalVideoTrack {
         }
     }
 
-    /// Returns the inner raw [`Track`](crate::media::Track), or `None` if
-    /// this is a pre-encoded track.
-    pub fn as_raw(&self) -> Option<&crate::media::Track> {
+    /// Returns the inner raw [`VideoTrack`](crate::media::VideoTrack), or
+    /// `None` if this is a pre-encoded track.
+    pub fn as_raw(&self) -> Option<&crate::media::VideoTrack> {
         match self {
             Self::Raw(t) => Some(t),
             Self::Encoded(_) => None,
@@ -904,7 +904,7 @@ impl LocalVideoTrack {
 /// is cheap (pre-allocated; the I420 data is discarded by the encoder
 /// callback before it ever touches your encoded bytes).
 pub struct EncodedVideoTrack {
-    pub(crate) track: crate::media::Track,
+    pub(crate) track: crate::media::VideoTrack,
     pub(crate) queue: Arc<Mutex<VecDeque<EncodedVideoFrame>>>,
     // Pre-allocated BGRA buffer used to trigger the WebRTC encoder thread.
     // The dimensions are kept in sync with the track's configured resolution
@@ -945,7 +945,7 @@ unsafe impl Sync for EncodedVideoTrack {}
 
 impl EncodedVideoTrack {
     pub(crate) fn new(
-        track: crate::media::Track,
+        track: crate::media::VideoTrack,
         queue: Arc<Mutex<VecDeque<EncodedVideoFrame>>>,
         width: u32,
         height: u32,
@@ -967,10 +967,11 @@ impl EncodedVideoTrack {
         }
     }
 
-    /// The underlying video [`Track`](crate::Track). Pass this to
-    /// [`Transceiver::set_track`](crate::Transceiver::set_track) after creating
-    /// the send-only transceiver.
-    pub fn track(&self) -> &crate::media::Track {
+    /// The underlying video track handle — pass `track()` (or the
+    /// [`VideoTrack`](crate::VideoTrack) itself) to
+    /// [`Transceiver::set_track`](crate::Transceiver::set_track); it derefs to
+    /// [`&Track`](crate::Track).
+    pub fn track(&self) -> &crate::media::VideoTrack {
         &self.track
     }
 
@@ -983,7 +984,7 @@ impl EncodedVideoTrack {
     /// Set `frame.width` / `frame.height` to 0 to inherit from the track's
     /// configured resolution — the
     /// [`PreEncodedOptions`] the track was created with.
-    pub fn push_encoded_frame(&self, frame: EncodedVideoFrame) {
+    pub fn push_frame(&self, frame: EncodedVideoFrame) -> crate::Result<()> {
         // Queue first so the frame is always present when the encoder thread
         // dequeues it (the two operations are not atomic, but the encoder
         // thread is asynchronous, so the queue push always wins the race).
@@ -991,8 +992,12 @@ impl EncodedVideoTrack {
         // Push a dummy raw frame to wake the WebRTC encoder thread.
         // The I420 data is thrown away in the encoder callback — the actual
         // encoded bytes come from the queue above.
-        self.track
-            .push_video_frame(&self.dummy, self.width, self.height);
+        self.track.push_frame(crate::media::VideoFrame::new(
+            &self.dummy,
+            self.width,
+            self.height,
+        ))?;
+        Ok(())
     }
 
     /// Inject a pre-encoded frame with per-frame metadata embedded as a
@@ -1007,7 +1012,11 @@ impl EncodedVideoTrack {
     /// [`sender_metadata_transform`](Self::sender_metadata_transform) to be
     /// called and the returned [`FrameTransform`](crate::FrameTransform) to
     /// be attached to the sender transceiver before the first SDP exchange.
-    pub fn push_encoded_frame_with_metadata(&self, frame: EncodedVideoFrame, user_data: &[u8]) {
+    pub fn push_frame_with_metadata(
+        &self,
+        frame: EncodedVideoFrame,
+        user_data: &[u8],
+    ) -> crate::Result<()> {
         let meta = crate::metadata::FrameMetadata {
             frame_id: self.track.next_frame_id(),
             capture_time_us: crate::time_micros().max(0) as u64,
@@ -1019,7 +1028,11 @@ impl EncodedVideoTrack {
             fifo.push_back(meta);
         }
         self.queue.lock().unwrap().push_back(frame);
-        self.track
-            .push_video_frame(&self.dummy, self.width, self.height);
+        self.track.push_frame(crate::media::VideoFrame::new(
+            &self.dummy,
+            self.width,
+            self.height,
+        ))?;
+        Ok(())
     }
 }

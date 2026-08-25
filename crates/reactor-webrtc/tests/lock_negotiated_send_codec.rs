@@ -210,7 +210,9 @@ fn set_local_description_locks_the_answerer_send_codec_automatically() {
                 for (i, b) in bgra.iter_mut().enumerate() {
                     *b = (i as u8).wrapping_add(t);
                 }
-                track.push_video_frame(&bgra, w, h);
+                track
+                    .push_frame(reactor_webrtc::VideoFrame::new(&bgra, w, h))
+                    .expect("push frame");
                 t = t.wrapping_add(7);
                 thread::sleep(Duration::from_millis(30));
             }
@@ -321,7 +323,9 @@ fn falls_back_to_the_next_preferred_codec_when_the_top_choice_was_not_negotiated
                 for (i, b) in bgra.iter_mut().enumerate() {
                     *b = (i as u8).wrapping_add(t);
                 }
-                track.push_video_frame(&bgra, w, h);
+                track
+                    .push_frame(reactor_webrtc::VideoFrame::new(&bgra, w, h))
+                    .expect("push frame");
                 t = t.wrapping_add(7);
                 thread::sleep(Duration::from_millis(30));
             }

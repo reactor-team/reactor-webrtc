@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use reactor_webrtc::{
     EncodedVideoFrame, FrameAction, FrameDirection, FrameMetadata, FrameTransform, IceCandidate,
     LocalVideoTrack, MediaKind, PeerConnection, PeerConnectionFactory, PeerConnectionObserver,
-    PeerConnectionState, PreEncodedOptions, RtcConfiguration, Track, TrackVideoEncoder,
+    PeerConnectionState, PreEncodedOptions, RtcConfiguration, TrackVideoEncoder,
     TransceiverDirection, VideoTrackOptions,
 };
 
@@ -27,7 +27,7 @@ use reactor_webrtc::{
 struct Ice {
     q: Mutex<VecDeque<IceCandidate>>,
     connected: AtomicBool,
-    recv: Mutex<Vec<Track>>,
+    recv: Mutex<Vec<reactor_webrtc::RemoteTrack>>,
 }
 
 fn make_peer(
@@ -50,7 +50,7 @@ fn make_peer(
         })
         .on_track({
             let s = ice.clone();
-            move |_kind, track| {
+            move |track| {
                 s.recv.lock().unwrap().push(track);
             }
         });
@@ -177,7 +177,12 @@ fn frame_metadata_roundtrip() {
             let mut seed = 0u8;
             while !stop.load(Ordering::SeqCst) {
                 let bgra = varying_bgra(seed);
-                video.push_video_frame_with_metadata(&bgra, W, H, user_data);
+                video
+                    .push_frame_with_metadata(
+                        reactor_webrtc::VideoFrame::new(&bgra, W, H),
+                        user_data,
+                    )
+                    .expect("push frame");
                 seed = seed.wrapping_add(7);
                 thread::sleep(Duration::from_millis(33));
             }
@@ -192,10 +197,10 @@ fn frame_metadata_roundtrip() {
 
             // Wire up the receiver once the remote track arrives via on_track.
             if !recv_setup {
-                let mut tracks = s2.recv.lock().unwrap();
-                if let Some(track) = tracks.iter_mut().find(|t| t.kind() == MediaKind::Video) {
+                let tracks = s2.recv.lock().unwrap();
+                if let Some(video) = tracks.iter().find_map(|t| t.as_video()) {
                     let out = received.clone();
-                    track.on_video_frame(move |frame| {
+                    video.on_frame(move |frame| {
                         if let Some(meta) = frame.metadata {
                             out.lock().unwrap().push(meta);
                         }
@@ -290,7 +295,9 @@ fn encoded_frame_metadata_roundtrip() {
                 let mut seed = 0u8;
                 while !stop.load(Ordering::SeqCst) {
                     let bgra = varying_bgra(seed);
-                    video.push_video_frame(&bgra, W, H);
+                    video
+                        .push_frame(reactor_webrtc::VideoFrame::new(&bgra, W, H))
+                        .expect("push frame");
                     seed = seed.wrapping_add(7);
                     thread::sleep(Duration::from_millis(33));
                 }
@@ -348,16 +355,18 @@ fn encoded_frame_metadata_roundtrip() {
     thread::scope(|scope| {
         scope.spawn(|| {
             while !stop.load(Ordering::SeqCst) {
-                enc_track.push_encoded_frame_with_metadata(
-                    EncodedVideoFrame {
-                        data: vp8_bytes.clone(),
-                        is_key_frame: true,
-                        width: W,
-                        height: H,
-                        rtp_timestamp: 0,
-                    },
-                    user_data,
-                );
+                enc_track
+                    .push_frame_with_metadata(
+                        EncodedVideoFrame {
+                            data: vp8_bytes.clone(),
+                            is_key_frame: true,
+                            width: W,
+                            height: H,
+                            rtp_timestamp: 0,
+                        },
+                        user_data,
+                    )
+                    .expect("push frame");
                 thread::sleep(Duration::from_millis(33));
             }
         });
@@ -370,10 +379,10 @@ fn encoded_frame_metadata_roundtrip() {
             forward_ice(&s4, &pc3);
 
             if !recv_setup {
-                let mut tracks = s4.recv.lock().unwrap();
-                if let Some(track) = tracks.iter_mut().find(|t| t.kind() == MediaKind::Video) {
+                let tracks = s4.recv.lock().unwrap();
+                if let Some(video) = tracks.iter().find_map(|t| t.as_video()) {
                     let out = received.clone();
-                    track.on_video_frame(move |frame| {
+                    video.on_frame(move |frame| {
                         if let Some(meta) = frame.metadata {
                             out.lock().unwrap().push(meta);
                         }
@@ -480,7 +489,12 @@ fn legacy_peer_gets_no_trailer() {
             let mut seed = 0u8;
             while !stop.load(Ordering::SeqCst) {
                 let bgra = varying_bgra(seed);
-                video.push_video_frame_with_metadata(&bgra, W, H, b"must-not-ship");
+                video
+                    .push_frame_with_metadata(
+                        reactor_webrtc::VideoFrame::new(&bgra, W, H),
+                        b"must-not-ship",
+                    )
+                    .expect("push frame");
                 seed = seed.wrapping_add(7);
                 thread::sleep(Duration::from_millis(33));
             }
@@ -562,7 +576,12 @@ fn caller_transform_and_metadata_compose_on_one_sender() {
             let mut seed = 0u8;
             while !stop.load(Ordering::SeqCst) {
                 let bgra = varying_bgra(seed);
-                video.push_video_frame_with_metadata(&bgra, W, H, b"composed");
+                video
+                    .push_frame_with_metadata(
+                        reactor_webrtc::VideoFrame::new(&bgra, W, H),
+                        b"composed",
+                    )
+                    .expect("push frame");
                 seed = seed.wrapping_add(7);
                 thread::sleep(Duration::from_millis(33));
             }
@@ -574,10 +593,10 @@ fn caller_transform_and_metadata_compose_on_one_sender() {
             forward_ice(&s1, &pc2);
             forward_ice(&s2, &pc1);
             if !recv_setup {
-                let mut tracks = s2.recv.lock().unwrap();
-                if let Some(track) = tracks.iter_mut().find(|t| t.kind() == MediaKind::Video) {
+                let tracks = s2.recv.lock().unwrap();
+                if let Some(video) = tracks.iter().find_map(|t| t.as_video()) {
                     let out = received.clone();
-                    track.on_video_frame(move |frame| {
+                    video.on_frame(move |frame| {
                         if let Some(meta) = frame.metadata {
                             out.lock().unwrap().push(meta);
                         }
@@ -733,7 +752,12 @@ fn answerer_attaching_its_track_after_the_offer_still_sends_metadata() {
             let mut seed = 0u8;
             while !stop.load(Ordering::SeqCst) {
                 let bgra = varying_bgra(seed);
-                video.push_video_frame_with_metadata(&bgra, W, H, b"late-attach");
+                video
+                    .push_frame_with_metadata(
+                        reactor_webrtc::VideoFrame::new(&bgra, W, H),
+                        b"late-attach",
+                    )
+                    .expect("push frame");
                 seed = seed.wrapping_add(7);
                 thread::sleep(Duration::from_millis(33));
             }
@@ -745,10 +769,10 @@ fn answerer_attaching_its_track_after_the_offer_still_sends_metadata() {
             forward_ice(&s2, &offerer);
             forward_ice(&s1, &answerer);
             if !recv_setup {
-                let mut tracks = s1.recv.lock().unwrap();
-                if let Some(track) = tracks.iter_mut().find(|t| t.kind() == MediaKind::Video) {
+                let tracks = s1.recv.lock().unwrap();
+                if let Some(video) = tracks.iter().find_map(|t| t.as_video()) {
                     let out = received.clone();
-                    track.on_video_frame(move |frame| {
+                    video.on_frame(move |frame| {
                         if let Some(meta) = frame.metadata {
                             out.lock().unwrap().push(meta);
                         }

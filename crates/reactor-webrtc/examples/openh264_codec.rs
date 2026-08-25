@@ -42,8 +42,8 @@ fn run() {
 
     use reactor_webrtc::{
         openh264, H264Backend, IceCandidate, LocalVideoTrack, MediaKind, PeerConnection,
-        PeerConnectionFactory, PeerConnectionObserver, PeerConnectionState, RtcConfiguration,
-        Track, TransceiverDirection, VideoCodec, VideoTrackOptions,
+        PeerConnectionFactory, PeerConnectionObserver, PeerConnectionState, RemoteTrack,
+        RtcConfiguration, TransceiverDirection, VideoCodec, VideoTrackOptions,
     };
 
     // Required by Cisco's binary license: show this in your app's
@@ -64,7 +64,7 @@ fn run() {
         connected: AtomicBool,
         video_frames: AtomicU32,
         audio_frames: AtomicU32,
-        tracks: Mutex<Vec<Track>>,
+        tracks: Mutex<Vec<RemoteTrack>>,
     }
 
     fn make_peer(
@@ -87,11 +87,11 @@ fn run() {
             })
             .on_track({
                 let s = shared.clone();
-                move |kind, track| {
-                    match kind {
-                        MediaKind::Video => {
+                move |track| {
+                    match &track {
+                        RemoteTrack::Video(v) => {
                             let s = s.clone();
-                            track.on_video_frame(move |f| {
+                            v.on_frame(move |f| {
                                 println!(
                                     "  [pc2 video/H264] {}×{} frame — {} bytes BGRA",
                                     f.width,
@@ -101,13 +101,12 @@ fn run() {
                                 s.video_frames.fetch_add(1, Ordering::SeqCst);
                             });
                         }
-                        MediaKind::Audio => {
+                        RemoteTrack::Audio(a) => {
                             let s = s.clone();
-                            track.on_audio_frame(move |_f| {
+                            a.on_frame(move |_f| {
                                 s.audio_frames.fetch_add(1, Ordering::SeqCst);
                             });
                         }
-                        MediaKind::Unknown => {}
                     }
                     s.tracks.lock().unwrap().push(track);
                 }
@@ -208,8 +207,12 @@ fn run() {
                 for (i, b) in bgra.iter_mut().enumerate() {
                     *b = ((i as u32 + phase as u32 * 7) % 256) as u8;
                 }
-                video_auto.push_video_frame(&bgra, w, h);
-                video_oh.push_video_frame(&bgra, w, h);
+                video_auto
+                    .push_frame(reactor_webrtc::VideoFrame::new(&bgra, w, h))
+                    .expect("push frame");
+                video_oh
+                    .push_frame(reactor_webrtc::VideoFrame::new(&bgra, w, h))
+                    .expect("push frame");
                 phase = phase.wrapping_add(1);
 
                 for _ in 0..3 {

@@ -54,7 +54,7 @@ fn run() {
     use reactor_webrtc::{
         EncodedVideoFrame, FrameAction, FrameTransform, IceCandidate, LocalVideoTrack, MediaKind,
         PeerConnection, PeerConnectionFactory, PeerConnectionObserver, PeerConnectionState,
-        PreEncodedOptions, RtcConfiguration, Track, TrackVideoEncoder, TransceiverDirection,
+        PreEncodedOptions, RemoteTrack, RtcConfiguration, TrackVideoEncoder, TransceiverDirection,
         VideoTrackOptions,
     };
 
@@ -64,7 +64,7 @@ fn run() {
     struct Peer {
         ice: Mutex<VecDeque<IceCandidate>>,
         connected: AtomicBool,
-        tracks: Mutex<Vec<Track>>,
+        tracks: Mutex<Vec<RemoteTrack>>,
     }
 
     fn make_peer(
@@ -87,7 +87,7 @@ fn run() {
             })
             .on_track({
                 let s = shared.clone();
-                move |_kind, track| s.tracks.lock().unwrap().push(track)
+                move |track| s.tracks.lock().unwrap().push(track)
             });
         let pc = factory
             .create_peer_connection(config, obs)
@@ -219,7 +219,7 @@ fn run() {
     // This is the developer-facing API. Whenever YOUR encoder (VideoToolbox,
     // NVENC, GStreamer, libvpx, rav1e, …) produces a frame, call:
     //
-    //   video.push_encoded_frame(EncodedVideoFrame { data, is_key_frame, … });
+    //   video.push_frame(EncodedVideoFrame { data, is_key_frame, … });
     //
     // No raw pixel pumping. No closure. Any thread. Any rate.
 
@@ -245,14 +245,16 @@ fn run() {
                 let mut data = vec![if is_key { 0xAA } else { 0xBB }; 64];
                 data[1..5].copy_from_slice(&frame_idx.to_be_bytes());
 
-                video.push_encoded_frame(EncodedVideoFrame {
-                    data,
-                    is_key_frame: is_key,
-                    // 0 = inherit from the track's configured resolution (640×480).
-                    width: 0,
-                    height: 0,
-                    rtp_timestamp: 0,
-                });
+                video
+                    .push_frame(EncodedVideoFrame {
+                        data,
+                        is_key_frame: is_key,
+                        // 0 = inherit from the track's configured resolution (640×480).
+                        width: 0,
+                        height: 0,
+                        rtp_timestamp: 0,
+                    })
+                    .expect("push frame");
 
                 encoded_count.fetch_add(1, Ordering::SeqCst);
                 frame_idx += 1;

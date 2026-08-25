@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use reactor_webrtc::{
     EncodedVideoFrame, H264Backend, IceCandidate, LocalVideoTrack, MediaKind, PeerConnection,
     PeerConnectionFactory, PeerConnectionObserver, PeerConnectionState, PreEncodedOptions,
-    RtcConfiguration, TrackVideoEncoder, TransceiverDirection, VideoTrackOptions,
+    RemoteTrack, RtcConfiguration, TrackVideoEncoder, TransceiverDirection, VideoTrackOptions,
 };
 
 #[derive(Default)]
@@ -26,7 +26,7 @@ struct Peer {
     connected: AtomicBool,
     video_frames: AtomicU32,
     // Received remote tracks, kept alive (with their sinks) for the test.
-    recv: Mutex<Vec<reactor_webrtc::Track>>,
+    recv: Mutex<Vec<reactor_webrtc::RemoteTrack>>,
 }
 
 fn make_peer(
@@ -49,13 +49,15 @@ fn make_peer(
         })
         .on_track({
             let s = s.clone();
-            move |_kind, track| {
-                track.on_video_frame({
-                    let s = s.clone();
-                    move |_f| {
-                        s.video_frames.fetch_add(1, Ordering::SeqCst);
-                    }
-                });
+            move |track| {
+                if let RemoteTrack::Video(v) = &track {
+                    v.on_frame({
+                        let s = s.clone();
+                        move |_f| {
+                            s.video_frames.fetch_add(1, Ordering::SeqCst);
+                        }
+                    });
+                }
                 s.recv.lock().unwrap().push(track); // keep the sink alive
             }
         });
@@ -196,15 +198,20 @@ fn raw_and_pre_encoded_and_inline_tracks_coexist() {
             let bgra = vec![128u8; (w * h * 4) as usize];
             let mut i = 0u32;
             while !stop.load(Ordering::SeqCst) {
-                raw.push_video_frame(&bgra, w, h);
-                inline.push_video_frame(&bgra, w, h);
-                encoded.push_encoded_frame(EncodedVideoFrame {
-                    data: vec![0xAA; 64],
-                    is_key_frame: i % 30 == 0,
-                    width: 0,
-                    height: 0,
-                    rtp_timestamp: 0,
-                });
+                raw.push_frame(reactor_webrtc::VideoFrame::new(&bgra, w, h))
+                    .expect("push frame");
+                inline
+                    .push_frame(reactor_webrtc::VideoFrame::new(&bgra, w, h))
+                    .expect("push frame");
+                encoded
+                    .push_frame(EncodedVideoFrame {
+                        data: vec![0xAA; 64],
+                        is_key_frame: i % 30 == 0,
+                        width: 0,
+                        height: 0,
+                        rtp_timestamp: 0,
+                    })
+                    .expect("push frame");
                 i += 1;
                 thread::sleep(Duration::from_millis(33));
             }
