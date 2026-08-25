@@ -569,6 +569,7 @@ impl Drop for Track {
             crate::sender_meta::deregister(self.native_id, &source);
             crate::sender_meta::deregister_receiver(self.native_id, &self.receiver_meta);
             crate::sender_meta::deregister_allowed(self.native_id);
+            crate::encoded::deregister_feedback_binding(self.native_id);
         }
         // Video-only: this track may have reserved encoder slots — reclaim
         // them so nothing else can be routed through the dead lane.
@@ -688,6 +689,31 @@ impl VideoTrack {
                 "cannot push frames onto a remote track".to_owned(),
             ));
         }
+        Ok(())
+    }
+
+    /// Listen for encoder feedback
+    /// ([`EncoderFeedback::RateUpdate`](crate::EncoderFeedback::RateUpdate)) on
+    /// a track created with [`TrackVideoEncoder::Inline`]. Inline tracks see
+    /// keyframe demands inside the [`RawVideoFrame`] their callback receives
+    /// (`request_key_frame`); the other feedback — rate control from the
+    /// congestion controller — surfaces here. Latest registration wins.
+    ///
+    /// Only meaningful on inline-encoder tracks: returns an error on raw
+    /// (builtin-encoder) tracks, where BWE adaptation is internal to
+    /// libwebrtc, and on remote tracks.
+    pub fn on_encoder_feedback(
+        &self,
+        cb: impl FnMut(crate::encoded::EncoderFeedback) + Send + 'static,
+    ) -> Result<()> {
+        self.guard_remote()?;
+        let Some(listeners) = crate::encoded::feedback_binding(self.0.native_id()) else {
+            return Err(Error::Webrtc(
+                "on_encoder_feedback is only valid on tracks created with                  TrackVideoEncoder::Inline — builtin-encoder tracks adapt internally"
+                    .to_owned(),
+            ));
+        };
+        listeners.set(Box::new(cb));
         Ok(())
     }
 }

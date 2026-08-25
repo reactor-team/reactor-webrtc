@@ -327,6 +327,7 @@ pub type InlineEncoderCallback =
 
 pub(crate) struct CustomEncoderState {
     cb: Mutex<InlineEncoderCallback>,
+    feedback: Arc<FeedbackListeners>,
 }
 
 /// Borrowed view of a glue raw frame, for the inline-encoder callback.
@@ -370,27 +371,132 @@ extern "C" fn free_encoded_data(data: *const u8, len: usize) {
     unsafe { drop(Vec::from_raw_parts(data as *mut u8, len, len)) };
 }
 
+// ── Encoder feedback ─────────────────────────────────────────────────────────
+
+/// Feedback from the BWE / rate-control machinery for a custom-encoded
+/// ([`TrackVideoEncoder`]) track's encoder instance. The builtin encoder
+/// pipeline consumes the same signals internally; custom encoders hear them
+/// here through [`VideoTrack::on_encoder_feedback`] /
+/// [`EncodedVideoTrack::on_encoder_feedback`].
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum EncoderFeedback {
+    /// The remote peer (or libwebrtc's recovery logic) asked for a key frame —
+    /// PLI/FIR routed by the media engine. **You must answer with an IDR
+    /// promptly** (`EncodedVideoFrame::is_key_frame = true` on the pre-encoded
+    /// path; produce a key frame from your encoder on the inline path) or new
+    /// receivers wait a whole GOP for decodable video.
+    KeyFrameRequest,
+    /// The congestion controller's current allocation for this encoder:
+    /// adapt your own encoder's target to match. Fires on BWE changes and
+    /// `PeerConnection::set_bitrate` calls.
+    RateUpdate {
+        /// Target bitrate in bits per second for this encoder.
+        bitrate_bps: u32,
+        /// Target framerate in frames per second.
+        framerate_fps: f64,
+    },
+}
+
+/// A boxed encoder-feedback listener (single-slot per slot).
+pub(crate) type FeedbackCallback = Box<dyn FnMut(EncoderFeedback) + Send>;
+
+/// Callbacks registered for encoder feedback, boxed and shareable across the
+/// registry → track wrapper lifetime boundary.
+pub(crate) struct FeedbackListeners {
+    cb: Mutex<Option<FeedbackCallback>>,
+}
+
+impl FeedbackListeners {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            cb: Mutex::new(None),
+        })
+    }
+
+    /// Overwrite the listener. Latest call wins (sinks and callbacks are
+    /// single-slot in this API).
+    pub(crate) fn set(&self, cb: FeedbackCallback) {
+        *self.cb.lock().unwrap() = Some(cb);
+    }
+
+    /// Deliver feedback to the registered listener, if any. Runs on
+    /// whatever WebRTC thread the signal arrived on — the callback re-enters
+    /// the app synchronously there, like every other sink.
+    fn fire(&self, feedback: EncoderFeedback) {
+        if let Some(cb) = self.cb.lock().unwrap().as_mut() {
+            cb(feedback);
+        }
+    }
+}
+
+/// Native-track identity → the encoder feedback listeners of the slot that
+/// track occupies. Mirrors the sender_meta registration pattern: created
+/// when a track with a custom encoder slot is created, removed at drop.
+type FeedbackBindings = Mutex<std::collections::HashMap<usize, Arc<FeedbackListeners>>>;
+
+fn feedback_bindings() -> &'static FeedbackBindings {
+    static BINDINGS: std::sync::OnceLock<FeedbackBindings> = std::sync::OnceLock::new();
+    BINDINGS.get_or_init(FeedbackBindings::default)
+}
+
+/// Bind a track's feedback listeners to its native-track identity.
+pub(crate) fn register_feedback_binding(native_id: usize, listeners: &Arc<FeedbackListeners>) {
+    if native_id != 0 {
+        feedback_bindings()
+            .lock()
+            .unwrap()
+            .insert(native_id, listeners.clone());
+    }
+}
+
+/// Remove the binding for `native_id` (the track is gone).
+pub(crate) fn deregister_feedback_binding(native_id: usize) {
+    feedback_bindings().lock().unwrap().remove(&native_id);
+}
+
+/// The feedback listener registration for `native_id`, if the track's slot
+/// has one (only tracks created with a [`TrackVideoEncoder`] have some).
+/// Used by [`VideoTrack::on_encoder_feedback`] and
+/// [`EncodedVideoTrack::on_encoder_feedback`].
+pub(crate) fn feedback_binding(native_id: usize) -> Option<Arc<FeedbackListeners>> {
+    feedback_bindings().lock().unwrap().get(&native_id).cloned()
+}
+
 // ── Multi-track encoder registry ─────────────────────────────────────────────
 
 /// A pending slot for one video transceiver in an [`EncoderRegistry`].
 ///
 /// - `Custom` — frames are read from the associated queue (push via
-///   [`EncodedVideoTrack`]); the queue drain itself is the "encoder".
+///   [`EncodedVideoTrack`]); the queue drain itself is the "encoder", and the
+///   feedback listeners include everything the pull-based API cannot say.
 /// - `Inline` — the registry calls the user callback synchronously with every
-///   raw I420 frame ([`TrackVideoEncoder::Inline`] tracks).
+///   raw I420 frame ([`TrackVideoEncoder::Inline`] tracks); keyframe requests
+///   travel inside that callback's frame, feedback for the rest is attached to
+///   the slot.
 /// - `Builtin` — the factory delegates to a backend encoder (builtin
 ///   VP8/VP9/AV1, or H264 via the slot's backend preference); push raw BGRA
 ///   frames via the returned [`Track`](crate::media::Track).
 pub(crate) enum RegistrySlot {
-    Custom(Arc<Mutex<VecDeque<EncodedVideoFrame>>>),
+    Custom(CustomSlotState),
     Inline(Arc<CustomEncoderState>),
     Builtin(H264BackendPref),
+}
+
+/// Registry state for a [`TrackVideoEncoder::PreEncoded`] slot: the queue the
+/// app pushes into, plus the listeners the queue-pull API cannot reach.
+pub(crate) struct CustomSlotState {
+    pub(crate) queue: Arc<Mutex<VecDeque<EncodedVideoFrame>>>,
+    pub(crate) feedback: Arc<FeedbackListeners>,
 }
 
 impl Clone for RegistrySlot {
     fn clone(&self) -> Self {
         match self {
-            Self::Custom(q) => Self::Custom(q.clone()),
+            Self::Custom(s) => Self::Custom(CustomSlotState {
+                queue: s.queue.clone(),
+                feedback: s.feedback.clone(),
+            }),
             Self::Inline(s) => Self::Inline(s.clone()),
             Self::Builtin(pref) => Self::Builtin(*pref),
         }
@@ -450,6 +556,15 @@ struct AssignedSlot {
     slot: RegistrySlot,
 }
 
+impl Clone for AssignedSlot {
+    fn clone(&self) -> Self {
+        AssignedSlot {
+            native_id: self.native_id,
+            slot: self.slot.clone(),
+        }
+    }
+}
+
 impl EncoderRegistry {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -476,20 +591,30 @@ impl EncoderRegistry {
         opts.encode_use_builtin = Some(registry_use_builtin_tramp);
         opts.encode_has_custom_slots = Some(registry_has_custom_tramp);
         opts.encode_video_backend_for = Some(registry_backend_for_tramp);
+        opts.encode_rate_update = Some(registry_rate_update_tramp);
     }
 
     /// Reserve a custom (pre-encoded) slot for the track `native_id`.
-    /// Returns the queue the [`EncodedVideoTrack`] will push frames into.
+    /// Returns the queue the [`EncodedVideoTrack`] will push frames into
+    /// plus the slot's feedback listeners
+    /// ([`EncodedVideoTrack::on_encoder_feedback`]).
     pub(crate) fn add_encoded_slot(
         &self,
         native_id: usize,
-    ) -> Arc<Mutex<VecDeque<EncodedVideoFrame>>> {
-        let q = Arc::new(Mutex::new(VecDeque::new()));
+    ) -> (
+        Arc<Mutex<VecDeque<EncodedVideoFrame>>>,
+        Arc<FeedbackListeners>,
+    ) {
+        let slot = CustomSlotState {
+            queue: Arc::new(Mutex::new(VecDeque::new())),
+            feedback: FeedbackListeners::new(),
+        };
+        let out = (slot.queue.clone(), slot.feedback.clone());
         self.pending.lock().unwrap().push_back(RegistryReservation {
             native_id,
-            slot: RegistrySlot::Custom(q.clone()),
+            slot: RegistrySlot::Custom(slot),
         });
-        q
+        out
     }
 
     /// Reserve a builtin (raw BGRA) slot for the track `native_id`. The C++
@@ -510,13 +635,21 @@ impl EncoderRegistry {
 
     /// Reserve an inline-encoder slot for the track `native_id`. The
     /// registry calls `cb` synchronously with every raw I420 frame for the
-    /// encoder instance that binds here.
-    pub(crate) fn add_inline_slot(&self, native_id: usize, cb: InlineEncoderCallback) {
-        let state = Arc::new(CustomEncoderState { cb: Mutex::new(cb) });
+    /// encoder instance that binds here; the returned feedback listeners
+    /// surface the rest (rate updates) through
+    /// [`VideoTrack::on_encoder_feedback`](crate::media::VideoTrack::on_encoder_feedback).
+    pub(crate) fn add_inline_slot(&self, native_id: usize, cb: InlineEncoderCallback) -> Arc<FeedbackListeners> {
+        let feedback = FeedbackListeners::new();
+        let out = feedback.clone();
+        let state = Arc::new(CustomEncoderState {
+            cb: Mutex::new(cb),
+            feedback,
+        });
         self.pending.lock().unwrap().push_back(RegistryReservation {
             native_id,
             slot: RegistrySlot::Inline(state),
         });
+        out
     }
 
     /// Drop everything reserved for a track that no longer exists.
@@ -620,9 +753,15 @@ impl EncoderRegistry {
             }
         });
         match &a.slot {
-            RegistrySlot::Custom(q) => {
-                let q = q.clone();
+            RegistrySlot::Custom(slot) => {
+                let (q, feedback) = (slot.queue.clone(), slot.feedback.clone());
                 drop(assigned);
+                if raw.request_key_frame {
+                    // Queue-mode has no other channel: clone, drop the guard,
+                    // then fire — never run the callback under the registry
+                    // lock (mirrors `rate_update`'s shape below).
+                    feedback.fire(EncoderFeedback::KeyFrameRequest);
+                }
                 let frame = q.lock().unwrap().pop_front();
                 frame
             }
@@ -635,6 +774,31 @@ impl EncoderRegistry {
                 cb(raw)
             }
             RegistrySlot::Builtin(_) => None,
+        }
+    }
+
+    /// Called by `registry_rate_update_tramp`. Routes a rate-control update
+    /// to the encoder instance's slot's feedback listeners.
+    fn rate_update(&self, encoder_id: u64, bitrate_bps: u32, framerate_fps: f64) {
+        let assigned = self.assigned.lock().unwrap();
+        let slot = match assigned.get(&encoder_id) {
+            Some(s) => AssignedSlot {
+                native_id: s.native_id,
+                slot: s.slot.clone(),
+            },
+            None => return,
+        };
+        drop(assigned);
+        let feedback = match &slot.slot {
+            RegistrySlot::Custom(slot) => Some(slot.feedback.clone()),
+            RegistrySlot::Inline(state) => Some(state.feedback.clone()),
+            RegistrySlot::Builtin(_) => None,
+        };
+        if let Some(fb) = feedback {
+            fb.fire(EncoderFeedback::RateUpdate {
+                bitrate_bps,
+                framerate_fps,
+            });
         }
     }
 
@@ -720,6 +884,18 @@ pub(crate) extern "C" fn registry_has_custom_tramp(ud: *mut c_void) -> c_int {
 pub(crate) extern "C" fn registry_backend_for_tramp(ud: *mut c_void, encoder_id: u64) -> c_int {
     let st = unsafe { &*(ud as *const RegistryState) };
     st.registry.backend_for(encoder_id).as_c_int()
+}
+
+/// Called by the native encoder on every rate-control (BWE) update.
+pub(crate) extern "C" fn registry_rate_update_tramp(
+    ud: *mut c_void,
+    encoder_id: u64,
+    bitrate_bps: u32,
+    framerate_fps: f64,
+) {
+    let st = unsafe { &*(ud as *const RegistryState) };
+    st.registry
+        .rate_update(encoder_id, bitrate_bps, framerate_fps);
 }
 
 // ── Per-track encoder selection ─────────────────────────────────────────────
@@ -920,12 +1096,13 @@ pub struct EncodedVideoTrack {
     dummy: Vec<u8>,
     width: u32,
     height: u32,
-    // FIFO metadata queue for push_encoded_frame_with_metadata: the sender
+    // FIFO metadata queue for push_frame_with_metadata: the sender
     // FrameTransform pops one entry per encoded frame in push order. A FIFO rather
     // than timestamp correlation because capture_time_ms is unreliable here —
     // VideoStreamEncoder clamps future timestamps back to post_time, which can
     // collide when two pushes land in the same millisecond.
     sender_meta_fifo: Arc<FifoMeta>,
+    feedback: Arc<FeedbackListeners>,
 }
 
 /// An [`EncodedVideoTrack`]'s outgoing metadata, in push order.
@@ -955,6 +1132,7 @@ impl EncodedVideoTrack {
     pub(crate) fn new(
         track: crate::media::VideoTrack,
         queue: Arc<Mutex<VecDeque<EncodedVideoFrame>>>,
+        feedback: Arc<FeedbackListeners>,
         width: u32,
         height: u32,
     ) -> Self {
@@ -965,6 +1143,7 @@ impl EncodedVideoTrack {
         // that correlates correctly.
         let source: Arc<dyn crate::sender_meta::SenderMetaSource> = sender_meta_fifo.clone();
         crate::sender_meta::register(track.native_id(), &source);
+        crate::encoded::register_feedback_binding(track.native_id(), &feedback);
         Self {
             track,
             queue,
@@ -972,7 +1151,17 @@ impl EncodedVideoTrack {
             width,
             height,
             sender_meta_fifo,
+            feedback,
         }
+    }
+
+    /// Listen for encoder feedback for this track —
+    /// [`EncoderFeedback::KeyFrameRequest`] (answer with an IDR promptly) and
+    /// [`EncoderFeedback::RateUpdate`] (adapt your encoder's target). Latest
+    /// registration wins. The callback fires on WebRTC threads, like every
+    /// other sink in this API.
+    pub fn on_encoder_feedback(&self, cb: impl FnMut(EncoderFeedback) + Send + 'static) {
+        self.feedback.set(Box::new(cb));
     }
 
     /// The underlying video track handle — pass `track()` (or the

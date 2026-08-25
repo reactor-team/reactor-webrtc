@@ -158,6 +158,12 @@ pub struct ReactorFactoryOptions {
     /// elsewhere), 1 = VideoToolbox, 2 = OpenH264. null = all auto.
     pub encode_video_backend_for:
         Option<extern "C" fn(userdata: *mut c_void, encoder_id: u64) -> c_int>,
+    /// Rate-control (BWE) updates for custom-slotted encoder instances: the
+    /// target bitrate (bps) and framerate the congestion controller wants.
+    /// null = suppress rate feedback.
+    pub encode_rate_update: Option<
+        extern "C" fn(userdata: *mut c_void, encoder_id: u64, bitrate_bps: u32, framerate_fps: f64),
+    >,
 }
 
 impl Default for ReactorFactoryOptions {
@@ -173,6 +179,7 @@ impl Default for ReactorFactoryOptions {
             encode_use_builtin: None,
             encode_has_custom_slots: None,
             encode_video_backend_for: None,
+            encode_rate_update: None,
         }
     }
 }
