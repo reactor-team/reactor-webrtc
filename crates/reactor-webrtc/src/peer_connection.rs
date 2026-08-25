@@ -1238,22 +1238,26 @@ impl PeerConnection {
             // working, and attach_* returns a transformer to install only the first
             // time this side needs one.
             let id = tc.transceiver_id();
-            if let Some(source) = crate::sender_meta::lookup(tc.sender_track_id()) {
-                if let Some(native) = crate::sender_meta::attach_embed(
-                    pc_id,
-                    id,
-                    source,
-                    self.frame_metadata_gate.clone(),
-                ) {
-                    if tc
-                        .attach_native_transform(crate::sender_meta::Side::Send, &native)
-                        .is_err()
-                    {
-                        crate::sender_meta::release_install(
-                            pc_id,
-                            id,
-                            crate::sender_meta::Side::Send,
-                        );
+            // Per-track gate: a track created with frame_metadata off never
+            // gets a trailer writer, whatever the connection negotiated.
+            if crate::sender_meta::allowed(tc.sender_track_id()) {
+                if let Some(source) = crate::sender_meta::lookup(tc.sender_track_id()) {
+                    if let Some(native) = crate::sender_meta::attach_embed(
+                        pc_id,
+                        id,
+                        source,
+                        self.frame_metadata_gate.clone(),
+                    ) {
+                        if tc
+                            .attach_native_transform(crate::sender_meta::Side::Send, &native)
+                            .is_err()
+                        {
+                            crate::sender_meta::release_install(
+                                pc_id,
+                                id,
+                                crate::sender_meta::Side::Send,
+                            );
+                        }
                     }
                 }
             }

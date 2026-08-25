@@ -250,6 +250,11 @@ pub struct Track {
     // Tracks delivered by the observer are inbound-only: pushing frames onto
     // them is an error (surfaced by the media wrappers).
     is_remote: bool,
+    // Per-track frame-metadata switch: off tracks never get a trailer writer
+    // installed and drop `user_data` on pushes (the frame itself still flows).
+    // Defaults from the factory kill switch; overridable per track via
+    // `VideoTrackOptions::frame_metadata`.
+    metadata_enabled: bool,
     // The factory's encoder registry for local tracks — dropped slots must be
     // retracted when the track dies ([`EncoderRegistry::retract`]). None for
     // remote tracks: their slots never existed.
@@ -269,8 +274,9 @@ impl Track {
         kind: MediaKind,
         factory: Arc<FactoryHandle>,
         is_remote: bool,
+        metadata_enabled: bool,
     ) -> Self {
-        Self::from_raw_with_registry(raw, kind, factory, is_remote, None)
+        Self::from_raw_with_registry(raw, kind, factory, is_remote, true, None)
     }
 
     pub(crate) fn from_raw_with_registry(
@@ -278,6 +284,7 @@ impl Track {
         kind: MediaKind,
         factory: Arc<FactoryHandle>,
         is_remote: bool,
+        metadata_enabled: bool,
         registry: Option<Arc<crate::encoded::EncoderRegistry>>,
     ) -> Self {
         let sender_meta = Arc::new(CaptureTimeMeta::default());
@@ -289,6 +296,7 @@ impl Track {
             let source: Arc<dyn crate::sender_meta::SenderMetaSource> = sender_meta.clone();
             crate::sender_meta::register(native_id, &source);
             crate::sender_meta::register_receiver(native_id, &receiver_meta);
+            crate::sender_meta::register_allowed(native_id, metadata_enabled);
         }
         Self {
             raw,
@@ -302,6 +310,7 @@ impl Track {
             last_send_ms: AtomicI64::new(0),
             _factory: factory,
             is_remote,
+            metadata_enabled,
             registry,
         }
     }
@@ -310,6 +319,12 @@ impl Track {
     /// Remote tracks only receive — pushing frames onto one is an error.
     pub fn is_remote(&self) -> bool {
         self.is_remote
+    }
+
+    /// Whether this track carries a frame-metadata trailer (`user_data`
+    /// survives the push and reaches the receiver).
+    pub(crate) fn metadata_enabled(&self) -> bool {
+        self.metadata_enabled
     }
 
     pub(crate) fn raw(&self) -> *mut reactor_webrtc_sys::MediaStreamTrack {
@@ -553,6 +568,7 @@ impl Drop for Track {
             let source: Arc<dyn crate::sender_meta::SenderMetaSource> = self.sender_meta.clone();
             crate::sender_meta::deregister(self.native_id, &source);
             crate::sender_meta::deregister_receiver(self.native_id, &self.receiver_meta);
+            crate::sender_meta::deregister_allowed(self.native_id);
         }
         // Video-only: this track may have reserved encoder slots — reclaim
         // them so nothing else can be routed through the dead lane.
@@ -628,8 +644,14 @@ impl VideoTrack {
     /// are filled in internally.
     pub fn push_frame_with_metadata(&self, frame: VideoFrame<'_>, user_data: &[u8]) -> Result<()> {
         self.guard_remote()?;
-        self.0
-            .push_metadata_frame(frame.bgra, frame.width, frame.height, user_data, None);
+        if self.0.metadata_enabled() {
+            self.0
+                .push_metadata_frame(frame.bgra, frame.width, frame.height, user_data, None);
+        } else {
+            // user_data dropped by contract; the frame itself still flows.
+            self.0
+                .push_video_frame_now(frame.bgra, frame.width, frame.height);
+        }
         Ok(())
     }
 
@@ -644,13 +666,19 @@ impl VideoTrack {
         capture_time_us: i64,
     ) -> Result<()> {
         self.guard_remote()?;
-        self.0.push_metadata_frame(
-            frame.bgra,
-            frame.width,
-            frame.height,
-            user_data,
-            Some(capture_time_us),
-        );
+        if self.0.metadata_enabled() {
+            self.0.push_metadata_frame(
+                frame.bgra,
+                frame.width,
+                frame.height,
+                user_data,
+                Some(capture_time_us),
+            );
+        } else {
+            // user_data dropped by contract; the frame still flows, stamped.
+            self.0
+                .push_video_frame_ts(frame.bgra, frame.width, frame.height, capture_time_us);
+        }
         Ok(())
     }
 

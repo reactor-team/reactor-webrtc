@@ -838,6 +838,14 @@ pub struct VideoTrackOptions {
     /// Which H.264 backend encodes this track when it is raw and H264 wins
     /// negotiation. Errors when set together with `encoder`.
     pub h264_backend: Option<H264Backend>,
+    /// Per-track frame-metadata switch. `None` (default) inherits the
+    /// factory's kill switch
+    /// ([`PeerConnectionFactoryBuilder::with_metadata`]); `Some(false)`
+    /// disables trailers for this track only — pushes with `user_data` drop
+    /// it silently (the frame itself still flows) and the peer sees no
+    /// trailer whatever the connection negotiated. The SDP stays
+    /// session-level either way.
+    pub frame_metadata: Option<bool>,
 }
 
 /// One video track created by
@@ -1023,9 +1031,12 @@ impl EncodedVideoTrack {
             user_data: user_data.to_vec(),
         };
         // Enqueue metadata first so the FIFO entry is always present when the
-        // sender FrameTransform fires on the encoder thread.
-        if let Ok(mut fifo) = self.sender_meta_fifo.0.lock() {
-            fifo.push_back(meta);
+        // sender FrameTransform fires on the encoder thread. Off-track
+        // (frame_metadata off) drops user_data here, mirroring the raw path.
+        if self.track.metadata_enabled() {
+            if let Ok(mut fifo) = self.sender_meta_fifo.0.lock() {
+                fifo.push_back(meta);
+            }
         }
         self.queue.lock().unwrap().push_back(frame);
         self.track.push_frame(crate::media::VideoFrame::new(

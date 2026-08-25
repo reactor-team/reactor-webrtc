@@ -154,7 +154,7 @@ extern "C" fn tramp_track(ud: *mut c_void, track: *mut reactor_webrtc_sys::Media
         reactor_webrtc_sys::reactor_webrtc_media_stream_track_kind(track)
     });
     // Take ownership of the handle; if there's no handler, dropping it frees it.
-    let t = Track::from_raw(track, kind, Arc::clone(&st.factory), true);
+    let t = Track::from_raw(track, kind, Arc::clone(&st.factory), true, true);
     let remote = match kind {
         MediaKind::Video => RemoteTrack::Video(VideoTrack::wrap(t)),
         _ => RemoteTrack::Audio(AudioTrack::wrap(t)),
