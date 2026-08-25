@@ -2092,9 +2092,13 @@ impl PeerConnectionFactory {
     /// Each call returns an independent track — different audio can be pushed
     /// to different peer connections.
     fn create_audio_track_with_local_source(&self, py: Python, id: &str) -> PyResult<Track> {
-        py.allow_threads(|| self.inner.create_audio_track_with_local_source(id))
-            .map(Track::from_rust)
-            .map_err(err)
+        py.allow_threads(|| {
+            let mut options = rw::AudioTrackOptions::default();
+            options.source = rw::AudioTrackSource::LocalPush;
+            self.inner.create_audio_track_with_options(id, options)
+        })
+        .map(Track::from_rust)
+        .map_err(err)
     }
 
     /// Push interleaved signed 16-bit little-endian PCM to the synthetic ADM.

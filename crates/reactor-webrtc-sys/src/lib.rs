@@ -177,6 +177,38 @@ impl Default for ReactorFactoryOptions {
     }
 }
 
+/// Options for [`reactor_webrtc_audio_track_create`]. ABI-versioned: `size`
+/// must be `std::mem::size_of::<ReactorAudioTrackOptions>()`; future fields
+/// are only appended, and zero is always the absent/default value.
+/// Layout must match `ReactorAudioTrackOptions` in the C++ glue.
+#[repr(C)]
+pub struct ReactorAudioTrackOptions {
+    pub size: u32,
+    /// 0 = factory ADM (platform mic, or the shared synthetic pipe fed by
+    /// [`reactor_webrtc_factory_push_audio_frame`]); 1 = per-track local
+    /// source (feed with [`reactor_webrtc_audio_track_push_pcm`]).
+    pub source: c_int,
+    /// Tri-state source constraints: -1 unset (libwebrtc/APM default),
+    /// 0 = forced off, 1 = forced on.
+    pub echo_cancellation: c_int,
+    pub noise_suppression: c_int,
+    pub auto_gain_control: c_int,
+    pub high_pass_filter: c_int,
+}
+
+impl Default for ReactorAudioTrackOptions {
+    fn default() -> Self {
+        Self {
+            size: std::mem::size_of::<Self>() as u32,
+            source: 0,
+            echo_cancellation: -1,
+            noise_suppression: -1,
+            auto_gain_control: -1,
+            high_pass_filter: -1,
+        }
+    }
+}
+
 /// A single entry in the stats snapshot delivered by
 /// [`reactor_webrtc_peer_connection_get_stats`]. The `kind` field selects
 /// which subset of fields is populated; all others are zero-initialised.
@@ -639,26 +671,21 @@ extern "C" {
     pub fn reactor_webrtc_media_stream_track_destroy(track: *mut MediaStreamTrack);
 
     // ── Audio tracks ─────────────────────────────────────────────────────────
-    /// Create a local audio track. Its samples come from the factory's ADM —
-    /// push PCM with [`reactor_webrtc_factory_push_audio_frame`]. Returns an
-    /// owned [`MediaStreamTrack`] handle or null.
+    /// Create a local audio track per `opts` (required; null returns null).
+    /// `source = 0` sources from the factory's ADM (push PCM with
+    /// [`reactor_webrtc_factory_push_audio_frame`]); `source = 1` creates a
+    /// per-track local source (push with [`reactor_webrtc_audio_track_push_pcm`],
+    /// independent audio per track). Returns an owned [`MediaStreamTrack`]
+    /// handle or null.
     pub fn reactor_webrtc_audio_track_create(
         factory: *mut PeerConnectionFactory,
         id: *const c_char,
+        opts: *const ReactorAudioTrackOptions,
     ) -> *mut MediaStreamTrack;
-    /// Create a local audio track with a per-track audio source, independent of
-    /// the factory ADM. Each call returns a track whose audio is fed exclusively
-    /// via [`reactor_webrtc_audio_track_push_pcm`], allowing different audio to
-    /// be delivered to different peer connections. Returns an owned
-    /// [`MediaStreamTrack`] handle or null.
-    pub fn reactor_webrtc_audio_track_create_with_local_source(
-        factory: *mut PeerConnectionFactory,
-        id: *const c_char,
-    ) -> *mut MediaStreamTrack;
-    /// Push interleaved i16 PCM directly to a local audio track that was created
-    /// with [`reactor_webrtc_audio_track_create_with_local_source`]. No-op for
-    /// tracks backed by the factory ADM. `samples_per_channel` is the frame
-    /// count (e.g. 480 for 10ms @ 48kHz).
+    /// Push interleaved i16 PCM directly to a track created with
+    /// `source = 1` (a per-track local source). No-op for tracks backed by the
+    /// factory ADM. `samples_per_channel` is the frame count (e.g. 480 for
+    /// 10ms @ 48kHz).
     pub fn reactor_webrtc_audio_track_push_pcm(
         track: *mut MediaStreamTrack,
         pcm: *const i16,

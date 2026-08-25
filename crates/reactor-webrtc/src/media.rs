@@ -59,6 +59,67 @@ pub struct AudioFrame<'a> {
     pub frames: u32,
 }
 
+/// Where an audio track's samples come from
+/// ([`create_audio_track_with_options`](crate::PeerConnectionFactory::create_audio_track_with_options)).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AudioTrackSource {
+    /// The factory's ADM: the platform microphone (real mic/speaker on
+    /// desktop) or the shared synthetic pipe fed by
+    /// [`PeerConnectionFactory::push_audio_frame`](crate::PeerConnectionFactory::push_audio_frame).
+    /// Every ADM-sourced track carries the **same** signal.
+    ///
+    /// There is exactly one ADM per factory — per-track choice is "tap it or
+    /// bypass it", not "which ADM".
+    #[default]
+    Adm,
+    /// A per-track push source, fully independent of the ADM: feed it with
+    /// [`Track::push_pcm`]. The way to send per-track audio — e.g. a music
+    /// track next to the mic — or to route different audio to different
+    /// peers from one factory.
+    LocalPush,
+}
+
+/// Options for
+/// [`PeerConnectionFactory::create_audio_track_with_options`].
+///
+/// All fields optional; `Default::default()` produces exactly what
+/// [`PeerConnectionFactory::create_audio_track`] produces. The struct is
+/// `#[non_exhaustive]` — construct via `Default` and assign fields.
+///
+/// The processing flags are **constraints on this track's source**, tri-state:
+/// `None` leaves the libwebrtc/APM default (built by
+/// [`PeerConnectionFactoryBuilder::with_apm`](crate::PeerConnectionFactoryBuilder::with_apm)),
+/// `Some(v)` forces the stage on/off for this track. They constrain the
+/// capture/send side — received audio is never processed. Meaningful on
+/// [`AudioTrackSource::Adm`] sources (a mic hears the room); a
+/// [`LocalPush`](AudioTrackSource::LocalPush) source has no echo to cancel
+/// and the flags are not applied there — music + mic is the canonical
+/// combination:
+///
+/// ```rust,ignore
+/// let mic = factory.create_audio_track("mic")?;                    // Adm, inherit APM
+/// let music = factory.create_audio_track_with_options("music", AudioTrackOptions {
+///     source: AudioTrackSource::LocalPush,
+///     echo_cancellation: Some(false),  // never let the AEC eat the music
+///     ..Default::default()
+/// })?;
+/// ```
+#[derive(Default)]
+#[non_exhaustive]
+pub struct AudioTrackOptions {
+    /// Where this track's samples come from. Default: [`AudioTrackSource::Adm`].
+    pub source: AudioTrackSource,
+    /// AEC3 echo cancellation for this track's source.
+    pub echo_cancellation: Option<bool>,
+    /// Noise suppression for this track's source.
+    pub noise_suppression: Option<bool>,
+    /// Automatic gain control for this track's source.
+    pub auto_gain_control: Option<bool>,
+    /// High-pass filter for this track's source.
+    pub high_pass_filter: Option<bool>,
+}
+
 type VideoSinkCb = Box<dyn for<'a> FnMut(VideoFrame<'a>) + Send>;
 type AudioSinkCb = Box<dyn for<'a> FnMut(AudioFrame<'a>) + Send>;
 
@@ -447,9 +508,9 @@ impl Track {
     }
 
     /// Push interleaved i16 PCM to a local audio track created with
-    /// [`PeerConnectionFactory::create_audio_track_with_local_source`]. Delivers
-    /// audio directly to the sender's encoder, bypassing the shared ADM. No-op
-    /// for tracks backed by the factory ADM or for remote tracks.
+    /// [`AudioTrackSource::LocalPush`]. Delivers audio directly to the
+    /// sender's encoder, bypassing the shared ADM. No-op for tracks backed by
+    /// the factory ADM or for remote tracks.
     ///
     /// `pcm.len()` must be a multiple of `channels`; a partial trailing frame
     /// is an error. Only one thread should call `push_pcm` at a time for a

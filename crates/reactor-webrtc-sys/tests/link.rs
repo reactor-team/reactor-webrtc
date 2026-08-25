@@ -39,7 +39,8 @@ use reactor_webrtc_sys::{
     reactor_webrtc_peer_connection_set_remote_description, reactor_webrtc_selftest,
     reactor_webrtc_video_track_add_sink, reactor_webrtc_video_track_create,
     reactor_webrtc_video_track_push_frame, MediaStreamTrack, PeerConnection,
-    PeerConnectionCallbacks, PeerConnectionFactory, ReactorFactoryOptions, ReactorRtcConfig,
+    PeerConnectionCallbacks, PeerConnectionFactory, ReactorAudioTrackOptions,
+    ReactorFactoryOptions, ReactorRtcConfig,
 };
 
 // PeerConnectionState::kConnected (enum order in peer_connection_interface.h).
@@ -371,7 +372,11 @@ fn loopback_two_peers_exchange_media() {
         );
 
         let aud_id = CString::new("reactor-audio").unwrap();
-        let atrack = reactor_webrtc_audio_track_create(factory, aud_id.as_ptr());
+        let atrack = reactor_webrtc_audio_track_create(
+            factory,
+            aud_id.as_ptr(),
+            &ReactorAudioTrackOptions::default(),
+        );
         assert!(!atrack.is_null(), "audio track creation failed");
         assert_eq!(
             reactor_webrtc_peer_connection_add_track(pc1, atrack),

@@ -1264,31 +1264,57 @@ int reactor_webrtc_peer_connection_add_track(void* pc, void* track) {
   return rpc->pc->AddTrack(h->track, {kReactorStreamId}).ok() ? 1 : 0;
 }
 
-// Create a local audio track. Its samples come from the factory's ADM (push
-// PCM with reactor_webrtc_factory_push_audio_frame). Returns an owned
-// MediaStreamTrack handle or nullptr.
-void* reactor_webrtc_audio_track_create(void* factory, const char* id) {
-  auto* rf = reinterpret_cast<ReactorFactory*>(factory);
-  if (!rf || !rf->factory) return nullptr;
-  webrtc::scoped_refptr<webrtc::AudioSourceInterface> source =
-      rf->factory->CreateAudioSource(webrtc::AudioOptions());
-  auto handle = std::make_unique<ReactorMediaStreamTrack>();
-  handle->track = rf->factory->CreateAudioTrack(id ? id : "", source.get());
-  if (!handle->track) return nullptr;
-  return handle.release();
-}
+// Per-track audio-creation options. ABI-versioned: `size` MUST be
+// sizeof(ReactorAudioTrackOptions); future fields only ever get appended
+// (callers zero-fill, so appended defaults are the zero value).
+//
+// `source`: 0 = the factory's ADM — the platform mic, or the synthetic pipe
+//   shared by all ADM-sourced tracks (feed with
+//   reactor_webrtc_factory_push_audio_frame);
+//           1 = a per-track LocalAudioSource, independent of the ADM — feed
+//   with reactor_webrtc_audio_track_push_pcm. (The mic-vs-push
+//   coexistence scenario is this: platform ADM track for the mic next to a
+//   LocalAudioSource track for the music.)
+// The processing flags are constraints on the created source, tri-state:
+// -1 leaves the libwebrtc/APM default, 0 forces off, 1 forces on. They map
+// to cricket::AudioOptions and are meaningful only for ADM sources — a
+// LocalAudioSource never hears the room, so they are not applied there.
+struct ReactorAudioTrackOptions {
+  uint32_t size;
+  int      source;             // 0 = factory ADM, 1 = per-track local source
+  int      echo_cancellation;  // -1 unset | 0 off | 1 on
+  int      noise_suppression;  // -1 unset | 0 off | 1 on
+  int      auto_gain_control;  // -1 unset | 0 off | 1 on
+  int      high_pass_filter;   // -1 unset | 0 off | 1 on
+};
 
-// Create a local audio track backed by a per-track LocalAudioSource instead of
-// the factory-level ADM. Each call returns an independent source, so different
-// audio can be pushed to different peer connections. Feed via
-// reactor_webrtc_audio_track_push_pcm.
-void* reactor_webrtc_audio_track_create_with_local_source(void* factory,
-                                                          const char* id) {
+// Create a local audio track per `opts` (required; returns nullptr on a null
+// or undersized struct — there is no error channel here by design).
+void* reactor_webrtc_audio_track_create(void* factory, const char* id,
+                                         const ReactorAudioTrackOptions* opts) {
   auto* rf = reinterpret_cast<ReactorFactory*>(factory);
   if (!rf || !rf->factory) return nullptr;
-  auto source = LocalAudioSource::Create();
+  if (!opts || opts->size < sizeof(ReactorAudioTrackOptions)) return nullptr;
+  if (opts->source < 0 || opts->source > 1) return nullptr;
+
+  webrtc::AudioOptions ao;
+  auto tristate = [](int v) -> std::optional<bool> {
+    return v < 0 ? std::nullopt : std::optional<bool>(v != 0);
+  };
+  ao.echo_cancellation = tristate(opts->echo_cancellation);
+  ao.noise_suppression = tristate(opts->noise_suppression);
+  ao.auto_gain_control = tristate(opts->auto_gain_control);
+  ao.highpass_filter   = tristate(opts->high_pass_filter);
+
   auto handle = std::make_unique<ReactorMediaStreamTrack>();
-  handle->audio_source = source;
+  webrtc::scoped_refptr<webrtc::AudioSourceInterface> source;
+  if (opts->source == 1) {
+    auto local = LocalAudioSource::Create();
+    handle->audio_source = local;
+    source = local;
+  } else {
+    source = rf->factory->CreateAudioSource(ao);
+  }
   handle->track = rf->factory->CreateAudioTrack(id ? id : "", source.get());
   if (!handle->track) return nullptr;
   return handle.release();
@@ -1310,7 +1336,7 @@ void reactor_webrtc_audio_track_push_pcm_ts(void* track, const int16_t* pcm,
 }
 
 // Push interleaved int16 PCM directly to a local audio track that was created
-// with reactor_webrtc_audio_track_create_with_local_source. No-op on tracks
+// with a LocalAudioSource (ReactorAudioTrackOptions.source == 1). No-op on tracks
 // backed by the factory ADM.
 void reactor_webrtc_audio_track_push_pcm(void* track, const int16_t* pcm,
                                          int samples_per_channel,
