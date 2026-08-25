@@ -225,7 +225,7 @@ fn links_and_runs_libwebrtc() {
     // SAFETY: every symbol is implemented by the C++ glue compiled in build.rs
     // and resolved against our libwebrtc.a.
     unsafe {
-        assert_eq!(reactor_webrtc_abi_version(), 2, "ABI version mismatch");
+        assert_eq!(reactor_webrtc_abi_version(), 3, "ABI version mismatch");
 
         // Codec factories.
         let mut buf = [0u8; 1024];

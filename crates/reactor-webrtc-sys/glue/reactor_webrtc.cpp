@@ -873,7 +873,7 @@ static webrtc::scoped_refptr<webrtc::AudioProcessing> build_apm(int apm_flags) {
 extern "C" {
 
 // ABI version of this native build. The safe crate asserts compatibility.
-unsigned int reactor_webrtc_abi_version() { return 2; }
+unsigned int reactor_webrtc_abi_version() { return 3; }
 
 // Link/run self-test: build the builtin audio + video encoder factories and
 // enumerate the codecs they support. Writes a comma-separated, NUL-terminated
