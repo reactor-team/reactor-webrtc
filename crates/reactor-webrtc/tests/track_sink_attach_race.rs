@@ -76,7 +76,7 @@ fn forward_ice(from: &Shared, to: &PeerConnection) {
 
 #[test]
 fn concurrent_on_video_frame_attach_survives_live_frame_delivery() {
-    let factory = PeerConnectionFactory::new().expect("factory");
+    let factory = PeerConnectionFactory::builder().build().expect("factory");
     let config = RtcConfiguration::default();
 
     let (pc1, s1) = make_peer(&factory, &config);

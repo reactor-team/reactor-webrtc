@@ -109,7 +109,7 @@ mod tests {
     #[test]
     #[cfg_attr(target_os = "windows", ignore)]
     fn data_channel_send_receive() {
-        let factory = PeerConnectionFactory::new().expect("factory");
+        let factory = PeerConnectionFactory::builder().build().expect("factory");
         let cfg = RtcConfiguration::default();
 
         let (pc1, s1) = make_peer(&factory, &cfg);
@@ -170,7 +170,7 @@ mod tests {
     #[test]
     #[cfg_attr(target_os = "windows", ignore)]
     fn data_channel_state_transitions() {
-        let factory = PeerConnectionFactory::new().expect("factory");
+        let factory = PeerConnectionFactory::builder().build().expect("factory");
         let cfg = RtcConfiguration::default();
 
         let (pc1, s1) = make_peer(&factory, &cfg);
@@ -209,7 +209,7 @@ mod tests {
 
     #[test]
     fn data_channel_label_and_buffered_amount() {
-        let factory = PeerConnectionFactory::new().expect("factory");
+        let factory = PeerConnectionFactory::builder().build().expect("factory");
         let cfg = RtcConfiguration::default();
 
         let (pc1, s1) = make_peer(&factory, &cfg);

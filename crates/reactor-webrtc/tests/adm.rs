@@ -6,7 +6,10 @@
 use reactor_webrtc::{AdmMode, PeerConnectionFactory, PeerConnectionObserver, RtcConfiguration};
 
 fn smoke(mode: AdmMode) {
-    let factory = PeerConnectionFactory::with_adm(mode).expect("factory");
+    let factory = PeerConnectionFactory::builder()
+        .with_adm(mode)
+        .build()
+        .expect("factory");
     let pc = factory
         .create_peer_connection(&RtcConfiguration::default(), PeerConnectionObserver::new())
         .expect("peer connection");

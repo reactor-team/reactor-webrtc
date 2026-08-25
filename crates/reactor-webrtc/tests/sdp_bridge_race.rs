@@ -100,7 +100,7 @@ fn forward_ice(from: &Shared, to: &PeerConnection) {
 #[test]
 #[ignore = "reproducer meant to be run as several concurrent processes — see module docs"]
 fn sdp_bridge_survives_repeated_connects_with_media() {
-    let factory = PeerConnectionFactory::new().expect("factory");
+    let factory = PeerConnectionFactory::builder().build().expect("factory");
     let config = RtcConfiguration::default();
     let deadline = Instant::now() + Duration::from_secs(45);
     let mut iterations = 0u32;

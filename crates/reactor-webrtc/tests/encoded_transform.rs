@@ -76,7 +76,7 @@ fn forward_ice(from: &Ice, to: &PeerConnection) {
 #[test]
 #[cfg_attr(target_os = "windows", ignore)]
 fn encoded_frames_flow_both_directions() {
-    let factory = PeerConnectionFactory::new().expect("factory");
+    let factory = PeerConnectionFactory::builder().build().expect("factory");
     let config = RtcConfiguration::default();
 
     let (pc1, s1) = make_peer(&factory, &config);

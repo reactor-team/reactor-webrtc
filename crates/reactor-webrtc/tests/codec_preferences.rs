@@ -34,7 +34,7 @@ fn first_video_codec(sdp: &str) -> String {
 
 #[test]
 fn set_codec_preferences_reorders_without_dropping() {
-    let factory = PeerConnectionFactory::new().expect("factory");
+    let factory = PeerConnectionFactory::builder().build().expect("factory");
     let pc = factory
         .create_peer_connection(&RtcConfiguration::default(), PeerConnectionObserver::new())
         .expect("pc");
@@ -78,7 +78,7 @@ fn set_codec_preferences_reorders_without_dropping() {
 
 #[test]
 fn set_codec_preferences_rejects_audio_transceiver() {
-    let factory = PeerConnectionFactory::new().expect("factory");
+    let factory = PeerConnectionFactory::builder().build().expect("factory");
     let pc = factory
         .create_peer_connection(&RtcConfiguration::default(), PeerConnectionObserver::new())
         .expect("pc");

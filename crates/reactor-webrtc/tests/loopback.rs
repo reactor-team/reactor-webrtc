@@ -93,7 +93,7 @@ fn forward_ice(from: &Shared, to: &PeerConnection) {
 
 #[test]
 fn safe_loopback_exchanges_media() {
-    let factory = PeerConnectionFactory::new().expect("factory");
+    let factory = PeerConnectionFactory::builder().build().expect("factory");
     let config = RtcConfiguration::default();
 
     let (pc1, s1) = make_peer(&factory, &config);

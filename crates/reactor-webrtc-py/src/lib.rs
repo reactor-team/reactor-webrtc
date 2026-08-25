@@ -2041,7 +2041,10 @@ impl PeerConnectionFactory {
             agc,
             high_pass_filter,
         };
-        rw::PeerConnectionFactory::with_adm_apm(adm, apm)
+        rw::PeerConnectionFactory::builder()
+            .with_adm(adm)
+            .with_apm(apm)
+            .build()
             .map(|inner| Self { inner })
             .map_err(|e| {
                 FACTORY_LIVE.store(false, Ordering::SeqCst);

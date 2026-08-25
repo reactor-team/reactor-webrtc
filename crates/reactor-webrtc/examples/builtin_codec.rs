@@ -6,7 +6,7 @@
 //! PCM in `on_audio_frame`.
 //!
 //! This is the zero-integration path: no custom encoder, no codec knowledge
-//! required. Swap `PeerConnectionFactory::new()` for `::with_platform_adm()`
+//! required. Swap `PeerConnectionFactory::builder().build()` for `::with_platform_adm()`
 //! to capture from a real microphone instead of synthetic audio.
 //!
 //! ```sh
@@ -128,7 +128,7 @@ fn run() {
     // Synthetic ADM: no real audio hardware. Push PCM manually below.
     // Switch to PeerConnectionFactory::with_platform_adm() to capture from
     // the real microphone and play decoded audio through the speaker.
-    let factory = PeerConnectionFactory::new().expect("factory");
+    let factory = PeerConnectionFactory::builder().build().expect("factory");
     let config = RtcConfiguration::default();
 
     let (pc1, s1) = make_peer(&factory, &config);

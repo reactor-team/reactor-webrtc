@@ -42,7 +42,7 @@ mod tests {
     /// churn in a single process is unsafe.
     #[test]
     fn libwebrtc_accepts_every_credentialed_ice_configuration() {
-        let factory = PeerConnectionFactory::new().expect("factory");
+        let factory = PeerConnectionFactory::builder().build().expect("factory");
 
         let cases: Vec<(&str, RtcConfiguration)> = vec![
             ("no ice servers", RtcConfiguration::default()),
@@ -141,7 +141,7 @@ mod tests {
 
     #[test]
     fn libwebrtc_rejects_turn_without_credentials_and_reports_why() {
-        let factory = PeerConnectionFactory::new().expect("factory");
+        let factory = PeerConnectionFactory::builder().build().expect("factory");
         let config = with_servers(vec![IceServer {
             urls: vec!["turn:turn.example.com:3478".into()],
             ..Default::default()
@@ -188,7 +188,8 @@ mod tests {
                 },
             ),
         ] {
-            let result = PeerConnectionFactory::new()
+            let result = PeerConnectionFactory::builder()
+                .build()
                 .expect("factory")
                 .create_peer_connection(&config, PeerConnectionObserver::new());
             assert!(result.is_err(), "{label}: expected error but got Ok");

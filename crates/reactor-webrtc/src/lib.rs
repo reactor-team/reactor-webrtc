@@ -50,7 +50,7 @@ use std::ffi::CString;
 use std::os::raw::c_int;
 use std::sync::{Arc, Mutex};
 
-pub use builder::{EncodedVideoBuilder, MixedVideoTrack};
+pub use builder::{EncodedVideoBuilder, MixedVideoTrack, PeerConnectionFactoryBuilder};
 pub use config::{
     BundlePolicy, ContinualGatheringPolicy, IceServer, IceTransportsType, RtcConfiguration,
     TcpCandidatePolicy,
@@ -70,7 +70,8 @@ pub use peer_connection::{
     SdpType, SessionDescription, StatsReport, Transceiver, TransceiverDirection,
 };
 /// Runtime download/verification/caching of Cisco's OpenH264 shared library,
-/// and the required attribution string — see [`PeerConnectionFactory::with_openh264`].
+/// and the required attribution string — registered with
+/// [`PeerConnectionFactoryBuilder::with_openh264`].
 #[cfg(feature = "openh264")]
 pub use reactor_webrtc_sys::openh264;
 
@@ -150,7 +151,7 @@ pub struct ApmConfig {
 }
 
 impl ApmConfig {
-    fn to_flags(self) -> c_int {
+    pub(crate) fn to_flags(self) -> c_int {
         let mut f: c_int = 0;
         if self.echo_canceller {
             f |= 0x01;
@@ -196,9 +197,14 @@ impl Drop for FactoryHandle {
 }
 
 /// Entry point: creates peer connections and tracks, and owns the audio device
-/// module (synthetic by default, or the platform device).
+/// module (synthetic by default, or the platform device). Construct it with
+/// [`PeerConnectionFactory::builder`].
 pub struct PeerConnectionFactory {
     handle: Arc<FactoryHandle>,
+    /// Factory-level kill switch for per-frame metadata: when `false`, every
+    /// [`PeerConnection`] from this factory behaves like one created with
+    /// `RtcConfiguration::frame_metadata` off, whatever each config says.
+    metadata_enabled: bool,
 }
 
 impl PeerConnectionFactory {
@@ -209,25 +215,27 @@ impl PeerConnectionFactory {
         Arc::clone(&self.handle)
     }
 
-    /// Create a factory with the given [`AdmMode`] and no APM processing.
-    pub fn with_adm(mode: AdmMode) -> Result<Self> {
-        Self::with_adm_apm(mode, ApmConfig::default())
-    }
-
-    /// Create a factory with full control over the audio device and APM chain.
-    pub fn with_adm_apm(mode: AdmMode, apm: ApmConfig) -> Result<Self> {
-        Self::create_from_options(&reactor_webrtc_sys::ReactorFactoryOptions {
-            use_platform_adm: matches!(mode, AdmMode::Platform) as c_int,
-            apm_flags: apm.to_flags(),
-            ..Default::default()
-        })
+    /// Start composing a factory — the replacement for the old one-shot
+    /// constructors. Chain the knobs you need, then [`build`](PeerConnectionFactoryBuilder::build):
+    ///
+    /// ```rust,ignore
+    /// let factory = PeerConnectionFactory::builder()
+    ///     .with_platform_adm()
+    ///     .with_metadata(false)
+    ///     .build()?;
+    /// ```
+    pub fn builder() -> PeerConnectionFactoryBuilder {
+        PeerConnectionFactoryBuilder::new()
     }
 
     /// Shared create path: every constructor shapes a
     /// [`reactor_webrtc_sys::ReactorFactoryOptions`] and lands here. The glue
     /// writes a reason into `err` when it returns null; a silent null gets the
     /// generic message.
-    fn create_from_options(opts: &reactor_webrtc_sys::ReactorFactoryOptions) -> Result<Self> {
+    pub(crate) fn create_from_options(
+        opts: &reactor_webrtc_sys::ReactorFactoryOptions,
+        metadata_enabled: bool,
+    ) -> Result<Self> {
         let mut err = [0 as std::os::raw::c_char; 256];
         let raw = unsafe {
             reactor_webrtc_sys::reactor_webrtc_factory_create(
@@ -248,29 +256,8 @@ impl PeerConnectionFactory {
         }
         Ok(Self {
             handle: Arc::new(FactoryHandle(raw)),
+            metadata_enabled,
         })
-    }
-
-    /// Create a factory using the **synthetic** audio device module — no audio
-    /// hardware; feed audio with [`PeerConnectionFactory::push_audio_frame`].
-    pub fn new() -> Result<Self> {
-        Self::with_adm(AdmMode::Synthetic)
-    }
-
-    /// Create a factory using the **platform** audio device module (real
-    /// mic/speaker, e.g. CoreAudio on macOS) with the full AEC3 + noise
-    /// suppression + AGC + high-pass chain enabled — the sensible default for
-    /// real hardware capture.
-    pub fn with_platform_adm() -> Result<Self> {
-        Self::with_adm_apm(
-            AdmMode::Platform,
-            ApmConfig {
-                echo_canceller: true,
-                noise_suppression: true,
-                agc: true,
-                high_pass_filter: true,
-            },
-        )
     }
 
     /// Create a factory that replaces the builtin H.264 encoder with `encoder`.
@@ -283,15 +270,18 @@ impl PeerConnectionFactory {
     /// Audio encoding is unaffected; the builtin audio codecs (Opus, G.711,
     /// etc.) remain active.
     pub fn with_custom_video_encoder(encoder: crate::CustomVideoEncoder) -> Result<Self> {
-        let result = Self::create_from_options(&reactor_webrtc_sys::ReactorFactoryOptions {
-            encode_cb: Some(encoder.encode_fn),
-            encode_userdata: encoder.userdata,
-            encode_free_ud: encoder.free_ud,
-            encode_use_builtin: encoder.use_builtin,
-            use_platform_adm: 0, // synthetic ADM
-            apm_flags: 0,        // all processing disabled
-            ..Default::default()
-        });
+        let result = Self::create_from_options(
+            &reactor_webrtc_sys::ReactorFactoryOptions {
+                encode_cb: Some(encoder.encode_fn),
+                encode_userdata: encoder.userdata,
+                encode_free_ud: encoder.free_ud,
+                encode_use_builtin: encoder.use_builtin,
+                use_platform_adm: 0, // synthetic ADM
+                apm_flags: 0,        // all processing disabled
+                ..Default::default()
+            },
+            true,
+        );
         if result.is_err() {
             // Factory did not take ownership — free the state ourselves.
             if let Some(f) = encoder.free_ud {
@@ -299,37 +289,6 @@ impl PeerConnectionFactory {
             }
         }
         result
-    }
-
-    /// Create a factory with real H.264 encode/decode backed by a
-    /// dynamically loaded OpenH264 shared library — see
-    /// [`crate::openh264::ensure_available`] to obtain `lib_path`. VP8/VP9/AV1
-    /// remain builtin; only H264 is affected.
-    ///
-    /// This never fails because OpenH264 itself couldn't be loaded: if
-    /// `lib_path` doesn't `dlopen`/`LoadLibraryW`, the factory still
-    /// constructs, H264 is simply not advertised in SDP (peers negotiate
-    /// VP8/VP9/AV1 as usual). Errors here mean factory/thread construction
-    /// itself failed, same as [`Self::with_adm_apm`].
-    ///
-    /// Requires the `openh264` crate feature. Cisco's binary license
-    /// conditions the royalty carve-out on showing
-    /// [`crate::openh264::OPENH264_ATTRIBUTION`] in your app's
-    /// licensing/EULA surface — see that constant's doc comment.
-    #[cfg(feature = "openh264")]
-    pub fn with_openh264(
-        lib_path: &std::path::Path,
-        mode: AdmMode,
-        apm: ApmConfig,
-    ) -> Result<Self> {
-        let lib_path = CString::new(lib_path.to_string_lossy().into_owned())
-            .map_err(|_| Error::Webrtc("lib_path contains a NUL byte".into()))?;
-        Self::create_from_options(&reactor_webrtc_sys::ReactorFactoryOptions {
-            openh264_lib_path: lib_path.as_ptr(),
-            use_platform_adm: matches!(mode, AdmMode::Platform) as c_int,
-            apm_flags: apm.to_flags(),
-            ..Default::default()
-        })
     }
 
     /// Create a builder for a factory that supports **multiple** pre-encoded
@@ -422,7 +381,7 @@ impl PeerConnectionFactory {
             raw,
             state,
             self.handle(),
-            config.frame_metadata,
+            config.frame_metadata && self.metadata_enabled,
         ))
     }
 
