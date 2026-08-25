@@ -280,7 +280,8 @@ impl VideoCodec {
     }
 }
 
-/// Raw I420 video frame delivered to a [`CustomVideoEncoder`] callback.
+/// Raw I420 video frame delivered to an inline encoder callback
+/// ([`TrackVideoEncoder::Inline`]).
 ///
 /// Planes are slices into the native frame buffer and are **only valid for the
 /// duration of the callback**. Copy the data if your encoder is asynchronous.
@@ -303,7 +304,8 @@ pub struct RawVideoFrame<'a> {
     pub request_key_frame: bool,
 }
 
-/// An encoded H.264 frame produced by a [`CustomVideoEncoder`] callback.
+/// An encoded video frame, produced by an inline encoder callback or pushed
+/// to an [`EncodedVideoTrack`].
 pub struct EncodedVideoFrame {
     /// Raw H.264 Annex-B or AVCC bitstream bytes.
     pub data: Vec<u8>,
@@ -317,26 +319,23 @@ pub struct EncodedVideoFrame {
     pub rtp_timestamp: u32,
 }
 
-type EncodeCallbackBox = Box<dyn FnMut(&RawVideoFrame<'_>) -> Option<EncodedVideoFrame> + Send>;
+/// The boxed encoder callback a [`TrackVideoEncoder::Inline`] track hands
+/// the factory — called synchronously with every raw I420 frame on the
+/// encoder thread; return `Some(encoded)` to forward, `None` to drop.
+pub type InlineEncoderCallback =
+    Box<dyn FnMut(&RawVideoFrame<'_>) -> Option<EncodedVideoFrame> + Send + 'static>;
 
-struct CustomEncoderState {
-    cb: Mutex<EncodeCallbackBox>,
+pub(crate) struct CustomEncoderState {
+    cb: Mutex<InlineEncoderCallback>,
 }
 
-extern "C" fn encode_tramp(
-    ud: *mut c_void,
-    raw: *const reactor_webrtc_sys::ReactorRawVideoFrame,
-    out: *mut reactor_webrtc_sys::ReactorEncodedVideoOutput,
-) -> c_int {
-    let Some(r) = (unsafe { raw.as_ref() }) else {
-        return 1;
-    };
-    let st = unsafe { &*(ud as *const CustomEncoderState) };
-
+/// Borrowed view of a glue raw frame, for the inline-encoder callback.
+/// Planes are valid only for the duration of the native Encode() call.
+fn raw_view(r: &reactor_webrtc_sys::ReactorRawVideoFrame) -> RawVideoFrame<'_> {
     let y_len = (r.y_stride.max(0) as usize) * r.height as usize;
     let uv_len = (r.u_stride.max(0) as usize) * (r.height as usize).div_ceil(2);
 
-    let frame = RawVideoFrame {
+    RawVideoFrame {
         codec: VideoCodec::from_u32(r.codec).unwrap_or(VideoCodec::H264),
         y: if r.y.is_null() {
             &[]
@@ -360,16 +359,6 @@ extern "C" fn encode_tramp(
         height: r.height,
         rtp_timestamp: r.rtp_timestamp,
         request_key_frame: r.request_key_frame != 0,
-    };
-
-    let result = match st.cb.lock() {
-        Ok(mut cb) => cb(&frame),
-        Err(_) => return 1,
-    };
-
-    match result {
-        None => 1,
-        Some(encoded) => fill_output(encoded, out),
     }
 }
 
@@ -381,29 +370,37 @@ extern "C" fn free_encoded_data(data: *const u8, len: usize) {
     unsafe { drop(Vec::from_raw_parts(data as *mut u8, len, len)) };
 }
 
-extern "C" fn free_encoder_state_tramp(ud: *mut c_void) {
-    drop(unsafe { Box::from_raw(ud as *mut CustomEncoderState) });
-}
-
 // ── Multi-track encoder registry ─────────────────────────────────────────────
 
 /// A pending slot for one video transceiver in an [`EncoderRegistry`].
 ///
-/// - `Custom` — the custom Rust encoder handles this slot; frames are read from
-///   the associated queue (push via [`EncodedVideoTrack`]).
+/// - `Custom` — frames are read from the associated queue (push via
+///   [`EncodedVideoTrack`]); the queue drain itself is the "encoder".
+/// - `Inline` — the registry calls the user callback synchronously with every
+///   raw I420 frame ([`TrackVideoEncoder::Inline`] tracks).
 /// - `Builtin` — the factory delegates to libwebrtc's builtin VP8/VP9/AV1
 ///   encoder; push raw BGRA frames via the returned [`Track`](crate::media::Track).
-#[derive(Clone)]
 pub(crate) enum RegistrySlot {
     Custom(Arc<Mutex<VecDeque<EncodedVideoFrame>>>),
+    Inline(Arc<CustomEncoderState>),
     Builtin,
+}
+
+impl Clone for RegistrySlot {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Custom(q) => Self::Custom(q.clone()),
+            Self::Inline(s) => Self::Inline(s.clone()),
+            Self::Builtin => Self::Builtin,
+        }
+    }
 }
 
 /// Routes encoder instances to per-track slots using the per-encoder-instance ID
 /// stamped by the C++ factory.
 ///
 /// Slots are assigned lazily: when a given `encoder_id` appears for the first
-/// time (either in `use_builtin_for` or `pop_for`), the next pending slot is
+/// time (either in `use_builtin_for` or `encode_for`), the next pending slot is
 /// consumed and bound to that ID. The assignment order matches the order
 /// libwebrtc calls `VideoEncoderFactory::Create()` — one call per video
 /// transceiver, in negotiation order — which in turn matches the order
@@ -419,6 +416,25 @@ impl EncoderRegistry {
             pending: Mutex::new(VecDeque::new()),
             assigned: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Wire this registry into factory-create options: leaks a
+    /// [`RegistryState`] the native side frees via `free_registry_state_tramp`
+    /// when the last encoder goes away (or the caller frees manually after a
+    /// failed create), and points every encode/`use_builtin`/`has_custom`
+    /// trampoline at it.
+    pub(crate) fn install_into(
+        self: &Arc<Self>,
+        opts: &mut reactor_webrtc_sys::ReactorFactoryOptions,
+    ) {
+        let state = Box::into_raw(Box::new(RegistryState {
+            registry: Arc::clone(self),
+        }));
+        opts.encode_cb = Some(registry_encode_tramp);
+        opts.encode_userdata = state as *mut c_void;
+        opts.encode_free_ud = Some(free_registry_state_tramp);
+        opts.encode_use_builtin = Some(registry_use_builtin_tramp);
+        opts.encode_has_custom_slots = Some(registry_has_custom_tramp);
     }
 
     /// Reserve a custom (pre-encoded) slot. Returns the queue the
@@ -441,6 +457,25 @@ impl EncoderRegistry {
             .push_back(RegistrySlot::Builtin);
     }
 
+    /// Reserve an inline-encoder slot. The registry calls `cb` synchronously
+    /// with every raw I420 frame for the encoder instance that binds here.
+    pub(crate) fn add_inline_slot(&self, cb: InlineEncoderCallback) {
+        let state = Arc::new(CustomEncoderState { cb: Mutex::new(cb) });
+        self.pending
+            .lock()
+            .unwrap()
+            .push_back(RegistrySlot::Inline(state));
+    }
+
+    /// Whether any custom (pre-encoded or inline) slot exists — pending or
+    /// already assigned. Drives the `has_custom_slots` predicate the native
+    /// factory consults when advertising codecs.
+    pub(crate) fn has_custom(&self) -> bool {
+        let is_custom = |s: &RegistrySlot| !matches!(s, RegistrySlot::Builtin);
+        self.pending.lock().unwrap().iter().any(is_custom)
+            || self.assigned.lock().unwrap().values().any(is_custom)
+    }
+
     /// Called by `registry_use_builtin_tramp`. Assigns the next pending slot to
     /// `encoder_id` if it has not been seen before, then returns whether the
     /// C++ factory should delegate to the builtin encoder.
@@ -460,9 +495,11 @@ impl EncoderRegistry {
         is_builtin
     }
 
-    /// Called by `registry_encode_tramp`. Pops the next pre-encoded frame for
-    /// this encoder instance, assigning its slot on first call if needed.
-    fn pop_for(&self, encoder_id: u64) -> Option<EncodedVideoFrame> {
+    /// Called by `registry_encode_tramp`. Produces the next encoded frame for
+    /// this encoder instance — draining the queue for pre-encoded slots,
+    /// invoking the user callback for inline slots — assigning its slot on
+    /// first call if needed.
+    fn encode_for(&self, encoder_id: u64, raw: &RawVideoFrame) -> Option<EncodedVideoFrame> {
         let mut assigned = self.assigned.lock().unwrap();
         let slot = assigned.entry(encoder_id).or_insert_with(|| {
             self.pending
@@ -478,7 +515,15 @@ impl EncoderRegistry {
                 let frame = q.lock().unwrap().pop_front();
                 frame
             }
-            _ => None,
+            RegistrySlot::Inline(state) => {
+                let state = state.clone();
+                drop(assigned);
+                let Ok(mut cb) = state.cb.lock() else {
+                    return None;
+                };
+                cb(raw)
+            }
+            RegistrySlot::Builtin => None,
         }
     }
 }
@@ -512,7 +557,7 @@ fn fill_output(
     0
 }
 
-extern "C" fn registry_encode_tramp(
+pub(crate) extern "C" fn registry_encode_tramp(
     ud: *mut c_void,
     raw: *const reactor_webrtc_sys::ReactorRawVideoFrame,
     out: *mut reactor_webrtc_sys::ReactorEncodedVideoOutput,
@@ -521,7 +566,8 @@ extern "C" fn registry_encode_tramp(
         return 1;
     };
     let st = unsafe { &*(ud as *const RegistryState) };
-    match st.registry.pop_for(r.encoder_id) {
+    let frame = raw_view(r);
+    match st.registry.encode_for(r.encoder_id, &frame) {
         None => 1,
         Some(encoded) => fill_output(encoded, out),
     }
@@ -529,80 +575,140 @@ extern "C" fn registry_encode_tramp(
 
 /// Called by C++ before creating each encoder instance. Returns 1 if the
 /// builtin VP8/VP9/AV1 encoder should be used for this slot, 0 for custom.
-extern "C" fn registry_use_builtin_tramp(ud: *mut c_void, encoder_id: u64) -> c_int {
+pub(crate) extern "C" fn registry_use_builtin_tramp(ud: *mut c_void, encoder_id: u64) -> c_int {
     let st = unsafe { &*(ud as *const RegistryState) };
     st.registry.use_builtin_for(encoder_id) as c_int
 }
 
-extern "C" fn free_registry_state_tramp(ud: *mut c_void) {
+pub(crate) extern "C" fn free_registry_state_tramp(ud: *mut c_void) {
     drop(unsafe { Box::from_raw(ud as *mut RegistryState) });
 }
 
-/// A factory-level custom video encoder. Pass to
-/// [`PeerConnectionFactory::with_custom_video_encoder`](crate::PeerConnectionFactory::with_custom_video_encoder).
-///
-/// The closure is called **synchronously** on the WebRTC encoder thread for every
-/// raw I420 frame. Return `Some(encoded)` to inject H.264 bytes into the RTP
-/// stack, or `None` to drop the frame.
-///
-/// For asynchronous hardware encoders (VideoToolbox, GStreamer, etc.), copy the
-/// I420 planes into your pipeline and block until output is ready. The closure
-/// must be `Send` because it is called from a WebRTC-internal thread.
-pub struct CustomVideoEncoder {
-    pub(crate) encode_fn: extern "C" fn(
-        *mut c_void,
-        *const reactor_webrtc_sys::ReactorRawVideoFrame,
-        *mut reactor_webrtc_sys::ReactorEncodedVideoOutput,
-    ) -> c_int,
-    pub(crate) userdata: *mut c_void,
-    pub(crate) free_ud: Option<extern "C" fn(*mut c_void)>,
-    /// Optional: called by the C++ factory before creating each encoder instance.
-    /// Non-null only when the registry contains a mix of custom and builtin slots.
-    pub(crate) use_builtin: Option<extern "C" fn(*mut c_void, u64) -> c_int>,
+/// Called by the native factory when enumerating advertised video codecs.
+/// Returns nonzero while any custom (pre-encoded or inline) slot exists.
+pub(crate) extern "C" fn registry_has_custom_tramp(ud: *mut c_void) -> c_int {
+    let st = unsafe { &*(ud as *const RegistryState) };
+    st.registry.has_custom() as c_int
 }
 
-// SAFETY: the callback is Mutex-guarded; userdata is a heap-pinned Box that
-// lives until the native factory calls free_ud.
-unsafe impl Send for CustomVideoEncoder {}
-unsafe impl Sync for CustomVideoEncoder {}
+// ── Per-track encoder selection ─────────────────────────────────────────────
 
-impl CustomVideoEncoder {
-    /// Create a custom encoder that calls `cb` for every frame to be encoded.
-    pub fn new(
-        cb: impl FnMut(&RawVideoFrame<'_>) -> Option<EncodedVideoFrame> + Send + 'static,
-    ) -> Self {
-        // Leak the state: the factory holds it and frees via free_encoder_state_tramp.
-        let state = Box::into_raw(Box::new(CustomEncoderState {
-            cb: Mutex::new(Box::new(cb)),
-        }));
-        Self {
-            encode_fn: encode_tramp,
-            userdata: state as *mut c_void,
-            free_ud: Some(free_encoder_state_tramp),
-            use_builtin: None,
+/// Geometry for a pre-encoded video track
+/// ([`TrackVideoEncoder::PreEncoded`]).
+///
+/// `width`/`height` set the resolution libwebrtc's encoder pipeline is
+/// configured for. They must match what your encoder actually produces. Pass
+/// 0 in [`EncodedVideoFrame`] fields to inherit them per frame.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct PreEncodedOptions {
+    /// Encoded width in pixels.
+    pub width: u32,
+    /// Encoded height in pixels.
+    pub height: u32,
+}
+
+impl PreEncodedOptions {
+    /// Pre-encoded track encoded at `width`×`height`.
+    pub fn new(width: u32, height: u32) -> Self {
+        Self { width, height }
+    }
+}
+
+/// How a video track produces its encoded bitstream, replacing libwebrtc's
+/// builtin encoder **for that track only**.
+///
+/// One mechanism, two feeding styles:
+///
+/// - [`PreEncoded`](TrackVideoEncoder::PreEncoded) — **asynchronous**: you
+///   push already-encoded bytes at your own pace, from any thread (a
+///   hardware encoder callback, a relay, a file dumper). A queue decouples
+///   your producer from the encoder thread. The track comes back as
+///   [`LocalVideoTrack::Encoded`] and you feed it with
+///   [`EncodedVideoTrack::push_encoded_frame`].
+/// - [`Inline`](TrackVideoEncoder::Inline) — **synchronous**: libwebrtc calls
+///   your closure on the encoder thread with every raw I420 frame; return
+///   `Some(encoded)` to inject bytes into the RTP stack or `None` to drop the
+///   frame. Right when your pipeline is raw-in/encoded-out and you want
+///   libwebrtc to drive the cadence. The track comes back as
+///   [`LocalVideoTrack::Raw`] and you feed it like any raw track.
+///
+/// Either way, the bytes **you** produce must match the codec negotiated for
+/// the track's transceiver — read [`RawVideoFrame::codec`] (inline) or set
+/// codec preferences to pin it.
+///
+/// # Slot assignment order
+///
+/// Slot routing between encoder instances and tracks is **positional**: the
+/// n-th video transceiver to negotiate binds the n-th track created with
+/// [`TrackVideoEncoder`]. Create your tracks before (or in the same order as)
+/// the transceivers that carry them.
+#[non_exhaustive]
+pub enum TrackVideoEncoder {
+    /// You push already-encoded bytes at your own pace.
+    PreEncoded(PreEncodedOptions),
+    /// libwebrtc calls your encoder synchronously with every raw I420 frame.
+    Inline(InlineEncoderCallback),
+}
+
+/// Options for [`PeerConnectionFactory::create_video_track_with_options`].
+///
+/// All fields optional; `Default::default()` produces exactly what
+/// [`PeerConnectionFactory::create_video_track`] produces. The struct is
+/// `#[non_exhaustive]` — construct via `Default` and assign fields:
+///
+/// ```rust,ignore
+/// let mut opts = VideoTrackOptions::default();
+/// opts.encoder = Some(TrackVideoEncoder::PreEncoded(PreEncodedOptions::new(1280, 720)));
+/// ```
+#[derive(Default)]
+#[non_exhaustive]
+pub struct VideoTrackOptions {
+    /// Encoder override for this track. `None` (default) = libwebrtc's
+    /// builtin/software pipeline encodes (also see `h264_backend`, landing
+    /// with the backend-selection change).
+    pub encoder: Option<TrackVideoEncoder>,
+}
+
+/// One video track created by
+/// [`PeerConnectionFactory::create_video_track_with_options`].
+///
+/// - [`Raw`](LocalVideoTrack::Raw) — push BGRA frames; either libwebrtc
+///   encodes them itself (default) or they go through an
+///   [`Inline`](TrackVideoEncoder::Inline) callback.
+/// - [`Encoded`](LocalVideoTrack::Encoded) — push pre-encoded bytes;
+///   libwebrtc only packetises.
+pub enum LocalVideoTrack {
+    /// A raw (BGRA-in) video track.
+    Raw(crate::media::Track),
+    /// A pre-encoded (bytes-in) video track.
+    Encoded(EncodedVideoTrack),
+}
+
+impl LocalVideoTrack {
+    /// The underlying [`Track`](crate::media::Track) handle — attach this to
+    /// a transceiver with [`Transceiver::set_track`](crate::Transceiver::set_track).
+    pub fn track(&self) -> &crate::media::Track {
+        match self {
+            Self::Raw(t) => t,
+            Self::Encoded(e) => e.track(),
         }
     }
 
-    /// Create a custom encoder driven by an [`EncodedVideoTrack`] queue.
-    ///
-    /// Internal — called by [`PeerConnectionFactory::with_encoded_video_track`].
-    pub(crate) fn from_queue(queue: Arc<Mutex<VecDeque<EncodedVideoFrame>>>) -> Self {
-        Self::new(move |_raw| queue.lock().unwrap().pop_front())
+    /// Returns the inner [`EncodedVideoTrack`], or `None` if this is a raw track.
+    pub fn as_encoded(&self) -> Option<&EncodedVideoTrack> {
+        match self {
+            Self::Encoded(e) => Some(e),
+            Self::Raw(_) => None,
+        }
     }
 
-    /// Create a custom encoder backed by a shared [`EncoderRegistry`].
-    ///
-    /// Internal — used by [`EncodedVideoBuilder`](crate::EncodedVideoBuilder)
-    /// to route frames across multiple encoded and/or raw video tracks.
-    /// The `use_builtin` trampoline is passed to the C++ factory so it can
-    /// delegate individual encoder instances to the builtin VP8/VP9/AV1 pipeline.
-    pub(crate) fn from_registry(registry: Arc<EncoderRegistry>) -> Self {
-        let state = Box::into_raw(Box::new(RegistryState { registry }));
-        Self {
-            encode_fn: registry_encode_tramp,
-            userdata: state as *mut c_void,
-            free_ud: Some(free_registry_state_tramp),
-            use_builtin: Some(registry_use_builtin_tramp),
+    /// Returns the inner raw [`Track`](crate::media::Track), or `None` if
+    /// this is a pre-encoded track.
+    pub fn as_raw(&self) -> Option<&crate::media::Track> {
+        match self {
+            Self::Raw(t) => Some(t),
+            Self::Encoded(_) => None,
         }
     }
 }
@@ -612,7 +718,9 @@ impl CustomVideoEncoder {
 /// A video track that accepts **pre-encoded** frames directly, bypassing the
 /// libwebrtc software encoder pipeline entirely.
 ///
-/// Obtain one via [`PeerConnectionFactory::with_encoded_video_track`], then:
+/// Obtain one via
+/// [`PeerConnectionFactory::create_video_track_with_options`] with
+/// [`TrackVideoEncoder::PreEncoded`], then:
 ///
 /// 1. Attach `EncodedVideoTrack::track()` to a send-only transceiver.
 /// 2. Call `push_encoded_frame` whenever your encoder (VideoToolbox, NVENC,
@@ -703,8 +811,8 @@ impl EncodedVideoTrack {
     /// any thread, including a hardware encoder callback.
     ///
     /// Set `frame.width` / `frame.height` to 0 to inherit from the track's
-    /// configured resolution (the value passed to
-    /// [`with_encoded_video_track`](crate::PeerConnectionFactory::with_encoded_video_track)).
+    /// configured resolution — the
+    /// [`PreEncodedOptions`] the track was created with.
     pub fn push_encoded_frame(&self, frame: EncodedVideoFrame) {
         // Queue first so the frame is always present when the encoder thread
         // dequeues it (the two operations are not atomic, but the encoder

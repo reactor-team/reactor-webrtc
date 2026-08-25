@@ -1,13 +1,7 @@
-//! Builders: [`PeerConnectionFactoryBuilder`] — the composable entry point
-//! for every [`PeerConnectionFactory`] — and [`EncodedVideoBuilder`] for a
-//! factory plus a mix of raw and pre-encoded video tracks.
+//! [`PeerConnectionFactoryBuilder`] — the composable entry point for every
+//! [`PeerConnectionFactory`].
 
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
-
-use crate::encoded::{EncodedVideoFrame, EncodedVideoTrack, EncoderRegistry};
-use crate::media::Track;
-use crate::{AdmMode, ApmConfig, CustomVideoEncoder, PeerConnectionFactory, Result};
+use crate::{AdmMode, ApmConfig, PeerConnectionFactory, Result};
 
 /// Builds a [`PeerConnectionFactory`] knob by knob — the single entry point
 /// that replaced the old mutually-exclusive constructors (they could not
@@ -34,7 +28,6 @@ pub struct PeerConnectionFactoryBuilder {
     adm: AdmMode,
     apm: ApmConfig,
     metadata: bool,
-    custom_encoder: Option<CustomVideoEncoder>,
     #[cfg(feature = "openh264")]
     openh264: Option<std::path::PathBuf>,
 }
@@ -45,7 +38,6 @@ impl PeerConnectionFactoryBuilder {
             adm: AdmMode::Synthetic,
             apm: ApmConfig::default(),
             metadata: true,
-            custom_encoder: None,
             #[cfg(feature = "openh264")]
             openh264: None,
         }
@@ -120,15 +112,6 @@ impl PeerConnectionFactoryBuilder {
         self
     }
 
-    /// Transitional (post-constructor) hook for the still-public
-    /// [`PeerConnectionFactory::with_custom_video_encoder`] /
-    /// [`EncodedVideoBuilder`] path — replaced by per-track encoder options
-    /// in an upcoming change.
-    pub(crate) fn with_custom_video_encoder(mut self, encoder: CustomVideoEncoder) -> Self {
-        self.custom_encoder = Some(encoder);
-        self
-    }
-
     /// Finalise the factory. Fails on malformed options (an OpenH264 path
     /// with a NUL byte) or on factory/thread construction — the error carries
     /// the reason the glue reported.
@@ -142,180 +125,28 @@ impl PeerConnectionFactoryBuilder {
             ),
             None => None,
         };
-        let encoder = self.custom_encoder.as_ref();
-        let opts = reactor_webrtc_sys::ReactorFactoryOptions {
+        // Every factory wires the encoder registry: per-track encoder options
+        // (pre-encoded / inline) need no factory-level heads-up. The
+        // `has_custom_slots` predicate keeps factories without custom slots
+        // out of the H264/H265 advertisement.
+        let registry = crate::encoded::EncoderRegistry::new();
+        let mut opts = reactor_webrtc_sys::ReactorFactoryOptions {
             use_platform_adm: matches!(self.adm, AdmMode::Platform) as std::os::raw::c_int,
             apm_flags: self.apm.to_flags(),
             #[cfg(feature = "openh264")]
             openh264_lib_path: openh264_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
-            encode_cb: encoder.map(|e| e.encode_fn),
-            encode_userdata: encoder.map_or(std::ptr::null_mut(), |e| e.userdata),
-            encode_free_ud: encoder.and_then(|e| e.free_ud),
-            encode_use_builtin: encoder.and_then(|e| e.use_builtin),
             ..Default::default()
         };
-        let result = PeerConnectionFactory::create_from_options(&opts, self.metadata);
-        if result.is_err() {
-            // Factory did not take ownership — free the encoder state.
-            if let Some(e) = self.custom_encoder {
-                if let Some(f) = e.free_ud {
-                    f(e.userdata);
-                }
+        registry.install_into(&mut opts);
+        let factory =
+            PeerConnectionFactory::create_from_options(&opts, self.metadata, registry.clone());
+        if factory.is_err() {
+            // The native side never took ownership of the leaked registry
+            // state — free it ourselves.
+            if let Some(free) = opts.encode_free_ud {
+                free(opts.encode_userdata);
             }
         }
-        result
-    }
-}
-
-/// One video track produced by [`EncodedVideoBuilder::build`].
-///
-/// - [`Raw`](MixedVideoTrack::Raw) — push BGRA frames with
-///   [`Track::push_video_frame`]; libwebrtc encodes to VP8/VP9/AV1.
-/// - [`Encoded`](MixedVideoTrack::Encoded) — push pre-encoded bytes with
-///   [`EncodedVideoTrack::push_encoded_frame`]; libwebrtc only packetises.
-pub enum MixedVideoTrack {
-    Raw(Track),
-    Encoded(EncodedVideoTrack),
-}
-
-impl MixedVideoTrack {
-    /// The underlying [`Track`] handle — attach this to a transceiver with
-    /// [`Transceiver::set_track`](crate::Transceiver::set_track).
-    pub fn track(&self) -> &Track {
-        match self {
-            Self::Raw(t) => t,
-            Self::Encoded(e) => e.track(),
-        }
-    }
-
-    /// Returns the inner [`EncodedVideoTrack`], or `None` if this is a raw track.
-    pub fn as_encoded(&self) -> Option<&EncodedVideoTrack> {
-        match self {
-            Self::Encoded(e) => Some(e),
-            Self::Raw(_) => None,
-        }
-    }
-
-    /// Returns the inner raw [`Track`], or `None` if this is a pre-encoded track.
-    pub fn as_raw(&self) -> Option<&Track> {
-        match self {
-            Self::Raw(t) => Some(t),
-            Self::Encoded(_) => None,
-        }
-    }
-}
-
-enum SlotConfig {
-    Raw {
-        id: String,
-    },
-    Encoded {
-        id: String,
-        width: u32,
-        height: u32,
-        queue: Arc<Mutex<VecDeque<EncodedVideoFrame>>>,
-    },
-}
-
-/// Builds a [`PeerConnectionFactory`] wired for **multiple** video tracks that
-/// may be a mix of raw (builtin encoder) and pre-encoded (custom encoder).
-///
-/// ```rust,ignore
-/// let mut b = PeerConnectionFactory::encoded_video_builder();
-///
-/// // Raw track: push BGRA → libwebrtc encodes → RTP
-/// let cam_idx = b.add_raw_track("camera", 1280, 720);
-///
-/// // Pre-encoded track: push your own bytes → RTP
-/// let scr_idx = b.add_encoded_track("screen", 1920, 1080);
-///
-/// let (factory, tracks) = b.build()?;
-///
-/// if let MixedVideoTrack::Raw(cam) = &tracks[cam_idx] {
-///     cam.push_video_frame(&bgra, 1280, 720);
-/// }
-/// if let MixedVideoTrack::Encoded(scr) = &tracks[scr_idx] {
-///     scr.push_encoded_frame(screen_frame);
-/// }
-/// ```
-///
-/// For a single pre-encoded track the convenience method
-/// [`PeerConnectionFactory::with_encoded_video_track`] is simpler.
-pub struct EncodedVideoBuilder {
-    registry: Arc<EncoderRegistry>,
-    slots: Vec<SlotConfig>,
-}
-
-impl EncodedVideoBuilder {
-    pub(crate) fn new() -> Self {
-        Self {
-            registry: EncoderRegistry::new(),
-            slots: Vec::new(),
-        }
-    }
-
-    /// Add a **raw** video track. Push BGRA frames with
-    /// [`Track::push_video_frame`]; libwebrtc's builtin VP8/VP9/AV1 encoder
-    /// handles compression. No `width`/`height` needed here — set them per frame.
-    ///
-    /// Returns the index into the `Vec<MixedVideoTrack>` that [`build`] produces.
-    pub fn add_raw_track(&mut self, id: &str) -> usize {
-        self.registry.add_raw_slot();
-        let idx = self.slots.len();
-        self.slots.push(SlotConfig::Raw { id: id.to_owned() });
-        idx
-    }
-
-    /// Add a **pre-encoded** video track. Push encoded bytes with
-    /// [`EncodedVideoTrack::push_encoded_frame`]; libwebrtc only packetises.
-    ///
-    /// Returns the index into the `Vec<MixedVideoTrack>` that [`build`] produces.
-    pub fn add_encoded_track(&mut self, id: &str, width: u32, height: u32) -> usize {
-        let queue = self.registry.add_encoded_slot();
-        let idx = self.slots.len();
-        self.slots.push(SlotConfig::Encoded {
-            id: id.to_owned(),
-            width,
-            height,
-            queue,
-        });
-        idx
-    }
-
-    /// Convenience alias for [`add_encoded_track`] (backward compat).
-    pub fn add_track(&mut self, id: &str, width: u32, height: u32) -> usize {
-        self.add_encoded_track(id, width, height)
-    }
-
-    /// Finalise the factory and create all registered video tracks.
-    ///
-    /// Returns `(factory, tracks)` where `tracks[i]` corresponds to the i-th
-    /// `add_*_track` call.
-    pub fn build(self) -> Result<(PeerConnectionFactory, Vec<MixedVideoTrack>)> {
-        let encoder = CustomVideoEncoder::from_registry(self.registry);
-        let factory = PeerConnectionFactory::builder()
-            .with_custom_video_encoder(encoder)
-            .build()?;
-        let mut out = Vec::with_capacity(self.slots.len());
-        for slot in self.slots {
-            match slot {
-                SlotConfig::Raw { id } => {
-                    let track = factory.create_video_track(&id)?;
-                    out.push(MixedVideoTrack::Raw(track));
-                }
-                SlotConfig::Encoded {
-                    id,
-                    width,
-                    height,
-                    queue,
-                } => {
-                    let track = factory.create_video_track(&id)?;
-                    out.push(MixedVideoTrack::Encoded(EncodedVideoTrack::new(
-                        track, queue, width, height,
-                    )));
-                }
-            }
-        }
-        Ok((factory, out))
+        factory
     }
 }

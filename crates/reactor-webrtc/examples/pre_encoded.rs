@@ -2,10 +2,12 @@
 //!
 //! # Sender side
 //!
-//! [`PeerConnectionFactory::with_encoded_video_track`] returns `(factory, track)`.
-//! Call [`EncodedVideoTrack::push_encoded_frame`] whenever your encoder
-//! (VideoToolbox, NVENC, GStreamer, libvpx, …) produces a frame — at your own
-//! pace, on any thread. No raw pixel pumping required.
+//! [`PeerConnectionFactory::create_video_track_with_options`] with
+//! [`TrackVideoEncoder::PreEncoded`] returns an [`EncodedVideoTrack`] (via
+//! [`LocalVideoTrack`]). Call [`EncodedVideoTrack::push_encoded_frame`]
+//! whenever your encoder (VideoToolbox, NVENC, GStreamer, libvpx, …)
+//! produces a frame — at your own pace, on any thread. No raw pixel pumping
+//! required.
 //!
 //! The negotiated codec is determined by SDP: the factory advertises VP8, VP9,
 //! H264, AV1 and H265; whichever the remote peer accepts first is used. Your
@@ -50,9 +52,10 @@ fn run() {
     use std::time::{Duration, Instant};
 
     use reactor_webrtc::{
-        EncodedVideoFrame, FrameAction, FrameTransform, IceCandidate, MediaKind, PeerConnection,
-        PeerConnectionFactory, PeerConnectionObserver, PeerConnectionState, RtcConfiguration,
-        Track, TransceiverDirection,
+        EncodedVideoFrame, FrameAction, FrameTransform, IceCandidate, LocalVideoTrack, MediaKind,
+        PeerConnection, PeerConnectionFactory, PeerConnectionObserver, PeerConnectionState,
+        PreEncodedOptions, RtcConfiguration, Track, TrackVideoEncoder, TransceiverDirection,
+        VideoTrackOptions,
     };
 
     // ── peer boilerplate ──────────────────────────────────────────────────────
@@ -98,18 +101,25 @@ fn run() {
         }
     }
 
-    // ── factory + encoded video track ─────────────────────────────────────────
+    // ── factory + pre-encoded video track ─────────────────────────────────────
     //
-    // with_encoded_video_track returns both the factory and a push handle.
-    // The factory internally:
-    //   1. Creates a CustomVideoEncoder whose closure pops from a shared queue.
-    //   2. Creates a video track to trigger the encoder thread.
-    // Push a frame → it goes on the queue → the encoder thread dequeues it →
-    // RTP packetizer → ICE transport.
+    // The factory is plain (builder defaults); the pre-encoded plumbing is a
+    // per-track option. Push a frame → it goes on the track's queue → the
+    // encoder thread dequeues it → RTP packetizer → ICE transport.
 
     let (w, h) = (640u32, 480u32);
-    let (factory, video) =
-        PeerConnectionFactory::with_encoded_video_track("cam", w, h).expect("factory");
+    let factory = PeerConnectionFactory::builder().build().expect("factory");
+    let video = {
+        let mut options = VideoTrackOptions::default();
+        options.encoder = Some(TrackVideoEncoder::PreEncoded(PreEncodedOptions::new(w, h)));
+        match factory
+            .create_video_track_with_options("cam", options)
+            .expect("encoded track")
+        {
+            LocalVideoTrack::Encoded(track) => track,
+            LocalVideoTrack::Raw(_) => panic!("expected a pre-encoded track"),
+        }
+    };
 
     let config = RtcConfiguration::default();
     let (pc1, s1) = make_peer(&factory, &config);
@@ -185,8 +195,8 @@ fn run() {
             //   - feed a hardware decoder             (VideoToolbox / MediaCodec)
             //
             // FrameAction::Forward hands the bytes to the builtin decoder.
-            // FrameAction::Drop discards them (right when using the null decoder
-            // that comes with with_encoded_video_track).
+            // FrameAction::Drop discards them (right when the negotiated
+            // codec has no real decoder in this build).
 
             received_count.fetch_add(1, Ordering::SeqCst);
             if f.is_key_frame {

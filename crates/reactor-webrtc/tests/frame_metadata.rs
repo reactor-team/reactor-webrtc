@@ -16,8 +16,9 @@ use std::time::{Duration, Instant};
 
 use reactor_webrtc::{
     EncodedVideoFrame, FrameAction, FrameDirection, FrameMetadata, FrameTransform, IceCandidate,
-    MediaKind, PeerConnection, PeerConnectionFactory, PeerConnectionObserver, PeerConnectionState,
-    RtcConfiguration, Track, TransceiverDirection,
+    LocalVideoTrack, MediaKind, PeerConnection, PeerConnectionFactory, PeerConnectionObserver,
+    PeerConnectionState, PreEncodedOptions, RtcConfiguration, Track, TrackVideoEncoder,
+    TransceiverDirection, VideoTrackOptions,
 };
 
 // ── Shared test plumbing (mirrors the pattern in encoded_transform.rs) ────────
@@ -314,9 +315,19 @@ fn encoded_frame_metadata_roundtrip() {
         .clone()
         .expect("no VP8 key frame captured in phase 1");
 
-    // ── Phase 2: replay with metadata via EncodedVideoTrack ──────────────────
-    let (factory2, enc_track) =
-        PeerConnectionFactory::with_encoded_video_track("enc-meta", W, H).expect("factory2");
+    // ── Phase 2: replay with metadata via a pre-encoded video track ──────────
+    let factory2 = PeerConnectionFactory::builder().build().expect("factory2");
+    let enc_track = {
+        let mut options = VideoTrackOptions::default();
+        options.encoder = Some(TrackVideoEncoder::PreEncoded(PreEncodedOptions::new(W, H)));
+        match factory2
+            .create_video_track_with_options("enc-meta", options)
+            .expect("encoded track")
+        {
+            LocalVideoTrack::Encoded(t) => t,
+            LocalVideoTrack::Raw(_) => panic!("expected a pre-encoded track"),
+        }
+    };
 
     let (pc3, s3) = make_peer(&factory2, &config);
     let (pc4, s4) = make_peer(&factory2, &config);

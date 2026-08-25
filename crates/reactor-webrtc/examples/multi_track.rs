@@ -1,18 +1,19 @@
-//! Demonstrates all video-track factory patterns side by side.
+//! Demonstrates all video-track patterns side by side — all through
+//! [`PeerConnectionFactory::create_video_track`]/[`create_video_track_with_options`]
+//! with per-track [`VideoTrackOptions`].
 //!
 //! Three scenarios run in sequence, each creating a fresh factory:
 //!
-//! 1. **Single pre-encoded track** — [`PeerConnectionFactory::with_encoded_video_track`]
-//!    (convenience shorthand for one track).
+//! 1. **Single pre-encoded track** — one
+//!    [`TrackVideoEncoder::PreEncoded`] option.
 //!
-//! 2. **Multiple pre-encoded tracks** — [`PeerConnectionFactory::encoded_video_builder`]
-//!    with two [`add_encoded_track`](EncodedVideoBuilder::add_encoded_track) calls.
-//!    Each track is driven by an independent queue; frames never cross.
+//! 2. **Multiple pre-encoded tracks** — two of them on one factory;
+//!    each track is driven by an independent queue; frames never cross.
 //!
-//! 3. **Mixed raw + pre-encoded + audio** — same builder with one
-//!    [`add_raw_track`](EncodedVideoBuilder::add_raw_track) (libwebrtc encodes BGRA)
-//!    and one [`add_encoded_track`](EncodedVideoBuilder::add_encoded_track)
-//!    (your bitstream goes directly to the RTP stack), plus an audio track.
+//! 3. **Mixed raw + pre-encoded + audio** — a plain raw
+//!    [`create_video_track`](PeerConnectionFactory::create_video_track)
+//!    (libwebrtc encodes BGRA) next to a pre-encoded track (your bitstream
+//!    goes directly to the RTP stack), plus an audio track.
 //!
 //! ```sh
 //! REACTOR_WEBRTC_LIB_DIR=webrtc-build/out/mac-arm64-release/dist \
@@ -37,9 +38,10 @@ fn run() {
     use std::time::{Duration, Instant};
 
     use reactor_webrtc::{
-        EncodedVideoFrame, FrameAction, FrameTransform, IceCandidate, MediaKind, MixedVideoTrack,
-        PeerConnection, PeerConnectionFactory, PeerConnectionObserver, PeerConnectionState,
-        RtcConfiguration, Track, TransceiverDirection,
+        EncodedVideoFrame, EncodedVideoTrack, FrameAction, FrameTransform, IceCandidate,
+        LocalVideoTrack, MediaKind, PeerConnection, PeerConnectionFactory, PeerConnectionObserver,
+        PeerConnectionState, PreEncodedOptions, RtcConfiguration, Track, TrackVideoEncoder,
+        TransceiverDirection, VideoTrackOptions,
     };
 
     // ── shared peer boilerplate ───────────────────────────────────────────────
@@ -128,6 +130,29 @@ fn run() {
         }
     }
 
+    // ── the API this example is about: plain factory, per-track options ───────
+
+    fn new_factory() -> PeerConnectionFactory {
+        PeerConnectionFactory::builder().build().expect("factory")
+    }
+
+    fn pre_encoded_track(
+        factory: &PeerConnectionFactory,
+        id: &str,
+        w: u32,
+        h: u32,
+    ) -> EncodedVideoTrack {
+        let mut options = VideoTrackOptions::default();
+        options.encoder = Some(TrackVideoEncoder::PreEncoded(PreEncodedOptions::new(w, h)));
+        match factory
+            .create_video_track_with_options(id, options)
+            .expect("encoded track")
+        {
+            LocalVideoTrack::Encoded(t) => t,
+            LocalVideoTrack::Raw(_) => panic!("expected a pre-encoded track"),
+        }
+    }
+
     let cfg = RtcConfiguration::default();
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -136,8 +161,8 @@ fn run() {
     println!("\n── Scenario 1: single pre-encoded track ──");
     {
         // ┌── factory + one push handle ────────────────────────────────────────
-        let (factory, video) =
-            PeerConnectionFactory::with_encoded_video_track("cam", 640, 480).expect("factory");
+        let factory = new_factory();
+        let video = pre_encoded_track(&factory, "cam", 640, 480);
         // └─────────────────────────────────────────────────────────────────────
 
         let (pc1, s1) = make_peer(&factory, &cfg);
@@ -147,6 +172,8 @@ fn run() {
             .add_transceiver(MediaKind::Video, TransceiverDirection::SendOnly)
             .expect("tx");
         tx.set_track(video.track()).expect("set track");
+
+        negotiate(&pc1, &pc2);
 
         let recv = Arc::new(AtomicU32::new(0));
         let tf = FrameTransform::new({
@@ -158,14 +185,14 @@ fn run() {
                 FrameAction::Drop
             }
         });
+        // The receiving transceiver only materialises once the remote offer
+        // has been applied — attach after negotiation.
         pc2.transceivers()
             .into_iter()
             .find(|t| t.kind() == MediaKind::Video)
             .expect("rx transceiver")
             .set_receiver_transform(&tf)
             .expect("transform");
-
-        negotiate(&pc1, &pc2);
 
         let stop = AtomicBool::new(false);
         thread::scope(|scope| {
@@ -195,21 +222,11 @@ fn run() {
     // ═══════════════════════════════════════════════════════════════════════════
     println!("\n── Scenario 2: two pre-encoded tracks ──");
     {
-        // ┌── builder: one slot per stream ─────────────────────────────────────
-        let mut b = PeerConnectionFactory::encoded_video_builder();
-        let cam_idx = b.add_encoded_track("camera", 1280, 720);
-        let scr_idx = b.add_encoded_track("screen", 1920, 1080);
-        let (factory, mut tracks) = b.build().expect("factory");
+        // ┌── two pre-encoded tracks on one factory ────────────────────────────
+        let factory = new_factory();
+        let camera = pre_encoded_track(&factory, "camera", 1280, 720);
+        let screen = pre_encoded_track(&factory, "screen", 1920, 1080);
         // └─────────────────────────────────────────────────────────────────────
-
-        // Pull the two track handles out of the Vec by index.
-        // (swap_remove is fine here — we only use these once.)
-        let screen = tracks.swap_remove(scr_idx);
-        let camera = tracks.swap_remove(cam_idx);
-        let (MixedVideoTrack::Encoded(camera), MixedVideoTrack::Encoded(screen)) = (camera, screen)
-        else {
-            panic!("unexpected track kind")
-        };
 
         let (pc1, s1) = make_peer(&factory, &cfg);
         let (pc2, s2) = make_peer(&factory, &cfg);
@@ -278,27 +295,22 @@ fn run() {
     // ═══════════════════════════════════════════════════════════════════════════
     println!("\n── Scenario 3: raw video + pre-encoded video + audio ──");
     {
-        // ┌── builder: mix raw and encoded video; audio is always separate ─────
-        let mut b = PeerConnectionFactory::encoded_video_builder();
-        let cam_idx = b.add_raw_track("camera"); // BGRA → libwebrtc encodes
-        let scr_idx = b.add_encoded_track("screen", 1920, 1080); // your bitstream → RTP
-        let (factory, tracks) = b.build().expect("factory");
+        // ┌── raw video + pre-encoded video + audio, one factory ───────────────
+        let factory = new_factory();
+        let camera = factory
+            .create_video_track("camera") // BGRA → libwebrtc encodes
+            .expect("video track");
+        let screen = pre_encoded_track(&factory, "screen", 1920, 1080); // your bitstream → RTP
 
         // Audio track from the same factory (synthetic ADM — push PCM manually)
         let audio = factory.create_audio_track("mic").expect("audio track");
         // └─────────────────────────────────────────────────────────────────────
 
-        let (MixedVideoTrack::Raw(camera), MixedVideoTrack::Encoded(screen)) =
-            (&tracks[cam_idx], &tracks[scr_idx])
-        else {
-            panic!("unexpected track kind")
-        };
-
         let (pc1, s1) = make_peer(&factory, &cfg);
         let (pc2, s2) = make_peer(&factory, &cfg);
 
         // Add video transceivers
-        for t in [camera, screen.track()] {
+        for t in [&camera, screen.track()] {
             let tx = pc1
                 .add_transceiver(MediaKind::Video, TransceiverDirection::SendOnly)
                 .expect("tx");
