@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Callable, Optional, Union
+from typing import Callable, Optional, Union, final
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -528,6 +528,80 @@ class PeerConnection:
         Typical streaming values: `min_bps=200_000, start_bps=500_000, max_bps=2_000_000`."""
         ...
 
+# ── per-track options + builder (5617) ───────────────────────────────────────
+
+class AudioTrackSource:
+    """Where an audio track's samples come from."""
+    Adm: AudioTrackSource
+    """The factory's ADM — platform mic (real device) or shared synthetic pipe."""
+    LocalPush: AudioTrackSource
+    """An independent per-track push source; feed with `Track.push_pcm`."""
+
+class H264Backend:
+    """H.264 backend selectable per raw video track."""
+    VideoToolbox: H264Backend
+    """Apple's hardware VideoToolbox (macOS/iOS)."""
+    OpenH264: H264Backend
+    """Cisco's software OpenH264 — needs `with_openh264(lib_path)`."""
+
+@final
+class KeyFrameRequest:
+    """A keyframe demand routed to `on_encoder_feedback` — answer with an IDR on
+    the next pushed frame or new receivers wait out the whole GOP."""
+
+@final
+class RateUpdate:
+    """A congestion-controller allocation routed to `on_encoder_feedback`."""
+    bitrate_bps: int
+    framerate_fps: float
+
+@final
+class RawVideoFrameInfo:
+    """The raw frame an inline encoder callback receives. Planes are copies."""
+    codec: VideoCodec
+    width: int
+    height: int
+    rtp_timestamp: int
+    request_key_frame: bool
+    y: bytes
+    u: bytes
+    v: bytes
+
+class PeerConnectionFactoryBuilder:
+    """Builds a [`PeerConnectionFactory`] knob by knob. Everything is optional:
+    `PeerConnectionFactoryBuilder().build()` is the plain headless factory."""
+
+    def __init__(self) -> None: ...
+    def with_adm(self, platform: bool) -> None:
+        """`True` for the real mic/speaker, `False` for the synthetic push device."""
+        ...
+    def with_platform_adm(self) -> None:
+        """Platform audio device + full DSP chain (AEC3/NS/AGC/high-pass)."""
+        ...
+    def with_synthetic_adm(self) -> None:
+        """The push (synthetic) audio device — the default."""
+        ...
+    def with_apm(
+        self,
+        echo_canceller: bool = False,
+        noise_suppression: bool = False,
+        agc: bool = False,
+        high_pass_filter: bool = False,
+    ) -> None:
+        """Configure the audio-processing chain (all stages default to off)."""
+        ...
+    def with_metadata(self, enabled: bool) -> None:
+        """Factory-wide frame-metadata kill switch (default enabled)."""
+        ...
+    def with_openh264(self, lib_path: str) -> None:
+        """Register the OpenH264 backend from a downloaded library path
+        (attribution requirements apply; a failed load degrades to "no backend").
+        Only wheels built with the feature expose this."""
+        ...
+    def build(self) -> PeerConnectionFactory:
+        """Finalise the factory. This builder is consumed."""
+        ...
+
 # ── Factory ───────────────────────────────────────────────────────────────────
 
 class PeerConnectionFactory:
@@ -556,6 +630,43 @@ class PeerConnectionFactory:
         self, pcm: bytes, sample_rate: int, channels: int
     ) -> None:
         """Feed interleaved signed 16-bit little-endian PCM to the synthetic ADM."""
+        ...
+    @staticmethod
+    @staticmethod
+    def builder() -> PeerConnectionFactoryBuilder:
+        """Start composing a factory — same as constructing the builder directly."""
+        ...
+    def create_video_track_with_options(
+        self,
+        id: str,
+        *,
+        pre_encoded: tuple[int, int] | None = None,
+        inline_encoder: Callable[
+            [RawVideoFrameInfo], bytes | tuple[bytes, bool] | None
+        ]
+        | None = None,
+        h264_backend: H264Backend | None = None,
+        frame_metadata: bool | None = None,
+    ) -> Track | EncodedVideoTrack:
+        """Create a local video track with per-track options — encoder plumbing,
+        backend, and metadata. Returns `Track` for plain/inline tracks, or
+        `EncodedVideoTrack` when `pre_encoded=(width, height)` is given.
+        `pre_encoded` and `inline_encoder` are mutually exclusive; `h264_backend`
+        with any custom encoder raises (your own pipeline owns the bytes)."""
+        ...
+    def create_audio_track_with_options(
+        self,
+        id: str,
+        *,
+        source: AudioTrackSource | None = None,
+        echo_cancellation: bool | None = None,
+        noise_suppression: bool | None = None,
+        auto_gain_control: bool | None = None,
+        high_pass_filter: bool | None = None,
+    ) -> Track:
+        """Create a local audio track with a per-track source and per-source
+        processing constraints. See `create_audio_track_with_local_source` for
+        the headless pre-curated shape of the `LocalPush` case."""
         ...
     @staticmethod
     def with_encoded_video_track(
