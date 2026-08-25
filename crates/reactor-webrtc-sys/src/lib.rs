@@ -120,6 +120,52 @@ pub struct ReactorEncodedVideoOutput {
     pub free_data: Option<extern "C" fn(data: *const u8, len: usize)>,
 }
 
+/// Options for [`reactor_webrtc_factory_create`]. ABI-versioned: `size` must be
+/// `std::mem::size_of::<ReactorFactoryOptions>()`, so the glue can reject
+/// callers built against an older struct — future fields are only appended,
+/// and zero is always the absent/default value.
+/// Layout must match `ReactorFactoryOptions` in the C++ glue.
+#[repr(C)]
+pub struct ReactorFactoryOptions {
+    pub size: u32,
+    /// 0 → synthetic ADM (push PCM via `reactor_webrtc_factory_push_audio_frame`);
+    /// nonzero → the platform default ADM (real mic/speaker, e.g. CoreAudio).
+    pub use_platform_adm: c_int,
+    /// OR of REACTOR_APM_* bits (0 = all processing disabled).
+    pub apm_flags: c_int,
+    /// OpenH264 backend library path (NUL-terminated); null = no OpenH264.
+    /// Only honored in builds with OpenH264 support — otherwise create fails.
+    pub openh264_lib_path: *const c_char,
+    /// Custom encode plumbing (registry / inline encoder); null = backends only.
+    pub encode_cb: Option<
+        extern "C" fn(
+            userdata: *mut c_void,
+            raw: *const ReactorRawVideoFrame,
+            out: *mut ReactorEncodedVideoOutput,
+        ) -> c_int,
+    >,
+    pub encode_userdata: *mut c_void,
+    /// Called when the last encoder instance using `encode_userdata` is gone.
+    pub encode_free_ud: Option<extern "C" fn(userdata: *mut c_void)>,
+    /// Per-encoder-instance escape to the backend path; null = always custom.
+    pub encode_use_builtin: Option<extern "C" fn(userdata: *mut c_void, encoder_id: u64) -> c_int>,
+}
+
+impl Default for ReactorFactoryOptions {
+    fn default() -> Self {
+        Self {
+            size: std::mem::size_of::<Self>() as u32,
+            use_platform_adm: 0,
+            apm_flags: 0,
+            openh264_lib_path: std::ptr::null(),
+            encode_cb: None,
+            encode_userdata: std::ptr::null_mut(),
+            encode_free_ud: None,
+            encode_use_builtin: None,
+        }
+    }
+}
+
 /// A single entry in the stats snapshot delivered by
 /// [`reactor_webrtc_peer_connection_get_stats`]. The `kind` field selects
 /// which subset of fields is populated; all others are zero-initialised.
@@ -272,52 +318,17 @@ extern "C" {
     pub fn reactor_webrtc_selftest(out: *mut c_char, cap: c_int) -> c_int;
 
     // ── Factory ──────────────────────────────────────────────────────────────
-    /// Create a factory with the synthetic (push-able) ADM — no audio hardware.
-    pub fn reactor_webrtc_factory_create() -> *mut PeerConnectionFactory;
-    /// Create a factory choosing the audio device backend. `use_platform_adm`:
-    /// 0 → synthetic ADM (push PCM via [`reactor_webrtc_factory_push_audio_frame`]);
-    /// nonzero → the platform default ADM (real mic/speaker, e.g. CoreAudio).
-    /// `apm_flags` is an OR of REACTOR_APM_* bits (0 = all processing disabled).
-    pub fn reactor_webrtc_factory_create_with_adm_apm(
-        use_platform_adm: c_int,
-        apm_flags: c_int,
-    ) -> *mut PeerConnectionFactory;
-    pub fn reactor_webrtc_factory_create_with_adm(
-        use_platform_adm: c_int,
+    /// The single factory-create entry point (options-based, ABI-versioned).
+    /// Always installs the composite video codec factory pair:
+    /// custom-slot routing → OpenH264 → Apple VideoToolbox → builtin.
+    /// On failure returns null and writes a reason into `err` (NUL-terminated,
+    /// truncated to `err_cap`); both `err`/`err_cap` may be null/0 to ignore.
+    pub fn reactor_webrtc_factory_create(
+        opts: *const ReactorFactoryOptions,
+        err: *mut c_char,
+        err_cap: c_int,
     ) -> *mut PeerConnectionFactory;
     pub fn reactor_webrtc_factory_destroy(factory: *mut PeerConnectionFactory);
-
-    /// Create a factory that routes all video encoding through `on_encode`.
-    /// `on_encode` is called synchronously within `VideoEncoder::Encode()` with
-    /// the raw I420 frame; fill `*out` and return 0 to inject encoded bytes into
-    /// the RTP stack, or return non-zero to drop the frame. `userdata` lifetime
-    /// follows the same contract as `reactor_webrtc_frame_transformer_create`.
-    /// `apm_flags` is an OR of REACTOR_APM_* bits (0 = all processing disabled).
-    pub fn reactor_webrtc_factory_create_with_custom_video_encoder(
-        use_platform_adm: c_int,
-        on_encode: extern "C" fn(
-            userdata: *mut c_void,
-            raw: *const ReactorRawVideoFrame,
-            out: *mut ReactorEncodedVideoOutput,
-        ) -> c_int,
-        userdata: *mut c_void,
-        free_ud: Option<extern "C" fn(userdata: *mut c_void)>,
-        use_builtin: Option<extern "C" fn(userdata: *mut c_void, encoder_id: u64) -> c_int>,
-        apm_flags: c_int,
-    ) -> *mut PeerConnectionFactory;
-
-    /// Create a factory with real H.264 encode/decode backed by a dynamically
-    /// loaded OpenH264 shared library (`lib_path`, e.g. from
-    /// [`crate::openh264::ensure_available`]). VP8/VP9/AV1 remain builtin.
-    /// `lib_path` must be a NUL-terminated UTF-8/ANSI path. Returns null if the
-    /// library fails to `dlopen`/`LoadLibraryW`, or on any other factory
-    /// construction failure. `apm_flags` is an OR of REACTOR_APM_* bits.
-    #[cfg(feature = "openh264")]
-    pub fn reactor_webrtc_factory_create_with_openh264(
-        lib_path: *const c_char,
-        use_platform_adm: c_int,
-        apm_flags: c_int,
-    ) -> *mut PeerConnectionFactory;
 
     /// Create a peer connection. `config` carries the ICE servers and policies
     /// (may be null for the defaults). `callbacks` may be null. Returns null on

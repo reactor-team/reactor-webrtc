@@ -216,14 +216,35 @@ impl PeerConnectionFactory {
 
     /// Create a factory with full control over the audio device and APM chain.
     pub fn with_adm_apm(mode: AdmMode, apm: ApmConfig) -> Result<Self> {
+        Self::create_from_options(&reactor_webrtc_sys::ReactorFactoryOptions {
+            use_platform_adm: matches!(mode, AdmMode::Platform) as c_int,
+            apm_flags: apm.to_flags(),
+            ..Default::default()
+        })
+    }
+
+    /// Shared create path: every constructor shapes a
+    /// [`reactor_webrtc_sys::ReactorFactoryOptions`] and lands here. The glue
+    /// writes a reason into `err` when it returns null; a silent null gets the
+    /// generic message.
+    fn create_from_options(opts: &reactor_webrtc_sys::ReactorFactoryOptions) -> Result<Self> {
+        let mut err = [0 as std::os::raw::c_char; 256];
         let raw = unsafe {
-            reactor_webrtc_sys::reactor_webrtc_factory_create_with_adm_apm(
-                matches!(mode, AdmMode::Platform) as c_int,
-                apm.to_flags(),
+            reactor_webrtc_sys::reactor_webrtc_factory_create(
+                opts,
+                err.as_mut_ptr(),
+                err.len() as c_int,
             )
         };
         if raw.is_null() {
-            return Err(Error::Webrtc("factory creation returned null".into()));
+            let reason = unsafe { std::ffi::CStr::from_ptr(err.as_ptr()) }
+                .to_string_lossy()
+                .into_owned();
+            return Err(Error::Webrtc(if reason.is_empty() {
+                "factory creation returned null".into()
+            } else {
+                format!("factory creation failed: {reason}")
+            }));
         }
         Ok(Self {
             handle: Arc::new(FactoryHandle(raw)),
@@ -262,33 +283,22 @@ impl PeerConnectionFactory {
     /// Audio encoding is unaffected; the builtin audio codecs (Opus, G.711,
     /// etc.) remain active.
     pub fn with_custom_video_encoder(encoder: crate::CustomVideoEncoder) -> Result<Self> {
-        let encode_fn = encoder.encode_fn;
-        let userdata = encoder.userdata;
-        let free_ud = encoder.free_ud;
-        let use_builtin = encoder.use_builtin;
-
-        let raw = unsafe {
-            reactor_webrtc_sys::reactor_webrtc_factory_create_with_custom_video_encoder(
-                0, // synthetic ADM
-                encode_fn,
-                userdata,
-                free_ud,
-                use_builtin,
-                0, // apm_flags: all disabled
-            )
-        };
-        if raw.is_null() {
+        let result = Self::create_from_options(&reactor_webrtc_sys::ReactorFactoryOptions {
+            encode_cb: Some(encoder.encode_fn),
+            encode_userdata: encoder.userdata,
+            encode_free_ud: encoder.free_ud,
+            encode_use_builtin: encoder.use_builtin,
+            use_platform_adm: 0, // synthetic ADM
+            apm_flags: 0,        // all processing disabled
+            ..Default::default()
+        });
+        if result.is_err() {
             // Factory did not take ownership — free the state ourselves.
-            if let Some(f) = free_ud {
-                f(userdata);
+            if let Some(f) = encoder.free_ud {
+                f(encoder.userdata);
             }
-            return Err(Error::Webrtc(
-                "factory with custom encoder returned null".into(),
-            ));
         }
-        Ok(Self {
-            handle: Arc::new(FactoryHandle(raw)),
-        })
+        result
     }
 
     /// Create a factory with real H.264 encode/decode backed by a
@@ -314,18 +324,11 @@ impl PeerConnectionFactory {
     ) -> Result<Self> {
         let lib_path = CString::new(lib_path.to_string_lossy().into_owned())
             .map_err(|_| Error::Webrtc("lib_path contains a NUL byte".into()))?;
-        let raw = unsafe {
-            reactor_webrtc_sys::reactor_webrtc_factory_create_with_openh264(
-                lib_path.as_ptr(),
-                matches!(mode, AdmMode::Platform) as c_int,
-                apm.to_flags(),
-            )
-        };
-        if raw.is_null() {
-            return Err(Error::Webrtc("factory with openh264 returned null".into()));
-        }
-        Ok(Self {
-            handle: Arc::new(FactoryHandle(raw)),
+        Self::create_from_options(&reactor_webrtc_sys::ReactorFactoryOptions {
+            openh264_lib_path: lib_path.as_ptr(),
+            use_platform_adm: matches!(mode, AdmMode::Platform) as c_int,
+            apm_flags: apm.to_flags(),
+            ..Default::default()
         })
     }
 
