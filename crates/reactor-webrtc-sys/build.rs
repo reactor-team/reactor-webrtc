@@ -340,6 +340,18 @@ fn link_system_deps(lib_dir: &Path) {
             }
         }
         "ios" => {
+            // NOTE: `IPHONEOS_DEPLOYMENT_TARGET` is deliberately left unset here.
+            // Unset, rustc stamps the output `LC_VERSION_MIN_IPHONEOS 10.0` while
+            // every member of the prebuilt `libwebrtc.a` is built for 14.0, and
+            // the linker warns once per member:
+            //   `ld: warning: object file (...) was built for newer 'iOS' version
+            //    (14.0) than being linked (10.0)`
+            // ~2.9k lines, surfaced whenever a link fails. Only a warning: the
+            // link succeeds and the binary is correct. Setting a floor from this
+            // build script would raise the minimum iOS version of every consumer
+            // without them asking, so it stays their call - export
+            // `IPHONEOS_DEPLOYMENT_TARGET=14.0` (or higher) to match the prebuilt
+            // and silence it.
             println!("cargo:rustc-link-lib=c++");
             for fw in [
                 "Foundation",
@@ -352,6 +364,13 @@ fn link_system_deps(lib_dir: &Path) {
                 "VideoToolbox",
                 "AVFoundation",
                 "Metal",
+                // `RTCNetworkMonitor` (the ObjC SDK's monitor, compiled in for
+                // iOS only) calls `nw_path_monitor_*` / `nw_interface_*`. Without
+                // this, every iOS link fails with nine undefined `_nw_*` symbols.
+                // macOS does not need it: the mac prebuilt carries no
+                // `RTCNetworkMonitor.o` member and no undefined `_nw_*` symbols
+                // - it watches the network through `SystemConfiguration`.
+                "Network",
                 "UIKit",
             ] {
                 println!("cargo:rustc-link-lib=framework={fw}");
