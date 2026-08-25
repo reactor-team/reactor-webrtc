@@ -56,9 +56,12 @@ pub use config::{
 };
 pub use encoded::{
     EncodedFrame, EncodedVideoFrame, EncodedVideoTrack, FrameAction, FrameDirection,
-    FrameTransform, LocalVideoTrack, PreEncodedOptions, RawVideoFrame, TrackVideoEncoder,
-    VideoCodec, VideoTrackOptions,
+    FrameTransform, H264Backend, InlineEncoderCallback, LocalVideoTrack, PreEncodedOptions,
+    RawVideoFrame, TrackVideoEncoder, VideoCodec, VideoTrackOptions,
 };
+
+/// Whether this build targets Apple (H.264 VideoToolbox backend exists).
+pub(crate) const HAVE_VIDEO_TOOLBOX: bool = cfg!(target_vendor = "apple");
 pub use media::{AudioFrame, MediaKind, Track, VideoFrame};
 pub use metadata::{
     FrameMetadata, FrameMetadataGate, FRAME_METADATA_ATTRIBUTE, FRAME_METADATA_VERSION,
@@ -209,6 +212,13 @@ pub struct PeerConnectionFactory {
     /// factory at creation. Every factory has one; tracks register slots via
     /// [`PeerConnectionFactory::create_video_track_with_options`].
     registry: Arc<crate::encoded::EncoderRegistry>,
+    /// Whether an OpenH264 library path was registered at build
+    /// ([`PeerConnectionFactoryBuilder::with_openh264`]). Gates the explicit
+    /// [`H264Backend::OpenH264`] per-track selection. (Whether the library
+    /// itself loaded is a native-side concern — a failed load degrades to
+    /// "no OpenH264 backend", it never fails the factory.)
+    #[cfg_attr(not(feature = "openh264"), allow(dead_code))]
+    openh264_registered: bool,
 }
 
 impl PeerConnectionFactory {
@@ -240,6 +250,7 @@ impl PeerConnectionFactory {
         opts: &reactor_webrtc_sys::ReactorFactoryOptions,
         metadata_enabled: bool,
         registry: Arc<crate::encoded::EncoderRegistry>,
+        openh264_registered: bool,
     ) -> Result<Self> {
         let mut err = [0 as std::os::raw::c_char; 256];
         let raw = unsafe {
@@ -263,6 +274,7 @@ impl PeerConnectionFactory {
             handle: Arc::new(FactoryHandle(raw)),
             metadata_enabled,
             registry,
+            openh264_registered,
         })
     }
 
@@ -316,7 +328,7 @@ impl PeerConnectionFactory {
     /// so a failed creation (bad id, native error) never leaves an orphan
     /// slot misbinding the next track's encoder.
     pub fn create_video_track(&self, id: &str) -> Result<Track> {
-        let track = self.create_video_track_native(id)?;
+        let track = self.create_video_track_no_slot(id)?;
         self.registry.add_raw_slot(track.native_id());
         Ok(track)
     }
@@ -353,28 +365,65 @@ impl PeerConnectionFactory {
         id: &str,
         options: VideoTrackOptions,
     ) -> Result<LocalVideoTrack> {
+        if options.encoder.is_some() && options.h264_backend.is_some() {
+            return Err(Error::Webrtc(
+                "h264_backend with a custom encoder: the track's bytes come \
+                 from your own pipeline — there is no backend to route to"
+                    .into(),
+            ));
+        }
         match options.encoder {
-            None => Ok(LocalVideoTrack::Raw(self.create_video_track(id)?)),
+            None => {
+                let pref = self.h264_backend_pref(options.h264_backend)?;
+                let track = self.create_video_track_no_slot(id)?;
+                self.registry
+                    .add_raw_slot_with_backend(track.native_id(), pref);
+                Ok(LocalVideoTrack::Raw(track))
+            }
             Some(TrackVideoEncoder::PreEncoded(o)) => {
-                let track = self.create_video_track_native(id)?;
+                let track = self.create_video_track_no_slot(id)?;
                 let queue = self.registry.add_encoded_slot(track.native_id());
                 Ok(LocalVideoTrack::Encoded(EncodedVideoTrack::new(
                     track, queue, o.width, o.height,
                 )))
             }
             Some(TrackVideoEncoder::Inline(cb)) => {
-                let track = self.create_video_track_native(id)?;
+                let track = self.create_video_track_no_slot(id)?;
                 self.registry.add_inline_slot(track.native_id(), cb);
                 Ok(LocalVideoTrack::Raw(track))
             }
         }
     }
 
+    /// Validate an explicit [`H264Backend`] choice against what this build /
+    /// this factory can actually serve, and map it to the slot preference.
+    fn h264_backend_pref(
+        &self,
+        backend: Option<H264Backend>,
+    ) -> Result<crate::encoded::H264BackendPref> {
+        use crate::encoded::H264BackendPref as Pref;
+        match backend {
+            None => Ok(Pref::Auto),
+            Some(H264Backend::VideoToolbox) if !HAVE_VIDEO_TOOLBOX => Err(Error::Webrtc(
+                "H264Backend::VideoToolbox is only available on Apple platforms".into(),
+            )),
+            Some(H264Backend::VideoToolbox) => Ok(Pref::VideoToolbox),
+            #[cfg(feature = "openh264")]
+            Some(H264Backend::OpenH264) if !self.openh264_registered => Err(Error::Webrtc(
+                "H264Backend::OpenH264 requires registering the library first \
+                 (PeerConnectionFactory::builder().with_openh264(path))"
+                    .into(),
+            )),
+            #[cfg(feature = "openh264")]
+            Some(H264Backend::OpenH264) => Ok(Pref::OpenH264),
+        }
+    }
+
     /// Shared native side of [`create_video_track`](Self::create_video_track):
-    /// the strict FFI call, **without** a registry slot (any slot is the
-    /// caller's to reserve — purely positional, and deliberately after this
-    /// has succeeded).
-    fn create_video_track_native(&self, id: &str) -> Result<Track> {
+    /// the strict FFI call, **without** touching the registry — callers
+    /// reserve their slot *after* this succeeds (so a failed create never
+    /// leaves an orphan positional slot behind).
+    fn create_video_track_no_slot(&self, id: &str) -> Result<Track> {
         let cid = CString::new(id).map_err(|_| Error::Webrtc("id contains a NUL byte".into()))?;
         let raw = unsafe {
             reactor_webrtc_sys::reactor_webrtc_video_track_create(self.handle.raw(), cid.as_ptr())

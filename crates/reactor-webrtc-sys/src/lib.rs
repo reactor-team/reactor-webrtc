@@ -153,6 +153,11 @@ pub struct ReactorFactoryOptions {
     /// gates the H264/H265 claim so plain factories keep the builtin-only
     /// advertisement. null = never claim via custom plumbing.
     pub encode_has_custom_slots: Option<extern "C" fn(userdata: *mut c_void) -> c_int>,
+    /// Per-encoder-instance H264 backend preference for backend-routed
+    /// instances: 0 = platform default (VideoToolbox on Apple, OpenH264
+    /// elsewhere), 1 = VideoToolbox, 2 = OpenH264. null = all auto.
+    pub encode_video_backend_for:
+        Option<extern "C" fn(userdata: *mut c_void, encoder_id: u64) -> c_int>,
 }
 
 impl Default for ReactorFactoryOptions {
@@ -167,6 +172,7 @@ impl Default for ReactorFactoryOptions {
             encode_free_ud: None,
             encode_use_builtin: None,
             encode_has_custom_slots: None,
+            encode_video_backend_for: None,
         }
     }
 }

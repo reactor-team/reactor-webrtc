@@ -1730,6 +1730,15 @@ typedef int (*reactor_use_builtin_cb)(void* userdata, uint64_t encoder_id);
 // advertisement. May be null (never claim via custom plumbing).
 typedef int (*reactor_has_custom_slots_cb)(void* userdata);
 
+// Called when an H264 encoder is built for a backend-routed (non-custom)
+// encoder instance. Return which H264 backend the track prefers:
+//   0 = platform default (VideoToolbox on Apple, OpenH264 elsewhere),
+//   1 = VideoToolbox,  2 = OpenH264.
+// A forced preference for an unavailable backend falls back to the platform
+// default; when no backend can encode H264 at all the encoder factory
+// returns null (H264 simply can't be used then). May be null (always auto).
+typedef int (*reactor_video_backend_cb)(void* userdata, uint64_t encoder_id);
+
 // Unified factory-create options. ABI-versioned: `size` MUST be
 // sizeof(ReactorFactoryOptions) as known to the caller; the glue rejects
 // undersized structs, and future fields only ever get appended at the end
@@ -1754,6 +1763,9 @@ struct ReactorFactoryOptions {
   // typedef). May be null — then H264/H265 are never claimed via custom
   // plumbing regardless of `encode_cb`.
   reactor_has_custom_slots_cb  encode_has_custom_slots;
+  // Per-encoder-instance H264 backend preference (0 = auto, 1 = VideoToolbox,
+  // 2 = OpenH264). May be null — all instances use the platform default.
+  reactor_video_backend_cb     encode_video_backend_for;
 };
 }
 
@@ -1763,11 +1775,14 @@ struct ReactorEncoderState {
   reactor_webrtc_userdata_free   free_ud;
   reactor_use_builtin_cb         use_builtin;      // null = always use custom
   reactor_has_custom_slots_cb    has_custom_slots; // null = never claim custom codecs
+  reactor_video_backend_cb       video_backend_for; // null = all instances auto
 
   ReactorEncoderState(reactor_video_encode_cb c, void* u, reactor_webrtc_userdata_free f,
                       reactor_use_builtin_cb ub = nullptr,
-                      reactor_has_custom_slots_cb hcs = nullptr)
-      : cb(c), userdata(u), free_ud(f), use_builtin(ub), has_custom_slots(hcs) {}
+                      reactor_has_custom_slots_cb hcs = nullptr,
+                      reactor_video_backend_cb vbf = nullptr)
+      : cb(c), userdata(u), free_ud(f), use_builtin(ub),
+        has_custom_slots(hcs), video_backend_for(vbf) {}
   ~ReactorEncoderState() { if (free_ud) free_ud(userdata); }
   // Disable copy+move: free_ud would fire twice (once on the copy, once on
   // the original) which would double-free `userdata`.
@@ -1962,8 +1977,24 @@ class ReactorCompositeVideoEncoderFactory : public webrtc::VideoEncoderFactory {
       return std::make_unique<ReactorVideoEncoder>(state_, id);
     }
     if (format.name == "H264") {
+      int pref = 0;  // 0 = auto, 1 = VideoToolbox, 2 = OpenH264
+      if (state_ && state_->video_backend_for) {
+        pref = state_->video_backend_for(state_->userdata, id);
+      }
+      std::unique_ptr<webrtc::VideoEncoder> enc;
+      if (pref == 1 && apple_h264_) enc = apple_h264_->Create(env, format);
+      if (pref == 2 && openh264_) enc = openh264_->Create(env, format);
+      if (enc) return enc;
+      // Auto (or an unavailable forced backend): platform default chain —
+      // VideoToolbox on Apple, OpenH264 elsewhere. Nothing available → the
+      // builtin factory returns null (H264 can't be encoded this session).
+#if defined(WEBRTC_MAC)
+      if (apple_h264_) return apple_h264_->Create(env, format);
+      if (openh264_) return openh264_->Create(env, format);
+#else
       if (openh264_) return openh264_->Create(env, format);
       if (apple_h264_) return apple_h264_->Create(env, format);
+#endif
     }
     return builtin_->Create(env, format);
   }
@@ -2114,7 +2145,8 @@ void* reactor_webrtc_factory_create(const ReactorFactoryOptions* opts,
   if (opts->encode_cb) {
     state = std::make_shared<ReactorEncoderState>(
         opts->encode_cb, opts->encode_userdata, opts->encode_free_ud,
-        opts->encode_use_builtin, opts->encode_has_custom_slots);
+        opts->encode_use_builtin, opts->encode_has_custom_slots,
+        opts->encode_video_backend_for);
   }
 
   auto f = std::make_unique<ReactorFactory>();

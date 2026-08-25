@@ -15,7 +15,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use reactor_webrtc::{
-    EncodedVideoFrame, IceCandidate, LocalVideoTrack, MediaKind, PeerConnection,
+    EncodedVideoFrame, H264Backend, IceCandidate, LocalVideoTrack, MediaKind, PeerConnection,
     PeerConnectionFactory, PeerConnectionObserver, PeerConnectionState, PreEncodedOptions,
     RtcConfiguration, TrackVideoEncoder, TransceiverDirection, VideoTrackOptions,
 };
@@ -296,4 +296,82 @@ fn dropping_an_encoded_track_frees_its_slot() {
         s2.video_frames.load(Ordering::SeqCst) > 0,
         "raw track got no frames — its slot was poisoned by the dropped track"
     );
+}
+
+// ── H264Backend: per-track backend selection (REA-5611) ────────────────────
+
+#[test]
+fn h264_backend_conflicts_with_custom_encoder() {
+    let factory = PeerConnectionFactory::builder().build().expect("factory");
+    let mut options = VideoTrackOptions::default();
+    options.encoder = Some(TrackVideoEncoder::PreEncoded(PreEncodedOptions::new(
+        320, 240,
+    )));
+    options.h264_backend = Some(H264Backend::VideoToolbox);
+    let err = match factory.create_video_track_with_options("bad", options) {
+        Ok(_) => panic!("encoder + h264_backend must be rejected"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("no backend to route"),
+        "unexpected error: {err}"
+    );
+}
+
+#[cfg(target_vendor = "apple")]
+#[test]
+fn videotoolbox_forced_ok_on_apple_errors_elsewhere() {
+    let factory = PeerConnectionFactory::builder().build().expect("factory");
+    let mut options = VideoTrackOptions::default();
+    options.h264_backend = Some(H264Backend::VideoToolbox);
+    factory
+        .create_video_track_with_options("vt", options)
+        .expect("VideoToolbox must be available on Apple");
+}
+
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn videotoolbox_forced_ok_on_apple_errors_elsewhere() {
+    let factory = PeerConnectionFactory::builder().build().expect("factory");
+    let mut options = VideoTrackOptions::default();
+    options.h264_backend = Some(H264Backend::VideoToolbox);
+    let err = match factory.create_video_track_with_options("vt", options) {
+        Ok(_) => panic!("VideoToolbox off Apple must be rejected"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("only available on Apple"),
+        "unexpected error: {err}"
+    );
+}
+
+#[cfg(feature = "openh264")]
+#[test]
+fn openh264_forced_requires_registration() {
+    // Without builder().with_openh264(), the explicit backend selection must
+    // fail loudly at track creation.
+    let factory = PeerConnectionFactory::builder().build().expect("factory");
+    let mut options = VideoTrackOptions::default();
+    options.h264_backend = Some(H264Backend::OpenH264);
+    let err = match factory.create_video_track_with_options("oh", options) {
+        Ok(_) => panic!("OpenH264 without registration must be rejected"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("requires registering"),
+        "unexpected error: {err}"
+    );
+
+    // Registration makes the track selectable even if the library itself
+    // can't load from a bogus path — load failure degrades to "no backend",
+    // it never fails creation (the link.rs degrade test owns the SDP side).
+    let factory = PeerConnectionFactory::builder()
+        .with_openh264(std::path::Path::new("/nonexistent/libopenh264.so"))
+        .build()
+        .expect("factory with openh264 registration");
+    let mut options = VideoTrackOptions::default();
+    options.h264_backend = Some(H264Backend::OpenH264);
+    factory
+        .create_video_track_with_options("oh", options)
+        .expect("registered OpenH264 track creation (library may fail to load)");
 }

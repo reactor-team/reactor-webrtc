@@ -138,6 +138,10 @@ impl PeerConnectionFactoryBuilder {
             ..Default::default()
         };
         registry.install_into(&mut opts);
+        #[cfg(feature = "openh264")]
+        let openh264_registered = self.openh264.is_some();
+        #[cfg(not(feature = "openh264"))]
+        let openh264_registered = false;
         // Ownership of the registry state transfers to the glue at
         // encoder-state construction, which the glue only performs after
         // every fallible step. The only paths returning before that keep the
@@ -147,6 +151,11 @@ impl PeerConnectionFactoryBuilder {
         // gains another pre-construction failure, own-and-free the Box here
         // on `Err` from create_from_options (see ReactorFactoryOptions'
         // ownership note).
-        PeerConnectionFactory::create_from_options(&opts, self.metadata, registry.clone())
+        PeerConnectionFactory::create_from_options(
+            &opts,
+            self.metadata,
+            registry.clone(),
+            openh264_registered,
+        )
     }
 }
