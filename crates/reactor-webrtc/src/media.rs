@@ -169,6 +169,10 @@ pub struct Track {
     // the track is a local one this factory produced or a remote one the
     // observer delivered over a connection this factory created.
     _factory: Arc<FactoryHandle>,
+    // The factory's encoder registry for local tracks — dropped slots must be
+    // retracted when the track dies ([`EncoderRegistry::retract`]). None for
+    // remote tracks: their slots never existed.
+    registry: Option<Arc<crate::encoded::EncoderRegistry>>,
 }
 
 // SAFETY: the native track is internally thread-safe; sink callbacks and sink
@@ -183,6 +187,15 @@ impl Track {
         raw: *mut reactor_webrtc_sys::MediaStreamTrack,
         kind: MediaKind,
         factory: Arc<FactoryHandle>,
+    ) -> Self {
+        Self::from_raw_with_registry(raw, kind, factory, None)
+    }
+
+    pub(crate) fn from_raw_with_registry(
+        raw: *mut reactor_webrtc_sys::MediaStreamTrack,
+        kind: MediaKind,
+        factory: Arc<FactoryHandle>,
+        registry: Option<Arc<crate::encoded::EncoderRegistry>>,
     ) -> Self {
         let sender_meta = Arc::new(CaptureTimeMeta::default());
         let receiver_meta: Arc<ReceiverMetaQueue> = Arc::new(ReceiverMetaQueue::default());
@@ -205,6 +218,7 @@ impl Track {
             frame_counter: AtomicU64::new(0),
             last_send_ms: AtomicI64::new(0),
             _factory: factory,
+            registry,
         }
     }
 
@@ -522,6 +536,13 @@ impl Drop for Track {
             let source: Arc<dyn crate::sender_meta::SenderMetaSource> = self.sender_meta.clone();
             crate::sender_meta::deregister(self.native_id, &source);
             crate::sender_meta::deregister_receiver(self.native_id, &self.receiver_meta);
+        }
+        // Video-only: this track may have reserved encoder slots — reclaim
+        // them so nothing else can be routed through the dead lane.
+        if let Some(registry) = &self.registry {
+            if self.kind == MediaKind::Video {
+                registry.retract(self.native_id());
+            }
         }
         // Detaches the C++ sink before the sink-state boxes are freed.
         unsafe { reactor_webrtc_sys::reactor_webrtc_media_stream_track_destroy(self.raw) }

@@ -405,9 +405,25 @@ impl Clone for RegistrySlot {
 /// libwebrtc calls `VideoEncoderFactory::Create()` — one call per video
 /// transceiver, in negotiation order — which in turn matches the order
 /// [`add_encoded_slot`] / [`add_raw_slot`] were called on the builder.
+///
+/// Every reservation carries the owning track's native id so the registry
+/// can retract a dead track's slots ([`EncoderRegistry::retract`]): an
+/// unreserved-pending slot for a dead track gets dropped, and an assigned
+/// slot degrades to Builtin with a loud fallback, never silently routing
+/// another track's frames.
 pub(crate) struct EncoderRegistry {
-    pending: Mutex<VecDeque<RegistrySlot>>,
-    assigned: Mutex<HashMap<u64, RegistrySlot>>,
+    pending: Mutex<VecDeque<RegistryReservation>>,
+    assigned: Mutex<HashMap<u64, AssignedSlot>>,
+}
+
+struct RegistryReservation {
+    native_id: usize,
+    slot: RegistrySlot,
+}
+
+struct AssignedSlot {
+    native_id: usize,
+    slot: RegistrySlot,
 }
 
 impl EncoderRegistry {
@@ -437,34 +453,60 @@ impl EncoderRegistry {
         opts.encode_has_custom_slots = Some(registry_has_custom_tramp);
     }
 
-    /// Reserve a custom (pre-encoded) slot. Returns the queue the
-    /// [`EncodedVideoTrack`] will push frames into.
-    pub(crate) fn add_encoded_slot(&self) -> Arc<Mutex<VecDeque<EncodedVideoFrame>>> {
+    /// Reserve a custom (pre-encoded) slot for the track `native_id`.
+    /// Returns the queue the [`EncodedVideoTrack`] will push frames into.
+    pub(crate) fn add_encoded_slot(
+        &self,
+        native_id: usize,
+    ) -> Arc<Mutex<VecDeque<EncodedVideoFrame>>> {
         let q = Arc::new(Mutex::new(VecDeque::new()));
-        self.pending
-            .lock()
-            .unwrap()
-            .push_back(RegistrySlot::Custom(q.clone()));
+        self.pending.lock().unwrap().push_back(RegistryReservation {
+            native_id,
+            slot: RegistrySlot::Custom(q.clone()),
+        });
         q
     }
 
-    /// Reserve a builtin (raw BGRA) slot. The C++ factory will delegate to
-    /// the builtin VP8/VP9/AV1 encoder for this transceiver.
-    pub(crate) fn add_raw_slot(&self) {
-        self.pending
-            .lock()
-            .unwrap()
-            .push_back(RegistrySlot::Builtin);
+    /// Reserve a builtin (raw BGRA) slot for the track `native_id`. The C++
+    /// factory delegates to the builtin VP8/VP9/AV1 encoder for this
+    /// transceiver.
+    pub(crate) fn add_raw_slot(&self, native_id: usize) {
+        self.pending.lock().unwrap().push_back(RegistryReservation {
+            native_id,
+            slot: RegistrySlot::Builtin,
+        });
     }
 
-    /// Reserve an inline-encoder slot. The registry calls `cb` synchronously
-    /// with every raw I420 frame for the encoder instance that binds here.
-    pub(crate) fn add_inline_slot(&self, cb: InlineEncoderCallback) {
+    /// Reserve an inline-encoder slot for the track `native_id`. The
+    /// registry calls `cb` synchronously with every raw I420 frame for the
+    /// encoder instance that binds here.
+    pub(crate) fn add_inline_slot(&self, native_id: usize, cb: InlineEncoderCallback) {
         let state = Arc::new(CustomEncoderState { cb: Mutex::new(cb) });
+        self.pending.lock().unwrap().push_back(RegistryReservation {
+            native_id,
+            slot: RegistrySlot::Inline(state),
+        });
+    }
+
+    /// Drop everything reserved for a track that no longer exists.
+    /// Pending reservations are simply removed; an already-assigned slot is
+    /// degraded to Builtin with a loud fallback — libwebrtc may legitimately
+    /// recreate an encoder for a dead stream, and that must never consume
+    /// another track's slot (the old grey-silence failure).
+    pub(crate) fn retract(&self, native_id: usize) {
         self.pending
             .lock()
             .unwrap()
-            .push_back(RegistrySlot::Inline(state));
+            .retain(|r| r.native_id != native_id);
+        let mut assigned = self.assigned.lock().unwrap();
+        for a in assigned.values_mut() {
+            if a.native_id == native_id && !matches!(a.slot, RegistrySlot::Builtin) {
+                eprintln!(
+                    "[reactor-webrtc] retracting encoder slot for dropped track {native_id:#x}:                      degrading to builtin (loud fallback — never reroutes another track's slot)"
+                );
+                a.slot = RegistrySlot::Builtin;
+            }
+        }
     }
 
     /// Whether any custom (pre-encoded or inline) slot exists — pending or
@@ -472,8 +514,22 @@ impl EncoderRegistry {
     /// factory consults when advertising codecs.
     pub(crate) fn has_custom(&self) -> bool {
         let is_custom = |s: &RegistrySlot| !matches!(s, RegistrySlot::Builtin);
-        self.pending.lock().unwrap().iter().any(is_custom)
-            || self.assigned.lock().unwrap().values().any(is_custom)
+        // Drop pending's guard before touching `assigned`: holding both is an
+        // ABBA deadlock against use_builtin_for/encode_for under concurrent
+        // negotiation + encode.
+        let pending_has = self
+            .pending
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| is_custom(&r.slot));
+        pending_has
+            || self
+                .assigned
+                .lock()
+                .unwrap()
+                .values()
+                .any(|a| is_custom(&a.slot))
     }
 
     /// Called by `registry_use_builtin_tramp`. Assigns the next pending slot to
@@ -481,17 +537,29 @@ impl EncoderRegistry {
     /// C++ factory should delegate to the builtin encoder.
     pub(crate) fn use_builtin_for(&self, encoder_id: u64) -> bool {
         let mut assigned = self.assigned.lock().unwrap();
-        if let Some(slot) = assigned.get(&encoder_id) {
-            return matches!(slot, RegistrySlot::Builtin);
+        if let Some(a) = assigned.get(&encoder_id) {
+            return matches!(a.slot, RegistrySlot::Builtin);
         }
-        let slot = self
-            .pending
-            .lock()
-            .unwrap()
-            .pop_front()
-            .unwrap_or(RegistrySlot::Builtin);
-        let is_builtin = matches!(slot, RegistrySlot::Builtin);
-        assigned.insert(encoder_id, slot);
+        let next = {
+            let mut pending = self.pending.lock().unwrap();
+            pending.pop_front()
+        };
+        let Some(reservation) = next else {
+            // No reservation left: the positional fallback, loud — previously
+            // this degraded a custom-encoded stream to builtin silently.
+            eprintln!(
+                "[reactor-webrtc] no encoder slot reservation left for encoder {encoder_id}:                  delegating to builtin — custom-encoded tracks after this may not produce video"
+            );
+            return true;
+        };
+        let is_builtin = matches!(reservation.slot, RegistrySlot::Builtin);
+        assigned.insert(
+            encoder_id,
+            AssignedSlot {
+                native_id: reservation.native_id,
+                slot: reservation.slot,
+            },
+        );
         is_builtin
     }
 
@@ -501,14 +569,25 @@ impl EncoderRegistry {
     /// first call if needed.
     fn encode_for(&self, encoder_id: u64, raw: &RawVideoFrame) -> Option<EncodedVideoFrame> {
         let mut assigned = self.assigned.lock().unwrap();
-        let slot = assigned.entry(encoder_id).or_insert_with(|| {
-            self.pending
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or(RegistrySlot::Builtin)
+        let a = assigned.entry(encoder_id).or_insert_with(|| {
+            let reservation = self.pending.lock().unwrap().pop_front();
+            match reservation {
+                Some(r) => AssignedSlot {
+                    native_id: r.native_id,
+                    slot: r.slot,
+                },
+                None => {
+                    eprintln!(
+                        "[reactor-webrtc] no encoder slot reservation left for encoder {encoder_id}:                          delegating to builtin"
+                    );
+                    AssignedSlot {
+                        native_id: 0,
+                        slot: RegistrySlot::Builtin,
+                    }
+                }
+            }
         });
-        match slot {
+        match &a.slot {
             RegistrySlot::Custom(q) => {
                 let q = q.clone();
                 drop(assigned);
@@ -637,12 +716,21 @@ impl PreEncodedOptions {
 /// the track's transceiver — read [`RawVideoFrame::codec`] (inline) or set
 /// codec preferences to pin it.
 ///
-/// # Slot assignment order
+/// # Slot assignment order — positional, with fresh upgrades
 ///
-/// Slot routing between encoder instances and tracks is **positional**: the
-/// n-th video transceiver to negotiate binds the n-th track created with
-/// [`TrackVideoEncoder`]. Create your tracks before (or in the same order as)
-/// the transceivers that carry them.
+/// Slots route encoder instances ↔ tracks **positionally**: reservation order
+/// (track creation) must match the negotiation order of the transceivers
+/// carrying those tracks. Create encoder-carrying tracks **before** the
+/// peer connection they're attached to negotiates (before `create_offer`),
+/// or the registry may not yet see a reservation to bind to; ordering across
+/// **multiple** peer connections sharing one factory follows whichever
+/// negotiates first, not track creation order.
+///
+/// Dropping an encoder-carrying track retracts its pending slots and degrades
+/// any surviving assigned slot to Builtin (loud fallback, never another
+/// track's). libwebrtc may recreate encoder instances on internal errors or
+/// renegotiation past a dead track; that path degrades the same way rather
+/// than re-routing another live track's pipeline.
 #[non_exhaustive]
 pub enum TrackVideoEncoder {
     /// You push already-encoded bytes at your own pace.

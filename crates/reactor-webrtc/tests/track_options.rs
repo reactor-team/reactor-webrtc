@@ -110,12 +110,14 @@ fn custom_codecs_are_advertised_only_with_custom_slots() {
     );
 
     // Add a pre-encoded track → the registry gains a custom slot: H264+H265
-    // must be claimable now (the track delivers its own bitstream).
+    // must be claimable **while the track lives** (the track delivers its own
+    // bitstream). It has to be kept alive for that — dropping it retracts
+    // the slot again, which is the lifecycle this test also pins.
     let mut options = VideoTrackOptions::default();
     options.encoder = Some(TrackVideoEncoder::PreEncoded(PreEncodedOptions::new(
         320, 240,
     )));
-    factory
+    let keep_enc = factory
         .create_video_track_with_options("enc", options)
         .expect("encoded track");
     let with_custom = offer_sdp(&factory).to_lowercase();
@@ -126,6 +128,15 @@ fn custom_codecs_are_advertised_only_with_custom_slots() {
     assert!(
         with_custom.contains("h264"),
         "H264 should be claimed with a custom slot: {with_custom}"
+    );
+
+    // Lifecycle: once the only custom track is dropped, the registry retracts
+    // its slot and the codec claim goes back to factory defaults.
+    drop(keep_enc);
+    let after = offer_sdp(&factory).to_lowercase();
+    assert!(
+        !after.contains("h265"),
+        "H265 must be unclaimed after the custom track is dropped: {after}"
     );
 }
 
@@ -221,5 +232,68 @@ fn raw_and_pre_encoded_and_inline_tracks_coexist() {
     assert!(
         s2.video_frames.load(Ordering::SeqCst) > 0,
         "pc2 received no video frames from the raw track"
+    );
+}
+
+// Slot retraction: a dropped pre-encoded track must not leave an orphan
+// Custom slot for the next track to consume (the grey-silence shape the
+// registry used to allow: raw frames swallowed by the dead queue).
+#[test]
+fn dropping_an_encoded_track_frees_its_slot() {
+    let factory = PeerConnectionFactory::builder().build().expect("factory");
+    let config = RtcConfiguration::default();
+
+    // Create a pre-encoded track with a Custom slot, then drop every handle.
+    let doomed = {
+        let mut options = VideoTrackOptions::default();
+        options.encoder = Some(TrackVideoEncoder::PreEncoded(PreEncodedOptions::new(
+            320, 240,
+        )));
+        match factory
+            .create_video_track_with_options("doomed", options)
+            .expect("doomed track")
+        {
+            LocalVideoTrack::Encoded(t) => t,
+            LocalVideoTrack::Raw(_) => panic!("must be encoded"),
+        }
+    };
+    drop(doomed); // retraction must happen here, through Track::drop
+
+    // And now a raw track: it must receive a Builtin slot, not the orphan.
+    let raw = factory.create_video_track("alive").expect("alive track");
+    let (pc1, s1) = make_peer(&factory, &config);
+    let (pc2, s2) = make_peer(&factory, &config);
+    let tx1 = pc1
+        .add_transceiver(MediaKind::Video, TransceiverDirection::SendOnly)
+        .expect("tx");
+    tx1.set_track(&raw).expect("set track");
+
+    negotiate(&pc1, &pc2);
+    let stop = AtomicBool::new(false);
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            let (w, h) = (320u32, 240u32);
+            let bgra = vec![128u8; (w * h * 4) as usize];
+            while !stop.load(Ordering::SeqCst) {
+                raw.push_video_frame(&bgra, w, h);
+                thread::sleep(Duration::from_millis(33));
+            }
+        });
+        let start = Instant::now();
+        loop {
+            trickle(&s1, &pc2);
+            trickle(&s2, &pc1);
+            let done = s2.video_frames.load(Ordering::SeqCst) > 0;
+            if done || start.elapsed() > Duration::from_secs(20) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        stop.store(true, Ordering::SeqCst);
+    });
+
+    assert!(
+        s2.video_frames.load(Ordering::SeqCst) > 0,
+        "raw track got no frames — its slot was poisoned by the dropped track"
     );
 }

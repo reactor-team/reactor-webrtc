@@ -317,7 +317,7 @@ impl PeerConnectionFactory {
     /// slot misbinding the next track's encoder.
     pub fn create_video_track(&self, id: &str) -> Result<Track> {
         let track = self.create_video_track_native(id)?;
-        self.registry.add_raw_slot();
+        self.registry.add_raw_slot(track.native_id());
         Ok(track)
     }
 
@@ -349,14 +349,14 @@ impl PeerConnectionFactory {
             None => Ok(LocalVideoTrack::Raw(self.create_video_track(id)?)),
             Some(TrackVideoEncoder::PreEncoded(o)) => {
                 let track = self.create_video_track_native(id)?;
-                let queue = self.registry.add_encoded_slot();
+                let queue = self.registry.add_encoded_slot(track.native_id());
                 Ok(LocalVideoTrack::Encoded(EncodedVideoTrack::new(
                     track, queue, o.width, o.height,
                 )))
             }
             Some(TrackVideoEncoder::Inline(cb)) => {
                 let track = self.create_video_track_native(id)?;
-                self.registry.add_inline_slot(cb);
+                self.registry.add_inline_slot(track.native_id(), cb);
                 Ok(LocalVideoTrack::Raw(track))
             }
         }
@@ -374,7 +374,12 @@ impl PeerConnectionFactory {
         if raw.is_null() {
             return Err(Error::Webrtc("video track creation returned null".into()));
         }
-        Ok(Track::from_raw(raw, MediaKind::Video, self.handle()))
+        Ok(Track::from_raw_with_registry(
+            raw,
+            MediaKind::Video,
+            self.handle(),
+            Some(Arc::clone(&self.registry)),
+        ))
     }
 
     /// Create a local audio track. Its samples come from this factory's ADM —

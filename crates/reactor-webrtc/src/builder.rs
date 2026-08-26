@@ -140,10 +140,13 @@ impl PeerConnectionFactoryBuilder {
         registry.install_into(&mut opts);
         // Ownership of the registry state transfers to the glue at
         // encoder-state construction, which the glue only performs after
-        // every fallible step — any earlier failure keeps the binding's
-        // ownership, and a binding-allocated state then leaks nowhere
-        // (there is simply nothing cleaning it up here: the glue's own
-        // destructor path never runs for those failures).
+        // every fallible step. The only paths returning before that keep the
+        // binding's ownership (bad options/undersized struct — unreachable
+        // from this builder, which always emits valid options), so no
+        // binding-side free is needed on error **today**; if the glue ever
+        // gains another pre-construction failure, own-and-free the Box here
+        // on `Err` from create_from_options (see ReactorFactoryOptions'
+        // ownership note).
         PeerConnectionFactory::create_from_options(&opts, self.metadata, registry.clone())
     }
 }
