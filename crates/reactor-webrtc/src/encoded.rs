@@ -638,7 +638,11 @@ impl EncoderRegistry {
     /// encoder instance that binds here; the returned feedback listeners
     /// surface the rest (rate updates) through
     /// [`VideoTrack::on_encoder_feedback`](crate::media::VideoTrack::on_encoder_feedback).
-    pub(crate) fn add_inline_slot(&self, native_id: usize, cb: InlineEncoderCallback) -> Arc<FeedbackListeners> {
+    pub(crate) fn add_inline_slot(
+        &self,
+        native_id: usize,
+        cb: InlineEncoderCallback,
+    ) -> Arc<FeedbackListeners> {
         let feedback = FeedbackListeners::new();
         let out = feedback.clone();
         let state = Arc::new(CustomEncoderState {
