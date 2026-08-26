@@ -79,10 +79,10 @@ Every process-physical choice composes on one builder; every per-track choice
 arrives as kwargs on the track creation:
 
 ```python
-factory = (rw.PeerConnectionFactoryBuilder()
-    .with_platform_adm()          # real mic + AEC3/NS/AGC/high_pass
-    .with_metadata(False)         # factory-wide frame-metadata kill switch
-    .build())
+builder = rw.PeerConnectionFactoryBuilder()
+builder.with_platform_adm()          # real mic + AEC3/NS/AGC/high_pass
+builder.with_metadata(False)         # factory-wide frame-metadata kill switch
+factory = builder.build()
 
 # Raw video with an H.264 backend chosen per track:
 camera = factory.create_video_track_with_options(

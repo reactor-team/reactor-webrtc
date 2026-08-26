@@ -351,6 +351,17 @@ class Track:
         Note: all-zero frames (empty jitter buffer from peers with no incoming
         RTP) are suppressed and will not trigger this callback."""
         ...
+    def on_encoder_feedback(
+        self,
+        callback: Callable[[Union[KeyFrameRequest, RateUpdate]], None],
+    ) -> None:
+        """Listen for encoder feedback on an inline-encoder track —
+        `KeyFrameRequest` (answer with a key frame promptly) or
+        `RateUpdate { bitrate_bps, framerate_fps }` (adapt your encoder's
+        target). Only tracks created with `inline_encoder` carry feedback;
+        builtin-encoder tracks reject this registration, and so do audio
+        tracks. Latest registration wins."""
+        ...
     def push_pcm(
         self,
         pcm: bytes,
@@ -395,6 +406,15 @@ class EncodedVideoTrack:
         packet trailer. Nothing else has to be arranged: the trailer is appended
         once the peer has declared that it strips them, and `user_data` is
         silently dropped while it has not (see `FrameMetadataGate`)."""
+        ...
+    def on_encoder_feedback(
+        self,
+        callback: Callable[[Union[KeyFrameRequest, RateUpdate]], None],
+    ) -> None:
+        """Listen for encoder feedback on a pre-encoded track — answer
+        `KeyFrameRequest` by pushing an IDR promptly, adapt on
+        `RateUpdate { bitrate_bps, framerate_fps }`. Latest registration
+        wins."""
         ...
     def add_to_peer_connection(self, pc: PeerConnection) -> None: ...
     def add_transceiver(
