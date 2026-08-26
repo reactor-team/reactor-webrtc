@@ -31,7 +31,7 @@ the Rust table.
 | `EncodedVideoTrack::push_encoded_frame(_with_metadata)` | `EncodedVideoTrack::push_frame(_with_metadata)` |
 | `Track::on_video_frame` / `on_audio_frame` | `VideoTrack::on_frame` / `AudioTrack::on_frame` |
 | `PeerConnectionObserver::on_track` with `(MediaKind, Track)` | `on_track` with one [`RemoteTrack`](Video/Audio) per call |
-| `PeerConnectionFactory::create_audio_track_with_local_source(id)` | `create_audio_track_with_options(id, { source: AudioTrackSource::LocalPush, … })` |
+| `PeerConnectionFactory::create_audio_track_with_local_source(id)` | **kept as a deprecated shim** over `create_audio_track_with_options(id, { source: AudioTrackSource::LocalPush, … })` — deprecated but functional so 0.12 callers keep building |
 | FFI `reactor_webrtc_factory_create(_with_adm/_with_adm_apm/_with_custom_video_encoder/_with_openh264)` | FFI `reactor_webrtc_factory_create(const ReactorFactoryOptions*, err, err_cap)` |
 | FFI `reactor_webrtc_audio_track_create_with_local_source` | `reactor_webrtc_audio_track_create(factory, id, const ReactorAudioTrackOptions*)` |
 
