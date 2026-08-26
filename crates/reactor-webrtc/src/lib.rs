@@ -447,6 +447,23 @@ impl PeerConnectionFactory {
         self.create_audio_track_with_options(id, AudioTrackOptions::default())
     }
 
+    /// Create a local audio track with a per-track audio source, independent of
+    /// the factory ADM. Feed samples with [`Track::push_pcm`].
+    ///
+    /// **Deprecated:** retained for 0.12 source compatibility; use
+    /// [`create_audio_track_with_options`](Self::create_audio_track_with_options)
+    /// with [`AudioTrackSource::LocalPush`] instead.
+    #[deprecated(note = "use create_audio_track_with_options with AudioTrackSource::LocalPush")]
+    pub fn create_audio_track_with_local_source(&self, id: &str) -> Result<Track> {
+        self.create_audio_track_with_options(
+            id,
+            AudioTrackOptions {
+                source: AudioTrackSource::LocalPush,
+                ..Default::default()
+            },
+        )
+    }
+
     /// Create a local audio track with per-track [`AudioTrackOptions`] —
     /// choose the source (factory ADM vs independent push source) and the
     /// per-source processing constraints (AEC / noise suppression / AGC /
