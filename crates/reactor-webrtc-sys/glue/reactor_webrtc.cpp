@@ -2096,6 +2096,7 @@ void* reactor_webrtc_factory_create(const ReactorFactoryOptions* opts,
   f->signaling_thread = webrtc::Thread::Create();
   if (!f->network_thread->Start() || !f->worker_thread->Start() ||
       !f->signaling_thread->Start()) {
+    write_error(err, err_cap, "failed to start network/worker/signaling threads");
     return nullptr;
   }
 
@@ -2117,7 +2118,10 @@ void* reactor_webrtc_factory_create(const ReactorFactoryOptions* opts,
       std::make_unique<ReactorCompositeVideoDecoderFactory>(
           std::move(openh264_dec), std::move(apple_dec), state != nullptr),
       /*audio_mixer=*/nullptr, /*audio_processing=*/apm);
-  if (!f->factory) return nullptr;
+  if (!f->factory) {
+    write_error(err, err_cap, "CreatePeerConnectionFactory returned null");
+    return nullptr;
+  }
   return f.release();
 }
 
