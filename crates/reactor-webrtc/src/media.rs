@@ -87,22 +87,33 @@ pub enum AudioTrackSource {
 /// [`PeerConnectionFactory::create_audio_track`] produces. The struct is
 /// `#[non_exhaustive]` — construct via `Default` and assign fields.
 ///
-/// The processing flags are **constraints on this track's source**, tri-state:
-/// `None` leaves the libwebrtc/APM default (built by
-/// [`PeerConnectionFactoryBuilder::with_apm`](crate::PeerConnectionFactoryBuilder::with_apm)),
-/// `Some(v)` forces the stage on/off for this track. They constrain the
-/// capture/send side — received audio is never processed. Meaningful on
-/// [`AudioTrackSource::Adm`] sources (a mic hears the room); a
-/// [`LocalPush`](AudioTrackSource::LocalPush) source has no echo to cancel
-/// and the flags are not applied there — music + mic is the canonical
-/// combination:
+/// The processing flags are **constraints refining what this track asks of
+/// the factory's APM chain** (the one
+/// [`PeerConnectionFactoryBuilder::with_apm`] built — default: none):
+/// `None` inherits the chain's state, `Some(v)` forces the stage on/off for
+/// this track's source. They act **one level above the flags list** — with
+/// libwebrtc semantics this crate honors: a flag set per constraint only
+/// takes effect by engaging part of an APM the factory already has.
+/// **On a factory without an APM (the default) they are inert** — there is
+/// nothing in the capture pipeline for them to toggle; that is not a bug,
+/// the DSP chain genuinely doesn't exist. They constrain the capture/send
+/// side only — received audio is never processed.
+///
+/// A [`LocalPush`](AudioTrackSource::LocalPush) source bypasses the ADM
+/// device path entirely, so these flags only ever matter on
+/// [`AudioTrackSource::Adm`] — pushed audio has no echo to cancel.
 ///
 /// ```rust,ignore
-/// let mic = factory.create_audio_track("mic")?;                    // Adm, inherit APM
-/// let music = factory.create_audio_track_with_options("music", AudioTrackOptions {
-///     source: AudioTrackSource::LocalPush,
-///     echo_cancellation: Some(false),  // never let the AEC eat the music
-///     ..Default::default()
+/// let mic = factory.create_audio_track_with_options("mic", {
+///     let mut o = AudioTrackOptions::default();
+///     o.echo_cancellation = Some(true);      // target the APM chain
+///     o.noise_suppression = Some(true);
+///     o
+/// })?;
+/// let music = factory.create_audio_track_with_options("music", {
+///     let mut o = AudioTrackOptions::default();
+///     o.source = AudioTrackSource::LocalPush;
+///     o
 /// })?;
 /// ```
 #[derive(Default)]
