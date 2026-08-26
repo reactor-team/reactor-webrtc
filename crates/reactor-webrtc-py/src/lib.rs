@@ -1885,6 +1885,11 @@ impl PeerConnection {
             inner: self.pc().frame_metadata_gate(),
         }
     }
+    /// Add a remote ICE candidate received out of band (trickle ICE).
+    ///
+    /// An empty `candidate.candidate` string is the end-of-candidates marker
+    /// (RFC 8838) and succeeds as a no-op rather than failing the
+    /// candidate-string parse.
     fn add_ice_candidate<'py>(
         &self,
         py: Python<'py>,

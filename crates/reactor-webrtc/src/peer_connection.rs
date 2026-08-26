@@ -277,6 +277,10 @@ impl SessionDescription {
 }
 
 /// A trickled ICE candidate.
+///
+/// An empty [`IceCandidate::candidate`] string is the end-of-candidates
+/// marker (RFC 8838), not a candidate to parse; `sdp_mid` and
+/// `sdp_mline_index` still identify the m-line it ends.
 #[derive(Debug, Clone)]
 pub struct IceCandidate {
     pub candidate: String,
@@ -1319,6 +1323,11 @@ impl PeerConnection {
             }
         })
     }
+    /// Add a remote ICE candidate received out of band (trickle ICE).
+    ///
+    /// An empty [`IceCandidate::candidate`] string is the end-of-candidates
+    /// marker (RFC 8838) and succeeds as a no-op rather than failing the
+    /// candidate-string parse.
     pub fn add_ice_candidate(&self, candidate: &IceCandidate) -> Result<()> {
         let mid = CString::new(candidate.sdp_mid.clone().unwrap_or_default()).unwrap_or_default();
         let cand = CString::new(candidate.candidate.as_str())
