@@ -2077,13 +2077,6 @@ void* reactor_webrtc_factory_create(const ReactorFactoryOptions* opts,
     return nullptr;
   }
 
-  std::shared_ptr<ReactorEncoderState> state;
-  if (opts->encode_cb) {
-    state = std::make_shared<ReactorEncoderState>(
-        opts->encode_cb, opts->encode_userdata, opts->encode_free_ud,
-        opts->encode_use_builtin, opts->encode_has_custom_slots);
-  }
-
   std::unique_ptr<webrtc::VideoEncoderFactory> openh264_enc;
   std::unique_ptr<webrtc::VideoDecoderFactory> openh264_dec;
 #ifdef REACTOR_WEBRTC_OPENH264
@@ -2110,6 +2103,19 @@ void* reactor_webrtc_factory_create(const ReactorFactoryOptions* opts,
   apple_enc = reactor::CreateAppleHwVideoEncoderFactory();
   apple_dec = reactor::CreateAppleHwVideoDecoderFactory();
 #endif
+
+  // Encoder-callback ownership is taken HERE — after every fallible step
+  // above: an earlier return (bad options, OpenH264 path in a non-OpenH264
+  // build, thread start) never constructs the state and never frees its
+  // userdata, so the binding's own error cleanup owns exactly that region.
+  // From here on, any failure destroys `state`, whose destructor is the one
+  // place userdata gets freed — the binding must not free it a second time.
+  std::shared_ptr<ReactorEncoderState> state;
+  if (opts->encode_cb) {
+    state = std::make_shared<ReactorEncoderState>(
+        opts->encode_cb, opts->encode_userdata, opts->encode_free_ud,
+        opts->encode_use_builtin, opts->encode_has_custom_slots);
+  }
 
   auto f = std::make_unique<ReactorFactory>();
   f->network_thread   = webrtc::Thread::CreateWithSocketServer();

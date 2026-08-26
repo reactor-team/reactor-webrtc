@@ -312,18 +312,13 @@ impl PeerConnectionFactory {
     ///
     /// Slot assignment between encoder instances and tracks is **positional**:
     /// create tracks before (or in the same order as) the transceivers that
-    /// carry them — the fallback for an encoder with no matching slot is the
-    /// builtin path, never another track's slot.
+    /// carry them. Slots are reserved only after native creation succeeds,
+    /// so a failed creation (bad id, native error) never leaves an orphan
+    /// slot misbinding the next track's encoder.
     pub fn create_video_track(&self, id: &str) -> Result<Track> {
+        let track = self.create_video_track_native(id)?;
         self.registry.add_raw_slot();
-        let cid = CString::new(id).map_err(|_| Error::Webrtc("id contains a NUL byte".into()))?;
-        let raw = unsafe {
-            reactor_webrtc_sys::reactor_webrtc_video_track_create(self.handle.raw(), cid.as_ptr())
-        };
-        if raw.is_null() {
-            return Err(Error::Webrtc("video track creation returned null".into()));
-        }
-        Ok(Track::from_raw(raw, MediaKind::Video, self.handle()))
+        Ok(track)
     }
 
     /// Create a local video track with per-track [`VideoTrackOptions`] —
@@ -343,7 +338,8 @@ impl PeerConnectionFactory {
     /// ```
     ///
     /// The same positional slot-assignment rule as
-    /// [`create_video_track`](Self::create_video_track) applies.
+    /// [`create_video_track`](Self::create_video_track) applies, and slots are
+    /// likewise reserved only after a successful native creation.
     pub fn create_video_track_with_options(
         &self,
         id: &str,
@@ -352,22 +348,25 @@ impl PeerConnectionFactory {
         match options.encoder {
             None => Ok(LocalVideoTrack::Raw(self.create_video_track(id)?)),
             Some(TrackVideoEncoder::PreEncoded(o)) => {
+                let track = self.create_video_track_native(id)?;
                 let queue = self.registry.add_encoded_slot();
-                let track = self.create_video_track_no_slot(id)?;
                 Ok(LocalVideoTrack::Encoded(EncodedVideoTrack::new(
                     track, queue, o.width, o.height,
                 )))
             }
             Some(TrackVideoEncoder::Inline(cb)) => {
+                let track = self.create_video_track_native(id)?;
                 self.registry.add_inline_slot(cb);
-                Ok(LocalVideoTrack::Raw(self.create_video_track_no_slot(id)?))
+                Ok(LocalVideoTrack::Raw(track))
             }
         }
     }
 
-    /// [`create_video_track`](Self::create_video_track) without the registry
-    /// slot — the caller reserved a slot of its own kind already.
-    fn create_video_track_no_slot(&self, id: &str) -> Result<Track> {
+    /// Shared native side of [`create_video_track`](Self::create_video_track):
+    /// the strict FFI call, **without** a registry slot (any slot is the
+    /// caller's to reserve — purely positional, and deliberately after this
+    /// has succeeded).
+    fn create_video_track_native(&self, id: &str) -> Result<Track> {
         let cid = CString::new(id).map_err(|_| Error::Webrtc("id contains a NUL byte".into()))?;
         let raw = unsafe {
             reactor_webrtc_sys::reactor_webrtc_video_track_create(self.handle.raw(), cid.as_ptr())

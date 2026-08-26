@@ -138,15 +138,12 @@ impl PeerConnectionFactoryBuilder {
             ..Default::default()
         };
         registry.install_into(&mut opts);
-        let factory =
-            PeerConnectionFactory::create_from_options(&opts, self.metadata, registry.clone());
-        if factory.is_err() {
-            // The native side never took ownership of the leaked registry
-            // state — free it ourselves.
-            if let Some(free) = opts.encode_free_ud {
-                free(opts.encode_userdata);
-            }
-        }
-        factory
+        // Ownership of the registry state transfers to the glue at
+        // encoder-state construction, which the glue only performs after
+        // every fallible step — any earlier failure keeps the binding's
+        // ownership, and a binding-allocated state then leaks nowhere
+        // (there is simply nothing cleaning it up here: the glue's own
+        // destructor path never runs for those failures).
+        PeerConnectionFactory::create_from_options(&opts, self.metadata, registry.clone())
     }
 }
