@@ -500,7 +500,13 @@ class PeerConnection:
         not need to. It stays closed until `set_remote_description` sees a remote
         description that declares support."""
         ...
-    async def add_ice_candidate(self, candidate: IceCandidate) -> None: ...
+    async def add_ice_candidate(self, candidate: IceCandidate) -> None:
+        """Add a remote ICE candidate received out of band (trickle ICE).
+
+        An empty `candidate.candidate` string is the end-of-candidates marker
+        (RFC 8838) and succeeds as a no-op rather than failing the
+        candidate-string parse."""
+        ...
     def add_track(self, track: Track) -> None: ...
     def add_transceiver(
         self, kind: MediaKind, direction: TransceiverDirection

@@ -1145,7 +1145,11 @@ void reactor_webrtc_peer_connection_set_remote_description(
 }
 
 // Add a remote ICE candidate (from the peer's OnIceCandidate). `on_complete`
-// fires once with a null error on success.
+// fires once with a null error on success. An empty `candidate` string is the
+// end-of-candidates marker (RFC 8838): it succeeds without reaching
+// CreateIceCandidate, which rejects it, and this libwebrtc has nothing that
+// consumes a remote end-of-candidates indication (crbug.com/935898) — so the
+// marker is a no-op at the ICE layer.
 void reactor_webrtc_peer_connection_add_ice_candidate(
     void* pc, const char* sdp_mid, int sdp_mline_index, const char* candidate,
     void* userdata, void (*on_complete)(void* userdata, const char* error)) {
@@ -1154,10 +1158,14 @@ void reactor_webrtc_peer_connection_add_ice_candidate(
     if (on_complete) on_complete(userdata, "no peer connection");
     return;
   }
+  const std::string cand_str(candidate ? candidate : "");
+  if (cand_str.empty()) {
+    if (on_complete) on_complete(userdata, nullptr);
+    return;
+  }
   webrtc::SdpParseError err;
   std::unique_ptr<webrtc::IceCandidate> cand(webrtc::CreateIceCandidate(
-      sdp_mid ? sdp_mid : "", sdp_mline_index,
-      std::string(candidate ? candidate : ""), &err));
+      sdp_mid ? sdp_mid : "", sdp_mline_index, cand_str, &err));
   if (!cand) {
     if (on_complete) on_complete(userdata, err.description.c_str());
     return;
