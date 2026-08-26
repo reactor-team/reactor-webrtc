@@ -332,6 +332,10 @@ impl IceGatheringState {
 pub struct Transceiver {
     raw: *mut reactor_webrtc_sys::RtpTransceiver,
     pc_id: usize,
+    // Shared with the owning PeerConnection: what negotiation concluded about
+    // frame metadata. Consulted by set_track when replacing a disallowed
+    // track with an allowed one.
+    frame_metadata_gate: crate::FrameMetadataGate,
 }
 
 // SAFETY: the native transceiver is internally thread-safe.
@@ -339,8 +343,16 @@ unsafe impl Send for Transceiver {}
 unsafe impl Sync for Transceiver {}
 
 impl Transceiver {
-    pub(crate) fn from_raw(raw: *mut reactor_webrtc_sys::RtpTransceiver, pc_id: usize) -> Self {
-        Self { raw, pc_id }
+    pub(crate) fn from_raw(
+        raw: *mut reactor_webrtc_sys::RtpTransceiver,
+        pc_id: usize,
+        gate: crate::FrameMetadataGate,
+    ) -> Self {
+        Self {
+            raw,
+            pc_id,
+            frame_metadata_gate: gate,
+        }
     }
 
     /// The transceiver's media kind (audio/video).
@@ -406,12 +418,39 @@ impl Transceiver {
             reactor_webrtc_sys::reactor_webrtc_rtp_transceiver_set_track(self.raw, track.raw())
         };
         if ok == 1 {
+            let id = self.transceiver_id();
+            let sender_id = self.sender_track_id();
             // Re-wire the embed source when the gate is already open (replaceTrack
             // post-negotiation). Without this the old track's source stays in the
             // slot and pushes to the new track are silently dropped until the next
             // renegotiation re-runs install_frame_metadata_transforms.
-            if let Some(source) = crate::sender_meta::lookup(self.sender_track_id()) {
-                crate::sender_meta::update_embed_source(self.pc_id, self.transceiver_id(), source);
+            if let Some(source) = crate::sender_meta::lookup(sender_id) {
+                crate::sender_meta::update_embed_source(self.pc_id, id, source);
+            }
+            // Fresh embed only when both the negotiated gate is open and the new
+            // track is allowed to carry metadata — the mirror for, e.g., replacing
+            // a track created with frame_metadata off by one with it on. If the slot
+            // already runs an embed step this is a no-op rather than a second
+            // transformer.
+            if !self.frame_metadata_gate.is_open() || !crate::sender_meta::allowed(sender_id) {
+            } else if let Some(source) = crate::sender_meta::lookup(sender_id) {
+                if let Some(native) = crate::sender_meta::attach_embed(
+                    self.pc_id,
+                    id,
+                    source,
+                    self.frame_metadata_gate.clone(),
+                ) {
+                    if self
+                        .attach_native_transform(crate::sender_meta::Side::Send, &native)
+                        .is_err()
+                    {
+                        crate::sender_meta::release_install(
+                            self.pc_id,
+                            id,
+                            crate::sender_meta::Side::Send,
+                        );
+                    }
+                }
             }
             Ok(())
         } else {
@@ -1394,7 +1433,11 @@ impl PeerConnection {
         if raw.is_null() {
             Err(Error::Webrtc("add_transceiver failed".into()))
         } else {
-            Ok(Transceiver::from_raw(raw, self.raw as usize))
+            Ok(Transceiver::from_raw(
+                raw,
+                self.raw as usize,
+                self.frame_metadata_gate.clone(),
+            ))
         }
     }
 
@@ -1412,7 +1455,9 @@ impl PeerConnection {
                 let raw = unsafe {
                     reactor_webrtc_sys::reactor_webrtc_peer_connection_get_transceiver(self.raw, i)
                 };
-                (!raw.is_null()).then(|| Transceiver::from_raw(raw, self.raw as usize))
+                (!raw.is_null()).then(|| {
+                    Transceiver::from_raw(raw, self.raw as usize, self.frame_metadata_gate.clone())
+                })
             })
             .collect()
     }

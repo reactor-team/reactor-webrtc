@@ -1019,3 +1019,138 @@ fn factory_metadata_kill_switch_blocks_everything() {
     );
     println!("factory metadata kill switch ✅");
 }
+
+/// Codex #71: a transceiver negotiated with a metadata-disabled track must
+/// START emitting trailers after set_track swaps in a metadata-enabled one —
+/// replaceTrack without a renegotiation, matching how the source-swap path
+/// already behaves for a plain enabled→enabled replace.
+#[test]
+fn replace_track_starts_metadata_after_swap() {
+    let factory = PeerConnectionFactory::builder().build().expect("factory");
+    let config = RtcConfiguration::default();
+    let (pc1, s1) = make_peer(&factory, &config);
+    let (pc2, s2) = make_peer(&factory, &config);
+
+    let off_track = factory
+        .create_video_track_with_options("meta-off", {
+            let mut options = VideoTrackOptions::default();
+            options.frame_metadata = Some(false);
+            options
+        })
+        .expect("meta-off track");
+    let LocalVideoTrack::Raw(off_track) = off_track else {
+        panic!("must be raw");
+    };
+
+    let tx1 = pc1
+        .add_transceiver(MediaKind::Video, TransceiverDirection::SendOnly)
+        .expect("tx");
+    tx1.set_track(&off_track).expect("set track");
+
+    negotiate(&pc1, &pc2);
+    assert!(pc1.frame_metadata_gate().is_open());
+
+    // Swap the disallowed track for an allowed one — standalone, no new offer.
+    let on_track = factory
+        .create_video_track("meta-on")
+        .expect("meta-on track");
+    tx1.set_track(&on_track).expect("replace track");
+
+    let on_frames = Arc::new(AtomicU32::new(0));
+    let on_meta = Arc::new(AtomicU32::new(0));
+    let stop = AtomicBool::new(false);
+
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            while !stop.load(Ordering::SeqCst) {
+                let bgra = varying_bgra(0);
+                on_track
+                    .push_frame_with_metadata(reactor_webrtc::VideoFrame::new(&bgra, W, H), b"on")
+                    .expect("push on");
+                thread::sleep(Duration::from_millis(33));
+            }
+        });
+
+        let timed_out = Instant::now() + Duration::from_secs(20);
+        let mut wired = false;
+        loop {
+            forward_ice(&s1, &pc2);
+            forward_ice(&s2, &pc1);
+            if !wired {
+                let tracks = s2.recv.lock().unwrap();
+                if let Some(v) = tracks.iter().find_map(|t| t.as_video()) {
+                    let (f, m) = (on_frames.clone(), on_meta.clone());
+                    v.on_frame(move |frame| {
+                        f.fetch_add(1, Ordering::SeqCst);
+                        if frame.metadata.is_some() {
+                            m.fetch_add(1, Ordering::SeqCst);
+                        }
+                    });
+                    wired = true;
+                }
+            }
+            if on_meta.load(Ordering::SeqCst) >= 2 || Instant::now() > timed_out {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        stop.store(true, Ordering::SeqCst);
+    });
+
+    assert!(
+        on_frames.load(Ordering::SeqCst) > 0,
+        "no frames decoded after swap"
+    );
+    assert!(
+        on_meta.load(Ordering::SeqCst) > 0,
+        "metadata never flowed after swapping the disallowed track for an allowed one"
+    );
+    println!("replace-track metadata ✅");
+}
+
+/// AND-semantics: a track explicitly opting metadata ON cannot re-enable it
+/// when the factory was built with `with_metadata(false)` — the kill switch
+/// is a process-wide off, not a default.
+#[test]
+fn kill_switch_beats_per_track_opt_in() {
+    let factory = PeerConnectionFactory::builder()
+        .with_metadata(false)
+        .build()
+        .expect("factory");
+
+    let config = RtcConfiguration::default(); // frame_metadata: true
+    let (pc1, s1) = make_peer(&factory, &config);
+    let (pc2, s2) = make_peer(&factory, &config);
+
+    let tx1 = pc1
+        .add_transceiver(MediaKind::Video, TransceiverDirection::SendOnly)
+        .expect("tx");
+    // Explicit per-track Opt-IN against the kill switch.
+    let LocalVideoTrack::Raw(video) = factory
+        .create_video_track_with_options("meta-force-on", {
+            let mut options = VideoTrackOptions::default();
+            options.frame_metadata = Some(true);
+            options
+        })
+        .expect("meta-force-on track")
+    else {
+        panic!("must be raw");
+    };
+    tx1.set_track(&video).expect("set track");
+
+    {
+        let offer = pc1.create_offer().expect("offer");
+        assert!(
+            !offer.declares_frame_metadata(),
+            "kill switch must keep the capability out even with per-track Some(true)"
+        );
+        pc1.set_local_description(&offer).expect("pc1 local");
+        pc2.set_remote_description(&offer).expect("pc2 remote");
+        let answer = pc2.create_answer().expect("answer");
+        assert!(!answer.declares_frame_metadata());
+        pc2.set_local_description(&answer).expect("pc2 local");
+        pc1.set_remote_description(&answer).expect("pc1 remote");
+    }
+    assert!(!pc1.frame_metadata_gate().is_open());
+    println!("kill switch over per-track opt-in ✅");
+}

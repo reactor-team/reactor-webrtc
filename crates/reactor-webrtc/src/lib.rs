@@ -407,6 +407,15 @@ impl PeerConnectionFactory {
         }
     }
 
+    /// Effective frame-metadata on a track: the factory kill switch is a
+    /// process-wide **off** that a per-track `Some(true)` can never
+    /// re-enable, so a factory built with `with_metadata(false)` drops
+    /// `user_data` everywhere it was opted in to nothing. `None` inherits
+    /// the same ON/OFF as the factory.
+    fn track_metadata_enabled(&self, track_flag: Option<bool>) -> bool {
+        self.metadata_enabled && track_flag.unwrap_or(true)
+    }
+
     /// Validate an explicit [`H264Backend`] choice against what this build /
     /// this factory can actually serve, and map it to the slot preference.
     fn h264_backend_pref(
