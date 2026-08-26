@@ -2536,7 +2536,14 @@ impl PeerConnectionFactory {
                         u: PyBytes::new_bound(py, raw.u).unbind(),
                         v: PyBytes::new_bound(py, raw.v).unbind(),
                     };
-                    let result = cb.call1(py, (Py::new(py, info).unwrap(),)).ok()?;
+                    let info = match Py::new(py, info) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            e.restore(py);
+                            return None;
+                        }
+                    };
+                    let result = cb.call1(py, (info,)).ok()?;
                     if result.is_none(py) {
                         return None;
                     }
