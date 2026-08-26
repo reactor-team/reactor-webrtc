@@ -407,15 +407,6 @@ impl PeerConnectionFactory {
         }
     }
 
-    /// Effective frame-metadata on a track: the factory kill switch is a
-    /// process-wide **off** that a per-track `Some(true)` can never
-    /// re-enable, so a factory built with `with_metadata(false)` drops
-    /// `user_data` everywhere it was opted in to nothing. `None` inherits
-    /// the same ON/OFF as the factory.
-    fn track_metadata_enabled(&self, track_flag: Option<bool>) -> bool {
-        self.metadata_enabled && track_flag.unwrap_or(true)
-    }
-
     /// Validate an explicit [`H264Backend`] choice against what this build /
     /// this factory can actually serve, and map it to the slot preference.
     fn h264_backend_pref(
@@ -451,11 +442,7 @@ impl PeerConnectionFactory {
     /// the strict FFI call, **without** touching the registry — callers
     /// reserve their slot *after* this succeeds (so a failed create never
     /// leaves an orphan positional slot behind).
-    fn create_video_track_no_slot(
-        &self,
-        id: &str,
-        metadata_enabled: bool,
-    ) -> Result<Track> {
+    fn create_video_track_no_slot(&self, id: &str, metadata_enabled: bool) -> Result<Track> {
         let cid = CString::new(id).map_err(|_| Error::Webrtc("id contains a NUL byte".into()))?;
         let raw = unsafe {
             reactor_webrtc_sys::reactor_webrtc_video_track_create(self.handle.raw(), cid.as_ptr())
