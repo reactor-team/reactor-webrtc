@@ -1,12 +1,12 @@
 //! Mic + music on one factory — the `AudioTrackSource` showcase, portable
 //! (runs headless).
 //!
-//! A mic real world precisaria de `with_platform_adm()`; este exemplo roda em
-//! qualquer host usando o ADM **sintético** como stand-in do microfone: o
-//! track "mic" é alimentado por `factory.push_audio_frame` (o compartilhado
-//! pipe do ADM) e o track "music" é um `LocalPush` independente, alimentado
-//! por `track.push_pcm`. A semântica demonstrada é idêntica — para o mic
-//! real, basta uma linha do builder:
+//! A real mic would need `with_platform_adm()`; this example runs on any host
+//! by using the **synthetic** ADM as a stand-in for the microphone: the "mic"
+//! track is fed by `factory.push_audio_frame` (the shared ADM pipe) and the
+//! "music" track is an independent `LocalPush` source, fed by
+//! `track.push_pcm`. The semantics on show are identical — for the real mic,
+//! one builder line is all it takes:
 //!
 //! ```rust,ignore
 //! let factory = PeerConnectionFactory::builder()
@@ -14,7 +14,7 @@
 //!     .build()?;
 //! ```
 //!
-//! (Ver também: `music_and_mic.rs`, que usa o hardware de verdade.)
+//! (See also `music_and_mic.rs`, which uses the real hardware.)
 //!
 //! ```sh
 //! REACTOR_WEBRTC_LIB_DIR=webrtc-build/out/mac-arm64-release/dist \
@@ -128,8 +128,8 @@ fn run() {
 
     println!("\n── mic (shared ADM pipe) + music (LocalPush), one factory ──\n");
 
-    // …replace builder().build() with the the one-liner in the doc header to
-    // use real hardware instead of the stand-in pipe.
+    // …replace builder().build() with the one-liner in the doc header to use
+    // real hardware instead of the stand-in pipe.
     let factory = PeerConnectionFactory::builder().build().expect("factory");
     let config = RtcConfiguration::default();
 
