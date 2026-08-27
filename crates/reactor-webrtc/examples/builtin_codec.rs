@@ -6,8 +6,9 @@
 //! PCM in `on_audio_frame`.
 //!
 //! This is the zero-integration path: no custom encoder, no codec knowledge
-//! required. Swap `PeerConnectionFactory::new()` for `::with_platform_adm()`
-//! to capture from a real microphone instead of synthetic audio.
+//! required. Swap `PeerConnectionFactory::builder().build()` for
+//! `PeerConnectionFactory::builder().with_platform_adm().build()` to capture
+//! from a real microphone instead of synthetic audio.
 //!
 //! ```sh
 //! REACTOR_WEBRTC_LIB_DIR=webrtc-build/out/mac-arm64-release/dist \
@@ -126,9 +127,10 @@ fn run() {
     // ── factory and peers ─────────────────────────────────────────────────────
 
     // Synthetic ADM: no real audio hardware. Push PCM manually below.
-    // Switch to PeerConnectionFactory::with_platform_adm() to capture from
-    // the real microphone and play decoded audio through the speaker.
-    let factory = PeerConnectionFactory::new().expect("factory");
+    // Switch to PeerConnectionFactory::builder().with_platform_adm().build()
+    // to capture from the real microphone and play decoded audio through the
+    // speaker.
+    let factory = PeerConnectionFactory::builder().build().expect("factory");
     let config = RtcConfiguration::default();
 
     let (pc1, s1) = make_peer(&factory, &config);

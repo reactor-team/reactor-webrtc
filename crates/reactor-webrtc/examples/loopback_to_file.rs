@@ -59,7 +59,7 @@ mod imp {
         let frames = Arc::new(AtomicU32::new(0));
         let blocks = Arc::new(AtomicU32::new(0));
 
-        let factory = PeerConnectionFactory::new().expect("factory");
+        let factory = PeerConnectionFactory::builder().build().expect("factory");
         let config = RtcConfiguration::default();
 
         // Receiver: write decoded media to the files.

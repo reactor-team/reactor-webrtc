@@ -24,7 +24,9 @@ use reactor_webrtc::{PeerConnectionFactory, PeerConnectionObserver, RtcConfigura
 
 #[test]
 fn data_channel_survives_factory_and_connection_drop() {
-    let factory = PeerConnectionFactory::new().expect("factory creation failed");
+    let factory = PeerConnectionFactory::builder()
+        .build()
+        .expect("factory creation failed");
     let pc = factory
         .create_peer_connection(&RtcConfiguration::default(), PeerConnectionObserver::new())
         .expect("peer connection creation failed");

@@ -148,7 +148,7 @@ fn varying_bgra(seed: u8) -> Vec<u8> {
 /// `capture_time_us`.
 #[test]
 fn frame_metadata_roundtrip() {
-    let factory = PeerConnectionFactory::new().expect("factory");
+    let factory = PeerConnectionFactory::builder().build().expect("factory");
     let config = RtcConfiguration::default();
 
     let (pc1, s1) = make_peer(&factory, &config);
@@ -255,7 +255,7 @@ fn encoded_frame_metadata_roundtrip() {
     // ── Phase 1: capture a VP8 key frame ─────────────────────────────────────
     let kf_bytes: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
     {
-        let factory = PeerConnectionFactory::new().expect("factory");
+        let factory = PeerConnectionFactory::builder().build().expect("factory");
         let (pc1, s1) = make_peer(&factory, &config);
         let (pc2, s2) = make_peer(&factory, &config);
 
@@ -419,7 +419,7 @@ fn encoded_frame_metadata_roundtrip() {
 /// appended.
 #[test]
 fn legacy_peer_gets_no_trailer() {
-    let factory = PeerConnectionFactory::new().expect("factory");
+    let factory = PeerConnectionFactory::builder().build().expect("factory");
     let config = RtcConfiguration::default();
 
     let (pc1, s1) = make_peer(&factory, &config);
@@ -508,7 +508,7 @@ fn legacy_peer_gets_no_trailer() {
 /// metadata.
 #[test]
 fn caller_transform_and_metadata_compose_on_one_sender() {
-    let factory = PeerConnectionFactory::new().expect("factory");
+    let factory = PeerConnectionFactory::builder().build().expect("factory");
     let config = RtcConfiguration::default();
 
     let (pc1, s1) = make_peer(&factory, &config);
@@ -607,7 +607,7 @@ fn caller_transform_and_metadata_compose_on_one_sender() {
 /// and off the wire, on a connection that is otherwise identical.
 #[test]
 fn disabled_frame_metadata_never_negotiates() {
-    let factory = PeerConnectionFactory::new().expect("factory");
+    let factory = PeerConnectionFactory::builder().build().expect("factory");
     let off = RtcConfiguration {
         frame_metadata: false,
         ..Default::default()
@@ -672,7 +672,7 @@ fn disabled_frame_metadata_never_negotiates() {
 /// arrived.
 #[test]
 fn answerer_attaching_its_track_after_the_offer_still_sends_metadata() {
-    let factory = PeerConnectionFactory::new().expect("factory");
+    let factory = PeerConnectionFactory::builder().build().expect("factory");
     let config = RtcConfiguration::default();
 
     let (offerer, s1) = make_peer(&factory, &config);

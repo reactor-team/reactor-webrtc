@@ -27,7 +27,7 @@ fn wait_for(p: impl Fn() -> bool, timeout: Duration) -> bool {
 
 #[test]
 fn transceivers_mid_and_ice_gathering() {
-    let factory = PeerConnectionFactory::new().expect("factory");
+    let factory = PeerConnectionFactory::builder().build().expect("factory");
 
     let gathering_complete = Arc::new(AtomicBool::new(false));
     let observer = PeerConnectionObserver::new().on_ice_gathering_change({
@@ -97,7 +97,7 @@ fn transceivers_mid_and_ice_gathering() {
 /// own clock, which shows up as A/V drift.
 #[test]
 fn published_tracks_share_one_media_stream() {
-    let factory = PeerConnectionFactory::new().expect("factory");
+    let factory = PeerConnectionFactory::builder().build().expect("factory");
 
     // The bidirectional shape the SDK peer answers: the offerer sends a camera
     // and a mic (mids 0, 1) and asks to receive a processed pair (mids 2, 3), so

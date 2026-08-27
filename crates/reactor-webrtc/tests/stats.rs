@@ -97,7 +97,7 @@ mod tests {
 
     #[test]
     fn get_stats_connected_peer() {
-        let factory = PeerConnectionFactory::new().expect("factory");
+        let factory = PeerConnectionFactory::builder().build().expect("factory");
         let cfg = RtcConfiguration::default();
 
         let (pc1, s1) = make_peer(&factory, &cfg);
@@ -167,7 +167,7 @@ mod tests {
 
     #[test]
     fn get_stats_returns_immediately_when_not_connected() {
-        let factory = PeerConnectionFactory::new().expect("factory");
+        let factory = PeerConnectionFactory::builder().build().expect("factory");
         let cfg = RtcConfiguration::default();
         let obs = PeerConnectionObserver::new();
         let pc = factory.create_peer_connection(&cfg, obs).expect("pc");

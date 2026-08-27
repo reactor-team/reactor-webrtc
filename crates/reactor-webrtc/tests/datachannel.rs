@@ -70,7 +70,7 @@ fn wait_for(predicate: impl Fn() -> bool, timeout: Duration) -> bool {
 
 #[test]
 fn data_channel_round_trip() {
-    let factory = PeerConnectionFactory::new().expect("factory");
+    let factory = PeerConnectionFactory::builder().build().expect("factory");
     let config = RtcConfiguration::default();
 
     let ice1 = Arc::new(Ice::default());

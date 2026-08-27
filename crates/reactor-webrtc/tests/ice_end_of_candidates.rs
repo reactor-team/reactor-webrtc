@@ -42,7 +42,7 @@ fn make_peer(factory: &PeerConnectionFactory) -> (PeerConnection, Arc<Shared>) {
 /// Reach the state trickle ICE happens in: both peers described, candidates
 /// arriving on pc1's observer queue.
 fn negotiate() -> (PeerConnection, PeerConnection, Arc<Shared>, Arc<Shared>) {
-    let factory = PeerConnectionFactory::new().expect("factory");
+    let factory = PeerConnectionFactory::builder().build().expect("factory");
     let (pc1, s1) = make_peer(&factory);
     let (pc2, s2) = make_peer(&factory);
 

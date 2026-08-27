@@ -39,9 +39,9 @@ fn run() {
     use std::time::{Duration, Instant};
 
     use reactor_webrtc::{
-        openh264, AdmMode, ApmConfig, IceCandidate, MediaKind, PeerConnection,
-        PeerConnectionFactory, PeerConnectionObserver, PeerConnectionState, RtcConfiguration,
-        Track, TransceiverDirection, VideoCodec,
+        openh264, IceCandidate, MediaKind, PeerConnection, PeerConnectionFactory,
+        PeerConnectionObserver, PeerConnectionState, RtcConfiguration, Track, TransceiverDirection,
+        VideoCodec,
     };
 
     // Required by Cisco's binary license: show this in your app's
@@ -124,9 +124,10 @@ fn run() {
 
     // ── factory (real OpenH264 encode/decode) and peers ──────────────────────
 
-    let factory =
-        PeerConnectionFactory::with_openh264(&lib_path, AdmMode::Synthetic, ApmConfig::default())
-            .expect("factory with openh264");
+    let factory = PeerConnectionFactory::builder()
+        .with_openh264(&lib_path)
+        .build()
+        .expect("factory with openh264");
     let config = RtcConfiguration::default();
 
     let (pc1, s1) = make_peer(&factory, &config);
