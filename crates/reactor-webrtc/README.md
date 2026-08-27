@@ -22,7 +22,7 @@ use reactor_webrtc::{
     PeerConnectionFactory, PeerConnectionObserver, RtcConfiguration,
 };
 
-let factory = PeerConnectionFactory::new()?;
+let factory = PeerConnectionFactory::builder().build()?;
 
 let obs = PeerConnectionObserver::new()
     .on_ice_candidate(|c| println!("ICE: {:?}", c.candidate))
@@ -47,8 +47,14 @@ pc.set_local_description(&offer)?;
 | `PeerConnection` | Offer/answer, ICE, tracks, data channels, stats |
 | `PeerConnectionObserver` | Callbacks: state change, ICE candidate, track, data channel |
 | `DataChannel` | Reliable/unreliable messaging over SCTP |
-| `Track` | Local (push frames) or remote (attach a sink) media track; the `_at` push methods take a capture timestamp |
-| `EncodedVideoTrack` | Push pre-encoded video frames (H.264, VP8, VP9, …) |
+| `VideoTrack` / `AudioTrack` | Media-typed tracks (local or remote); `on_frame` receives decoded frames, `push_frame` family feeds a local track; `Deref` to the untyped `Track` core used by transceivers |
+| `RemoteTrack` | `Video(VideoTrack) \| Audio(AudioTrack)` — what `on_track` delivers |
+| `LocalVideoTrack` | `Raw(VideoTrack) \| Encoded(EncodedVideoTrack)` — return of `create_video_track_with_options` |
+| `EncodedVideoTrack` | Push pre-encoded video frames (H.264, VP8, VP9, …); `on_encoder_feedback` surfaces BWE + keyframe requests |
+| `VideoTrackOptions` | Per-track video choices: `encoder` (PreEncoded / Inline callback), `h264_backend`, `frame_metadata` |
+| `AudioTrackOptions` | Per-track audio choices: `source` (factory ADM vs independent `LocalPush`), per-source AEC/NS/AGC/HPF |
+| `H264Backend` | Per-track H.264 selection: `VideoToolbox` / `OpenH264` (Auto = platform default) |
+| `EncoderFeedback` | `KeyFrameRequest` + `RateUpdate { bitrate_bps, framerate_fps }` for custom-encoded tracks |
 | `Transceiver` | RTP send/recv direction + MID; `set_codec_preferences` for video codec choice |
 | `StatsReport` | `inbound_rtp`, `outbound_rtp`, `candidate_pairs` |
 | `SessionDescription` | SDP offer or answer; `ice_ufrags`, `with_ice_credentials`, `declares_frame_metadata`, `with_frame_metadata` |
@@ -138,9 +144,9 @@ appended to the payload:
 Push it with the frame; read it off the decoded one:
 
 ```rust
-track.push_video_frame_with_metadata(&bgra, w, h, b"anything you like");
+track.push_frame_with_metadata(VideoFrame::new(&bgra, w, h), b"anything you like")?;
 
-track.on_video_frame(|frame| {
+track.on_frame(|frame| {
     if let Some(meta) = frame.metadata {
         // meta.user_data, meta.frame_id, meta.capture_time_us
     }
@@ -200,53 +206,71 @@ no transforms, `user_data` dropped — build it with the capability off:
 let config = RtcConfiguration { frame_metadata: false, ..Default::default() };
 ```
 
-Worth doing for a peer whose encoded payloads must be byte-identical to the
-encoder's output, a rollout that has not reached both ends, or to rule frame
-metadata out while bisecting something else.
+Or scoped elsewhere — a whole factory (`with_metadata(false)` on the builder),
+or a single track (`VideoTrackOptions::frame_metadata: Some(false)`, whose
+pushes drop `user_data` silently). Worth doing for a peer whose encoded
+payloads must be byte-identical to the encoder's output, a rollout that has
+not reached both ends, or to rule frame metadata out while bisecting
+something else.
 
 ## Audio modes
 
 ```rust
-// Headless / server: push PCM programmatically
-let factory = PeerConnectionFactory::new()?;  // synthetic ADM (default)
+// Headless / server: synthetic ADM (default) — push PCM programmatically
+let factory = PeerConnectionFactory::builder().build()?;
 factory.push_audio_frame(&pcm_i16, 48000, 1);
 
 // Desktop client: real mic + AEC3 + noise suppression + AGC
-let factory = PeerConnectionFactory::with_platform_adm()?;
+let factory = PeerConnectionFactory::builder().with_platform_adm().build()?;
 
-// Per-peer track, fed directly. An audio track's RTP timestamp counts the
-// samples it has been handed, so it says how much audio exists but not when
-// it happened — stamp it and the video with one clock read to keep them
-// together. See docs/av-sync.md.
-let audio = factory.create_audio_track_with_local_source("mic")?;
+// Per-track source (LocalPush): an independent push pipe of its own, fed
+// directly. An audio track's RTP timestamp counts the samples it has been
+// handed, so it says how much audio exists but not when it happened — stamp
+// it and the video with one clock read to keep them together. See
+// docs/av-sync.md.
+let audio = factory.create_audio_track_with_options("music", {
+    let mut o = AudioTrackOptions::default();
+    o.source = AudioTrackSource::LocalPush;
+    o
+})?;
 let now = reactor_webrtc::time_micros();
-video.push_video_frame_at(&bgra, w, h, now);
-audio.push_pcm_at(&pcm_i16, 48000, 1, now)?;
+video.push_frame_at(VideoFrame::new(&bgra, w, h), now)?;
+audio.push_frame_at(AudioFrame::new(&pcm_i16, 48000, 1), now)?;
 ```
 
 ## Pre-encoded video
 
 ```rust
-let (factory, video) =
-    PeerConnectionFactory::with_encoded_video_track("cam", 1280, 720)?;
+let factory = PeerConnectionFactory::builder().build()?;
+let video = {
+    let mut options = VideoTrackOptions::default();
+    options.encoder = Some(TrackVideoEncoder::PreEncoded(PreEncodedOptions::new(1280, 720)));
+    match factory.create_video_track_with_options("cam", options)? {
+        LocalVideoTrack::Encoded(t) => t,
+        LocalVideoTrack::Raw(_) => panic!("expected a pre-encoded track"),
+    }
+};
+
+// Encoder feedback (BWE + keyframe requests) rides the same handle:
+// video.on_encoder_feedback(|fb| ...) — see docs or examples/pre_encoded.rs.
 
 let pc = factory.create_peer_connection(&config, observer)?;
 let tx = pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendOnly)?;
 tx.set_track(video.track())?;
 
 // From your encoder thread:
-video.push_encoded_frame(EncodedVideoFrame {
+video.push_frame(EncodedVideoFrame {
     data: h264_annex_b,
     is_key_frame: true,
     width: 1280, height: 720,
     rtp_timestamp: 0,
-});
+})?;
 ```
 
 ## H.264
 
-The builtin codec factories (`PeerConnectionFactory::new`/`with_adm_apm`/
-`with_platform_adm`) don't compile H.264 from source — `libwebrtc.a` is built
+The builtin codec path (a plain `PeerConnectionFactory::builder().build()`)
+doesn't compile H.264 from source — `libwebrtc.a` is built
 with `rtc_use_h264=false` everywhere. H.264 sits under the MPEG LA patent
 pool, and shipping our own from-source implementation would make every
 consumer of this crate responsible for that licensing. Instead, real H.264
@@ -258,19 +282,23 @@ own MPEG LA arrangement covers *that* binary and not a build from source.
 
 Two more ways to get real H.264, available on any platform:
 
-- **Bring your own encoder**: [`PeerConnectionFactory::with_custom_video_encoder`]
-  / [`PeerConnectionFactory::with_encoded_video_track`] if you already have
-  H.264 bytes from somewhere (hardware encoder, another library).
+- **Bring your own encoder / bitstream**: `TrackVideoEncoder` on a
+  `create_video_track_with_options` — `PreEncoded` if you already have H.264
+  bytes from somewhere (hardware encoder, another library), `Inline` for
+  libwebrtc to call your encoder with every raw frame.
+- **Per-track backend selection**: `VideoTrackOptions::h264_backend` picks
+  the H.264 engine per track ([`H264Backend`]): a camera on VideoToolbox next
+  to a screen share on OpenH264, one factory.
 - **OpenH264, on Linux/Windows**: enable the `openh264` crate feature, then
   ```rust
-  use reactor_webrtc::{openh264, AdmMode, ApmConfig, PeerConnectionFactory};
+  use reactor_webrtc::{openh264, PeerConnectionFactory};
 
   // Required by Cisco's binary license — show this in your app's
   // licensing/EULA surface.
   println!("{}", openh264::OPENH264_ATTRIBUTION);
 
   let lib_path = openh264::ensure_available(None)?; // downloads on first run
-  let factory = PeerConnectionFactory::with_openh264(&lib_path, AdmMode::Synthetic, ApmConfig::default())?;
+  let factory = PeerConnectionFactory::builder().with_openh264(&lib_path).build()?;
   ```
   This downloads Cisco's official prebuilt OpenH264 shared library at
   runtime and `dlopen`s it — the same approach Firefox and Chrome use. See
