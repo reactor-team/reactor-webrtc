@@ -276,7 +276,7 @@ impl Track {
         is_remote: bool,
         metadata_enabled: bool,
     ) -> Self {
-        Self::from_raw_with_registry(raw, kind, factory, is_remote, true, None)
+        Self::from_raw_with_registry(raw, kind, factory, is_remote, metadata_enabled, None)
     }
 
     pub(crate) fn from_raw_with_registry(
