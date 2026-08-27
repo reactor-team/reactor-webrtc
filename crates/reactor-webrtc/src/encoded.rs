@@ -734,7 +734,25 @@ impl EncoderRegistry {
             // Empty queue: the positional fallback. Loud only when custom
             // plumbing exists to lose — an entirely builtin factory must
             // never hear this (its fallback is the intentional answer).
-            if self.has_custom() {
+            //
+            // `assigned` is already locked on this thread, so consult it (and
+            // `pending`, in the usual assigned→pending order) directly instead
+            // of going through has_custom(): std::sync::Mutex is non-recursive,
+            // and re-locking `assigned` here self-deadlocks this thread. That
+            // wedged the encoder queue whenever libwebrtc recreated an encoder
+            // with an empty reservation queue (normal on stream teardown with
+            // cadence frames in flight), cascading into
+            // VideoStreamEncoder::Stop and PeerConnection::Close never
+            // returning.
+            let is_custom = |s: &RegistrySlot| !matches!(s, RegistrySlot::Builtin(_));
+            let any_custom_left = assigned.values().any(|a| is_custom(&a.slot))
+                || self
+                    .pending
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|r| is_custom(&r.slot));
+            if any_custom_left {
                 eprintln!(
                     "[reactor-webrtc] no encoder slot reservation left for encoder {encoder_id}: delegating to builtin — custom-encoded tracks after this point may not produce video"
                 );
@@ -1258,5 +1276,38 @@ impl EncodedVideoTrack {
             self.height,
         ))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod registry_locking_tests {
+    use super::*;
+
+    /// A new encoder id arriving with an empty reservation queue takes the
+    /// positional fallback. That branch must not consult has_custom() while
+    /// holding the `assigned` lock: std::sync::Mutex is non-recursive, so the
+    /// re-lock self-deadlocked the encoder queue whenever libwebrtc
+    /// recreated an encoder during stream teardown, cascading into
+    /// VideoStreamEncoder::Stop and PeerConnection::Close never returning
+    /// (sampled as the CI pytest hang).
+    #[test]
+    fn use_builtin_for_empty_pending_does_not_self_deadlock() {
+        let registry = EncoderRegistry::new();
+        let _live = registry.add_encoded_slot(0xdead);
+        assert!(
+            !registry.use_builtin_for(1),
+            "the single pending reservation is custom"
+        );
+        // Pending is now empty while a custom slot stays assigned — exactly
+        // the state a teardown-time encoder recreate hits.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reg = Arc::clone(&registry);
+        std::thread::spawn(move || {
+            let _ = tx.send(reg.use_builtin_for(2));
+        });
+        let fell_back = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("use_builtin_for self-deadlocked on an empty pending queue");
+        assert!(fell_back, "no reservation left → builtin fallback");
     }
 }
