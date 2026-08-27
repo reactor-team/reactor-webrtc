@@ -10,25 +10,115 @@
 #![cfg(have_libwebrtc)]
 
 use std::collections::VecDeque;
+use std::f64::consts::PI;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use reactor_webrtc::{
-    AudioTrackOptions, AudioTrackSource, IceCandidate, MediaKind, PeerConnection,
+    AudioFrame, AudioTrackOptions, AudioTrackSource, IceCandidate, MediaKind, PeerConnection,
     PeerConnectionFactory, PeerConnectionObserver, PeerConnectionState, RtcConfiguration, Track,
     TransceiverDirection,
 };
+
+const RATE: u32 = 48_000;
+const CHANNELS: u32 = 2;
+const AMPLITUDE: f64 = 8_000.0;
+
+// The two buses carry steady tones rather than DC levels: a constant offset
+// does not survive the Opus round-trip, a tone does — so the received lanes
+// can be told apart by their *content*, which is what "routed independently"
+// actually means. The two frequencies are deliberately not harmonically
+// related, so harmonic distortion of one never lands in the other's bin.
+const ADM_HZ: f64 = 440.0;
+const PUSH_HZ: f64 = 2_700.0;
+// Head of the decoded stream to discard (100 ms): the first packets ramp up.
+const SKIP_SAMPLES: usize = (RATE / 10) as usize;
+// 500 ms of decoded mono audio per lane — plenty for a single-bin DFT.
+const ANALYSIS_SAMPLES: usize = (RATE / 2) as usize;
+// A lane must show this much more energy in its own bin than in the other's.
+const DOMINANCE: f64 = 8.0;
+
+// One received audio lane: how many frames arrived, and the decoded samples
+// themselves (channel 0), so the test can check *which* bus they came from.
+#[derive(Default)]
+struct Lane {
+    frames: AtomicU32,
+    rate: AtomicU32,
+    pcm: Mutex<Vec<i16>>,
+}
+
+impl Lane {
+    fn record(&self, f: &AudioFrame<'_>) {
+        self.frames.fetch_add(1, Ordering::SeqCst);
+        self.rate.store(f.sample_rate, Ordering::SeqCst);
+        let mut pcm = self.pcm.lock().unwrap();
+        if pcm.len() < SKIP_SAMPLES + ANALYSIS_SAMPLES {
+            pcm.extend(f.pcm.iter().step_by(f.channels.max(1) as usize));
+        }
+    }
+
+    fn analysable(&self) -> bool {
+        self.pcm.lock().unwrap().len() >= SKIP_SAMPLES + ANALYSIS_SAMPLES
+    }
+}
+
+// Energy in a single DFT bin (Goertzel) — all that is needed to answer
+// "which tone is on this lane".
+fn tone_energy(pcm: &[i16], rate: u32, freq: f64) -> f64 {
+    let coeff = 2.0 * (2.0 * PI * freq / rate as f64).cos();
+    let (mut s1, mut s2) = (0.0f64, 0.0f64);
+    for &x in pcm {
+        let s0 = x as f64 / i16::MAX as f64 + coeff * s1 - s2;
+        s2 = s1;
+        s1 = s0;
+    }
+    ((s1 * s1 + s2 * s2 - coeff * s1 * s2) / pcm.len() as f64).max(0.0)
+}
+
+// The lane carries `own` Hz and not `other` Hz — a mixer that leaks push PCM
+// into the shared ADM bus (or the reverse) fails here.
+fn assert_lane_carries(name: &str, lane: &Lane, own: f64, other: f64) {
+    let pcm = lane.pcm.lock().unwrap();
+    let rate = lane.rate.load(Ordering::SeqCst);
+    assert!(
+        pcm.len() >= SKIP_SAMPLES + ANALYSIS_SAMPLES,
+        "{name}: only {} decoded samples, need {}",
+        pcm.len(),
+        SKIP_SAMPLES + ANALYSIS_SAMPLES
+    );
+    let body = &pcm[SKIP_SAMPLES..];
+    let own_energy = tone_energy(body, rate, own);
+    let other_energy = tone_energy(body, rate, other);
+    assert!(
+        own_energy > other_energy * DOMINANCE,
+        "{name}: expected only the {own:.0} Hz bus — {own:.0} Hz = {own_energy:.3e}, \
+         {other:.0} Hz = {other_energy:.3e} ({rate} Hz, {} samples): the two sources cross",
+        body.len()
+    );
+}
+
+// A continuous `freq` tone, interleaved over CHANNELS, starting at absolute
+// sample `start` so the phase carries across blocks.
+fn tone(freq: f64, start: u64, frames: usize) -> Vec<i16> {
+    let mut pcm = Vec::with_capacity(frames * CHANNELS as usize);
+    for i in 0..frames {
+        let phase = 2.0 * PI * freq * (start + i as u64) as f64 / RATE as f64;
+        let sample = (phase.sin() * AMPLITUDE) as i16;
+        pcm.extend(std::iter::repeat_n(sample, CHANNELS as usize));
+    }
+    pcm
+}
 
 #[derive(Default)]
 struct Peer {
     ice: Mutex<VecDeque<IceCandidate>>,
     connected: AtomicBool,
-    // Frames decoded per received track, keyed by on_track order: the
-    // transceivers were added in order, so recv[0] == ADM, recv[1] == push.
-    adm_frames: AtomicU32,
-    push_frames: AtomicU32,
+    // Received audio per track, keyed by on_track order: the transceivers
+    // were added in order, so recv[0] == ADM, recv[1] == push.
+    adm: Arc<Lane>,
+    push: Arc<Lane>,
     recv: Mutex<Vec<Track>>,
 }
 
@@ -54,18 +144,18 @@ fn make_peer(
             let s = s.clone();
             move |kind, track| {
                 if kind == MediaKind::Audio {
-                    let idx = s.recv.lock().unwrap().len();
-                    let s = s.clone();
-                    track.on_audio_frame(move |f| {
-                        if f.pcm.is_empty() {
-                            return;
-                        }
-                        match idx {
-                            0 => s.adm_frames.fetch_add(1, Ordering::SeqCst),
-                            1 => s.push_frames.fetch_add(1, Ordering::SeqCst),
-                            _ => 0,
-                        };
-                    });
+                    let lane = match s.recv.lock().unwrap().len() {
+                        0 => Some(s.adm.clone()),
+                        1 => Some(s.push.clone()),
+                        _ => None,
+                    };
+                    if let Some(lane) = lane {
+                        track.on_audio_frame(move |f| {
+                            if !f.pcm.is_empty() {
+                                lane.record(&f);
+                            }
+                        });
+                    }
                 }
                 s.recv.lock().unwrap().push(track); // keep the sink alive
             }
@@ -118,14 +208,14 @@ fn adm_and_local_push_tracks_route_independently_() {
     let stop = AtomicBool::new(false);
     thread::scope(|scope| {
         scope.spawn(|| {
-            let rate = 48_000u32;
-            let channels = 2u32;
-            let block = (rate / 100) as usize * channels as usize; // 10ms @ 48kHz stereo
-            let adm_pcm = vec![4_000i16; block];
-            let push_pcm = vec![-8_000i16; block];
+            let frames = (RATE / 100) as usize; // 10 ms blocks
+            let mut n = 0u64;
             while !stop.load(Ordering::SeqCst) {
-                factory.push_audio_frame(&adm_pcm, rate, channels);
-                music.push_pcm(&push_pcm, rate, channels).expect("push_pcm");
+                factory.push_audio_frame(&tone(ADM_HZ, n, frames), RATE, CHANNELS);
+                music
+                    .push_pcm(&tone(PUSH_HZ, n, frames), RATE, CHANNELS)
+                    .expect("push_pcm");
+                n += frames as u64;
                 thread::sleep(Duration::from_millis(10));
             }
         });
@@ -133,9 +223,8 @@ fn adm_and_local_push_tracks_route_independently_() {
         loop {
             trickle(&s1, &pc2);
             trickle(&s2, &pc1);
-            let done = s2.adm_frames.load(Ordering::SeqCst) > 0
-                && s2.push_frames.load(Ordering::SeqCst) > 0;
-            if done || start.elapsed() > Duration::from_secs(20) {
+            let done = s2.adm.analysable() && s2.push.analysable();
+            if done || start.elapsed() > Duration::from_secs(30) {
                 break;
             }
             thread::sleep(Duration::from_millis(50));
@@ -148,13 +237,16 @@ fn adm_and_local_push_tracks_route_independently_() {
         "loopback did not connect"
     );
     assert!(
-        s2.adm_frames.load(Ordering::SeqCst) > 0,
+        s2.adm.frames.load(Ordering::SeqCst) > 0,
         "no ADM-sourced (mic) frames received"
     );
     assert!(
-        s2.push_frames.load(Ordering::SeqCst) > 0,
+        s2.push.frames.load(Ordering::SeqCst) > 0,
         "no LocalPush (music) frames received"
     );
+    // Presence is not routing: each lane must carry its own bus and only it.
+    assert_lane_carries("ADM lane (mic)", &s2.adm, ADM_HZ, PUSH_HZ);
+    assert_lane_carries("LocalPush lane (music)", &s2.push, PUSH_HZ, ADM_HZ);
 }
 
 // The 4 per-source processing constraints in both positions are accepted —
