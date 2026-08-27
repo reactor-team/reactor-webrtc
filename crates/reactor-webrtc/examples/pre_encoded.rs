@@ -52,10 +52,10 @@ fn run() {
     use std::time::{Duration, Instant};
 
     use reactor_webrtc::{
-        EncodedVideoFrame, FrameAction, FrameTransform, IceCandidate, LocalVideoTrack, MediaKind,
-        PeerConnection, PeerConnectionFactory, PeerConnectionObserver, PeerConnectionState,
-        PreEncodedOptions, RemoteTrack, RtcConfiguration, TrackVideoEncoder, TransceiverDirection,
-        VideoTrackOptions,
+        EncodedVideoFrame, EncoderFeedback, FrameAction, FrameTransform, IceCandidate,
+        LocalVideoTrack, MediaKind, PeerConnection, PeerConnectionFactory, PeerConnectionObserver,
+        PeerConnectionState, PreEncodedOptions, RemoteTrack, RtcConfiguration, TrackVideoEncoder,
+        TransceiverDirection, VideoTrackOptions,
     };
 
     // ── peer boilerplate ──────────────────────────────────────────────────────
@@ -214,6 +214,34 @@ fn run() {
     rx2.set_receiver_transform(&recv_tf)
         .expect("receiver transform");
 
+    // ── encoder feedback: IDR-on-demand + BWE adaptation ─────────────────────
+    //
+    // Pre-encoded tracks receive no raw frames, so keyframe requests and BWE
+    // rate changes can only surface through on_encoder_feedback. The contract:
+    // KeyFrameRequest → push an IDR promptly, or new receivers wait out your
+    // whole GOP.
+
+    let need_keyframe = Arc::new(AtomicBool::new(false));
+    video.on_encoder_feedback({
+        let need_keyframe = need_keyframe.clone();
+        move |fb| match fb {
+            EncoderFeedback::KeyFrameRequest => {
+                println!("  [feedback] KeyFrameRequest — next frame goes out as IDR");
+                need_keyframe.store(true, Ordering::SeqCst);
+            }
+            EncoderFeedback::RateUpdate {
+                bitrate_bps,
+                framerate_fps,
+            } => {
+                println!(
+                    "  [feedback] RateUpdate: {} bps @ {:.0} fps (your encoder should adapt)",
+                    bitrate_bps, framerate_fps
+                );
+            }
+            _ => {}
+        }
+    });
+
     // ── push pre-encoded frames ───────────────────────────────────────────────
     //
     // This is the developer-facing API. Whenever YOUR encoder (VideoToolbox,
@@ -233,7 +261,8 @@ fn run() {
             // encoder (VideoToolbox CMSampleBuffer, GstBuffer, AVPacket, …).
             let mut frame_idx = 0u32;
             while !stop.load(Ordering::SeqCst) {
-                let is_key = frame_idx == 0 || frame_idx % 30 == 0;
+                let gop_key = frame_idx == 0 || frame_idx % 30 == 0;
+                let is_key = gop_key || need_keyframe.swap(false, Ordering::SeqCst);
 
                 // ── stub encoded payload ──────────────────────────────────
                 // Replace this with real encoder output:

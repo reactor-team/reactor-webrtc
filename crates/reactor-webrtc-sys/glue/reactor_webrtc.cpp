@@ -1765,6 +1765,15 @@ typedef int (*reactor_has_custom_slots_cb)(void* userdata);
 // returns null (H264 simply can't be used then). May be null (always auto).
 typedef int (*reactor_video_backend_cb)(void* userdata, uint64_t encoder_id);
 
+// Called on every rate-control update for a custom-slotted encoder instance —
+// this is the bandwidth estimation feedback custom encoders need to adapt
+// their own bitrate targeting (ReactorVideoEncoder's builtin counterpart
+// receives the same call internally). Routed by `encoder_id` like every other
+// encoder hook. May be null.
+typedef void (*reactor_rate_update_cb)(void* userdata, uint64_t encoder_id,
+                                       uint32_t bitrate_bps,
+                                       double framerate_fps);
+
 // Unified factory-create options. ABI-versioned: `size` MUST be
 // sizeof(ReactorFactoryOptions) as known to the caller; the glue rejects
 // undersized structs, and future fields only ever get appended at the end
@@ -1792,6 +1801,9 @@ struct ReactorFactoryOptions {
   // Per-encoder-instance H264 backend preference (0 = auto, 1 = VideoToolbox,
   // 2 = OpenH264). May be null — all instances use the platform default.
   reactor_video_backend_cb     encode_video_backend_for;
+  // Rate-control (BWE) updates for custom-slotted encoder instances — the
+  // bitrate/framerate the congestion controller wants. May be null.
+  reactor_rate_update_cb       encode_rate_update;
 };
 }
 
@@ -1802,13 +1814,15 @@ struct ReactorEncoderState {
   reactor_use_builtin_cb         use_builtin;      // null = always use custom
   reactor_has_custom_slots_cb    has_custom_slots; // null = never claim custom codecs
   reactor_video_backend_cb       video_backend_for; // null = all instances auto
+  reactor_rate_update_cb         rate_update;       // null = suppress rate feedback
 
   ReactorEncoderState(reactor_video_encode_cb c, void* u, reactor_webrtc_userdata_free f,
                       reactor_use_builtin_cb ub = nullptr,
                       reactor_has_custom_slots_cb hcs = nullptr,
-                      reactor_video_backend_cb vbf = nullptr)
+                      reactor_video_backend_cb vbf = nullptr,
+                      reactor_rate_update_cb ru = nullptr)
       : cb(c), userdata(u), free_ud(f), use_builtin(ub),
-        has_custom_slots(hcs), video_backend_for(vbf) {}
+        has_custom_slots(hcs), video_backend_for(vbf), rate_update(ru) {}
   ~ReactorEncoderState() { if (free_ud) free_ud(userdata); }
   // Disable copy+move: free_ud would fire twice (once on the copy, once on
   // the original) which would double-free `userdata`.
@@ -1928,7 +1942,15 @@ class ReactorVideoEncoder : public webrtc::VideoEncoder {
     return WEBRTC_VIDEO_CODEC_OK;
   }
 
-  void SetRates(const RateControlParameters&) override {}
+  void SetRates(const RateControlParameters& parameters) override {
+    // The congestion controller's current estimate. Custom encoders own their
+    // bitrate adaptation; without this they encode blind to BWE (the builtin
+    // encoders take the same call and adjust internally).
+    if (!state_->rate_update) return;
+    state_->rate_update(state_->userdata, id_,
+                        parameters.target_bitrate.get_sum_bps(),
+                        parameters.framerate_fps);
+  }
 
   EncoderInfo GetEncoderInfo() const override {
     EncoderInfo info;
@@ -2172,7 +2194,7 @@ void* reactor_webrtc_factory_create(const ReactorFactoryOptions* opts,
     state = std::make_shared<ReactorEncoderState>(
         opts->encode_cb, opts->encode_userdata, opts->encode_free_ud,
         opts->encode_use_builtin, opts->encode_has_custom_slots,
-        opts->encode_video_backend_for);
+        opts->encode_video_backend_for, opts->encode_rate_update);
   }
 
   auto f = std::make_unique<ReactorFactory>();

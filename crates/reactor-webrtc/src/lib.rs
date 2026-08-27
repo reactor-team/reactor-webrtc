@@ -55,9 +55,9 @@ pub use config::{
     TcpCandidatePolicy,
 };
 pub use encoded::{
-    EncodedFrame, EncodedVideoFrame, EncodedVideoTrack, FrameAction, FrameDirection,
-    FrameTransform, H264Backend, InlineEncoderCallback, LocalVideoTrack, PreEncodedOptions,
-    RawVideoFrame, TrackVideoEncoder, VideoCodec, VideoTrackOptions,
+    EncodedFrame, EncodedVideoFrame, EncodedVideoTrack, EncoderFeedback, FrameAction,
+    FrameDirection, FrameTransform, H264Backend, InlineEncoderCallback, LocalVideoTrack,
+    PreEncodedOptions, RawVideoFrame, TrackVideoEncoder, VideoCodec, VideoTrackOptions,
 };
 
 /// Whether this build targets Apple (H.264 VideoToolbox backend exists).
@@ -391,9 +391,9 @@ impl PeerConnectionFactory {
                     id,
                     self.track_metadata_enabled(options.frame_metadata),
                 )?);
-                let queue = self.registry.add_encoded_slot(track.native_id());
+                let (queue, feedback) = self.registry.add_encoded_slot(track.native_id());
                 Ok(LocalVideoTrack::Encoded(EncodedVideoTrack::new(
-                    track, queue, o.width, o.height,
+                    track, queue, feedback, o.width, o.height,
                 )))
             }
             Some(TrackVideoEncoder::Inline(cb)) => {
@@ -401,7 +401,8 @@ impl PeerConnectionFactory {
                     id,
                     self.track_metadata_enabled(options.frame_metadata),
                 )?);
-                self.registry.add_inline_slot(track.native_id(), cb);
+                let feedback = self.registry.add_inline_slot(track.native_id(), cb);
+                crate::encoded::register_feedback_binding(track.native_id(), &feedback);
                 Ok(LocalVideoTrack::Raw(track))
             }
         }
