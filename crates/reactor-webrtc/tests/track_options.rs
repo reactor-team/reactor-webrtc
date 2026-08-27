@@ -282,7 +282,8 @@ fn dropping_an_encoded_track_frees_its_slot() {
             let (w, h) = (320u32, 240u32);
             let bgra = vec![128u8; (w * h * 4) as usize];
             while !stop.load(Ordering::SeqCst) {
-                raw.push_video_frame(&bgra, w, h);
+                raw.push_frame(reactor_webrtc::VideoFrame::new(&bgra, w, h))
+                    .expect("push frame");
                 thread::sleep(Duration::from_millis(33));
             }
         });
