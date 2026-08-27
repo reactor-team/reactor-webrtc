@@ -660,19 +660,36 @@ impl EncoderRegistry {
     /// Pending reservations are simply removed; an already-assigned slot is
     /// degraded to Builtin with a loud fallback — libwebrtc may legitimately
     /// recreate an encoder for a dead stream, and that must never consume
-    /// another track's slot (the old grey-silence failure).
+    /// another track's slot (the old grey-silence failure). The last living
+    /// custom lane closing is a teardown, not a hazard: it stays quiet
+    /// instead of app woke-and-wail on every shutdown.
     pub(crate) fn retract(&self, native_id: usize) {
         self.pending
             .lock()
             .unwrap()
             .retain(|r| r.native_id != native_id);
+        // Any other custom lane matters? Check pending first, then assigned
+        // (same traversal order as has_custom — no ABBA regression).
+        let pending_has_custom = self
+            .pending
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| !matches!(r.slot, RegistrySlot::Builtin(_)));
+        let any_live_custom =
+            pending_has_custom
+                || self.assigned.lock().unwrap().values().any(|a| {
+                    a.native_id != native_id && !matches!(a.slot, RegistrySlot::Builtin(_))
+                });
         let mut assigned = self.assigned.lock().unwrap();
         for a in assigned.values_mut() {
             if a.native_id == native_id && !matches!(a.slot, RegistrySlot::Builtin(_)) {
-                eprintln!(
-                    "[reactor-webrtc] retracting encoder slot for dropped track {native_id:#x}: \
-                     degrading to builtin (loud fallback — never reroutes another track's slot)"
-                );
+                if any_live_custom {
+                    eprintln!(
+                        "[reactor-webrtc] retracting encoder slot for dropped track {native_id:#x}: \
+                         degrading to builtin with other custom slots still routed"
+                    );
+                }
                 a.slot = RegistrySlot::Builtin(H264BackendPref::Auto);
             }
         }
@@ -714,11 +731,14 @@ impl EncoderRegistry {
             pending.pop_front()
         };
         let Some(reservation) = next else {
-            // No reservation left: the positional fallback, loud — previously
-            // this degraded a custom-encoded stream to builtin silently.
-            eprintln!(
-                "[reactor-webrtc] no encoder slot reservation left for encoder {encoder_id}: delegating to builtin — custom-encoded tracks after this point may not produce video"
-            );
+            // Empty queue: the positional fallback. Loud only when custom
+            // plumbing exists to lose — an entirely builtin factory must
+            // never hear this (its fallback is the intentional answer).
+            if self.has_custom() {
+                eprintln!(
+                    "[reactor-webrtc] no encoder slot reservation left for encoder {encoder_id}: delegating to builtin — custom-encoded tracks after this point may not produce video"
+                );
+            }
             return true;
         };
         let is_builtin = matches!(reservation.slot, RegistrySlot::Builtin(_));
