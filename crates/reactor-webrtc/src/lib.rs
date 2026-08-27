@@ -62,7 +62,10 @@ pub use encoded::{
 
 /// Whether this build targets Apple (H.264 VideoToolbox backend exists).
 pub(crate) const HAVE_VIDEO_TOOLBOX: bool = cfg!(target_vendor = "apple");
-pub use media::{AudioFrame, AudioTrackOptions, AudioTrackSource, MediaKind, Track, VideoFrame};
+pub use media::{
+    AudioFrame, AudioTrack, AudioTrackOptions, AudioTrackSource, MediaKind, RemoteTrack, Track,
+    VideoFrame, VideoTrack,
+};
 pub use metadata::{
     FrameMetadata, FrameMetadataGate, FRAME_METADATA_ATTRIBUTE, FRAME_METADATA_VERSION,
 };
@@ -327,10 +330,10 @@ impl PeerConnectionFactory {
     /// carry them. Slots are reserved only after native creation succeeds,
     /// so a failed creation (bad id, native error) never leaves an orphan
     /// slot misbinding the next track's encoder.
-    pub fn create_video_track(&self, id: &str) -> Result<Track> {
+    pub fn create_video_track(&self, id: &str) -> Result<VideoTrack> {
         let track = self.create_video_track_no_slot(id)?;
         self.registry.add_raw_slot(track.native_id());
-        Ok(track)
+        Ok(VideoTrack::wrap(track))
     }
 
     /// Create a local video track with per-track [`VideoTrackOptions`] —
@@ -375,13 +378,13 @@ impl PeerConnectionFactory {
         match options.encoder {
             None => {
                 let pref = self.h264_backend_pref(options.h264_backend)?;
-                let track = self.create_video_track_no_slot(id)?;
+                let track = VideoTrack::wrap(self.create_video_track_no_slot(id)?);
                 self.registry
                     .add_raw_slot_with_backend(track.native_id(), pref);
                 Ok(LocalVideoTrack::Raw(track))
             }
             Some(TrackVideoEncoder::PreEncoded(o)) => {
-                let track = self.create_video_track_no_slot(id)?;
+                let track = VideoTrack::wrap(self.create_video_track_no_slot(id)?);
                 let queue = self.registry.add_encoded_slot(track.native_id());
                 Ok(LocalVideoTrack::Encoded(EncodedVideoTrack::new(
                     track, queue, o.width, o.height,
@@ -390,7 +393,7 @@ impl PeerConnectionFactory {
             Some(TrackVideoEncoder::Inline(cb)) => {
                 let track = self.create_video_track_no_slot(id)?;
                 self.registry.add_inline_slot(track.native_id(), cb);
-                Ok(LocalVideoTrack::Raw(track))
+                Ok(LocalVideoTrack::Raw(VideoTrack::wrap(track)))
             }
         }
     }
@@ -435,6 +438,7 @@ impl PeerConnectionFactory {
             raw,
             MediaKind::Video,
             self.handle(),
+            false,
             Some(Arc::clone(&self.registry)),
         ))
     }
@@ -443,7 +447,7 @@ impl PeerConnectionFactory {
     /// feed it with [`PeerConnectionFactory::push_audio_frame`]. For per-track
     /// sources and processing constraints use
     /// [`create_audio_track_with_options`](Self::create_audio_track_with_options).
-    pub fn create_audio_track(&self, id: &str) -> Result<Track> {
+    pub fn create_audio_track(&self, id: &str) -> Result<AudioTrack> {
         self.create_audio_track_with_options(id, AudioTrackOptions::default())
     }
 
@@ -452,9 +456,11 @@ impl PeerConnectionFactory {
     ///
     /// **Deprecated:** retained for 0.12 source compatibility; use
     /// [`create_audio_track_with_options`](Self::create_audio_track_with_options)
-    /// with [`AudioTrackSource::LocalPush`] instead.
+    /// with [`AudioTrackSource::LocalPush`] instead. Accepting that the type
+    /// is now `AudioTrack` — push helpers didn't change names, though; calls
+    /// typed against [`Track`] adapt trivially (`let track: AudioTrack`).
     #[deprecated(note = "use create_audio_track_with_options with AudioTrackSource::LocalPush")]
-    pub fn create_audio_track_with_local_source(&self, id: &str) -> Result<Track> {
+    pub fn create_audio_track_with_local_source(&self, id: &str) -> Result<AudioTrack> {
         self.create_audio_track_with_options(
             id,
             AudioTrackOptions {
@@ -477,7 +483,7 @@ impl PeerConnectionFactory {
         &self,
         id: &str,
         options: AudioTrackOptions,
-    ) -> Result<Track> {
+    ) -> Result<AudioTrack> {
         let cid = CString::new(id).map_err(|_| Error::Webrtc("id contains a NUL byte".into()))?;
         let tri = |v: Option<bool>| v.map_or(-1, |b| b as c_int);
         let sys_opts = reactor_webrtc_sys::ReactorAudioTrackOptions {
@@ -501,7 +507,12 @@ impl PeerConnectionFactory {
         if raw.is_null() {
             return Err(Error::Webrtc("audio track creation returned null".into()));
         }
-        Ok(Track::from_raw(raw, MediaKind::Audio, self.handle()))
+        Ok(AudioTrack::wrap(Track::from_raw(
+            raw,
+            MediaKind::Audio,
+            self.handle(),
+            false,
+        )))
     }
 
     /// Feed interleaved i16 PCM to the (synthetic) ADM, shared by all local

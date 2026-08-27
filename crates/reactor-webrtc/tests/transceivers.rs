@@ -143,7 +143,7 @@ fn published_tracks_share_one_media_stream() {
         if !published.contains(&mid.as_str()) {
             continue;
         }
-        let track = match tc.kind() {
+        let track: &reactor_webrtc::Track = match tc.kind() {
             MediaKind::Video => &video,
             MediaKind::Audio => &audio,
             MediaKind::Unknown => panic!("transceiver of unknown kind"),

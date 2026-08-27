@@ -8,14 +8,14 @@ use std::ffi::{c_void, CStr};
 use std::os::raw::{c_char, c_int};
 use std::sync::{Arc, Mutex};
 
-use crate::media::{MediaKind, Track};
+use crate::media::{AudioTrack, MediaKind, RemoteTrack, Track, VideoTrack};
 use crate::peer_connection::{DataChannel, IceCandidate, IceGatheringState, PeerConnectionState};
 use crate::FactoryHandle;
 
 type StateCb = Box<dyn FnMut(PeerConnectionState) + Send>;
 type GatheringCb = Box<dyn FnMut(IceGatheringState) + Send>;
 type IceCb = Box<dyn FnMut(IceCandidate) + Send>;
-type TrackCb = Box<dyn FnMut(MediaKind, Track) + Send>;
+type TrackCb = Box<dyn FnMut(RemoteTrack) + Send>;
 type DataChannelCb = Box<dyn FnMut(DataChannel) + Send>;
 
 /// Builder for the closures invoked over a peer connection's lifetime. Unset
@@ -52,7 +52,7 @@ impl PeerConnectionObserver {
         self.on_ice_candidate = Some(Box::new(cb));
         self
     }
-    pub fn on_track(mut self, cb: impl FnMut(MediaKind, Track) + Send + 'static) -> Self {
+    pub fn on_track(mut self, cb: impl FnMut(RemoteTrack) + Send + 'static) -> Self {
         self.on_track = Some(Box::new(cb));
         self
     }
@@ -154,10 +154,14 @@ extern "C" fn tramp_track(ud: *mut c_void, track: *mut reactor_webrtc_sys::Media
         reactor_webrtc_sys::reactor_webrtc_media_stream_track_kind(track)
     });
     // Take ownership of the handle; if there's no handler, dropping it frees it.
-    let t = Track::from_raw(track, kind, Arc::clone(&st.factory));
+    let t = Track::from_raw(track, kind, Arc::clone(&st.factory), true);
+    let remote = match kind {
+        MediaKind::Video => RemoteTrack::Video(VideoTrack::wrap(t)),
+        _ => RemoteTrack::Audio(AudioTrack::wrap(t)),
+    };
     if let Some(m) = &st.track {
         if let Ok(mut cb) = m.lock() {
-            cb(kind, t);
+            cb(remote);
         }
     }
 }

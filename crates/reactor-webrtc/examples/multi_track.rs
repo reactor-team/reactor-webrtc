@@ -40,7 +40,7 @@ fn run() {
     use reactor_webrtc::{
         EncodedVideoFrame, EncodedVideoTrack, FrameAction, FrameTransform, IceCandidate,
         LocalVideoTrack, MediaKind, PeerConnection, PeerConnectionFactory, PeerConnectionObserver,
-        PeerConnectionState, PreEncodedOptions, RtcConfiguration, Track, TrackVideoEncoder,
+        PeerConnectionState, PreEncodedOptions, RemoteTrack, RtcConfiguration, TrackVideoEncoder,
         TransceiverDirection, VideoTrackOptions,
     };
 
@@ -50,7 +50,7 @@ fn run() {
     struct Peer {
         ice: Mutex<VecDeque<IceCandidate>>,
         connected: AtomicBool,
-        tracks: Mutex<Vec<Track>>,
+        tracks: Mutex<Vec<RemoteTrack>>,
     }
 
     fn make_peer(
@@ -73,7 +73,7 @@ fn run() {
             })
             .on_track({
                 let s = shared.clone();
-                move |_kind, track| s.tracks.lock().unwrap().push(track)
+                move |track| s.tracks.lock().unwrap().push(track)
             });
         let pc = factory
             .create_peer_connection(cfg, obs)
@@ -202,7 +202,7 @@ fn run() {
                         break;
                     }
                     // ┌── developer-facing push ────────────────────────────────
-                    video.push_encoded_frame(stub_frame(i));
+                    video.push_frame(stub_frame(i));
                     // └─────────────────────────────────────────────────────────
                     thread::sleep(Duration::from_millis(33));
                 }
@@ -271,8 +271,8 @@ fn run() {
                         break;
                     }
                     // ┌── each track pushed independently ──────────────────────
-                    camera.push_encoded_frame(stub_frame(i));
-                    screen.push_encoded_frame(stub_frame(i));
+                    camera.push_frame(stub_frame(i)).expect("push frame");
+                    screen.push_frame(stub_frame(i)).expect("push frame");
                     // └─────────────────────────────────────────────────────────
                     thread::sleep(Duration::from_millis(33));
                 }
@@ -342,29 +342,6 @@ fn run() {
             tx.set_receiver_transform(&tf).expect("transform");
         }
 
-        // Count received audio frames via on_audio_frame
-        let recv_aud_obs = {
-            let s = s2.clone();
-            PeerConnectionObserver::new().on_track({
-                let recv_aud = recv_aud.clone();
-                move |kind, mut track| {
-                    if kind == MediaKind::Audio {
-                        track.on_audio_frame({
-                            let recv_aud = recv_aud.clone();
-                            move |_| {
-                                recv_aud.fetch_add(1, Ordering::SeqCst);
-                            }
-                        });
-                    }
-                    s.tracks.lock().unwrap().push(track);
-                }
-            })
-        };
-        // Re-create pc2 with audio observer attached before negotiation… in a real
-        // app you'd wire this in the initial observer. Kept simple here:
-        // audio counting happens via the existing on_track in make_peer — see below.
-        let _ = recv_aud_obs; // observer shown above is illustrative
-
         let stop = AtomicBool::new(false);
         let (w, h) = (1280u32, 720u32);
         let bgra = vec![128u8; (w * h * 4) as usize];
@@ -377,11 +354,13 @@ fn run() {
                 let mut si = 0usize;
                 while !stop.load(Ordering::SeqCst) {
                     // ┌── raw BGRA → libwebrtc encodes ──────────────────────────
-                    camera.push_video_frame(&bgra, w, h);
+                    camera
+                        .push_frame(reactor_webrtc::VideoFrame::new(&bgra, w, h))
+                        .expect("push frame");
                     // └──────────────────────────────────────────────────────────
 
                     // ┌── pre-encoded → straight to RTP ──────────────────────────
-                    screen.push_encoded_frame(stub_frame(i));
+                    screen.push_frame(stub_frame(i)).expect("push frame");
                     // └───────────────────────────────────────────────────────────
 
                     // ┌── synthetic PCM audio ────────────────────────────────────

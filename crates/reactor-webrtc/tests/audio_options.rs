@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 
 use reactor_webrtc::{
     AudioFrame, AudioTrackOptions, AudioTrackSource, IceCandidate, MediaKind, PeerConnection,
-    PeerConnectionFactory, PeerConnectionObserver, PeerConnectionState, RtcConfiguration, Track,
-    TransceiverDirection,
+    PeerConnectionFactory, PeerConnectionObserver, PeerConnectionState, RemoteTrack,
+    RtcConfiguration, TransceiverDirection,
 };
 
 const RATE: u32 = 48_000;
@@ -119,7 +119,7 @@ struct Peer {
     // were added in order, so recv[0] == ADM, recv[1] == push.
     adm: Arc<Lane>,
     push: Arc<Lane>,
-    recv: Mutex<Vec<Track>>,
+    recv: Mutex<Vec<RemoteTrack>>,
 }
 
 fn make_peer(
@@ -142,15 +142,15 @@ fn make_peer(
         })
         .on_track({
             let s = s.clone();
-            move |kind, track| {
-                if kind == MediaKind::Audio {
+            move |track| {
+                if let RemoteTrack::Audio(a) = &track {
                     let lane = match s.recv.lock().unwrap().len() {
                         0 => Some(s.adm.clone()),
                         1 => Some(s.push.clone()),
                         _ => None,
                     };
                     if let Some(lane) = lane {
-                        track.on_audio_frame(move |f| {
+                        a.on_frame(move |f| {
                             if !f.pcm.is_empty() {
                                 lane.record(&f);
                             }
@@ -213,8 +213,8 @@ fn adm_and_local_push_tracks_route_independently_() {
             while !stop.load(Ordering::SeqCst) {
                 factory.push_audio_frame(&tone(ADM_HZ, n, frames), RATE, CHANNELS);
                 music
-                    .push_pcm(&tone(PUSH_HZ, n, frames), RATE, CHANNELS)
-                    .expect("push_pcm");
+                    .push_frame(AudioFrame::new(&tone(PUSH_HZ, n, frames), RATE, CHANNELS))
+                    .expect("push_frame");
                 n += frames as u64;
                 thread::sleep(Duration::from_millis(10));
             }

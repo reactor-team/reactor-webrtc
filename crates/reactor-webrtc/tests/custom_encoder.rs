@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use reactor_webrtc::{
     IceCandidate, LocalVideoTrack, MediaKind, PeerConnection, PeerConnectionFactory,
-    PeerConnectionObserver, PeerConnectionState, RtcConfiguration, Track, TrackVideoEncoder,
+    PeerConnectionObserver, PeerConnectionState, RtcConfiguration, TrackVideoEncoder,
     TransceiverDirection, VideoTrackOptions,
 };
 
@@ -27,7 +27,7 @@ use reactor_webrtc::{
 struct Ice {
     q: Mutex<VecDeque<IceCandidate>>,
     connected: AtomicBool,
-    recv: Mutex<Vec<Track>>,
+    recv: Mutex<Vec<reactor_webrtc::RemoteTrack>>,
 }
 
 fn make_peer(
@@ -50,7 +50,7 @@ fn make_peer(
         })
         .on_track({
             let s = ice.clone();
-            move |_kind, track| {
+            move |track| {
                 s.recv.lock().unwrap().push(track);
             }
         });
@@ -134,7 +134,9 @@ fn custom_encoder_receives_raw_frames() {
                 for (i, b) in bgra.iter_mut().enumerate() {
                     *b = (i as u8).wrapping_add(t);
                 }
-                video.push_video_frame(&bgra, w, h);
+                video
+                    .push_frame(reactor_webrtc::VideoFrame::new(&bgra, w, h))
+                    .expect("push frame");
                 t = t.wrapping_add(7);
                 thread::sleep(Duration::from_millis(30));
             }

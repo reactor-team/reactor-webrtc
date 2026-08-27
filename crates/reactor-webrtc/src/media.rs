@@ -247,6 +247,9 @@ pub struct Track {
     // the track is a local one this factory produced or a remote one the
     // observer delivered over a connection this factory created.
     _factory: Arc<FactoryHandle>,
+    // Tracks delivered by the observer are inbound-only: pushing frames onto
+    // them is an error (surfaced by the media wrappers).
+    is_remote: bool,
     // The factory's encoder registry for local tracks — dropped slots must be
     // retracted when the track dies ([`EncoderRegistry::retract`]). None for
     // remote tracks: their slots never existed.
@@ -265,14 +268,16 @@ impl Track {
         raw: *mut reactor_webrtc_sys::MediaStreamTrack,
         kind: MediaKind,
         factory: Arc<FactoryHandle>,
+        is_remote: bool,
     ) -> Self {
-        Self::from_raw_with_registry(raw, kind, factory, None)
+        Self::from_raw_with_registry(raw, kind, factory, is_remote, None)
     }
 
     pub(crate) fn from_raw_with_registry(
         raw: *mut reactor_webrtc_sys::MediaStreamTrack,
         kind: MediaKind,
         factory: Arc<FactoryHandle>,
+        is_remote: bool,
         registry: Option<Arc<crate::encoded::EncoderRegistry>>,
     ) -> Self {
         let sender_meta = Arc::new(CaptureTimeMeta::default());
@@ -296,8 +301,15 @@ impl Track {
             frame_counter: AtomicU64::new(0),
             last_send_ms: AtomicI64::new(0),
             _factory: factory,
+            is_remote,
             registry,
         }
+    }
+
+    /// Whether this track came from the remote side of a peer connection.
+    /// Remote tracks only receive — pushing frames onto one is an error.
+    pub fn is_remote(&self) -> bool {
+        self.is_remote
     }
 
     pub(crate) fn raw(&self) -> *mut reactor_webrtc_sys::MediaStreamTrack {
@@ -314,9 +326,9 @@ impl Track {
         self.kind
     }
 
-    /// Push a BGRA frame (`width*height*4` bytes) into a local video track,
-    /// captured now. No-op for non-video tracks.
-    pub fn push_video_frame(&self, bgra: &[u8], width: u32, height: u32) {
+    /// Push a BGRA frame captured *now* — the untimestamped native path.
+    /// Called by [`VideoTrack::push_frame`]. No-op for non-video tracks.
+    pub(crate) fn push_video_frame_now(&self, bgra: &[u8], width: u32, height: u32) {
         if self.kind != MediaKind::Video {
             return;
         }
@@ -330,45 +342,8 @@ impl Track {
         }
     }
 
-    /// Push a BGRA frame captured at `capture_time_us` ([`time_micros`]'s
-    /// epoch) rather than now.
-    ///
-    /// Stamping video and audio produced together with one timestamp is what
-    /// lets the receiver play them together: the alternative is for each stream
-    /// to inherit the moment it happened to reach the encoder, which differ by
-    /// however deep the buffers between the producer and the wire are.
-    ///
-    /// No-op for non-video tracks.
-    pub fn push_video_frame_at(&self, bgra: &[u8], width: u32, height: u32, capture_time_us: i64) {
-        if self.kind != MediaKind::Video {
-            return;
-        }
-        self.push_video_frame_ts(bgra, width, height, capture_time_us);
-    }
-
-    /// Push a BGRA frame with arbitrary `user_data` embedded in a protobuf
-    /// trailer, captured now. `frame_id` (monotonic counter) and
-    /// `capture_time_us` ([`time_micros`] read here) are filled in internally;
-    /// [`push_video_frame_with_metadata_at`](Self::push_video_frame_with_metadata_at)
-    /// is the same push with the capture time declared by the caller.
-    ///
-    /// Requires [`sender_metadata_transform`](Self::sender_metadata_transform)
-    /// to be attached to the sender transceiver; otherwise the frame goes out
-    /// without a trailer.
-    ///
-    /// No-op for non-video tracks.
-    pub fn push_video_frame_with_metadata(
-        &self,
-        bgra: &[u8],
-        width: u32,
-        height: u32,
-        user_data: &[u8],
-    ) {
-        self.push_metadata_frame(bgra, width, height, user_data, None);
-    }
-
-    /// Push a BGRA frame with a metadata trailer and a caller-supplied capture
-    /// time, in [`time_micros`]'s epoch.
+    /// Shared body of [`VideoTrack::push_frame_with_metadata` and `_at`]:
+    /// `capture_time_us` is the caller's declared time, or `None` for the clock.
     ///
     /// `capture_time_us` does two jobs, and they want different things from it.
     /// The trailer carries it **exactly**, so the receiver reads the number the
@@ -385,20 +360,7 @@ impl Track {
     /// reachable above 1000 fps. Neither the truncation nor the nudge reaches the
     /// trailer, so the value delivered is the value passed, and several tracks
     /// pushed with one stamp deliver that one stamp.
-    ///
-    /// No-op for non-video tracks.
-    pub fn push_video_frame_with_metadata_at(
-        &self,
-        bgra: &[u8],
-        width: u32,
-        height: u32,
-        user_data: &[u8],
-        capture_time_us: i64,
-    ) {
-        self.push_metadata_frame(bgra, width, height, user_data, Some(capture_time_us));
-    }
-
-    fn push_metadata_frame(
+    pub(crate) fn push_metadata_frame(
         &self,
         bgra: &[u8],
         width: u32,
@@ -496,14 +458,17 @@ impl Track {
         }
     }
 
-    /// Subscribe to decoded frames from a (remote) video track. Replaces any
-    /// previous sink. The closure runs on a WebRTC thread.
+    /// Register a decoded-frame sink, replacing any previous one. Called by
+    /// [`VideoTrack::on_frame`].
     ///
     /// [`VideoFrame::metadata`] is populated whenever the sender included a
     /// metadata trailer and the peer connection installed the strip transform —
     /// which it does automatically, on both peers, once the capability has been
     /// negotiated. Nothing here has to be arranged for it.
-    pub fn on_video_frame(&self, cb: impl for<'a> FnMut(VideoFrame<'a>) + Send + 'static) {
+    pub(crate) fn attach_video_sink(
+        &self,
+        cb: impl for<'a> FnMut(VideoFrame<'a>) + Send + 'static,
+    ) {
         let state = Box::new(VideoSinkState {
             cb: Mutex::new(Box::new(cb)),
             receiver_meta: self.receiver_meta.clone(),
@@ -524,38 +489,9 @@ impl Track {
         *guard = Some(state);
     }
 
-    /// Push interleaved i16 PCM to a local audio track created with
-    /// [`AudioTrackSource::LocalPush`]. Delivers audio directly to the
-    /// sender's encoder, bypassing the shared ADM. No-op for tracks backed by
-    /// the factory ADM or for remote tracks.
-    ///
-    /// `pcm.len()` must be a multiple of `channels`; a partial trailing frame
-    /// is an error. Only one thread should call `push_pcm` at a time for a
-    /// given track — concurrent callers produce interleaved, garbage audio.
-    pub fn push_pcm(&self, pcm: &[i16], sample_rate: u32, channels: u32) -> Result<()> {
-        self.push_pcm_inner(pcm, sample_rate, channels, 0)
-    }
-
-    /// Push PCM captured at `capture_time_us` ([`time_micros`]'s epoch) rather
-    /// than whenever it reaches the encoder.
-    ///
-    /// A track's RTP timestamp otherwise counts only the samples handed to it,
-    /// which says how much audio exists but not when it was captured. Supplying
-    /// the same timestamp used for the video produced alongside it is what lets
-    /// the receiver play the two together.
-    ///
-    /// Same input rules as [`push_pcm`](Self::push_pcm).
-    pub fn push_pcm_at(
-        &self,
-        pcm: &[i16],
-        sample_rate: u32,
-        channels: u32,
-        capture_time_us: i64,
-    ) -> Result<()> {
-        self.push_pcm_inner(pcm, sample_rate, channels, capture_time_us / 1000)
-    }
-
-    fn push_pcm_inner(
+    /// Shared body of [`AudioTrack::push_frame`] / [`push_frame_at`]:
+    /// `capture_time_ms = 0` means "unknown / stamp at arrival".
+    pub(crate) fn push_pcm_inner(
         &self,
         pcm: &[i16],
         sample_rate: u32,
@@ -587,9 +523,12 @@ impl Track {
         Ok(())
     }
 
-    /// Subscribe to decoded PCM from a (remote) audio track. Replaces any
-    /// previous sink. The closure runs on a WebRTC thread.
-    pub fn on_audio_frame(&self, cb: impl for<'a> FnMut(AudioFrame<'a>) + Send + 'static) {
+    /// Register a decoded-PCM sink, replacing any previous one. Called by
+    /// [`AudioTrack::on_frame`].
+    pub(crate) fn attach_audio_sink(
+        &self,
+        cb: impl for<'a> FnMut(AudioFrame<'a>) + Send + 'static,
+    ) {
         let state = Box::new(AudioSinkState {
             cb: Mutex::new(Box::new(cb)),
         });
@@ -624,6 +563,258 @@ impl Drop for Track {
         }
         // Detaches the C++ sink before the sink-state boxes are freed.
         unsafe { reactor_webrtc_sys::reactor_webrtc_media_stream_track_destroy(self.raw) }
+    }
+}
+
+// ── Media-typed wrappers ─────────────────────────────────────────────────────
+//
+// `Track` is the untyped core: the native handle, lifetime, metadata plumbing
+// and the transceiver/FFI surface. The public frame API lives on these
+// wrappers instead — pushing a video frame onto an audio track is a compile
+// error, not a runtime no-op. Everything derefs to `&Track`, so
+// `transceiver.set_track(&wrapper)` just works.
+
+use std::ops::Deref;
+
+/// A video [`Track`] — local (raw) or remote. `on_frame` receives decoded
+/// video; `push_frame` family feeds a local track (`Err` on a remote track).
+pub struct VideoTrack(Track);
+
+/// An audio [`Track`] — local or remote. `on_frame` receives decoded PCM;
+/// `push_frame` family feeds a local [`AudioTrackSource::LocalPush`] track
+/// (`Err` on a remote track; no-op semantics on ADM-backed locals match the
+/// native ADM).
+pub struct AudioTrack(Track);
+
+impl VideoTrack {
+    pub(crate) fn wrap(track: Track) -> Self {
+        debug_assert_eq!(track.kind(), MediaKind::Video);
+        Self(track)
+    }
+
+    /// Subscribe to decoded frames. Replaces any previous sink. The closure
+    /// runs on a WebRTC thread.
+    pub fn on_frame(&self, cb: impl for<'a> FnMut(VideoFrame<'a>) + Send + 'static) {
+        self.0.attach_video_sink(cb);
+    }
+
+    /// Push a BGRA frame (`width*height*4` bytes), captured now — on a local
+    /// track only (a remote track returns `Err`). What a
+    /// [`TrackVideoEncoder::Inline`](crate::TrackVideoEncoder) callback sees on
+    /// its slot comes straight from these pushes.
+    pub fn push_frame(&self, frame: VideoFrame<'_>) -> Result<()> {
+        self.guard_remote()?;
+        self.0
+            .push_video_frame_now(frame.bgra, frame.width, frame.height);
+        Ok(())
+    }
+
+    /// Push a BGRA frame captured at `capture_time_us` ([`time_micros`]'s
+    /// epoch) rather than whenever it reaches the encoder.
+    ///
+    /// A track's RTP timestamp otherwise counts only the samples handed to it,
+    /// which says how much media exists but not when it was captured.
+    /// Supplying the same timestamp used for the audio/video produced
+    /// alongside it is what lets the receiver play them together.
+    pub fn push_frame_at(&self, frame: VideoFrame<'_>, capture_time_us: i64) -> Result<()> {
+        self.guard_remote()?;
+        self.0
+            .push_video_frame_ts(frame.bgra, frame.width, frame.height, capture_time_us);
+        Ok(())
+    }
+
+    /// Push a BGRA frame with arbitrary `user_data` embedded as a protobuf
+    /// trailer, captured now. `frame_id` (monotonic) and `capture_time_us`
+    /// are filled in internally.
+    pub fn push_frame_with_metadata(&self, frame: VideoFrame<'_>, user_data: &[u8]) -> Result<()> {
+        self.guard_remote()?;
+        self.0
+            .push_metadata_frame(frame.bgra, frame.width, frame.height, user_data, None);
+        Ok(())
+    }
+
+    /// Same as [`push_frame_with_metadata`](Self::push_frame_with_metadata)
+    /// with the capture time declared by the caller. The trailer carries the
+    /// value **exactly**; the millisecond-uniqueness nudge lives elsewhere and
+    /// never reaches the wire value.
+    pub fn push_frame_with_metadata_at(
+        &self,
+        frame: VideoFrame<'_>,
+        user_data: &[u8],
+        capture_time_us: i64,
+    ) -> Result<()> {
+        self.guard_remote()?;
+        self.0.push_metadata_frame(
+            frame.bgra,
+            frame.width,
+            frame.height,
+            user_data,
+            Some(capture_time_us),
+        );
+        Ok(())
+    }
+
+    fn guard_remote(&self) -> Result<()> {
+        if self.0.is_remote() {
+            return Err(Error::Webrtc(
+                "cannot push frames onto a remote track".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl AudioTrack {
+    pub(crate) fn wrap(track: Track) -> Self {
+        debug_assert_eq!(track.kind(), MediaKind::Audio);
+        Self(track)
+    }
+
+    /// Subscribe to decoded PCM. Replaces any previous sink. The closure runs
+    /// on a WebRTC thread.
+    pub fn on_frame(&self, cb: impl for<'a> FnMut(AudioFrame<'a>) + Send + 'static) {
+        self.0.attach_audio_sink(cb);
+    }
+
+    /// Push interleaved i16 PCM, timestamped on arrival. Only meaningful on a
+    /// local [`AudioTrackSource::LocalPush`] track — it's a no-op on
+    /// ADM-backed locals and an `Err` on remote tracks. A remote→relay use
+    /// case passes the received [`AudioFrame`] straight back in — same struct
+    /// both ways.
+    ///
+    /// `pcm.len()` must be `frames * channels`; a partial trailing frame is an
+    /// error. Only one thread should call this at a time for a given track —
+    /// concurrent callers produce interleaved, garbage audio.
+    pub fn push_frame(&self, frame: AudioFrame<'_>) -> Result<()> {
+        self.guard_remote()?;
+        self.0
+            .push_pcm_inner(frame.pcm, frame.sample_rate, frame.channels, 0)
+    }
+
+    /// Push PCM captured at `capture_time_us` ([`time_micros`]'s epoch) rather
+    /// than whenever it reaches the encoder — see
+    /// [`VideoTrack::push_frame_at`] for why the shared stamp matters.
+    pub fn push_frame_at(&self, frame: AudioFrame<'_>, capture_time_us: i64) -> Result<()> {
+        self.guard_remote()?;
+        self.0.push_pcm_inner(
+            frame.pcm,
+            frame.sample_rate,
+            frame.channels,
+            capture_time_us / 1000,
+        )
+    }
+
+    fn guard_remote(&self) -> Result<()> {
+        if self.0.is_remote() {
+            return Err(Error::Webrtc(
+                "cannot push frames onto a remote track".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Deref for VideoTrack {
+    type Target = Track;
+    fn deref(&self) -> &Track {
+        &self.0
+    }
+}
+impl Deref for AudioTrack {
+    type Target = Track;
+    fn deref(&self) -> &Track {
+        &self.0
+    }
+}
+
+// SAFETY: wraps a Track; its own fields add no state.
+unsafe impl Send for VideoTrack {}
+unsafe impl Sync for VideoTrack {}
+unsafe impl Send for AudioTrack {}
+unsafe impl Sync for AudioTrack {}
+
+/// A track delivered by [`PeerConnectionObserver::on_track`] — media-typed,
+/// so `RemoteTrack::Video(v).on_frame(...)` and `RemoteTrack::Audio(a)
+/// .on_frame(...)` each take the matching frame type and nothing else.
+pub enum RemoteTrack {
+    /// A remote video track.
+    Video(VideoTrack),
+    /// A remote audio track.
+    Audio(AudioTrack),
+}
+
+impl RemoteTrack {
+    /// Audio vs video.
+    pub fn kind(&self) -> MediaKind {
+        match self {
+            Self::Video(_) => MediaKind::Video,
+            Self::Audio(_) => MediaKind::Audio,
+        }
+    }
+
+    /// `Some` when this is a video track.
+    pub fn as_video(&self) -> Option<&VideoTrack> {
+        match self {
+            Self::Video(t) => Some(t),
+            Self::Audio(_) => None,
+        }
+    }
+
+    /// `Some` when this is an audio track.
+    pub fn as_audio(&self) -> Option<&AudioTrack> {
+        match self {
+            Self::Audio(t) => Some(t),
+            Self::Video(_) => None,
+        }
+    }
+
+    /// Unwrap a video track (panics on audio tracks).
+    pub fn into_video(self) -> VideoTrack {
+        match self {
+            Self::Video(t) => t,
+            Self::Audio(_) => panic!("into_video on an audio track"),
+        }
+    }
+
+    /// Unwrap an audio track (panics on video tracks).
+    pub fn into_audio(self) -> AudioTrack {
+        match self {
+            Self::Audio(t) => t,
+            Self::Video(_) => panic!("into_audio on a video track"),
+        }
+    }
+}
+
+impl VideoFrame<'_> {
+    /// A push-side frame: BGRA pixels, no metadata (outgoing trailers go
+    /// through [`VideoTrack::push_frame_with_metadata(_at)`] with `user_data`).
+    /// The same struct `on_frame` delivers — relay use cases repack nothing.
+    /// `metadata` is populated only on receive.
+    pub const fn new(bgra: &'_ [u8], width: u32, height: u32) -> VideoFrame<'_> {
+        VideoFrame {
+            bgra,
+            width,
+            height,
+            metadata: None,
+        }
+    }
+}
+
+impl AudioFrame<'_> {
+    /// A push-side frame: interleaved i16 PCM + format. `frames` is derived
+    /// (`pcm.len() / channels`) — the push validates it against `pcm.len()`.
+    /// The same struct `on_frame` delivers.
+    pub fn new(pcm: &'_ [i16], sample_rate: u32, channels: u32) -> AudioFrame<'_> {
+        AudioFrame {
+            pcm,
+            sample_rate,
+            channels,
+            frames: if channels == 0 {
+                0
+            } else {
+                (pcm.len() / channels as usize) as u32
+            },
+        }
     }
 }
 

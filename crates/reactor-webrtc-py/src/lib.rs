@@ -965,27 +965,48 @@ impl From<rw::FrameMetadata> for FrameMetadata {
 ///
 /// Video frames are delivered as BGRA bytes (`width * height * 4`).
 /// Audio frames are interleaved signed 16-bit little-endian PCM bytes.
+pub(crate) enum NativeTrack {
+    Video(Arc<rw::VideoTrack>),
+    Audio(Arc<rw::AudioTrack>),
+}
+
 #[pyclass]
 pub struct Track {
     // Arc, not ManuallyDrop, so Transceiver.set_track can clone a handle into a
     // spawn_blocking future while this Python object keeps its own handle.
-    inner: Option<Arc<rw::Track>>,
+    inner: Option<NativeTrack>,
 }
 
 impl Track {
-    /// Borrows the native track. `inner` is only ever `None` after this
-    /// object's own `Drop` has run, so every live call through Python sees `Some`.
-    fn native(&self) -> PyResult<&Arc<rw::Track>> {
-        self.inner
-            .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("Track used after being dropped"))
+    /// Borrows the native video track, or fails if this is an audio track
+    /// (or the object was dropped).
+    fn video(&self) -> PyResult<&Arc<rw::VideoTrack>> {
+        match self.inner.as_ref() {
+            Some(NativeTrack::Video(v)) => Ok(v),
+            Some(NativeTrack::Audio(_)) => Err(PyRuntimeError::new_err("track is an audio track")),
+            None => Err(PyRuntimeError::new_err("Track used after being dropped")),
+        }
+    }
+
+    /// Borrows the native audio track, or fails if this is a video track
+    /// (or the object was dropped).
+    fn audio(&self) -> PyResult<&Arc<rw::AudioTrack>> {
+        match self.inner.as_ref() {
+            Some(NativeTrack::Audio(a)) => Ok(a),
+            Some(NativeTrack::Video(_)) => Err(PyRuntimeError::new_err("track is a video track")),
+            None => Err(PyRuntimeError::new_err("Track used after being dropped")),
+        }
     }
 }
 
 #[pymethods]
 impl Track {
     fn kind(&self) -> PyResult<MediaKind> {
-        Ok(MediaKind::from(self.native()?.kind()))
+        match self.inner.as_ref() {
+            Some(NativeTrack::Video(_)) => Ok(MediaKind::Video),
+            Some(NativeTrack::Audio(_)) => Ok(MediaKind::Audio),
+            None => Err(PyRuntimeError::new_err("Track used after being dropped")),
+        }
     }
 
     /// Push a raw BGRA video frame into a local video track.
@@ -1029,26 +1050,42 @@ impl Track {
                 bgra.len()
             )));
         }
-        let native = Arc::clone(self.native()?);
+        let native = Arc::clone(self.video()?);
         let owned = bgra.to_vec();
         match (user_data, capture_time_us) {
             (Some(ud), Some(us)) => {
                 let ud = ud.to_vec();
                 py.allow_threads(|| {
-                    native.push_video_frame_with_metadata_at(&owned, width, height, &ud, us)
-                });
+                    native
+                        .push_frame_with_metadata_at(
+                            rw::VideoFrame::new(&owned, width, height),
+                            &ud,
+                            us,
+                        )
+                        .map_err(err)
+                })?;
             }
             (Some(ud), None) => {
                 let ud = ud.to_vec();
                 py.allow_threads(|| {
-                    native.push_video_frame_with_metadata(&owned, width, height, &ud)
-                });
+                    native
+                        .push_frame_with_metadata(rw::VideoFrame::new(&owned, width, height), &ud)
+                        .map_err(err)
+                })?;
             }
             (None, Some(us)) => {
-                py.allow_threads(|| native.push_video_frame_at(&owned, width, height, us));
+                py.allow_threads(|| {
+                    native
+                        .push_frame_at(rw::VideoFrame::new(&owned, width, height), us)
+                        .map_err(err)
+                })?;
             }
             (None, None) => {
-                py.allow_threads(|| native.push_video_frame(&owned, width, height));
+                py.allow_threads(|| {
+                    native
+                        .push_frame(rw::VideoFrame::new(&owned, width, height))
+                        .map_err(err)
+                })?;
             }
         }
         Ok(())
@@ -1062,12 +1099,12 @@ impl Track {
     /// `callback(bgra, width, height)`, the 4-argument call is retried as a
     /// 3-argument call on `TypeError` when `metadata` is `None`.
     fn on_video_frame(&mut self, py: Python, callback: PyObject) -> PyResult<()> {
-        let native = Arc::clone(self.native()?);
+        let native = Arc::clone(self.video()?);
         // Attaching a sink dispatches synchronously to the worker thread, which
         // is also where another track's frame callback re-enters Python. The GIL
         // has to be free across the dispatch or the two deadlock.
         py.allow_threads(|| {
-            native.on_video_frame(move |frame| {
+            native.on_frame(move |frame| {
                 Python::with_gil(|py| {
                     let bytes = PyBytes::new_bound(py, frame.bgra);
                     let meta = frame.metadata.map(|m| {
@@ -1120,10 +1157,12 @@ impl Track {
             .chunks_exact(2)
             .map(|c| i16::from_le_bytes([c[0], c[1]]))
             .collect();
-        let native = Arc::clone(self.native()?);
+        let native = Arc::clone(self.audio()?);
         py.allow_threads(|| match capture_time_us {
-            Some(us) => native.push_pcm_at(&samples, sample_rate, channels, us),
-            None => native.push_pcm(&samples, sample_rate, channels),
+            Some(us) => {
+                native.push_frame_at(rw::AudioFrame::new(&samples, sample_rate, channels), us)
+            }
+            None => native.push_frame(rw::AudioFrame::new(&samples, sample_rate, channels)),
         })
         .map_err(err)
     }
@@ -1131,10 +1170,10 @@ impl Track {
     /// Register `callback(pcm: bytes, sample_rate, channels, frames)` for
     /// decoded audio from a remote track. `pcm` is i16 little-endian.
     fn on_audio_frame(&mut self, py: Python, callback: PyObject) -> PyResult<()> {
-        let native = Arc::clone(self.native()?);
+        let native = Arc::clone(self.audio()?);
         // Same worker-thread dispatch as `on_video_frame`.
         py.allow_threads(|| {
-            native.on_audio_frame(move |frame| {
+            native.on_frame(move |frame| {
                 Python::with_gil(|py| {
                     let raw: Vec<u8> = frame.pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
                     let bytes = PyBytes::new_bound(py, &raw);
@@ -1148,9 +1187,22 @@ impl Track {
 }
 
 impl Track {
-    fn from_rust(track: rw::Track) -> Self {
+    fn from_video(track: rw::VideoTrack) -> Self {
         Self {
-            inner: Some(Arc::new(track)),
+            inner: Some(NativeTrack::Video(Arc::new(track))),
+        }
+    }
+
+    fn from_audio(track: rw::AudioTrack) -> Self {
+        Self {
+            inner: Some(NativeTrack::Audio(Arc::new(track))),
+        }
+    }
+
+    fn from_remote(track: rw::RemoteTrack) -> Self {
+        match track {
+            rw::RemoteTrack::Video(t) => Self::from_video(t),
+            rw::RemoteTrack::Audio(t) => Self::from_audio(t),
         }
     }
 }
@@ -1231,10 +1283,10 @@ impl EncodedVideoTrack {
             rtp_timestamp,
         };
         py.allow_threads(|| match user_data {
-            Some(ud) => native.push_encoded_frame_with_metadata(frame, ud),
-            None => native.push_encoded_frame(frame),
-        });
-        Ok(())
+            Some(ud) => native.push_frame_with_metadata(frame, ud),
+            None => native.push_frame(frame),
+        })
+        .map_err(err)
     }
 
     /// Add this track to a peer connection via `add_track` (creates a sendrecv
@@ -1466,7 +1518,17 @@ impl Transceiver {
     ) -> PyResult<Bound<'py, PyAny>> {
         let inner = Arc::clone(self.tc()?);
         if let Ok(t) = track.downcast::<Track>() {
-            let native = Arc::clone(t.borrow().native()?);
+            let b = t.borrow();
+            if b.kind()? == MediaKind::Audio {
+                let native = Arc::clone(b.audio()?);
+                return pyo3_async_runtimes::tokio::future_into_py(py, async move {
+                    tokio::task::spawn_blocking(move || inner.set_track(&native))
+                        .await
+                        .map_err(join_err)?
+                        .map_err(err)
+                });
+            }
+            let native = Arc::clone(b.video()?);
             return pyo3_async_runtimes::tokio::future_into_py(py, async move {
                 tokio::task::spawn_blocking(move || inner.set_track(&native))
                     .await
@@ -1747,12 +1809,18 @@ impl PeerConnectionObserver {
         }
         if let Some(cb) = &self.on_track {
             let cb = cb.clone_ref(py);
-            obs = obs.on_track(move |kind, track| {
-                Python::with_gil(|py| match Py::new(py, Track::from_rust(track)) {
-                    Ok(py_track) => {
-                        let _ = cb.call1(py, (MediaKind::from(kind), py_track));
+            obs = obs.on_track(move |track| {
+                Python::with_gil(|py| {
+                    let kind = match &track {
+                        rw::RemoteTrack::Video(_) => MediaKind::Video,
+                        rw::RemoteTrack::Audio(_) => MediaKind::Audio,
+                    };
+                    match Py::new(py, Track::from_remote(track)) {
+                        Ok(py_track) => {
+                            let _ = cb.call1(py, (kind, py_track));
+                        }
+                        Err(e) => e.restore(py),
                     }
-                    Err(e) => e.restore(py),
                 });
             });
         }
@@ -1905,7 +1973,13 @@ impl PeerConnection {
         })
     }
     fn add_track(&self, py: Python, track: &Track) -> PyResult<()> {
-        let native = Arc::clone(track.native()?);
+        if track.kind()? == MediaKind::Audio {
+            let native = Arc::clone(track.audio()?);
+            return py
+                .allow_threads(|| self.pc().add_track(&native))
+                .map_err(err);
+        }
+        let native = Arc::clone(track.video()?);
         py.allow_threads(|| self.pc().add_track(&native))
             .map_err(err)
     }
@@ -2076,14 +2150,14 @@ impl PeerConnectionFactory {
     /// Create a local video track (push frames via `Track.push_video_frame`).
     fn create_video_track(&self, py: Python, id: &str) -> PyResult<Track> {
         py.allow_threads(|| self.inner.create_video_track(id))
-            .map(Track::from_rust)
+            .map(Track::from_video)
             .map_err(err)
     }
 
     /// Create a local audio track. Feed samples via `push_audio_frame`.
     fn create_audio_track(&self, py: Python, id: &str) -> PyResult<Track> {
         py.allow_threads(|| self.inner.create_audio_track(id))
-            .map(Track::from_rust)
+            .map(Track::from_audio)
             .map_err(err)
     }
 
@@ -2097,7 +2171,7 @@ impl PeerConnectionFactory {
             options.source = rw::AudioTrackSource::LocalPush;
             self.inner.create_audio_track_with_options(id, options)
         })
-        .map(Track::from_rust)
+        .map(Track::from_audio)
         .map_err(err)
     }
 
