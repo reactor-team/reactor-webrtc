@@ -213,8 +213,8 @@ fn adm_and_local_push_tracks_route_independently_() {
             while !stop.load(Ordering::SeqCst) {
                 factory.push_audio_frame(&tone(ADM_HZ, n, frames), RATE, CHANNELS);
                 music
-                    .push_pcm(&tone(PUSH_HZ, n, frames), RATE, CHANNELS)
-                    .expect("push_pcm");
+                    .push_frame(AudioFrame::new(&tone(PUSH_HZ, n, frames), RATE, CHANNELS))
+                    .expect("push_frame");
                 n += frames as u64;
                 thread::sleep(Duration::from_millis(10));
             }
