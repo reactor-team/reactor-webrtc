@@ -331,7 +331,7 @@ impl PeerConnectionFactory {
     /// so a failed creation (bad id, native error) never leaves an orphan
     /// slot misbinding the next track's encoder.
     pub fn create_video_track(&self, id: &str) -> Result<VideoTrack> {
-        let track = self.create_video_track_no_slot(id)?;
+        let track = self.create_video_track_no_slot(id, self.metadata_enabled)?;
         self.registry.add_raw_slot(track.native_id());
         Ok(VideoTrack::wrap(track))
     }
@@ -378,22 +378,31 @@ impl PeerConnectionFactory {
         match options.encoder {
             None => {
                 let pref = self.h264_backend_pref(options.h264_backend)?;
-                let track = VideoTrack::wrap(self.create_video_track_no_slot(id)?);
+                let track = VideoTrack::wrap(self.create_video_track_no_slot(
+                    id,
+                    self.track_metadata_enabled(options.frame_metadata),
+                )?);
                 self.registry
                     .add_raw_slot_with_backend(track.native_id(), pref);
                 Ok(LocalVideoTrack::Raw(track))
             }
             Some(TrackVideoEncoder::PreEncoded(o)) => {
-                let track = VideoTrack::wrap(self.create_video_track_no_slot(id)?);
+                let track = VideoTrack::wrap(self.create_video_track_no_slot(
+                    id,
+                    self.track_metadata_enabled(options.frame_metadata),
+                )?);
                 let queue = self.registry.add_encoded_slot(track.native_id());
                 Ok(LocalVideoTrack::Encoded(EncodedVideoTrack::new(
                     track, queue, o.width, o.height,
                 )))
             }
             Some(TrackVideoEncoder::Inline(cb)) => {
-                let track = self.create_video_track_no_slot(id)?;
+                let track = VideoTrack::wrap(self.create_video_track_no_slot(
+                    id,
+                    self.track_metadata_enabled(options.frame_metadata),
+                )?);
                 self.registry.add_inline_slot(track.native_id(), cb);
-                Ok(LocalVideoTrack::Raw(VideoTrack::wrap(track)))
+                Ok(LocalVideoTrack::Raw(track))
             }
         }
     }
@@ -422,11 +431,18 @@ impl PeerConnectionFactory {
         }
     }
 
+    /// Effective frame-metadata on a track: the factory kill switch is a
+    /// process-wide **off** that a per-track `Some(true)` can never
+    /// re-enable — `None` simply defers to the factory's setting.
+    fn track_metadata_enabled(&self, track_flag: Option<bool>) -> bool {
+        self.metadata_enabled && track_flag.unwrap_or(true)
+    }
+
     /// Shared native side of [`create_video_track`](Self::create_video_track):
     /// the strict FFI call, **without** touching the registry — callers
     /// reserve their slot *after* this succeeds (so a failed create never
     /// leaves an orphan positional slot behind).
-    fn create_video_track_no_slot(&self, id: &str) -> Result<Track> {
+    fn create_video_track_no_slot(&self, id: &str, metadata_enabled: bool) -> Result<Track> {
         let cid = CString::new(id).map_err(|_| Error::Webrtc("id contains a NUL byte".into()))?;
         let raw = unsafe {
             reactor_webrtc_sys::reactor_webrtc_video_track_create(self.handle.raw(), cid.as_ptr())
@@ -439,6 +455,7 @@ impl PeerConnectionFactory {
             MediaKind::Video,
             self.handle(),
             false,
+            metadata_enabled,
             Some(Arc::clone(&self.registry)),
         ))
     }
@@ -512,6 +529,7 @@ impl PeerConnectionFactory {
             MediaKind::Audio,
             self.handle(),
             false,
+            true, // metadata is a video feature; audio stays neutral
         )))
     }
 
