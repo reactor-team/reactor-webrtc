@@ -70,6 +70,13 @@ impl PeerConnectionFactoryBuilder {
     /// AGC + high-pass chain — the sensible default for real hardware
     /// capture. [`with_apm`](Self::with_apm) afterwards overrides the chain
     /// piece by piece.
+    ///
+    /// **Playout is automatic and unconditional here**: every inbound audio
+    /// track's decoded frames reach the speaker by default (there is no
+    /// per-track "played on speaker" switch, and `on_frame` sinks are taps
+    /// they don't divert). To keep an inbound audio silent in that setup you
+    /// must neutralize its transceiver (e.g. `set_direction` → Inactive) or
+    /// use the synthetic ADM, where nothing plays on its own.
     pub fn with_platform_adm(mut self) -> Self {
         self.adm = AdmMode::Platform;
         self.apm = ApmConfig {
