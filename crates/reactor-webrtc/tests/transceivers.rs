@@ -10,8 +10,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use reactor_webrtc::{
-    IceGatheringState, MediaKind, PeerConnectionFactory, PeerConnectionObserver, RtcConfiguration,
-    TransceiverDirection,
+    AudioTrackOptions, AudioTrackSource, IceGatheringState, MediaKind, PeerConnectionFactory,
+    PeerConnectionObserver, RtcConfiguration, TransceiverDirection,
 };
 
 fn wait_for(p: impl Fn() -> bool, timeout: Duration) -> bool {
@@ -129,7 +129,11 @@ fn published_tracks_share_one_media_stream() {
         .create_video_track("out_video")
         .expect("video track");
     let audio = factory
-        .create_audio_track_with_local_source("out_audio")
+        .create_audio_track_with_options("out_audio", {
+            let mut options = AudioTrackOptions::default();
+            options.source = AudioTrackSource::LocalPush;
+            options
+        })
         .expect("audio track");
     // Publish by mid, the way the peer resolves a client's track mapping: the
     // mids the offer marked recvonly get a track, the rest stay receive-only.

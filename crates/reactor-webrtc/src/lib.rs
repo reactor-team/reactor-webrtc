@@ -62,7 +62,7 @@ pub use encoded::{
 
 /// Whether this build targets Apple (H.264 VideoToolbox backend exists).
 pub(crate) const HAVE_VIDEO_TOOLBOX: bool = cfg!(target_vendor = "apple");
-pub use media::{AudioFrame, MediaKind, Track, VideoFrame};
+pub use media::{AudioFrame, AudioTrackOptions, AudioTrackSource, MediaKind, Track, VideoFrame};
 pub use metadata::{
     FrameMetadata, FrameMetadataGate, FRAME_METADATA_ATTRIBUTE, FRAME_METADATA_VERSION,
 };
@@ -440,34 +440,66 @@ impl PeerConnectionFactory {
     }
 
     /// Create a local audio track. Its samples come from this factory's ADM —
-    /// feed it with [`PeerConnectionFactory::push_audio_frame`].
+    /// feed it with [`PeerConnectionFactory::push_audio_frame`]. For per-track
+    /// sources and processing constraints use
+    /// [`create_audio_track_with_options`](Self::create_audio_track_with_options).
     pub fn create_audio_track(&self, id: &str) -> Result<Track> {
-        let cid = CString::new(id).map_err(|_| Error::Webrtc("id contains a NUL byte".into()))?;
-        let raw = unsafe {
-            reactor_webrtc_sys::reactor_webrtc_audio_track_create(self.handle.raw(), cid.as_ptr())
-        };
-        if raw.is_null() {
-            return Err(Error::Webrtc("audio track creation returned null".into()));
-        }
-        Ok(Track::from_raw(raw, MediaKind::Audio, self.handle()))
+        self.create_audio_track_with_options(id, AudioTrackOptions::default())
     }
 
     /// Create a local audio track with a per-track audio source, independent of
-    /// the factory ADM. Feed samples with [`Track::push_pcm`]. This allows
-    /// different audio to be delivered to different peer connections, since each
-    /// call returns a track backed by its own source.
+    /// the factory ADM. Feed samples with [`Track::push_pcm`].
+    ///
+    /// **Deprecated:** retained for 0.12 source compatibility; use
+    /// [`create_audio_track_with_options`](Self::create_audio_track_with_options)
+    /// with [`AudioTrackSource::LocalPush`] instead.
+    #[deprecated(note = "use create_audio_track_with_options with AudioTrackSource::LocalPush")]
     pub fn create_audio_track_with_local_source(&self, id: &str) -> Result<Track> {
+        self.create_audio_track_with_options(
+            id,
+            AudioTrackOptions {
+                source: AudioTrackSource::LocalPush,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Create a local audio track with per-track [`AudioTrackOptions`] —
+    /// choose the source (factory ADM vs independent push source) and the
+    /// per-source processing constraints (AEC / noise suppression / AGC /
+    /// high-pass), alongside any number of other audio tracks on the same
+    /// factory — the mic + music scenario, or different audio per peer.
+    ///
+    /// For [`AudioTrackSource::LocalPush`] tracks, feed samples with
+    /// [`Track::push_pcm`]; the returned [`Track`] handles both cases (push
+    /// methods are documented no-ops where they don't apply).
+    pub fn create_audio_track_with_options(
+        &self,
+        id: &str,
+        options: AudioTrackOptions,
+    ) -> Result<Track> {
         let cid = CString::new(id).map_err(|_| Error::Webrtc("id contains a NUL byte".into()))?;
+        let tri = |v: Option<bool>| v.map_or(-1, |b| b as c_int);
+        let sys_opts = reactor_webrtc_sys::ReactorAudioTrackOptions {
+            source: match options.source {
+                AudioTrackSource::Adm => 0,
+                AudioTrackSource::LocalPush => 1,
+            },
+            echo_cancellation: tri(options.echo_cancellation),
+            noise_suppression: tri(options.noise_suppression),
+            auto_gain_control: tri(options.auto_gain_control),
+            high_pass_filter: tri(options.high_pass_filter),
+            ..Default::default()
+        };
         let raw = unsafe {
-            reactor_webrtc_sys::reactor_webrtc_audio_track_create_with_local_source(
+            reactor_webrtc_sys::reactor_webrtc_audio_track_create(
                 self.handle.raw(),
                 cid.as_ptr(),
+                &sys_opts,
             )
         };
         if raw.is_null() {
-            return Err(Error::Webrtc(
-                "audio track with local source creation returned null".into(),
-            ));
+            return Err(Error::Webrtc("audio track creation returned null".into()));
         }
         Ok(Track::from_raw(raw, MediaKind::Audio, self.handle()))
     }
