@@ -29,8 +29,8 @@
 namespace reactor {
 namespace {
 
-// Matches the H264 SdpVideoFormat already advertised by
-// ReactorVideoEncoderFactory/ReactorCustomDecoderFactory in
+// Matches the H264 SdpVideoFormat already advertised by the composite
+// ReactorCompositeVideoEncoderFactory/ReactorCompositeVideoDecoderFactory in
 // reactor_webrtc.cpp for the non-OpenH264 build, so a peer sees the same
 // profile whether or not this process loaded OpenH264.
 webrtc::SdpVideoFormat H264Format() {
