@@ -64,13 +64,19 @@ pub struct AudioFrame<'a> {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AudioTrackSource {
-    /// The factory's ADM: the platform microphone (real mic/speaker on
+    /// The factory's ADM: the platform microphone + speaker (real devices on
     /// desktop) or the shared synthetic pipe fed by
     /// [`PeerConnectionFactory::push_audio_frame`](crate::PeerConnectionFactory::push_audio_frame).
     /// Every ADM-sourced track carries the **same** signal.
     ///
     /// There is exactly one ADM per factory — per-track choice is "tap it or
     /// bypass it", not "which ADM".
+    ///
+    /// On the **platform** device, the render path is fully automatic: every
+    /// inbound audio track decodes to the speaker by default — you cannot
+    /// route one remote track to the speaker and another elsewhere through
+    /// plumbing. `on_frame` taps them, it doesn't divert. Nothing plays
+    /// automatically through the synthetic device.
     #[default]
     Adm,
     /// A per-track push source, fully independent of the ADM: feed it with
