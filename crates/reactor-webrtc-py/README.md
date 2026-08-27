@@ -73,6 +73,36 @@ says how much audio exists but not when it happened — hence `capture_time_us`,
 and hence the rule that a producer owes the track a frame (silence, if it has
 nothing) on every tick. See [`docs/av-sync.md`](../../docs/av-sync.md).
 
+## Factory builder + per-track options
+
+Every process-physical choice composes on one builder; every per-track choice
+arrives as kwargs on the track creation:
+
+```python
+builder = rw.PeerConnectionFactoryBuilder()
+builder.with_platform_adm()          # real mic + AEC3/NS/AGC/high_pass
+builder.with_metadata(False)         # factory-wide frame-metadata kill switch
+factory = builder.build()
+
+# Raw video with an H.264 backend chosen per track:
+camera = factory.create_video_track_with_options(
+    "cam", h264_backend=rw.H264Backend.VideoToolbox)
+
+# Pre-encoded video (previously with_encoded_video_track's factory):
+screen = factory.create_video_track_with_options(
+    "screen", pre_encoded=(1920, 1080))
+
+# Encoder feedback: keyframe requests and BWE rate updates:
+screen.on_encoder_feedback(
+    lambda fb: push_an_idr_soon() if isinstance(fb, rw.KeyFrameRequest)
+    else adapt(bitrate=fb.bitrate_bps))
+
+# Music next to the mic — a per-track push pipe:
+music = factory.create_audio_track_with_options(
+    "music", source=rw.AudioTrackSource.LocalPush,
+    echo_cancellation=False, noise_suppression=False)
+```
+
 ## Pre-encoded video
 
 ```python

@@ -25,7 +25,7 @@ use ::reactor_webrtc as rw;
 
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyTuple};
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -677,7 +677,7 @@ impl From<TransceiverDirection> for rw::TransceiverDirection {
 
 /// A negotiable video codec, for [`Transceiver.set_codec_preferences`].
 #[pyclass(eq, eq_int)]
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VideoCodec {
     Vp8,
     Vp9,
@@ -1167,6 +1167,40 @@ impl Track {
         .map_err(err)
     }
 
+    /// Register `callback(fb)` for encoder feedback on a track created with
+    /// `inline_encoder` (`TrackVideoEncoder`'s inline form). `fb` is a
+    /// `KeyFrameRequest` or a `RateUpdate`; respond to the former by making
+    /// the next callback return a key frame.
+    ///
+    /// Raises on builtin-encoder tracks (they adapt internally) and on audio
+    /// tracks. Latest registration wins.
+    fn on_encoder_feedback(&mut self, py: Python, callback: PyObject) -> PyResult<()> {
+        let native = Arc::clone(self.video()?);
+        py.allow_threads(|| {
+            native.on_encoder_feedback(move |fb| {
+                Python::with_gil(|py| match fb {
+                    rw::EncoderFeedback::KeyFrameRequest => {
+                        let _ = callback.call1(py, (KeyFrameRequest,));
+                    }
+                    rw::EncoderFeedback::RateUpdate {
+                        bitrate_bps,
+                        framerate_fps,
+                    } => {
+                        let _ = callback.call1(
+                            py,
+                            (RateUpdate {
+                                bitrate_bps,
+                                framerate_fps,
+                            },),
+                        );
+                    }
+                    _ => {}
+                });
+            })
+        })
+        .map_err(err)
+    }
+
     /// Register `callback(pcm: bytes, sample_rate, channels, frames)` for
     /// decoded audio from a remote track. `pcm` is i16 little-endian.
     fn on_audio_frame(&mut self, py: Python, callback: PyObject) -> PyResult<()> {
@@ -1287,6 +1321,33 @@ impl EncodedVideoTrack {
             None => native.push_frame(frame),
         })
         .map_err(err)
+    }
+
+    /// Register `callback(fb)` for encoder feedback — answer
+    /// `KeyFrameRequest` by pushing an IDR promptly, adapt your encoder on
+    /// `RateUpdate { bitrate_bps, framerate_fps }`. Latest registration wins.
+    fn on_encoder_feedback(&mut self, callback: PyObject) -> PyResult<()> {
+        self.native()?.on_encoder_feedback(move |fb| {
+            Python::with_gil(|py| match fb {
+                rw::EncoderFeedback::KeyFrameRequest => {
+                    let _ = callback.call1(py, (KeyFrameRequest,));
+                }
+                rw::EncoderFeedback::RateUpdate {
+                    bitrate_bps,
+                    framerate_fps,
+                } => {
+                    let _ = callback.call1(
+                        py,
+                        (RateUpdate {
+                            bitrate_bps,
+                            framerate_fps,
+                        },),
+                    );
+                }
+                _ => {}
+            });
+        });
+        Ok(())
     }
 
     /// Add this track to a peer connection via `add_track` (creates a sendrecv
@@ -2066,6 +2127,213 @@ impl PeerConnection {
     }
 }
 
+// ── per-track options + builder (5617) ───────────────────────────────────────
+
+/// Where an audio track's samples come from (see
+/// `PeerConnectionFactory.create_audio_track_with_options`).
+#[pyclass(eq, eq_int)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum AudioTrackSource {
+    /// The factory's ADM — platform mic (real device) or the shared synthetic
+    /// pipe fed by `PeerConnectionFactory.push_audio_frame`.
+    Adm,
+    /// An independent per-track push source, fed with `Track.push_pcm`. The
+    /// way to send per-track audio — music next to the mic.
+    LocalPush,
+}
+
+/// H.264 backend selectable per raw video track.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[pyclass(eq, eq_int)]
+pub enum H264Backend {
+    /// Apple's hardware VideoToolbox (macOS/iOS).
+    VideoToolbox,
+    /// Cisco's software OpenH264 — needs `with_openh264(lib_path)` on the
+    /// builder; wheels built without the openh264 feature reject it.
+    OpenH264,
+}
+
+/// A keyframe demand routed to `on_encoder_feedback` — answer with an IDR on
+/// the next pushed frame or new receivers wait out the whole GOP.
+#[pyclass(frozen)]
+#[derive(Clone, Copy)]
+pub struct KeyFrameRequest;
+
+/// A congestion-controller allocation routed to `on_encoder_feedback`.
+#[pyclass(frozen)]
+#[derive(Clone, Copy)]
+pub struct RateUpdate {
+    /// Target bitrate in bits per second for this encoder.
+    #[pyo3(get)]
+    pub bitrate_bps: u32,
+    /// Target framerate (frames per second).
+    #[pyo3(get)]
+    pub framerate_fps: f64,
+}
+
+/// The raw frame an inline encoder callback receives (mirrors Rust's
+/// `RawVideoFrame`). Planes are copies — inline encoding off the GIL is a
+/// Rust-shaped job; use Python for correctness-first prototypes.
+#[pyclass(frozen)]
+pub struct RawVideoFrameInfo {
+    /// Which codec was negotiated — produce a matching bitstream.
+    #[pyo3(get)]
+    pub codec: VideoCodec,
+    #[pyo3(get)]
+    pub width: u32,
+    #[pyo3(get)]
+    pub height: u32,
+    #[pyo3(get)]
+    pub rtp_timestamp: u32,
+    /// `True` when the media engine asks for a key frame (IDR).
+    #[pyo3(get)]
+    pub request_key_frame: bool,
+    /// I420 planes, one byte string each.
+    #[pyo3(get)]
+    pub y: Py<PyBytes>,
+    #[pyo3(get)]
+    pub u: Py<PyBytes>,
+    #[pyo3(get)]
+    pub v: Py<PyBytes>,
+}
+
+#[pymethods]
+impl RawVideoFrameInfo {
+    fn __repr__(&self) -> String {
+        format!(
+            "RawVideoFrameInfo(codec={:?}, {}x{}, request_key_frame={})",
+            self.codec, self.width, self.height, self.request_key_frame
+        )
+    }
+}
+
+/// Builds a [`PeerConnectionFactory`] knob by knob. Everything is optional:
+/// `PeerConnectionFactoryBuilder().build()` is the plain headless factory.
+/// Chain on the same object:
+///
+/// ```python
+/// b = rw.PeerConnectionFactoryBuilder()
+/// b.with_platform_adm()
+/// b.with_metadata(False)
+/// factory = b.build()
+/// ```
+#[pyclass]
+pub struct PeerConnectionFactoryBuilder {
+    pending: Option<rw::PeerConnectionFactoryBuilder>,
+}
+
+#[pymethods]
+impl PeerConnectionFactoryBuilder {
+    #[new]
+    fn new() -> Self {
+        Self {
+            pending: Some(rw::PeerConnectionFactory::builder()),
+        }
+    }
+
+    /// Choose the audio device module: `platform=True` for the real
+    /// mic/speaker, `False` for the synthetic push device (the default).
+    fn with_adm(&mut self, platform: bool) -> PyResult<()> {
+        let b = self
+            .pending
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("builder already consumed by build()"))?;
+        self.pending = Some(b.with_adm(if platform {
+            rw::AdmMode::Platform
+        } else {
+            rw::AdmMode::Synthetic
+        }));
+        Ok(())
+    }
+
+    /// Use the **platform** audio device (real mic/speaker) with the full DSP
+    /// chain (AEC3 + NS + AGC + high-pass).
+    fn with_platform_adm(&mut self) -> PyResult<()> {
+        let b = self
+            .pending
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("builder already consumed by build()"))?;
+        self.pending = Some(b.with_platform_adm());
+        Ok(())
+    }
+
+    /// Use the **synthetic** (push) audio device — the default.
+    fn with_synthetic_adm(&mut self) -> PyResult<()> {
+        let b = self
+            .pending
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("builder already consumed by build()"))?;
+        self.pending = Some(b.with_synthetic_adm());
+        Ok(())
+    }
+
+    /// Configure the audio-processing chain (all stages default to off).
+    #[pyo3(signature = (
+        echo_canceller=false,
+        noise_suppression=false,
+        agc=false,
+        high_pass_filter=false,
+    ))]
+    fn with_apm(
+        &mut self,
+        echo_canceller: bool,
+        noise_suppression: bool,
+        agc: bool,
+        high_pass_filter: bool,
+    ) -> PyResult<()> {
+        let b = self
+            .pending
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("builder already consumed by build()"))?;
+        self.pending = Some(b.with_apm(rw::ApmConfig {
+            echo_canceller,
+            noise_suppression,
+            agc,
+            high_pass_filter,
+        }));
+        Ok(())
+    }
+
+    /// Factory-wide frame-metadata kill switch (default enabled). `False`
+    /// makes every connection behave as if frame metadata were off.
+    fn with_metadata(&mut self, enabled: bool) -> PyResult<()> {
+        let b = self
+            .pending
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("builder already consumed by build()"))?;
+        self.pending = Some(b.with_metadata(enabled));
+        Ok(())
+    }
+
+    /// Register the OpenH264 backend from a downloaded library path (see the
+    /// `openh264` module: attribution requirements apply). A failed load
+    /// degrades to "no OpenH264 backend"; it never fails the factory.
+    #[cfg(feature = "openh264")]
+    fn with_openh264(&mut self, lib_path: &str) -> PyResult<()> {
+        let b = self
+            .pending
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("builder already consumed by build()"))?;
+        self.pending = Some(b.with_openh264(std::path::Path::new(lib_path)));
+        Ok(())
+    }
+
+    /// Finalise the factory. The builder is consumed.
+    fn build(&mut self) -> PyResult<PeerConnectionFactory> {
+        let b = self
+            .pending
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("builder already consumed by build()"))?;
+        claim_factory()?;
+        b.build()
+            .map(|inner| PeerConnectionFactory { inner })
+            .map_err(|e| {
+                FACTORY_LIVE.store(false, Ordering::SeqCst);
+                err(e)
+            })
+    }
+}
+
 // ── PeerConnectionFactory ─────────────────────────────────────────────────────
 
 /// Entry point — creates peer connections and media tracks.
@@ -2173,6 +2441,208 @@ impl PeerConnectionFactory {
         })
         .map(Track::from_audio)
         .map_err(err)
+    }
+
+    /// Create a local video track with per-track [`VideoTrackOptions`]-style
+    /// kwargs — encoder plumbing, backend, metadata.
+    ///
+    /// Returns a `Track` for raw/inline tracks, or an `EncodedVideoTrack`
+    /// when `pre_encoded=(width, height)` is given.
+    ///
+    /// - `pre_encoded`: `(width, height)` — an asynchronous pre-encoded track
+    ///   (`EncodedVideoTrack`): push already-encoded bytes on it.
+    /// - `inline_encoder`: a callable `(RawVideoFrameInfo) -> bytes |
+    ///   (bytes, is_key_frame) | None` — libwebrtc calls it synchronously for
+    ///   every raw frame; return bytes to inject, or None to drop. Raising
+    ///   drops the frame.
+    /// - `h264_backend`: force the H.264 engine of a raw track
+    ///   (`H264Backend.VideoToolbox`, or `OpenH264` when the wheel ships it —
+    ///   requires registering the library on the builder first).
+    /// - `frame_metadata`: per-track trailer switch (default = factory
+    ///   setting); `False` drops `user_data` silently on pushes.
+    ///
+    /// Raises when `pre_encoded`/`inline_encoder` combine or when
+    /// `h264_backend` meets any custom encoder (the bytes come from your own
+    /// pipeline — there is no backend to route to).
+    #[pyo3(signature = (
+        id,
+        pre_encoded=None,
+        inline_encoder=None,
+        h264_backend=None,
+        frame_metadata=None,
+    ))]
+    fn create_video_track_with_options(
+        &self,
+        py: Python,
+        id: &str,
+        pre_encoded: Option<(u32, u32)>,
+        inline_encoder: Option<PyObject>,
+        h264_backend: Option<H264Backend>,
+        frame_metadata: Option<bool>,
+    ) -> PyResult<Py<PyAny>> {
+        if pre_encoded.is_some() && inline_encoder.is_some() {
+            return Err(PyRuntimeError::new_err(
+                "pre_encoded and inline_encoder are mutually exclusive",
+            ));
+        }
+        let backend = match h264_backend {
+            None => None,
+            Some(H264Backend::VideoToolbox) => Some(rw::H264Backend::VideoToolbox),
+            #[cfg(feature = "openh264")]
+            Some(H264Backend::OpenH264) => Some(rw::H264Backend::OpenH264),
+            #[cfg(not(feature = "openh264"))]
+            Some(H264Backend::OpenH264) => {
+                return Err(PyRuntimeError::new_err(
+                    "this wheel was built without OpenH264 support",
+                ));
+            }
+        };
+        let mut options = rw::VideoTrackOptions::default();
+        options.h264_backend = backend;
+        options.frame_metadata = frame_metadata;
+
+        if pre_encoded.is_some() && backend.is_some() {
+            return Err(PyRuntimeError::new_err(
+                "h264_backend with a custom encoder: the track's bytes come \
+                 from your own pipeline — there is no backend to route to",
+            ));
+        }
+        if let Some((w, h)) = pre_encoded {
+            options.encoder = Some(rw::TrackVideoEncoder::PreEncoded(
+                rw::PreEncodedOptions::new(w, h),
+            ));
+        } else if let Some(cb) = inline_encoder {
+            if backend.is_some() {
+                return Err(PyRuntimeError::new_err(
+                    "h264_backend with a custom encoder: the track's bytes come \
+                     from your own pipeline — there is no backend to route to",
+                ));
+            }
+            options.encoder = Some(rw::TrackVideoEncoder::Inline(Box::new(move |raw| {
+                Python::with_gil(|py| {
+                    let info = RawVideoFrameInfo {
+                        codec: match raw.codec {
+                            rw::VideoCodec::Vp8 => VideoCodec::Vp8,
+                            rw::VideoCodec::Vp9 => VideoCodec::Vp9,
+                            rw::VideoCodec::Av1 => VideoCodec::Av1,
+                            rw::VideoCodec::H264 => VideoCodec::H264,
+                            rw::VideoCodec::H265 => VideoCodec::H265,
+                        },
+                        width: raw.width,
+                        height: raw.height,
+                        rtp_timestamp: raw.rtp_timestamp,
+                        request_key_frame: raw.request_key_frame,
+                        y: PyBytes::new_bound(py, raw.y).unbind(),
+                        u: PyBytes::new_bound(py, raw.u).unbind(),
+                        v: PyBytes::new_bound(py, raw.v).unbind(),
+                    };
+                    let info = match Py::new(py, info) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            e.restore(py);
+                            return None;
+                        }
+                    };
+                    let result = cb.call1(py, (info,)).ok()?;
+                    if result.is_none(py) {
+                        return None;
+                    }
+                    if let Ok(bytes) = result.downcast_bound::<PyBytes>(py) {
+                        return Some(rw::EncodedVideoFrame {
+                            data: bytes.as_bytes().to_vec(),
+                            is_key_frame: raw.request_key_frame,
+                            width: 0,
+                            height: 0,
+                            rtp_timestamp: raw.rtp_timestamp,
+                        });
+                    }
+                    if let Ok(t) = result.downcast_bound::<PyTuple>(py) {
+                        if t.len() == 2 {
+                            if let Ok(bytes) = t.get_item(0).ok()?.downcast::<PyBytes>() {
+                                let is_key = t.get_item(1).ok()?.is_truthy().unwrap_or(false);
+                                return Some(rw::EncodedVideoFrame {
+                                    data: bytes.as_bytes().to_vec(),
+                                    is_key_frame: is_key,
+                                    width: 0,
+                                    height: 0,
+                                    rtp_timestamp: raw.rtp_timestamp,
+                                });
+                            }
+                        }
+                    }
+                    eprintln!(
+                        "[reactor-webrtc] inline_encoder returned an unexpected shape \
+                         (want bytes | (bytes, is_key_frame) | None) — frame dropped"
+                    );
+                    None
+                })
+            })));
+        }
+
+        let local = py
+            .allow_threads(|| self.inner.create_video_track_with_options(id, options))
+            .map_err(err)?;
+        match local {
+            rw::LocalVideoTrack::Raw(t) => Ok(Py::new(py, Track::from_video(t))?.into_any()),
+            rw::LocalVideoTrack::Encoded(t) => Ok(Py::new(
+                py,
+                EncodedVideoTrack {
+                    inner: Some(Arc::new(t)),
+                },
+            )?
+            .into_any()),
+        }
+    }
+
+    /// Create a local audio track with per-track kwargs — a per-track source
+    /// and per-source processing constraints. See docs for the mic+music
+    /// pattern.
+    ///
+    /// - `source`: `AudioTrackSource.Adm` (default; factory ADM — platform
+    ///   mic or shared synthetic pipe) or `AudioTrackSource.LocalPush`
+    ///   (independent per-track pipe — feed with `Track.push_pcm`).
+    /// - processing flags: `None` inherits the factory APM chain; `True`/`False`
+    ///   forces the stage per track (send/capture side only).
+    ///
+    /// LocalPush always ignores the processing flags (no room to hear).
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        id,
+        source=None,
+        echo_cancellation=None,
+        noise_suppression=None,
+        auto_gain_control=None,
+        high_pass_filter=None,
+    ))]
+    fn create_audio_track_with_options(
+        &self,
+        py: Python,
+        id: &str,
+        source: Option<AudioTrackSource>,
+        echo_cancellation: Option<bool>,
+        noise_suppression: Option<bool>,
+        auto_gain_control: Option<bool>,
+        high_pass_filter: Option<bool>,
+    ) -> PyResult<Track> {
+        let mut options = rw::AudioTrackOptions::default();
+        options.source = match source.unwrap_or(AudioTrackSource::Adm) {
+            AudioTrackSource::Adm => rw::AudioTrackSource::Adm,
+            AudioTrackSource::LocalPush => rw::AudioTrackSource::LocalPush,
+        };
+        options.echo_cancellation = echo_cancellation;
+        options.noise_suppression = noise_suppression;
+        options.auto_gain_control = auto_gain_control;
+        options.high_pass_filter = high_pass_filter;
+        py.allow_threads(|| self.inner.create_audio_track_with_options(id, options))
+            .map(Track::from_audio)
+            .map_err(err)
+    }
+
+    /// Start composing a factory — equivalent to constructing a
+    /// `PeerConnectionFactoryBuilder` directly.
+    #[staticmethod]
+    fn builder() -> PeerConnectionFactoryBuilder {
+        PeerConnectionFactoryBuilder::new()
     }
 
     /// Push interleaved signed 16-bit little-endian PCM to the synthetic ADM.
@@ -2290,6 +2760,12 @@ fn reactor_webrtc(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PeerConnectionObserver>()?;
     m.add_class::<PeerConnection>()?;
     m.add_class::<PeerConnectionFactory>()?;
+    m.add_class::<PeerConnectionFactoryBuilder>()?;
+    m.add_class::<AudioTrackSource>()?;
+    m.add_class::<H264Backend>()?;
+    m.add_class::<KeyFrameRequest>()?;
+    m.add_class::<RateUpdate>()?;
+    m.add_class::<RawVideoFrameInfo>()?;
 
     m.add_function(wrap_pyfunction!(time_micros, m)?)?;
 
