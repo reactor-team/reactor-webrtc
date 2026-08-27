@@ -378,12 +378,13 @@ extern "C" fn free_encoded_data(data: *const u8, len: usize) {
 ///   [`EncodedVideoTrack`]); the queue drain itself is the "encoder".
 /// - `Inline` — the registry calls the user callback synchronously with every
 ///   raw I420 frame ([`TrackVideoEncoder::Inline`] tracks).
-/// - `Builtin` — the factory delegates to libwebrtc's builtin VP8/VP9/AV1
-///   encoder; push raw BGRA frames via the returned [`Track`](crate::media::Track).
+/// - `Builtin` — the factory delegates to a backend encoder (builtin
+///   VP8/VP9/AV1, or H264 via the slot's backend preference); push raw BGRA
+///   frames via the returned [`Track`](crate::media::Track).
 pub(crate) enum RegistrySlot {
     Custom(Arc<Mutex<VecDeque<EncodedVideoFrame>>>),
     Inline(Arc<CustomEncoderState>),
-    Builtin,
+    Builtin(H264BackendPref),
 }
 
 impl Clone for RegistrySlot {
@@ -391,7 +392,30 @@ impl Clone for RegistrySlot {
         match self {
             Self::Custom(q) => Self::Custom(q.clone()),
             Self::Inline(s) => Self::Inline(s.clone()),
-            Self::Builtin => Self::Builtin,
+            Self::Builtin(pref) => Self::Builtin(*pref),
+        }
+    }
+}
+
+/// Which H.264 backend a builtin-routed slot prefers, mirroring the public
+/// [`H264Backend`] (None → `Auto`). `Auto` resolves at encoder creation:
+/// VideoToolbox on Apple, registered OpenH264 elsewhere.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum H264BackendPref {
+    Auto,
+    VideoToolbox,
+    #[cfg(feature = "openh264")]
+    OpenH264,
+}
+
+impl H264BackendPref {
+    /// The `reactor_video_backend_cb` wire value (0 = auto, 1 = VT, 2 = OH).
+    fn as_c_int(self) -> c_int {
+        match self {
+            Self::Auto => 0,
+            Self::VideoToolbox => 1,
+            #[cfg(feature = "openh264")]
+            Self::OpenH264 => 2,
         }
     }
 }
@@ -451,6 +475,7 @@ impl EncoderRegistry {
         opts.encode_free_ud = Some(free_registry_state_tramp);
         opts.encode_use_builtin = Some(registry_use_builtin_tramp);
         opts.encode_has_custom_slots = Some(registry_has_custom_tramp);
+        opts.encode_video_backend_for = Some(registry_backend_for_tramp);
     }
 
     /// Reserve a custom (pre-encoded) slot for the track `native_id`.
@@ -471,9 +496,15 @@ impl EncoderRegistry {
     /// factory delegates to the builtin VP8/VP9/AV1 encoder for this
     /// transceiver.
     pub(crate) fn add_raw_slot(&self, native_id: usize) {
+        self.add_raw_slot_with_backend(native_id, H264BackendPref::Auto);
+    }
+
+    /// Reserve a builtin (raw BGRA) slot with an explicit H264 backend
+    /// preference, for tracks created with `h264_backend` set.
+    pub(crate) fn add_raw_slot_with_backend(&self, native_id: usize, backend: H264BackendPref) {
         self.pending.lock().unwrap().push_back(RegistryReservation {
             native_id,
-            slot: RegistrySlot::Builtin,
+            slot: RegistrySlot::Builtin(backend),
         });
     }
 
@@ -500,11 +531,12 @@ impl EncoderRegistry {
             .retain(|r| r.native_id != native_id);
         let mut assigned = self.assigned.lock().unwrap();
         for a in assigned.values_mut() {
-            if a.native_id == native_id && !matches!(a.slot, RegistrySlot::Builtin) {
+            if a.native_id == native_id && !matches!(a.slot, RegistrySlot::Builtin(_)) {
                 eprintln!(
-                    "[reactor-webrtc] retracting encoder slot for dropped track {native_id:#x}:                      degrading to builtin (loud fallback — never reroutes another track's slot)"
+                    "[reactor-webrtc] retracting encoder slot for dropped track {native_id:#x}: \
+                     degrading to builtin (loud fallback — never reroutes another track's slot)"
                 );
-                a.slot = RegistrySlot::Builtin;
+                a.slot = RegistrySlot::Builtin(H264BackendPref::Auto);
             }
         }
     }
@@ -513,7 +545,7 @@ impl EncoderRegistry {
     /// already assigned. Drives the `has_custom_slots` predicate the native
     /// factory consults when advertising codecs.
     pub(crate) fn has_custom(&self) -> bool {
-        let is_custom = |s: &RegistrySlot| !matches!(s, RegistrySlot::Builtin);
+        let is_custom = |s: &RegistrySlot| !matches!(s, RegistrySlot::Builtin(_));
         // Drop pending's guard before touching `assigned`: holding both is an
         // ABBA deadlock against use_builtin_for/encode_for under concurrent
         // negotiation + encode.
@@ -538,7 +570,7 @@ impl EncoderRegistry {
     pub(crate) fn use_builtin_for(&self, encoder_id: u64) -> bool {
         let mut assigned = self.assigned.lock().unwrap();
         if let Some(a) = assigned.get(&encoder_id) {
-            return matches!(a.slot, RegistrySlot::Builtin);
+            return matches!(a.slot, RegistrySlot::Builtin(_));
         }
         let next = {
             let mut pending = self.pending.lock().unwrap();
@@ -548,11 +580,11 @@ impl EncoderRegistry {
             // No reservation left: the positional fallback, loud — previously
             // this degraded a custom-encoded stream to builtin silently.
             eprintln!(
-                "[reactor-webrtc] no encoder slot reservation left for encoder {encoder_id}:                  delegating to builtin — custom-encoded tracks after this may not produce video"
+                "[reactor-webrtc] no encoder slot reservation left for encoder {encoder_id}: delegating to builtin — custom-encoded tracks after this point may not produce video"
             );
             return true;
         };
-        let is_builtin = matches!(reservation.slot, RegistrySlot::Builtin);
+        let is_builtin = matches!(reservation.slot, RegistrySlot::Builtin(_));
         assigned.insert(
             encoder_id,
             AssignedSlot {
@@ -578,11 +610,11 @@ impl EncoderRegistry {
                 },
                 None => {
                     eprintln!(
-                        "[reactor-webrtc] no encoder slot reservation left for encoder {encoder_id}:                          delegating to builtin"
+                        "[reactor-webrtc] no encoder slot reservation left for encoder {encoder_id}: delegating to builtin"
                     );
                     AssignedSlot {
                         native_id: 0,
-                        slot: RegistrySlot::Builtin,
+                        slot: RegistrySlot::Builtin(H264BackendPref::Auto),
                     }
                 }
             }
@@ -602,7 +634,19 @@ impl EncoderRegistry {
                 };
                 cb(raw)
             }
-            RegistrySlot::Builtin => None,
+            RegistrySlot::Builtin(_) => None,
+        }
+    }
+
+    /// Called by the native composite when building an H264 encoder for a
+    /// backend-routed instance — the slot's stored preference.
+    pub(crate) fn backend_for(&self, encoder_id: u64) -> H264BackendPref {
+        match self.assigned.lock().unwrap().get(&encoder_id) {
+            Some(a) => match &a.slot {
+                RegistrySlot::Builtin(pref) => *pref,
+                _ => H264BackendPref::Auto,
+            },
+            None => H264BackendPref::Auto,
         }
     }
 }
@@ -668,6 +712,14 @@ pub(crate) extern "C" fn free_registry_state_tramp(ud: *mut c_void) {
 pub(crate) extern "C" fn registry_has_custom_tramp(ud: *mut c_void) -> c_int {
     let st = unsafe { &*(ud as *const RegistryState) };
     st.registry.has_custom() as c_int
+}
+
+/// Called by the native composite when it builds an H264 encoder for a
+/// backend-routed instance — returns the slot's stored preference as the
+/// wire code (0 = auto, 1 = VideoToolbox, 2 = OpenH264).
+pub(crate) extern "C" fn registry_backend_for_tramp(ud: *mut c_void, encoder_id: u64) -> c_int {
+    let st = unsafe { &*(ud as *const RegistryState) };
+    st.registry.backend_for(encoder_id).as_c_int()
 }
 
 // ── Per-track encoder selection ─────────────────────────────────────────────
@@ -739,6 +791,34 @@ pub enum TrackVideoEncoder {
     Inline(InlineEncoderCallback),
 }
 
+/// Which H.264 backend a **raw** video track encodes with.
+///
+/// `None` (Auto, the default) picks the platform default: **VideoToolbox**
+/// on Apple, **OpenH264** — when registered via
+/// [`PeerConnectionFactoryBuilder::with_openh264`] — elsewhere. Without any
+/// usable backend, H264 is simply not negotiated (VP8/VP9/AV1 take over).
+///
+/// Choose explicitly to force a backend per track — a camera on VideoToolbox
+/// (hardware, battery-friendly) beside a screen share on OpenH264
+/// (bitrate/intra control, cross-platform parity). An explicit-but-unusable
+/// backend (VideoToolbox off Apple, OpenH264 unregistered) fails track
+/// creation with an error.
+///
+/// Meaningless — and rejected — on tracks with
+/// [`TrackVideoEncoder`] set, since the track's bytes come from your own
+/// pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum H264Backend {
+    /// Apple's hardware VideoToolbox (macOS/iOS).
+    VideoToolbox,
+    /// Cisco's software OpenH264 — requires registering the shared library
+    /// with [`PeerConnectionFactoryBuilder::with_openh264`].
+    #[cfg(feature = "openh264")]
+    OpenH264,
+    // Future: MediaFoundation (Windows hw), NvEnc (NVIDIA), …
+}
+
 /// Options for [`PeerConnectionFactory::create_video_track_with_options`].
 ///
 /// All fields optional; `Default::default()` produces exactly what
@@ -753,9 +833,11 @@ pub enum TrackVideoEncoder {
 #[non_exhaustive]
 pub struct VideoTrackOptions {
     /// Encoder override for this track. `None` (default) = libwebrtc's
-    /// builtin/software pipeline encodes (also see `h264_backend`, landing
-    /// with the backend-selection change).
+    /// builtin/software pipeline encodes.
     pub encoder: Option<TrackVideoEncoder>,
+    /// Which H.264 backend encodes this track when it is raw and H264 wins
+    /// negotiation. Errors when set together with `encoder`.
+    pub h264_backend: Option<H264Backend>,
 }
 
 /// One video track created by
