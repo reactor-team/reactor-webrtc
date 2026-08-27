@@ -340,6 +340,14 @@ impl PeerConnectionFactory {
     /// The same positional slot-assignment rule as
     /// [`create_video_track`](Self::create_video_track) applies, and slots are
     /// likewise reserved only after a successful native creation.
+    ///
+    /// **One pre-encoded / inline track serves exactly one peer connection.**
+    /// Each PeerConnection layers on its own encoder instance, and the
+    /// registry binds them positionally by reservation — a second PC wired to
+    /// the same track finds no reservation and falls back to the builtin
+    /// encoder, which encodes the track's raw pushes as ordinary video
+    /// (grey/dropped output, not a copy of your bitstream). Create one
+    /// encoder-carrying track per PeerConnection instead of sharing.
     pub fn create_video_track_with_options(
         &self,
         id: &str,
