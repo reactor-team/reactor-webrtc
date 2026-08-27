@@ -2129,19 +2129,30 @@ impl PeerConnectionFactory {
         height: u32,
     ) -> PyResult<(Self, EncodedVideoTrack)> {
         claim_factory()?;
-        rw::PeerConnectionFactory::with_encoded_video_track(track_id, width, height)
-            .map(|(f, t)| {
-                (
-                    Self { inner: f },
-                    EncodedVideoTrack {
-                        inner: Some(Arc::new(t)),
-                    },
-                )
-            })
-            .map_err(|e| {
-                FACTORY_LIVE.store(false, Ordering::SeqCst);
-                err(e)
-            })
+        let build = || -> PyResult<(Self, EncodedVideoTrack)> {
+            let factory = rw::PeerConnectionFactory::builder().build().map_err(err)?;
+            let mut options = rw::VideoTrackOptions::default();
+            options.encoder = Some(rw::TrackVideoEncoder::PreEncoded(
+                rw::PreEncodedOptions::new(width, height),
+            ));
+            let local = factory
+                .create_video_track_with_options(track_id, options)
+                .map_err(err)?;
+            let rw::LocalVideoTrack::Encoded(t) = local else {
+                return Err(err(rw::Error::Webrtc(
+                    "pre-encoded track came back raw".into(),
+                )));
+            };
+            Ok((
+                Self { inner: factory },
+                EncodedVideoTrack {
+                    inner: Some(Arc::new(t)),
+                },
+            ))
+        };
+        build().inspect_err(|_| {
+            FACTORY_LIVE.store(false, Ordering::SeqCst);
+        })
     }
 
     fn set_adm_playout_enabled(&self, enabled: bool) {

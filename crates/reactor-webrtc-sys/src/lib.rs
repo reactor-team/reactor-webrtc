@@ -149,6 +149,10 @@ pub struct ReactorFactoryOptions {
     pub encode_free_ud: Option<extern "C" fn(userdata: *mut c_void)>,
     /// Per-encoder-instance escape to the backend path; null = always custom.
     pub encode_use_builtin: Option<extern "C" fn(userdata: *mut c_void, encoder_id: u64) -> c_int>,
+    /// Called during codec enumeration: nonzero while custom slots exist —
+    /// gates the H264/H265 claim so plain factories keep the builtin-only
+    /// advertisement. null = never claim via custom plumbing.
+    pub encode_has_custom_slots: Option<extern "C" fn(userdata: *mut c_void) -> c_int>,
 }
 
 impl Default for ReactorFactoryOptions {
@@ -162,6 +166,7 @@ impl Default for ReactorFactoryOptions {
             encode_userdata: std::ptr::null_mut(),
             encode_free_ud: None,
             encode_use_builtin: None,
+            encode_has_custom_slots: None,
         }
     }
 }

@@ -45,19 +45,19 @@ mod peer_connection;
 pub mod platform;
 mod sender_meta;
 
-use std::collections::VecDeque;
 use std::ffi::CString;
 use std::os::raw::c_int;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-pub use builder::{EncodedVideoBuilder, MixedVideoTrack, PeerConnectionFactoryBuilder};
+pub use builder::PeerConnectionFactoryBuilder;
 pub use config::{
     BundlePolicy, ContinualGatheringPolicy, IceServer, IceTransportsType, RtcConfiguration,
     TcpCandidatePolicy,
 };
 pub use encoded::{
-    CustomVideoEncoder, EncodedFrame, EncodedVideoFrame, EncodedVideoTrack, FrameAction,
-    FrameDirection, FrameTransform, RawVideoFrame, VideoCodec,
+    EncodedFrame, EncodedVideoFrame, EncodedVideoTrack, FrameAction, FrameDirection,
+    FrameTransform, LocalVideoTrack, PreEncodedOptions, RawVideoFrame, TrackVideoEncoder,
+    VideoCodec, VideoTrackOptions,
 };
 pub use media::{AudioFrame, MediaKind, Track, VideoFrame};
 pub use metadata::{
@@ -205,6 +205,10 @@ pub struct PeerConnectionFactory {
     /// [`PeerConnection`] from this factory behaves like one created with
     /// `RtcConfiguration::frame_metadata` off, whatever each config says.
     metadata_enabled: bool,
+    /// Per-track encoder slots (pre-encoded / inline), wired into the native
+    /// factory at creation. Every factory has one; tracks register slots via
+    /// [`PeerConnectionFactory::create_video_track_with_options`].
+    registry: Arc<crate::encoded::EncoderRegistry>,
 }
 
 impl PeerConnectionFactory {
@@ -235,6 +239,7 @@ impl PeerConnectionFactory {
     pub(crate) fn create_from_options(
         opts: &reactor_webrtc_sys::ReactorFactoryOptions,
         metadata_enabled: bool,
+        registry: Arc<crate::encoded::EncoderRegistry>,
     ) -> Result<Self> {
         let mut err = [0 as std::os::raw::c_char; 256];
         let raw = unsafe {
@@ -257,93 +262,8 @@ impl PeerConnectionFactory {
         Ok(Self {
             handle: Arc::new(FactoryHandle(raw)),
             metadata_enabled,
+            registry,
         })
-    }
-
-    /// Create a factory that replaces the builtin H.264 encoder with `encoder`.
-    ///
-    /// The encoder callback is invoked synchronously on the WebRTC encoder
-    /// thread for every raw I420 frame ready to be sent. Return
-    /// `Some(EncodedVideoFrame)` to push H.264 bytes into the RTP packetizer,
-    /// or `None` to drop the frame silently.
-    ///
-    /// Audio encoding is unaffected; the builtin audio codecs (Opus, G.711,
-    /// etc.) remain active.
-    pub fn with_custom_video_encoder(encoder: crate::CustomVideoEncoder) -> Result<Self> {
-        let result = Self::create_from_options(
-            &reactor_webrtc_sys::ReactorFactoryOptions {
-                encode_cb: Some(encoder.encode_fn),
-                encode_userdata: encoder.userdata,
-                encode_free_ud: encoder.free_ud,
-                encode_use_builtin: encoder.use_builtin,
-                use_platform_adm: 0, // synthetic ADM
-                apm_flags: 0,        // all processing disabled
-                ..Default::default()
-            },
-            true,
-        );
-        if result.is_err() {
-            // Factory did not take ownership — free the state ourselves.
-            if let Some(f) = encoder.free_ud {
-                f(encoder.userdata);
-            }
-        }
-        result
-    }
-
-    /// Create a builder for a factory that supports **multiple** pre-encoded
-    /// video tracks.
-    ///
-    /// ```rust,ignore
-    /// let mut b = PeerConnectionFactory::encoded_video_builder();
-    /// let camera = b.add_track("camera", 1280, 720);
-    /// let screen  = b.add_track("screen",  1920, 1080);
-    /// let (factory, tracks) = b.build()?;
-    ///
-    /// // tracks[0] == camera stream, tracks[1] == screen stream
-    /// tracks[0].push_encoded_frame(camera_frame);
-    /// tracks[1].push_encoded_frame(screen_frame);
-    /// ```
-    pub fn encoded_video_builder() -> EncodedVideoBuilder {
-        EncodedVideoBuilder::new()
-    }
-
-    /// Create a factory pre-wired for push-based encoded video.
-    ///
-    /// Returns both the factory and an [`EncodedVideoTrack`] handle. Call
-    /// [`EncodedVideoTrack::push_encoded_frame`] whenever your encoder produces
-    /// a frame — no raw pixel pumping required.
-    ///
-    /// ```rust,ignore
-    /// let (factory, video) =
-    ///     PeerConnectionFactory::with_encoded_video_track("cam", 1280, 720)?;
-    ///
-    /// let pc  = factory.create_peer_connection(&config, observer)?;
-    /// let tx  = pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendOnly)?;
-    /// tx.set_track(video.track())?;
-    ///
-    /// // … later, on your encoder thread:
-    /// video.push_encoded_frame(EncodedVideoFrame {
-    ///     data: h264_annex_b_bytes,
-    ///     is_key_frame: true,
-    ///     width: 1280, height: 720, rtp_timestamp: 0,
-    /// });
-    /// ```
-    ///
-    /// `width` and `height` set the resolution advertised to libwebrtc's
-    /// encoder pipeline. They must match the resolution you intend to encode.
-    /// Pass `0` in [`EncodedVideoFrame`] fields to inherit them automatically.
-    pub fn with_encoded_video_track(
-        track_id: &str,
-        width: u32,
-        height: u32,
-    ) -> Result<(Self, crate::EncodedVideoTrack)> {
-        let queue: Arc<Mutex<VecDeque<EncodedVideoFrame>>> = Arc::new(Mutex::new(VecDeque::new()));
-        let encoder = crate::CustomVideoEncoder::from_queue(queue.clone());
-        let factory = Self::with_custom_video_encoder(encoder)?;
-        let track = factory.create_video_track(track_id)?;
-        let encoded = crate::EncodedVideoTrack::new(track, queue, width, height);
-        Ok((factory, encoded))
     }
 
     /// Create a peer connection with the given configuration and observer.
@@ -386,8 +306,75 @@ impl PeerConnectionFactory {
     }
 
     /// Create a local video track backed by a push-able source
-    /// ([`Track::push_video_frame`]).
+    /// ([`Track::push_video_frame`]); libwebrtc's builtin encoder pipeline
+    /// encodes it. For encoder plumbing (pre-encoded / inline) use
+    /// [`create_video_track_with_options`](Self::create_video_track_with_options).
+    ///
+    /// Slot assignment between encoder instances and tracks is **positional**:
+    /// create tracks before (or in the same order as) the transceivers that
+    /// carry them. Slots are reserved only after native creation succeeds,
+    /// so a failed creation (bad id, native error) never leaves an orphan
+    /// slot misbinding the next track's encoder.
     pub fn create_video_track(&self, id: &str) -> Result<Track> {
+        let track = self.create_video_track_native(id)?;
+        self.registry.add_raw_slot(track.native_id());
+        Ok(track)
+    }
+
+    /// Create a local video track with per-track [`VideoTrackOptions`] —
+    /// encoder plumbing for this track alone, alongside any number of other
+    /// raw or encoded tracks on the same factory.
+    ///
+    /// ```rust,ignore
+    /// // Pre-encoded: push already-encoded bytes whenever you produce them.
+    /// let screen = factory.create_video_track_with_options("screen", {
+    ///     let mut o = VideoTrackOptions::default();
+    ///     o.encoder = Some(TrackVideoEncoder::PreEncoded(PreEncodedOptions::new(1920, 1080)));
+    ///     o
+    /// })?;
+    /// if let LocalVideoTrack::Encoded(enc) = screen {
+    ///     enc.push_encoded_frame(frame);
+    /// }
+    /// ```
+    ///
+    /// The same positional slot-assignment rule as
+    /// [`create_video_track`](Self::create_video_track) applies, and slots are
+    /// likewise reserved only after a successful native creation.
+    ///
+    /// **One pre-encoded / inline track serves exactly one peer connection.**
+    /// Each PeerConnection layers on its own encoder instance, and the
+    /// registry binds them positionally by reservation — a second PC wired to
+    /// the same track finds no reservation and falls back to the builtin
+    /// encoder, which encodes the track's raw pushes as ordinary video
+    /// (grey/dropped output, not a copy of your bitstream). Create one
+    /// encoder-carrying track per PeerConnection instead of sharing.
+    pub fn create_video_track_with_options(
+        &self,
+        id: &str,
+        options: VideoTrackOptions,
+    ) -> Result<LocalVideoTrack> {
+        match options.encoder {
+            None => Ok(LocalVideoTrack::Raw(self.create_video_track(id)?)),
+            Some(TrackVideoEncoder::PreEncoded(o)) => {
+                let track = self.create_video_track_native(id)?;
+                let queue = self.registry.add_encoded_slot(track.native_id());
+                Ok(LocalVideoTrack::Encoded(EncodedVideoTrack::new(
+                    track, queue, o.width, o.height,
+                )))
+            }
+            Some(TrackVideoEncoder::Inline(cb)) => {
+                let track = self.create_video_track_native(id)?;
+                self.registry.add_inline_slot(track.native_id(), cb);
+                Ok(LocalVideoTrack::Raw(track))
+            }
+        }
+    }
+
+    /// Shared native side of [`create_video_track`](Self::create_video_track):
+    /// the strict FFI call, **without** a registry slot (any slot is the
+    /// caller's to reserve — purely positional, and deliberately after this
+    /// has succeeded).
+    fn create_video_track_native(&self, id: &str) -> Result<Track> {
         let cid = CString::new(id).map_err(|_| Error::Webrtc("id contains a NUL byte".into()))?;
         let raw = unsafe {
             reactor_webrtc_sys::reactor_webrtc_video_track_create(self.handle.raw(), cid.as_ptr())
@@ -395,7 +382,12 @@ impl PeerConnectionFactory {
         if raw.is_null() {
             return Err(Error::Webrtc("video track creation returned null".into()));
         }
-        Ok(Track::from_raw(raw, MediaKind::Video, self.handle()))
+        Ok(Track::from_raw_with_registry(
+            raw,
+            MediaKind::Video,
+            self.handle(),
+            Some(Arc::clone(&self.registry)),
+        ))
     }
 
     /// Create a local audio track. Its samples come from this factory's ADM —

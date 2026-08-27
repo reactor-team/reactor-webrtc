@@ -1722,6 +1722,14 @@ typedef int (*reactor_video_encode_cb)(void*                      userdata,
 // value stamped on every subsequent ReactorRawVideoFrame from that encoder.
 typedef int (*reactor_use_builtin_cb)(void* userdata, uint64_t encoder_id);
 
+// Called when the factory enumerates the advertised video codecs
+// (Video{En,De}coderFactory::GetSupportedFormats). Return nonzero while any
+// custom (pre-encoded / inline) slot exists — pending OR already assigned —
+// so H264/H265 are claimed only when user code may actually produce those
+// bitstreams; a factory without custom slots keeps the plain builtin
+// advertisement. May be null (never claim via custom plumbing).
+typedef int (*reactor_has_custom_slots_cb)(void* userdata);
+
 // Unified factory-create options. ABI-versioned: `size` MUST be
 // sizeof(ReactorFactoryOptions) as known to the caller; the glue rejects
 // undersized structs, and future fields only ever get appended at the end
@@ -1742,18 +1750,24 @@ struct ReactorFactoryOptions {
   void*                        encode_userdata;
   reactor_webrtc_userdata_free encode_free_ud;      // may be null
   reactor_use_builtin_cb       encode_use_builtin;  // null = always custom
+  // Gates the H264/H265 advertisement on custom slots existing (see the
+  // typedef). May be null — then H264/H265 are never claimed via custom
+  // plumbing regardless of `encode_cb`.
+  reactor_has_custom_slots_cb  encode_has_custom_slots;
 };
 }
 
 struct ReactorEncoderState {
-  reactor_video_encode_cb       cb;
+  reactor_video_encode_cb        cb;
   void*                          userdata;
   reactor_webrtc_userdata_free   free_ud;
-  reactor_use_builtin_cb         use_builtin; // null = always use custom
+  reactor_use_builtin_cb         use_builtin;      // null = always use custom
+  reactor_has_custom_slots_cb    has_custom_slots; // null = never claim custom codecs
 
   ReactorEncoderState(reactor_video_encode_cb c, void* u, reactor_webrtc_userdata_free f,
-                      reactor_use_builtin_cb ub = nullptr)
-      : cb(c), userdata(u), free_ud(f), use_builtin(ub) {}
+                      reactor_use_builtin_cb ub = nullptr,
+                      reactor_has_custom_slots_cb hcs = nullptr)
+      : cb(c), userdata(u), free_ud(f), use_builtin(ub), has_custom_slots(hcs) {}
   ~ReactorEncoderState() { if (free_ud) free_ud(userdata); }
   // Disable copy+move: free_ud would fire twice (once on the copy, once on
   // the original) which would double-free `userdata`.
@@ -1923,8 +1937,11 @@ class ReactorCompositeVideoEncoderFactory : public webrtc::VideoEncoderFactory {
     if (openh264_) merge(openh264_.get());
     if (apple_h264_) merge(apple_h264_.get());
     // Custom slots deliver their own bitstream: advertise H264 (and H265, as
-    // the historical custom path did) so negotiation can select them.
-    if (state_) {
+    // the historical custom path did) so negotiation can select them — but
+    // only while a custom slot exists; a factory with none keeps the plain
+    // builtin advertisement.
+    if (state_ && state_->has_custom_slots &&
+        state_->has_custom_slots(state_->userdata) != 0) {
       const webrtc::SdpVideoFormat h264(
           "H264", {{"level-asymmetry-allowed", "1"},
                    {"packetization-mode", "1"},
@@ -1982,7 +1999,7 @@ class ReactorCompositeVideoDecoderFactory : public webrtc::VideoDecoderFactory {
   std::unique_ptr<webrtc::VideoDecoderFactory> builtin_;
   std::unique_ptr<webrtc::VideoDecoderFactory> openh264_;    // may be null
   std::unique_ptr<webrtc::VideoDecoderFactory> apple_h264_;  // may be null
-  bool allow_null_h26x_;
+  std::shared_ptr<ReactorEncoderState> state_;               // may be null
 
   static bool IsBuiltinCodec(const webrtc::SdpVideoFormat& f) {
     return f.name == "VP8" || f.name == "VP9" || f.name == "AV1";
@@ -1999,11 +2016,11 @@ class ReactorCompositeVideoDecoderFactory : public webrtc::VideoDecoderFactory {
   ReactorCompositeVideoDecoderFactory(
       std::unique_ptr<webrtc::VideoDecoderFactory> openh264,
       std::unique_ptr<webrtc::VideoDecoderFactory> apple_h264,
-      bool allow_null_h26x)
+      std::shared_ptr<ReactorEncoderState> state)
       : builtin_(webrtc::CreateBuiltinVideoDecoderFactory()),
         openh264_(std::move(openh264)),
         apple_h264_(std::move(apple_h264)),
-        allow_null_h26x_(allow_null_h26x) {}
+        state_(std::move(state)) {}
 
   std::vector<webrtc::SdpVideoFormat> GetSupportedFormats() const override {
     auto formats = builtin_->GetSupportedFormats();
@@ -2013,7 +2030,11 @@ class ReactorCompositeVideoDecoderFactory : public webrtc::VideoDecoderFactory {
     };
     if (openh264_) merge(openh264_.get());
     if (apple_h264_) merge(apple_h264_.get());
-    if (allow_null_h26x_) {
+    // Historical custom-path behavior: claim H264 (even backend-less) and
+    // H265 so offers listing only those codecs still negotiate, discarding
+    // received frames — but only while a custom slot exists.
+    if (state_ && state_->has_custom_slots &&
+        state_->has_custom_slots(state_->userdata) != 0) {
       const webrtc::SdpVideoFormat h264(
           "H264", {{"level-asymmetry-allowed", "1"},
                    {"packetization-mode", "1"},
@@ -2056,13 +2077,6 @@ void* reactor_webrtc_factory_create(const ReactorFactoryOptions* opts,
     return nullptr;
   }
 
-  std::shared_ptr<ReactorEncoderState> state;
-  if (opts->encode_cb) {
-    state = std::make_shared<ReactorEncoderState>(
-        opts->encode_cb, opts->encode_userdata, opts->encode_free_ud,
-        opts->encode_use_builtin);
-  }
-
   std::unique_ptr<webrtc::VideoEncoderFactory> openh264_enc;
   std::unique_ptr<webrtc::VideoDecoderFactory> openh264_dec;
 #ifdef REACTOR_WEBRTC_OPENH264
@@ -2090,6 +2104,19 @@ void* reactor_webrtc_factory_create(const ReactorFactoryOptions* opts,
   apple_dec = reactor::CreateAppleHwVideoDecoderFactory();
 #endif
 
+  // Encoder-callback ownership is taken HERE — after every fallible step
+  // above: an earlier return (bad options, OpenH264 path in a non-OpenH264
+  // build, thread start) never constructs the state and never frees its
+  // userdata, so the binding's own error cleanup owns exactly that region.
+  // From here on, any failure destroys `state`, whose destructor is the one
+  // place userdata gets freed — the binding must not free it a second time.
+  std::shared_ptr<ReactorEncoderState> state;
+  if (opts->encode_cb) {
+    state = std::make_shared<ReactorEncoderState>(
+        opts->encode_cb, opts->encode_userdata, opts->encode_free_ud,
+        opts->encode_use_builtin, opts->encode_has_custom_slots);
+  }
+
   auto f = std::make_unique<ReactorFactory>();
   f->network_thread   = webrtc::Thread::CreateWithSocketServer();
   f->worker_thread    = webrtc::Thread::Create();
@@ -2116,7 +2143,7 @@ void* reactor_webrtc_factory_create(const ReactorFactoryOptions* opts,
       std::make_unique<ReactorCompositeVideoEncoderFactory>(
           state, std::move(openh264_enc), std::move(apple_enc)),
       std::make_unique<ReactorCompositeVideoDecoderFactory>(
-          std::move(openh264_dec), std::move(apple_dec), state != nullptr),
+          std::move(openh264_dec), std::move(apple_dec), state),
       /*audio_mixer=*/nullptr, /*audio_processing=*/apm);
   if (!f->factory) {
     write_error(err, err_cap, "CreatePeerConnectionFactory returned null");
