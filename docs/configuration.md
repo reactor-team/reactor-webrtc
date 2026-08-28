@@ -15,6 +15,7 @@ an existing `pc`.
 - [TCP candidates](#tcp-candidates)
 - [ICE timeouts](#ice-timeouts)
 - [Congestion-control bitrate limits](#congestion-control-bitrate-limits)
+- [Per-sender bitrate limits](#per-sender-bitrate-limits)
 
 ## ICE servers
 
@@ -320,3 +321,71 @@ three you pass, and `set_bitrate` returns an error (`RuntimeError` in Python)
 if that ordering doesn't hold — validate your inputs before calling it
 rather than relying on the error to catch a misconfiguration at connection
 time.
+
+Note that `max_bps` here bounds what the *connection* may allocate, not what
+any one video stream may use. Raising it alone will not push a video track
+past 2.5 Mbps — see [Per-sender bitrate limits](#per-sender-bitrate-limits)
+below for the ceiling that does.
+
+## Per-sender bitrate limits
+
+`set_send_bitrate` is a `Transceiver` method. It bounds **one stream's**
+bitrate, where [`set_bitrate`](#congestion-control-bitrate-limits) bounds the
+whole connection's. The two are conjunctive — the lower one wins — so both
+have to be high enough for a stream to run fast.
+
+This is the one that matters for video quality, because of a libwebrtc
+default that is easy to hit and hard to see. When nothing sets an explicit
+per-stream maximum, libwebrtc picks one from the frame size alone
+(`GetMaxDefaultVideoBitrateKbps` in `media/engine/webrtc_video_engine.cc`):
+
+| Resolution | Default maximum |
+| ---------- | --------------- |
+| ≤ 320×240  | 600 kbps        |
+| ≤ 640×480  | 1700 kbps       |
+| ≤ 960×540  | 2000 kbps       |
+| above that | **2500 kbps**   |
+
+720p, 1080p and 4K all land on that same 2.5 Mbps ceiling. Calling
+`set_send_bitrate` with a `max_bps` is the only way to lift it — no amount of
+congestion-control headroom will.
+
+Both snippets below assume `tc` is a video transceiver, from
+`add_transceiver` or from `transceivers()`.
+
+<details>
+<summary>🦀 Example using Rust</summary>
+
+```rust
+// Let a 1080p track use up to 8 Mbps instead of libwebrtc's 2.5.
+tc.set_send_bitrate(None, Some(8_000_000))?;
+```
+
+</details>
+
+<details>
+<summary>🐍 Example using Python</summary>
+
+```python
+await tc.set_send_bitrate(max_bps=8_000_000)
+```
+
+</details>
+
+Both arguments are optional bits-per-second values; `None` leaves that bound
+at its libwebrtc default, and passing `None` for both restores the defaults
+for a sender you had previously bounded. `min_bps` above `max_bps` is
+rejected with an error (`RuntimeError` in Python).
+
+Call it before or after negotiation — the sender exists as soon as the
+transceiver does, and libwebrtc applies new bounds to a running encoder — and
+call it again to change the bounds mid-call.
+
+Two things worth knowing before you reach for it:
+
+- **A ceiling is permission, not a target.** The encoder still only spends
+  what the congestion controller has allocated and what the content needs; a
+  static scene stays cheap at any ceiling. What raising it buys you is
+  headroom for the moments that would otherwise be clipped.
+- **The bounds apply to the first encoding.** For a simulcast sender that is
+  the first layer, not the whole ladder — per-layer control is not exposed.

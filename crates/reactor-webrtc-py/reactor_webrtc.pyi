@@ -445,6 +445,26 @@ class Transceiver:
         call needed.
         """
         ...
+    async def set_send_bitrate(
+        self, min_bps: Optional[int] = None, max_bps: Optional[int] = None
+    ) -> None:
+        """Set this transceiver's per-sender bitrate bounds — the ceiling that
+        actually caps the video encoder.
+
+        A different knob from PeerConnection.set_bitrate, and the two are
+        conjunctive: the lower one wins. set_bitrate bounds the aggregate
+        congestion-control estimate for the whole connection; this bounds one
+        stream's share of it.
+
+        Without this call the stream's ceiling is libwebrtc's resolution-keyed
+        default — 2500 kbps above 960x540, so 720p, 1080p and 4K all cap at
+        2.5 Mbps however high the congestion-control ceiling goes. Setting
+        max_bps here is the only way to lift it.
+
+        Pass None to leave a bound at its libwebrtc default; 0 is treated as
+        None. Units are bits-per-second, applied to the first encoding.
+        """
+        ...
     def set_sender_transform(self, transform: FrameTransform) -> None:
         """Attach a FrameTransform to the sender path of this transceiver.
         The transform runs after the encoder, before RTP packetization.

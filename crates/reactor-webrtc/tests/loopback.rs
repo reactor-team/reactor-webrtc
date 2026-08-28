@@ -178,3 +178,56 @@ fn safe_loopback_exchanges_media() {
     println!("safe loopback connected ✅ — pc2 received {v} video + {a} audio frame(s)");
     // RAII teardown: tracks, peer connections, factory all drop here.
 }
+
+/// `Transceiver::set_send_bitrate` — the per-sender ceiling, which is a
+/// different knob from `PeerConnection::set_bitrate` (see the method docs).
+///
+/// This covers the API contract — accepted before and after negotiation, both
+/// bounds independently optional, bad input rejected — rather than the
+/// resulting wire bitrate. Proving the encoder actually exceeds libwebrtc's
+/// 2500 kbps default needs a sustained high-entropy 1080p stream over a path
+/// with real headroom, which is a bandwidth measurement, not a unit test: it
+/// would take tens of seconds and still be at the mercy of the congestion
+/// controller's ramp.
+#[test]
+fn set_send_bitrate_bounds() {
+    use reactor_webrtc::{MediaKind, TransceiverDirection};
+
+    let factory = PeerConnectionFactory::builder().build().expect("factory");
+    let config = RtcConfiguration::default();
+    let (pc, _shared) = make_peer(&factory, &config);
+
+    let tc = pc
+        .add_transceiver(MediaKind::Video, TransceiverDirection::SendOnly)
+        .expect("add video transceiver");
+
+    // Before negotiation: the sender exists as soon as the transceiver does.
+    tc.set_send_bitrate(None, Some(8_000_000))
+        .expect("max-only, pre-negotiation");
+    tc.set_send_bitrate(Some(1_000_000), Some(8_000_000))
+        .expect("both bounds");
+
+    // Each bound is independently optional, and clearing back to the libwebrtc
+    // default is expressible.
+    tc.set_send_bitrate(Some(1_000_000), None)
+        .expect("min-only");
+    tc.set_send_bitrate(None, None).expect("clear both");
+
+    // An inverted pair is rejected here, with a message that names the problem —
+    // libwebrtc's own rejection does not say which pair was at fault.
+    let err = tc
+        .set_send_bitrate(Some(8_000_000), Some(1_000_000))
+        .expect_err("min above max must be rejected");
+    assert!(
+        err.to_string().contains("min_bps exceeds max_bps"),
+        "unexpected error for inverted bounds: {err}",
+    );
+
+    // After negotiation the sender is live; the bounds still apply.
+    let offer = pc.create_offer().expect("create offer");
+    pc.set_local_description(&offer).expect("local offer");
+    tc.set_send_bitrate(None, Some(6_000_000))
+        .expect("post-negotiation");
+
+    println!("set_send_bitrate: bounds accepted pre- and post-negotiation ✅");
+}
