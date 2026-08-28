@@ -15,11 +15,14 @@ An answerer that bounds its audio senders while building the answer gets
 `sender has no encodings`, which took down a whole negotiation in
 reactor-runtime before the cause was clear.
 
-The refusal now names it, rather than leaving the reader to inspect their own
-track plumbing. And it costs nothing to work around: the ceiling this lifts is
-libwebrtc's resolution-keyed *video* default, so an audio sender has nothing to
-lift — Opus is bounded by its own codec parameters. Bound video senders, skip
-audio ones.
+The refusal now names the cause and when the call becomes valid, rather than
+leaving the reader to inspect their own track plumbing.
+
+Only the *default* being lifted is video-specific — it is keyed on frame size.
+The bounds themselves apply to an audio sender too, capping its allocation. So
+an answerer that only wants to clear that default can bound its video senders
+while building the answer; one that also wants an audio bound applies it after
+`set_local_description`.
 
 Docs corrected in the Rust API, the C ABI and `docs/configuration.md`. No API
 change.

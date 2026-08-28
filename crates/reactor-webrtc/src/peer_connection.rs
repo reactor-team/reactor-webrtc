@@ -579,10 +579,12 @@ impl Transceiver {
     /// remote offer does not get one for audio until the answer is set locally.
     /// Called before that, this returns "sender has no encodings".
     ///
-    /// In practice that costs nothing, because the ceiling this lifts is
-    /// libwebrtc's resolution-keyed *video* default: an audio sender has
-    /// nothing to lift, since Opus is bounded by its own codec parameters. An
-    /// answerer should bound its video senders and skip the audio ones.
+    /// Only the *default* being lifted is video-specific — it is keyed on frame
+    /// size. The bounds themselves apply to an audio sender too, capping its
+    /// allocation. So an answerer that only wants to clear that default can
+    /// bound its video senders while building the answer, and one that also
+    /// wants an audio bound applies it after
+    /// [`PeerConnection::set_local_description`].
     ///
     /// Can be called again at any point to change the bounds mid-call.
     ///

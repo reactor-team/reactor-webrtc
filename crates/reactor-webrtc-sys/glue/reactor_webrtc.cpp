@@ -1646,8 +1646,11 @@ int reactor_webrtc_rtp_transceiver_lock_negotiated_send_codec(void* transceiver)
 // until the local description is applied, though VIDEO does. Called before
 // that, this reports "sender has no encodings".
 //
-// It costs nothing in practice — the ceiling this lifts is the resolution-keyed
-// video default, so an audio sender has nothing to lift.
+// Only the *default* being lifted is video-specific (it is keyed on frame
+// size); the bounds themselves apply to an audio sender too, capping its
+// allocation. So an answerer wanting only to clear that default can bound its
+// video senders while building the answer, and one that also wants an audio
+// bound applies it after set_local_description.
 //
 // Can be called again at any point; libwebrtc applies new bounds to a running
 // encoder.
@@ -1702,8 +1705,8 @@ int reactor_webrtc_rtp_transceiver_set_send_bitrate(void* transceiver,
     write_error(err, err_cap,
                 h->tc->media_type() == webrtc::MediaType::AUDIO
                     ? "sender has no encodings: an audio transceiver from a remote description "
-                      "has none until the local description is applied. It needs no bound "
-                      "anyway; the default this lifts is the video one"
+                      "has none until the local description is applied. Call this again after "
+                      "set_local_description"
                     : "sender has no encodings");
     return -1;
   }

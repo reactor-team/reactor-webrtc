@@ -395,10 +395,11 @@ it is the one sharp edge here:
 offer does not get one for audio until the answer is set locally. Called before
 that, this returns an error reading `sender has no encodings`.
 
-In practice that costs nothing: the ceiling this lifts is libwebrtc's
-resolution-keyed *video* default, so an audio sender has nothing to lift —
-Opus is bounded by its own codec parameters instead. An answerer should bound
-its video senders and skip the audio ones.
+Only the *default* being lifted is video-specific — it is keyed on frame size.
+The bounds themselves apply to an audio sender too, capping its allocation. So
+an answerer that only wants to clear that default can bound its video senders
+while building the answer; one that also wants an audio bound applies it after
+`set_local_description`.
 
 Two things worth knowing before you reach for it:
 

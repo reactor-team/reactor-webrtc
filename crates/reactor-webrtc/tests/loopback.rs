@@ -313,6 +313,14 @@ fn an_answerers_audio_sender_has_no_encodings_before_the_local_description() {
                         && message.contains("local description is applied"),
                     "the refusal must name the cause: {message}",
                 );
+                // And when the call becomes valid. The bounds do apply to audio —
+                // they cap its allocation — so the refusal must read as "not yet",
+                // never as "not worth doing", or it talks a caller out of a
+                // legitimate audio limit.
+                assert!(
+                    message.contains("set_local_description"),
+                    "the refusal must say when to retry: {message}",
+                );
             }
             MediaKind::Unknown => {}
         }
