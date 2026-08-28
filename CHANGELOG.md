@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.14.0 — per-sender bitrate bounds
+
+`PeerConnection::set_bitrate` bounds the congestion controller's estimate for
+the whole connection. Nothing bounded a single sender, and that is the ceiling
+which actually caps a video encoder: with no explicit per-stream maximum,
+libwebrtc derives one from the frame size alone, and it is **2500 kbps for
+anything above 960x540**. 720p, 1080p and 4K all cap at 2.5 Mbps, and no amount
+of congestion-control headroom lifts it — the two ceilings are conjunctive, so
+the lower one wins.
+
+Additive. Nothing removed, nothing renamed.
+
+### Added
+
+`Transceiver::set_send_bitrate(min_bps, max_bps)` — sets
+`RtpEncodingParameters::min/max_bitrate_bps` on the sender's first encoding.
+Callable before or after negotiation, and again to change the bounds mid-call.
+
+```rust
+// Let a 1080p track use up to 8 Mbps instead of libwebrtc's 2.5.
+transceiver.set_send_bitrate(None, Some(8_000_000))?;
+```
+
+```python
+await transceiver.set_send_bitrate(max_bps=8_000_000)
+```
+
+Both bounds are optional; `None` leaves one at the libwebrtc default. A
+negative value is refused rather than read as "unset" — `None` is how a bound
+is left alone, so a negative is far likelier to be a typo or an arithmetic slip
+than a request, and quietly removing a cap somebody set would be the opposite
+of what was asked. `min_bps` above `max_bps` is refused too, with a message
+naming the pair, which libwebrtc's own rejection does not.
+
+The C ABI gains `reactor_webrtc_rtp_transceiver_set_send_bitrate`, where `-1`
+— and only `-1` — spells "leave at the default".
+
+See the new "Per-sender bitrate limits" section in
+[`docs/configuration.md`](docs/configuration.md), which spells out how this
+ceiling relates to `set_bitrate`'s. They are easy to confuse and only one of
+them lifts the default.
+
 ## 0.13.0 — composable factory builder + per-track options
 
 The factory learns a single composable builder, tracks learn per-track
