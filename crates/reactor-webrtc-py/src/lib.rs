@@ -1658,6 +1658,40 @@ impl Transceiver {
         })
     }
 
+    /// Set this transceiver's **per-sender** bitrate bounds — the ceiling that
+    /// actually caps the video encoder.
+    ///
+    /// This is a different knob from `PeerConnection.set_bitrate`, and the two
+    /// are conjunctive: the lower one wins. `set_bitrate` bounds the aggregate
+    /// congestion-control estimate for the whole connection; this bounds one
+    /// stream's share of it.
+    ///
+    /// Without this call the stream's ceiling is libwebrtc's resolution-keyed
+    /// default — 2500 kbps for anything above 960x540, so 720p, 1080p and 4K
+    /// all cap at 2.5 Mbps however high the congestion-control ceiling goes.
+    /// Setting `max_bps` here is the only way to lift it.
+    ///
+    /// Pass `None` to leave a bound at its libwebrtc default. A negative value
+    /// raises rather than clearing the bound, since `None` is how a bound is
+    /// left unset and a negative is far likelier to be a mistake. Units are
+    /// bits-per-second, and the bounds apply to the first encoding. Natively
+    /// awaitable.
+    #[pyo3(signature = (min_bps=None, max_bps=None))]
+    fn set_send_bitrate<'py>(
+        &self,
+        py: Python<'py>,
+        min_bps: Option<i32>,
+        max_bps: Option<i32>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(self.tc()?);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            tokio::task::spawn_blocking(move || inner.set_send_bitrate(min_bps, max_bps))
+                .await
+                .map_err(join_err)?
+                .map_err(err)
+        })
+    }
+
     /// Attach a `FrameTransform` to the sender path of this transceiver.
     /// The transform runs after the encoder, before RTP packetization.
     fn set_sender_transform(&self, py: Python, transform: &FrameTransform) -> PyResult<()> {

@@ -617,6 +617,24 @@ extern "C" {
     pub fn reactor_webrtc_rtp_transceiver_lock_negotiated_send_codec(
         transceiver: *mut RtpTransceiver,
     ) -> c_int;
+    /// Set this transceiver's **per-sender** bitrate bounds, on `encodings[0]`.
+    ///
+    /// This is not the same ceiling as
+    /// [`reactor_webrtc_peer_connection_set_bitrate`]: that one bounds the
+    /// aggregate congestion-control estimate for the connection, this one bounds
+    /// one stream's share of it. They are conjunctive — the lower wins — and
+    /// without this call the stream's ceiling is libwebrtc's resolution-keyed
+    /// default (2500 kbps for anything above 960x540).
+    ///
+    /// Pass `-1` for either bound to leave it unset. Returns 0 on success, -1 on
+    /// error, with the message written into `err`.
+    pub fn reactor_webrtc_rtp_transceiver_set_send_bitrate(
+        transceiver: *mut RtpTransceiver,
+        min_bps: c_int,
+        max_bps: c_int,
+        err: *mut c_char,
+        err_cap: c_int,
+    ) -> c_int;
     /// Identity of the transceiver itself, as an opaque value — **not** an owning
     /// handle. Stable for the transceiver's life, unlike the handle pointer, which
     /// is a fresh allocation per `transceivers()` call. Usable as a key before any

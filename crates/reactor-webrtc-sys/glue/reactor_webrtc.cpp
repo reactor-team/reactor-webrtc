@@ -1617,6 +1617,96 @@ int reactor_webrtc_rtp_transceiver_lock_negotiated_send_codec(void* transceiver)
   return 0;  // none of the preferred codecs were actually negotiated for this sender
 }
 
+// Set this transceiver's *per-sender* bitrate bounds — the ceiling that
+// actually caps the video encoder, which is NOT the same knob as
+// reactor_webrtc_peer_connection_set_bitrate.
+//
+// The two are conjunctive and the lower one wins:
+//
+//   - PeerConnection::SetBitrate (BitrateSettings) bounds the aggregate
+//     congestion-control estimate for the whole connection — how much
+//     bandwidth GCC believes it may allocate.
+//   - RtpEncodingParameters::max_bitrate_bps, set here, bounds this one
+//     stream's share of that allocation.
+//
+// Without this call the stream's ceiling is libwebrtc's resolution-keyed
+// default (GetMaxDefaultVideoBitrateKbps in webrtc_video_engine.cc), which is
+// 2500 kbps for anything above 960x540 — so 720p, 1080p and 4K all cap at
+// 2.5 Mbps no matter how high the congestion-control ceiling is raised.
+// Setting max_bps here is the only way to lift that.
+//
+// Use -1 for either bound to leave it unset (libwebrtc default). Values are in
+// bits per second and apply to encodings[0]; simulcast senders are out of
+// scope here — this deliberately touches only the first encoding, which is the
+// single-stream case every caller has today.
+//
+// Can be called before or after negotiation: the sender exists as soon as the
+// transceiver does, and libwebrtc applies the new bounds to the running
+// encoder.
+//
+// Returns 0 on success, -1 on error (message written to err/err_cap).
+int reactor_webrtc_rtp_transceiver_set_send_bitrate(void* transceiver,
+                                                    int min_bps,
+                                                    int max_bps,
+                                                    char* err,
+                                                    int err_cap) {
+  auto* h = reinterpret_cast<ReactorTransceiver*>(transceiver);
+  if (!h || !h->tc) {
+    write_error(err, err_cap, "no transceiver");
+    return -1;
+  }
+  auto sender = h->tc->sender();
+  if (!sender) {
+    write_error(err, err_cap, "transceiver has no sender");
+    return -1;
+  }
+
+  // -1 is the ABI's only spelling of "leave this bound at the libwebrtc
+  // default". Any other negative is a caller error — a typo, or an arithmetic
+  // slip like `budget - overhead` going below zero — and must not be read as
+  // "clear the cap": silently removing a limit somebody set is the opposite of
+  // what was asked, and it reports success while doing it.
+  if (min_bps < -1 || max_bps < -1) {
+    write_error(err, err_cap,
+                std::string{"a bitrate bound must be >= 0, or -1 to leave it at the libwebrtc "
+                            "default (got min_bps="} +
+                    std::to_string(min_bps) + ", max_bps=" + std::to_string(max_bps) + ")");
+    return -1;
+  }
+
+  // libwebrtc rejects the whole SetParameters call when min > max, with a
+  // message that does not name the offending pair. Catch it here so the caller
+  // gets something actionable.
+  if (min_bps >= 0 && max_bps >= 0 && min_bps > max_bps) {
+    write_error(err, err_cap, "min_bps exceeds max_bps");
+    return -1;
+  }
+
+  // GetParameters() must be the immediate source of the struct handed back to
+  // SetParameters() — libwebrtc stamps it with a transaction id and rejects
+  // anything stale or synthesized.
+  webrtc::RtpParameters params = sender->GetParameters();
+  if (params.encodings.empty()) {
+    write_error(err, err_cap, "sender has no encodings");
+    return -1;
+  }
+
+  // Only -1 becomes nullopt, and nullopt is what restores the libwebrtc
+  // default. Zero is a value like any other and goes through: a caller who
+  // wrote 0 asked for something, and libwebrtc's own answer to it says more
+  // than a reinterpretation here would.
+  const auto bound = [](int v) { return v < 0 ? std::nullopt : std::optional<int>(v); };
+  params.encodings[0].min_bitrate_bps = bound(min_bps);
+  params.encodings[0].max_bitrate_bps = bound(max_bps);
+
+  auto result = sender->SetParameters(params);
+  if (!result.ok()) {
+    write_error(err, err_cap, result.message());
+    return -1;
+  }
+  return 0;
+}
+
 // Identity of the *transceiver* itself, as an opaque value — not an owning
 // handle.
 //

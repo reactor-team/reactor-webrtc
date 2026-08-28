@@ -546,6 +546,77 @@ impl Transceiver {
         ok == 1
     }
 
+    /// Set this transceiver's **per-sender** bitrate bounds — the ceiling that
+    /// actually caps the video encoder.
+    ///
+    /// This is a different knob from [`PeerConnection::set_bitrate`], and the
+    /// two are conjunctive: the lower one wins.
+    ///
+    /// - [`PeerConnection::set_bitrate`] bounds the *aggregate* congestion-control
+    ///   estimate for the whole connection — how much bandwidth the GCC algorithm
+    ///   believes it may allocate.
+    /// - This method bounds *this one stream's* share of that allocation.
+    ///
+    /// Without this call, the stream's ceiling is libwebrtc's resolution-keyed
+    /// default: 600 kbps up to 320x240, 1700 up to 640x480, 2000 up to 960x540,
+    /// and **2500 kbps for everything above that**. So 720p, 1080p and 4K all cap
+    /// at 2.5 Mbps no matter how high the congestion-control ceiling is raised —
+    /// setting `max_bps` here is the only way to lift it.
+    ///
+    /// Both bounds are optional; pass `None` to leave one at the libwebrtc
+    /// default. Values are in bits per second, and apply to the first encoding
+    /// (the single-stream case — simulcast layers are not addressed individually).
+    ///
+    /// Can be called before or after negotiation, and again at any point to
+    /// change the bounds mid-call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Webrtc`] when either bound is negative — `None`, not a
+    /// negative number, is how a bound is left unset — when `min_bps` exceeds
+    /// `max_bps`, when the transceiver has no sender or no encodings, or when
+    /// libwebrtc rejects the parameters.
+    pub fn set_send_bitrate(&self, min_bps: Option<i32>, max_bps: Option<i32>) -> Result<()> {
+        // `None` is how a caller says "leave this at the libwebrtc default", and
+        // it crosses the ABI as -1. A negative `Some` is therefore ambiguous with
+        // that sentinel, and resolving it as "unset" would take a typo — or an
+        // arithmetic slip like `budget - overhead` going below zero — and quietly
+        // remove a cap the caller had set, reporting success. Refuse it here, so
+        // it never reaches the boundary where the two become indistinguishable.
+        for (label, value) in [("min_bps", min_bps), ("max_bps", max_bps)] {
+            if let Some(v) = value {
+                if v < 0 {
+                    return Err(Error::Webrtc(format!(
+                        "{label} must be >= 0; pass None to leave it at the libwebrtc default \
+                         (got {v})"
+                    )));
+                }
+            }
+        }
+
+        let mut err = [0 as std::os::raw::c_char; 256];
+        let rc = unsafe {
+            reactor_webrtc_sys::reactor_webrtc_rtp_transceiver_set_send_bitrate(
+                self.raw,
+                min_bps.unwrap_or(-1),
+                max_bps.unwrap_or(-1),
+                err.as_mut_ptr(),
+                err.len() as std::os::raw::c_int,
+            )
+        };
+        if rc != 0 {
+            let reason = unsafe { std::ffi::CStr::from_ptr(err.as_ptr()) }
+                .to_string_lossy()
+                .into_owned();
+            return Err(Error::Webrtc(if reason.is_empty() {
+                "transceiver set_send_bitrate failed".into()
+            } else {
+                reason
+            }));
+        }
+        Ok(())
+    }
+
     /// Attach an encoded-frame transform to this transceiver's **sender**
     /// (encoder → packetizer): observe/replace/drop each encoded frame before
     /// it is sent. See [`crate::FrameTransform`].
