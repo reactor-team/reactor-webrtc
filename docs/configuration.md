@@ -375,7 +375,10 @@ await tc.set_send_bitrate(max_bps=8_000_000)
 Both arguments are optional bits-per-second values; `None` leaves that bound
 at its libwebrtc default, and passing `None` for both restores the defaults
 for a sender you had previously bounded. `min_bps` above `max_bps` is
-rejected with an error (`RuntimeError` in Python).
+rejected with an error (`RuntimeError` in Python), and so is a negative
+bound — `None` is how a bound is left unset, so a negative is far likelier
+to be a typo or an arithmetic slip than a request, and quietly reading it as
+"remove the cap" would be the opposite of what was asked.
 
 Call it before or after negotiation — the sender exists as soon as the
 transceiver does, and libwebrtc applies new bounds to a running encoder — and

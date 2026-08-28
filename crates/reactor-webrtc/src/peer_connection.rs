@@ -572,10 +572,28 @@ impl Transceiver {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Webrtc`] when `min_bps` exceeds `max_bps`, when the
-    /// transceiver has no sender or no encodings, or when libwebrtc rejects the
-    /// parameters.
+    /// Returns [`Error::Webrtc`] when either bound is negative — `None`, not a
+    /// negative number, is how a bound is left unset — when `min_bps` exceeds
+    /// `max_bps`, when the transceiver has no sender or no encodings, or when
+    /// libwebrtc rejects the parameters.
     pub fn set_send_bitrate(&self, min_bps: Option<i32>, max_bps: Option<i32>) -> Result<()> {
+        // `None` is how a caller says "leave this at the libwebrtc default", and
+        // it crosses the ABI as -1. A negative `Some` is therefore ambiguous with
+        // that sentinel, and resolving it as "unset" would take a typo — or an
+        // arithmetic slip like `budget - overhead` going below zero — and quietly
+        // remove a cap the caller had set, reporting success. Refuse it here, so
+        // it never reaches the boundary where the two become indistinguishable.
+        for (label, value) in [("min_bps", min_bps), ("max_bps", max_bps)] {
+            if let Some(v) = value {
+                if v < 0 {
+                    return Err(Error::Webrtc(format!(
+                        "{label} must be >= 0; pass None to leave it at the libwebrtc default \
+                         (got {v})"
+                    )));
+                }
+            }
+        }
+
         let mut err = [0 as std::os::raw::c_char; 256];
         let rc = unsafe {
             reactor_webrtc_sys::reactor_webrtc_rtp_transceiver_set_send_bitrate(

@@ -461,8 +461,10 @@ class Transceiver:
         2.5 Mbps however high the congestion-control ceiling goes. Setting
         max_bps here is the only way to lift it.
 
-        Pass None to leave a bound at its libwebrtc default; 0 is treated as
-        None. Units are bits-per-second, applied to the first encoding.
+        Pass None to leave a bound at its libwebrtc default. A negative value
+        raises rather than clearing the bound, since None is how a bound is
+        left unset and a negative is far likelier to be a mistake. Units are
+        bits-per-second, applied to the first encoding.
         """
         ...
     def set_sender_transform(self, transform: FrameTransform) -> None:

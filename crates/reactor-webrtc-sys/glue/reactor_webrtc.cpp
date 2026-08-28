@@ -1661,10 +1661,23 @@ int reactor_webrtc_rtp_transceiver_set_send_bitrate(void* transceiver,
     return -1;
   }
 
+  // -1 is the ABI's only spelling of "leave this bound at the libwebrtc
+  // default". Any other negative is a caller error — a typo, or an arithmetic
+  // slip like `budget - overhead` going below zero — and must not be read as
+  // "clear the cap": silently removing a limit somebody set is the opposite of
+  // what was asked, and it reports success while doing it.
+  if (min_bps < -1 || max_bps < -1) {
+    write_error(err, err_cap,
+                std::string{"a bitrate bound must be >= 0, or -1 to leave it at the libwebrtc "
+                            "default (got min_bps="} +
+                    std::to_string(min_bps) + ", max_bps=" + std::to_string(max_bps) + ")");
+    return -1;
+  }
+
   // libwebrtc rejects the whole SetParameters call when min > max, with a
   // message that does not name the offending pair. Catch it here so the caller
   // gets something actionable.
-  if (min_bps > 0 && max_bps > 0 && min_bps > max_bps) {
+  if (min_bps >= 0 && max_bps >= 0 && min_bps > max_bps) {
     write_error(err, err_cap, "min_bps exceeds max_bps");
     return -1;
   }
@@ -1678,12 +1691,13 @@ int reactor_webrtc_rtp_transceiver_set_send_bitrate(void* transceiver,
     return -1;
   }
 
-  // std::nullopt, not 0: a zero here is a real "cap this stream at zero"
-  // request, whereas unset is what restores the libwebrtc default.
-  params.encodings[0].min_bitrate_bps =
-      min_bps > 0 ? std::optional<int>(min_bps) : std::nullopt;
-  params.encodings[0].max_bitrate_bps =
-      max_bps > 0 ? std::optional<int>(max_bps) : std::nullopt;
+  // Only -1 becomes nullopt, and nullopt is what restores the libwebrtc
+  // default. Zero is a value like any other and goes through: a caller who
+  // wrote 0 asked for something, and libwebrtc's own answer to it says more
+  // than a reinterpretation here would.
+  const auto bound = [](int v) { return v < 0 ? std::nullopt : std::optional<int>(v); };
+  params.encodings[0].min_bitrate_bps = bound(min_bps);
+  params.encodings[0].max_bitrate_bps = bound(max_bps);
 
   auto result = sender->SetParameters(params);
   if (!result.ok()) {

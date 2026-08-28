@@ -223,6 +223,31 @@ fn set_send_bitrate_bounds() {
         "unexpected error for inverted bounds: {err}",
     );
 
+    // A negative bound is refused rather than read as the -1 the ABI uses for
+    // "unset". Resolving it that way would take a typo and quietly remove a cap
+    // the caller had set, while reporting success.
+    for (label, min, max) in [
+        ("max_bps", None, Some(-8_000_000)),
+        ("min_bps", Some(-1_000_000), None),
+    ] {
+        let err = tc
+            .set_send_bitrate(min, max)
+            .expect_err("a negative bound must be rejected");
+        assert!(
+            err.to_string().contains(label) && err.to_string().contains("must be >= 0"),
+            "unexpected error for a negative {label}: {err}",
+        );
+    }
+    // The cap set above is still in force: the refusals above changed nothing.
+    tc.set_send_bitrate(None, Some(8_000_000))
+        .expect("still settable after a refusal");
+
+    // Zero is a value, not a spelling of "unset" — it reaches libwebrtc and
+    // libwebrtc answers. Whichever way it answers, it must not be silently
+    // rewritten into "leave the default alone" on the way there.
+    let zero = tc.set_send_bitrate(None, Some(0));
+    println!("set_send_bitrate(max=0) -> {zero:?}");
+
     // After negotiation the sender is live; the bounds still apply.
     let offer = pc.create_offer().expect("create offer");
     pc.set_local_description(&offer).expect("local offer");
