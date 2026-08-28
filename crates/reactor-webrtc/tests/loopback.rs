@@ -254,5 +254,93 @@ fn set_send_bitrate_bounds() {
     tc.set_send_bitrate(None, Some(6_000_000))
         .expect("post-negotiation");
 
+    // An audio transceiver that came from `add_transceiver` is writable straight
+    // away — AddTransceiver seeds a default encoding.
+    let audio = pc
+        .add_transceiver(MediaKind::Audio, TransceiverDirection::SendOnly)
+        .expect("add audio transceiver");
+    audio
+        .set_send_bitrate(None, Some(128_000))
+        .expect("an add_transceiver audio sender has encodings");
+
     println!("set_send_bitrate: bounds accepted pre- and post-negotiation ✅");
+}
+
+/// The one shape that cannot be bound before the answer: an **audio**
+/// transceiver materialised by applying a **remote description**. It has no
+/// encodings until the local description is set, where a video one in the same
+/// position has them immediately.
+///
+/// This is not a corner case — it is what every answerer does, and calling
+/// `set_send_bitrate` there took down a whole negotiation in reactor-runtime.
+/// So the refusal has to name the cause: "sender has no encodings" on its own
+/// sends the reader looking at their own track plumbing.
+#[test]
+fn an_answerers_audio_sender_has_no_encodings_before_the_local_description() {
+    use reactor_webrtc::{MediaKind, TransceiverDirection};
+
+    let factory = PeerConnectionFactory::builder().build().expect("factory");
+    let config = RtcConfiguration::default();
+
+    // A remote peer that wants to receive audio and video.
+    let (offerer, _s1) = make_peer(&factory, &config);
+    offerer
+        .add_transceiver(MediaKind::Audio, TransceiverDirection::RecvOnly)
+        .expect("remote audio");
+    offerer
+        .add_transceiver(MediaKind::Video, TransceiverDirection::RecvOnly)
+        .expect("remote video");
+    let offer = offerer.create_offer().expect("create offer");
+    offerer.set_local_description(&offer).expect("local offer");
+
+    // Our side: both transceivers exist only because the offer was applied.
+    let (answerer, _s2) = make_peer(&factory, &config);
+    answerer
+        .set_remote_description(&offer)
+        .expect("remote offer");
+
+    for tc in answerer.transceivers() {
+        let result = tc.set_send_bitrate(None, Some(8_000_000));
+        match tc.kind() {
+            MediaKind::Video => {
+                result.expect("a video sender has encodings before the answer");
+            }
+            MediaKind::Audio => {
+                let err = result.expect_err("an audio sender has none before the answer");
+                let message = err.to_string();
+                assert!(
+                    message.contains("remote description")
+                        && message.contains("local description is applied"),
+                    "the refusal must name the cause: {message}",
+                );
+                // And when the call becomes valid. The bounds do apply to audio —
+                // they cap its allocation — so the refusal must read as "not yet",
+                // never as "not worth doing", or it talks a caller out of a
+                // legitimate audio limit.
+                assert!(
+                    message.contains("set_local_description"),
+                    "the refusal must say when to retry: {message}",
+                );
+            }
+            MediaKind::Unknown => {}
+        }
+    }
+
+    // Once the answer is applied, the audio sender is writable like any other —
+    // provided the answerer actually declared itself as sending, which is what
+    // puts a sender behind the slot. This mirrors what reactor-runtime does.
+    for tc in answerer.transceivers() {
+        tc.set_direction(TransceiverDirection::SendOnly)
+            .expect("answer as a sender");
+    }
+    let answer = answerer.create_answer().expect("create answer");
+    answerer
+        .set_local_description(&answer)
+        .expect("local answer");
+    for tc in answerer.transceivers() {
+        tc.set_send_bitrate(None, Some(8_000_000))
+            .expect("both kinds are writable once the answer is applied");
+    }
+
+    println!("answerer audio sender: refused before the answer, accepted after ✅");
 }

@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.14.1 — say when a sender has encodings to write
+
+`set_send_bitrate` documented itself as callable "before or after negotiation".
+That is true of a transceiver from `add_transceiver`, which seeds a default
+encoding, and false of the shape every answerer actually has:
+
+| Transceiver from | audio | video |
+|---|---|---|
+| `add_transceiver` | has encodings | has encodings |
+| applying a remote description | **none until the local description is applied** | has encodings |
+
+An answerer that bounds its audio senders while building the answer gets
+`sender has no encodings`, which took down a whole negotiation in
+reactor-runtime before the cause was clear.
+
+The refusal now names the cause and when the call becomes valid, rather than
+leaving the reader to inspect their own track plumbing.
+
+Only the *default* being lifted is video-specific — it is keyed on frame size.
+The bounds themselves apply to an audio sender too, capping its allocation. So
+an answerer that only wants to clear that default can bound its video senders
+while building the answer; one that also wants an audio bound applies it after
+`set_local_description`.
+
+Docs corrected in the Rust API, the C ABI and `docs/configuration.md`. No API
+change.
+
 ## 0.14.0 — per-sender bitrate bounds
 
 `PeerConnection::set_bitrate` bounds the congestion controller's estimate for
