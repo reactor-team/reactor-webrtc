@@ -1640,8 +1640,16 @@ int reactor_webrtc_rtp_transceiver_lock_negotiated_send_codec(void* transceiver)
 // scope here — this deliberately touches only the first encoding, which is the
 // single-stream case every caller has today.
 //
-// Can be called before or after negotiation: the sender exists as soon as the
-// transceiver does, and libwebrtc applies the new bounds to the running
+// When the sender has encodings to write depends on where the transceiver came
+// from. AddTransceiver seeds a default encoding, so both kinds are writable at
+// once; one materialised from a remote description does not get one for AUDIO
+// until the local description is applied, though VIDEO does. Called before
+// that, this reports "sender has no encodings".
+//
+// It costs nothing in practice — the ceiling this lifts is the resolution-keyed
+// video default, so an audio sender has nothing to lift.
+//
+// Can be called again at any point; libwebrtc applies new bounds to a running
 // encoder.
 //
 // Returns 0 on success, -1 on error (message written to err/err_cap).
@@ -1687,7 +1695,16 @@ int reactor_webrtc_rtp_transceiver_set_send_bitrate(void* transceiver,
   // anything stale or synthesized.
   webrtc::RtpParameters params = sender->GetParameters();
   if (params.encodings.empty()) {
-    write_error(err, err_cap, "sender has no encodings");
+    // Almost always one specific mistake, so the message names it rather than
+    // leaving the caller to find out what "no encodings" means: an audio sender
+    // has none until the local description is applied, where a video one has
+    // them as soon as the transceiver exists.
+    write_error(err, err_cap,
+                h->tc->media_type() == webrtc::MediaType::AUDIO
+                    ? "sender has no encodings: an audio transceiver from a remote description "
+                      "has none until the local description is applied. It needs no bound "
+                      "anyway; the default this lifts is the video one"
+                    : "sender has no encodings");
     return -1;
   }
 

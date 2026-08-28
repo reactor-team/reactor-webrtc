@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.14.1 — say when a sender has encodings to write
+
+`set_send_bitrate` documented itself as callable "before or after negotiation".
+That is true of a transceiver from `add_transceiver`, which seeds a default
+encoding, and false of the shape every answerer actually has:
+
+| Transceiver from | audio | video |
+|---|---|---|
+| `add_transceiver` | has encodings | has encodings |
+| applying a remote description | **none until the local description is applied** | has encodings |
+
+An answerer that bounds its audio senders while building the answer gets
+`sender has no encodings`, which took down a whole negotiation in
+reactor-runtime before the cause was clear.
+
+The refusal now names it, rather than leaving the reader to inspect their own
+track plumbing. And it costs nothing to work around: the ceiling this lifts is
+libwebrtc's resolution-keyed *video* default, so an audio sender has nothing to
+lift — Opus is bounded by its own codec parameters. Bound video senders, skip
+audio ones.
+
+Docs corrected in the Rust API, the C ABI and `docs/configuration.md`. No API
+change.
+
 ## 0.14.0 — per-sender bitrate bounds
 
 `PeerConnection::set_bitrate` bounds the congestion controller's estimate for

@@ -380,9 +380,25 @@ bound — `None` is how a bound is left unset, so a negative is far likelier
 to be a typo or an arithmetic slip than a request, and quietly reading it as
 "remove the cap" would be the opposite of what was asked.
 
-Call it before or after negotiation — the sender exists as soon as the
-transceiver does, and libwebrtc applies new bounds to a running encoder — and
-call it again to change the bounds mid-call.
+Call it again at any point to change the bounds mid-call; libwebrtc applies
+new bounds to a running encoder.
+
+**When you can first call it depends on where the transceiver came from**, and
+it is the one sharp edge here:
+
+| Transceiver from | audio | video |
+| ---------------- | ----- | ----- |
+| `add_transceiver` | has encodings | has encodings |
+| applying a remote description | **none until the local description is applied** | has encodings |
+
+`add_transceiver` seeds a default encoding; one materialised from a remote
+offer does not get one for audio until the answer is set locally. Called before
+that, this returns an error reading `sender has no encodings`.
+
+In practice that costs nothing: the ceiling this lifts is libwebrtc's
+resolution-keyed *video* default, so an audio sender has nothing to lift —
+Opus is bounded by its own codec parameters instead. An answerer should bound
+its video senders and skip the audio ones.
 
 Two things worth knowing before you reach for it:
 

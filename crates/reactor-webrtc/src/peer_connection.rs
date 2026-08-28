@@ -567,8 +567,24 @@ impl Transceiver {
     /// default. Values are in bits per second, and apply to the first encoding
     /// (the single-stream case — simulcast layers are not addressed individually).
     ///
-    /// Can be called before or after negotiation, and again at any point to
-    /// change the bounds mid-call.
+    /// **When the sender has encodings to write depends on where the transceiver
+    /// came from**, and it is the one sharp edge here:
+    ///
+    /// | Transceiver from | audio | video |
+    /// |---|---|---|
+    /// | [`PeerConnection::add_transceiver`] | has encodings | has encodings |
+    /// | applying a remote description | **none until the local description is applied** | has encodings |
+    ///
+    /// `add_transceiver` seeds a default encoding; one materialised from a
+    /// remote offer does not get one for audio until the answer is set locally.
+    /// Called before that, this returns "sender has no encodings".
+    ///
+    /// In practice that costs nothing, because the ceiling this lifts is
+    /// libwebrtc's resolution-keyed *video* default: an audio sender has
+    /// nothing to lift, since Opus is bounded by its own codec parameters. An
+    /// answerer should bound its video senders and skip the audio ones.
+    ///
+    /// Can be called again at any point to change the bounds mid-call.
     ///
     /// # Errors
     ///
