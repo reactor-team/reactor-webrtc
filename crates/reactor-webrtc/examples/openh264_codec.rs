@@ -1,10 +1,12 @@
-//! Encode and decode H.264 via a runtime-downloaded OpenH264 (Cisco's
-//! prebuilt binary, dynamically loaded — never compiled in; see the
-//! `openh264` module's docs for why).
+//! H.264 backend selection **per track**: one factory carrying two raw video
+//! tracks pinned to H.264 — one on `Auto` (the platform default:
+//! VideoToolbox on Apple, OpenH264 elsewhere) and one forced to
+//! [`H264Backend::OpenH264`], registered once via
+//! [`PeerConnectionFactoryBuilder::with_openh264`].
 //!
-//! Same shape as `builtin_codec.rs`, except the video transceiver is pinned
-//! to H264 via `set_codec_preferences` so it actually exercises the OpenH264
-//! path instead of falling back to VP8/VP9/AV1.
+//! Same shape as `builtin_codec.rs`, except the video transceivers are
+//! pinned to H264 via `set_codec_preferences` so they actually exercise the
+//! backends instead of falling back to VP8/VP9/AV1.
 //!
 //! ```sh
 //! REACTOR_WEBRTC_LIB_DIR=webrtc-build/out/mac-arm64-release/dist \
@@ -13,8 +15,8 @@
 //!
 //! First run downloads Cisco's OpenH264 library for your platform (a few
 //! hundred KB) and caches it — see `openh264::ensure_available`'s docs for
-//! where. Requires Linux or Windows; on macOS/iOS/Android use the platform's
-//! hardware H.264 instead (no OpenH264 needed there).
+//! where. On Apple the Auto track encodes via VideoToolbox hardware; off
+//! Apple, both tracks use OpenH264.
 
 fn main() {
     #[cfg(not(all(have_libwebrtc, feature = "openh264")))]
@@ -39,9 +41,9 @@ fn run() {
     use std::time::{Duration, Instant};
 
     use reactor_webrtc::{
-        openh264, AdmMode, ApmConfig, IceCandidate, MediaKind, PeerConnection,
-        PeerConnectionFactory, PeerConnectionObserver, PeerConnectionState, RtcConfiguration,
-        Track, TransceiverDirection, VideoCodec,
+        openh264, H264Backend, IceCandidate, LocalVideoTrack, MediaKind, PeerConnection,
+        PeerConnectionFactory, PeerConnectionObserver, PeerConnectionState, RemoteTrack,
+        RtcConfiguration, TransceiverDirection, VideoCodec, VideoTrackOptions,
     };
 
     // Required by Cisco's binary license: show this in your app's
@@ -62,7 +64,7 @@ fn run() {
         connected: AtomicBool,
         video_frames: AtomicU32,
         audio_frames: AtomicU32,
-        tracks: Mutex<Vec<Track>>,
+        tracks: Mutex<Vec<RemoteTrack>>,
     }
 
     fn make_peer(
@@ -85,11 +87,11 @@ fn run() {
             })
             .on_track({
                 let s = shared.clone();
-                move |kind, track| {
-                    match kind {
-                        MediaKind::Video => {
+                move |track| {
+                    match &track {
+                        RemoteTrack::Video(v) => {
                             let s = s.clone();
-                            track.on_video_frame(move |f| {
+                            v.on_frame(move |f| {
                                 println!(
                                     "  [pc2 video/H264] {}×{} frame — {} bytes BGRA",
                                     f.width,
@@ -99,13 +101,12 @@ fn run() {
                                 s.video_frames.fetch_add(1, Ordering::SeqCst);
                             });
                         }
-                        MediaKind::Audio => {
+                        RemoteTrack::Audio(a) => {
                             let s = s.clone();
-                            track.on_audio_frame(move |_f| {
+                            a.on_frame(move |_f| {
                                 s.audio_frames.fetch_add(1, Ordering::SeqCst);
                             });
                         }
-                        MediaKind::Unknown => {}
                     }
                     s.tracks.lock().unwrap().push(track);
                 }
@@ -124,30 +125,48 @@ fn run() {
 
     // ── factory (real OpenH264 encode/decode) and peers ──────────────────────
 
-    let factory =
-        PeerConnectionFactory::with_openh264(&lib_path, AdmMode::Synthetic, ApmConfig::default())
-            .expect("factory with openh264");
+    let factory = PeerConnectionFactory::builder()
+        .with_openh264(&lib_path)
+        .build()
+        .expect("factory with openh264");
     let config = RtcConfiguration::default();
 
     let (pc1, s1) = make_peer(&factory, &config);
     let (pc2, s2) = make_peer(&factory, &config);
 
-    // ── local tracks, pinned to H264 on pc1's send side ──────────────────────
+    // ── two raw video tracks, one factory, both pinned to H264 ─────────────
+    //
+    // Track A: Auto backend (VideoToolbox on Apple, OpenH264 elsewhere).
+    // Track B: explicitly forced to OpenH264 — valid because the library was
+    // registered at factory build time (with_openh264 above).
 
-    let video = factory
-        .create_video_track("reactor-video")
-        .expect("video track");
+    let video_auto = factory
+        .create_video_track("video-auto")
+        .expect("auto track");
+    let video_oh = {
+        let mut options = VideoTrackOptions::default();
+        options.h264_backend = Some(H264Backend::OpenH264);
+        match factory
+            .create_video_track_with_options("video-openh264", options)
+            .expect("openh264 track")
+        {
+            LocalVideoTrack::Raw(t) => t,
+            LocalVideoTrack::Encoded(_) => panic!("raw track expected"),
+        }
+    };
     let audio = factory
         .create_audio_track("reactor-audio")
         .expect("audio track");
 
-    let video_tx = pc1
-        .add_transceiver(MediaKind::Video, TransceiverDirection::SendOnly)
-        .expect("add video transceiver");
-    video_tx.set_track(&video).expect("set video track");
-    video_tx
-        .set_codec_preferences(&[VideoCodec::H264])
-        .expect("prefer H264");
+    for (track, label) in [(&video_auto, "Auto"), (&video_oh, "OpenH264")] {
+        let tx = pc1
+            .add_transceiver(MediaKind::Video, TransceiverDirection::SendOnly)
+            .expect("add video transceiver");
+        tx.set_track(track).expect("set video track");
+        tx.set_codec_preferences(&[VideoCodec::H264])
+            .expect("prefer H264");
+        println!("  track '{label}' pinned to H264");
+    }
     pc1.add_track(&audio).expect("add audio track");
 
     // ── SDP offer / answer ────────────────────────────────────────────────────
@@ -188,7 +207,12 @@ fn run() {
                 for (i, b) in bgra.iter_mut().enumerate() {
                     *b = ((i as u32 + phase as u32 * 7) % 256) as u8;
                 }
-                video.push_video_frame(&bgra, w, h);
+                video_auto
+                    .push_frame(reactor_webrtc::VideoFrame::new(&bgra, w, h))
+                    .expect("push frame");
+                video_oh
+                    .push_frame(reactor_webrtc::VideoFrame::new(&bgra, w, h))
+                    .expect("push frame");
                 phase = phase.wrapping_add(1);
 
                 for _ in 0..3 {

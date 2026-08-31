@@ -69,6 +69,53 @@ fn recv_registry() -> &'static RecvRegistry {
     REGISTRY.get_or_init(RecvRegistry::default)
 }
 
+// ── Per-track metadata allowlist ─────────────────────────────────────────────
+//
+// Whether a native track carries frame metadata at all (`VideoTrackOptions::
+// frame_metadata`, defaulting from the factory kill switch). Consulted when
+// `install_frame_metadata_transforms` decides whether a transceiver gets a
+// trailer writer; a track not listed is treated as allowed (the historical
+// default).
+
+type AllowedRegistry = Mutex<HashMap<usize, bool>>;
+
+fn allowed_registry() -> &'static AllowedRegistry {
+    static REGISTRY: OnceLock<AllowedRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(AllowedRegistry::default)
+}
+
+/// Record whether the native track `track_id` carries frame metadata.
+pub(crate) fn register_allowed(track_id: usize, allowed: bool) {
+    if track_id == 0 {
+        return;
+    }
+    if let Ok(mut map) = allowed_registry().lock() {
+        map.insert(track_id, allowed);
+    }
+}
+
+/// Drop the allowlist entry for `track_id`.
+pub(crate) fn deregister_allowed(track_id: usize) {
+    if track_id == 0 {
+        return;
+    }
+    if let Ok(mut map) = allowed_registry().lock() {
+        map.remove(&track_id);
+    }
+}
+
+/// Whether the track carries frame metadata. Unknown tracks default to true:
+/// they predate the per-track flag.
+pub(crate) fn allowed(track_id: usize) -> bool {
+    if track_id == 0 {
+        return true;
+    }
+    match allowed_registry().lock() {
+        Ok(map) => *map.get(&track_id).unwrap_or(&true),
+        Err(_) => true,
+    }
+}
+
 /// Register `queue` as the inbound metadata queue for the native track `track_id`.
 pub(crate) fn register_receiver(track_id: usize, queue: &Arc<ReceiverMetaQueue>) {
     if track_id == 0 {

@@ -92,8 +92,8 @@ single process-wide factory behind a lock rather than one per connection).
 thread for the native round-trip. libwebrtc's own signaling/worker/network
 threads run independently underneath and are what actually deliver
 `PeerConnectionObserver` callbacks (`on_ice_candidate`,
-`on_connection_state_change`, `on_track`, …), `Track.on_video_frame` /
-`on_audio_frame`, and `FrameTransform` callbacks — on their thread, not the
+`on_connection_state_change`, `on_track`, …), `VideoTrack::on_frame` /
+`AudioTrack::on_frame`, and `FrameTransform` callbacks — on their thread, not the
 caller's. A callback that blocks holds up libwebrtc's own internals, not
 just your code, so keep them fast and hand off real work to your own thread
 or queue.

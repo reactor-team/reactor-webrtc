@@ -280,7 +280,8 @@ impl VideoCodec {
     }
 }
 
-/// Raw I420 video frame delivered to a [`CustomVideoEncoder`] callback.
+/// Raw I420 video frame delivered to an inline encoder callback
+/// ([`TrackVideoEncoder::Inline`]).
 ///
 /// Planes are slices into the native frame buffer and are **only valid for the
 /// duration of the callback**. Copy the data if your encoder is asynchronous.
@@ -303,7 +304,8 @@ pub struct RawVideoFrame<'a> {
     pub request_key_frame: bool,
 }
 
-/// An encoded H.264 frame produced by a [`CustomVideoEncoder`] callback.
+/// An encoded video frame, produced by an inline encoder callback or pushed
+/// to an [`EncodedVideoTrack`].
 pub struct EncodedVideoFrame {
     /// Raw H.264 Annex-B or AVCC bitstream bytes.
     pub data: Vec<u8>,
@@ -317,26 +319,24 @@ pub struct EncodedVideoFrame {
     pub rtp_timestamp: u32,
 }
 
-type EncodeCallbackBox = Box<dyn FnMut(&RawVideoFrame<'_>) -> Option<EncodedVideoFrame> + Send>;
+/// The boxed encoder callback a [`TrackVideoEncoder::Inline`] track hands
+/// the factory — called synchronously with every raw I420 frame on the
+/// encoder thread; return `Some(encoded)` to forward, `None` to drop.
+pub type InlineEncoderCallback =
+    Box<dyn FnMut(&RawVideoFrame<'_>) -> Option<EncodedVideoFrame> + Send + 'static>;
 
-struct CustomEncoderState {
-    cb: Mutex<EncodeCallbackBox>,
+pub(crate) struct CustomEncoderState {
+    cb: Mutex<InlineEncoderCallback>,
+    feedback: Arc<FeedbackListeners>,
 }
 
-extern "C" fn encode_tramp(
-    ud: *mut c_void,
-    raw: *const reactor_webrtc_sys::ReactorRawVideoFrame,
-    out: *mut reactor_webrtc_sys::ReactorEncodedVideoOutput,
-) -> c_int {
-    let Some(r) = (unsafe { raw.as_ref() }) else {
-        return 1;
-    };
-    let st = unsafe { &*(ud as *const CustomEncoderState) };
-
+/// Borrowed view of a glue raw frame, for the inline-encoder callback.
+/// Planes are valid only for the duration of the native Encode() call.
+fn raw_view(r: &reactor_webrtc_sys::ReactorRawVideoFrame) -> RawVideoFrame<'_> {
     let y_len = (r.y_stride.max(0) as usize) * r.height as usize;
     let uv_len = (r.u_stride.max(0) as usize) * (r.height as usize).div_ceil(2);
 
-    let frame = RawVideoFrame {
+    RawVideoFrame {
         codec: VideoCodec::from_u32(r.codec).unwrap_or(VideoCodec::H264),
         y: if r.y.is_null() {
             &[]
@@ -360,16 +360,6 @@ extern "C" fn encode_tramp(
         height: r.height,
         rtp_timestamp: r.rtp_timestamp,
         request_key_frame: r.request_key_frame != 0,
-    };
-
-    let result = match st.cb.lock() {
-        Ok(mut cb) => cb(&frame),
-        Err(_) => return 1,
-    };
-
-    match result {
-        None => 1,
-        Some(encoded) => fill_output(encoded, out),
     }
 }
 
@@ -381,36 +371,198 @@ extern "C" fn free_encoded_data(data: *const u8, len: usize) {
     unsafe { drop(Vec::from_raw_parts(data as *mut u8, len, len)) };
 }
 
-extern "C" fn free_encoder_state_tramp(ud: *mut c_void) {
-    drop(unsafe { Box::from_raw(ud as *mut CustomEncoderState) });
+// ── Encoder feedback ─────────────────────────────────────────────────────────
+
+/// Feedback from the BWE / rate-control machinery for a custom-encoded
+/// ([`TrackVideoEncoder`]) track's encoder instance. The builtin encoder
+/// pipeline consumes the same signals internally; custom encoders hear them
+/// here through [`VideoTrack::on_encoder_feedback`] /
+/// [`EncodedVideoTrack::on_encoder_feedback`].
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum EncoderFeedback {
+    /// The remote peer (or libwebrtc's recovery logic) asked for a key frame —
+    /// PLI/FIR routed by the media engine. **You must answer with an IDR
+    /// promptly** (`EncodedVideoFrame::is_key_frame = true` on the pre-encoded
+    /// path; produce a key frame from your encoder on the inline path) or new
+    /// receivers wait a whole GOP for decodable video.
+    KeyFrameRequest,
+    /// The congestion controller's current allocation for this encoder:
+    /// adapt your own encoder's target to match. Fires on BWE changes and
+    /// `PeerConnection::set_bitrate` calls.
+    RateUpdate {
+        /// Target bitrate in bits per second for this encoder.
+        bitrate_bps: u32,
+        /// Target framerate in frames per second.
+        framerate_fps: f64,
+    },
+}
+
+/// A boxed encoder-feedback listener (single-slot per slot).
+pub(crate) type FeedbackCallback = Box<dyn FnMut(EncoderFeedback) + Send>;
+
+/// Callbacks registered for encoder feedback, boxed and shareable across the
+/// registry → track wrapper lifetime boundary.
+pub(crate) struct FeedbackListeners {
+    cb: Mutex<Option<FeedbackCallback>>,
+}
+
+impl FeedbackListeners {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            cb: Mutex::new(None),
+        })
+    }
+
+    /// Overwrite the listener. Latest call wins (sinks and callbacks are
+    /// single-slot in this API).
+    pub(crate) fn set(&self, cb: FeedbackCallback) {
+        *self.cb.lock().unwrap() = Some(cb);
+    }
+
+    /// Deliver feedback to the registered listener, if any. Runs on
+    /// whatever WebRTC thread the signal arrived on — the callback re-enters
+    /// the app synchronously there, like every other sink.
+    fn fire(&self, feedback: EncoderFeedback) {
+        if let Some(cb) = self.cb.lock().unwrap().as_mut() {
+            cb(feedback);
+        }
+    }
+}
+
+/// Native-track identity → the encoder feedback listeners of the slot that
+/// track occupies. Mirrors the sender_meta registration pattern: created
+/// when a track with a custom encoder slot is created, removed at drop.
+type FeedbackBindings = Mutex<std::collections::HashMap<usize, Arc<FeedbackListeners>>>;
+
+fn feedback_bindings() -> &'static FeedbackBindings {
+    static BINDINGS: std::sync::OnceLock<FeedbackBindings> = std::sync::OnceLock::new();
+    BINDINGS.get_or_init(FeedbackBindings::default)
+}
+
+/// Bind a track's feedback listeners to its native-track identity.
+pub(crate) fn register_feedback_binding(native_id: usize, listeners: &Arc<FeedbackListeners>) {
+    if native_id != 0 {
+        feedback_bindings()
+            .lock()
+            .unwrap()
+            .insert(native_id, listeners.clone());
+    }
+}
+
+/// Remove the binding for `native_id` (the track is gone).
+pub(crate) fn deregister_feedback_binding(native_id: usize) {
+    feedback_bindings().lock().unwrap().remove(&native_id);
+}
+
+/// The feedback listener registration for `native_id`, if the track's slot
+/// has one (only tracks created with a [`TrackVideoEncoder`] have some).
+/// Used by [`VideoTrack::on_encoder_feedback`] and
+/// [`EncodedVideoTrack::on_encoder_feedback`].
+pub(crate) fn feedback_binding(native_id: usize) -> Option<Arc<FeedbackListeners>> {
+    feedback_bindings().lock().unwrap().get(&native_id).cloned()
 }
 
 // ── Multi-track encoder registry ─────────────────────────────────────────────
 
 /// A pending slot for one video transceiver in an [`EncoderRegistry`].
 ///
-/// - `Custom` — the custom Rust encoder handles this slot; frames are read from
-///   the associated queue (push via [`EncodedVideoTrack`]).
-/// - `Builtin` — the factory delegates to libwebrtc's builtin VP8/VP9/AV1
-///   encoder; push raw BGRA frames via the returned [`Track`](crate::media::Track).
-#[derive(Clone)]
+/// - `Custom` — frames are read from the associated queue (push via
+///   [`EncodedVideoTrack`]); the queue drain itself is the "encoder", and the
+///   feedback listeners include everything the pull-based API cannot say.
+/// - `Inline` — the registry calls the user callback synchronously with every
+///   raw I420 frame ([`TrackVideoEncoder::Inline`] tracks); keyframe requests
+///   travel inside that callback's frame, feedback for the rest is attached to
+///   the slot.
+/// - `Builtin` — the factory delegates to a backend encoder (builtin
+///   VP8/VP9/AV1, or H264 via the slot's backend preference); push raw BGRA
+///   frames via the returned [`Track`](crate::media::Track).
 pub(crate) enum RegistrySlot {
-    Custom(Arc<Mutex<VecDeque<EncodedVideoFrame>>>),
-    Builtin,
+    Custom(CustomSlotState),
+    Inline(Arc<CustomEncoderState>),
+    Builtin(H264BackendPref),
+}
+
+/// Registry state for a [`TrackVideoEncoder::PreEncoded`] slot: the queue the
+/// app pushes into, plus the listeners the queue-pull API cannot reach.
+pub(crate) struct CustomSlotState {
+    pub(crate) queue: Arc<Mutex<VecDeque<EncodedVideoFrame>>>,
+    pub(crate) feedback: Arc<FeedbackListeners>,
+}
+
+impl Clone for RegistrySlot {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Custom(s) => Self::Custom(CustomSlotState {
+                queue: s.queue.clone(),
+                feedback: s.feedback.clone(),
+            }),
+            Self::Inline(s) => Self::Inline(s.clone()),
+            Self::Builtin(pref) => Self::Builtin(*pref),
+        }
+    }
+}
+
+/// Which H.264 backend a builtin-routed slot prefers, mirroring the public
+/// [`H264Backend`] (None → `Auto`). `Auto` resolves at encoder creation:
+/// VideoToolbox on Apple, registered OpenH264 elsewhere.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum H264BackendPref {
+    Auto,
+    VideoToolbox,
+    #[cfg(feature = "openh264")]
+    OpenH264,
+}
+
+impl H264BackendPref {
+    /// The `reactor_video_backend_cb` wire value (0 = auto, 1 = VT, 2 = OH).
+    fn as_c_int(self) -> c_int {
+        match self {
+            Self::Auto => 0,
+            Self::VideoToolbox => 1,
+            #[cfg(feature = "openh264")]
+            Self::OpenH264 => 2,
+        }
+    }
 }
 
 /// Routes encoder instances to per-track slots using the per-encoder-instance ID
 /// stamped by the C++ factory.
 ///
 /// Slots are assigned lazily: when a given `encoder_id` appears for the first
-/// time (either in `use_builtin_for` or `pop_for`), the next pending slot is
+/// time (either in `use_builtin_for` or `encode_for`), the next pending slot is
 /// consumed and bound to that ID. The assignment order matches the order
 /// libwebrtc calls `VideoEncoderFactory::Create()` — one call per video
 /// transceiver, in negotiation order — which in turn matches the order
 /// [`add_encoded_slot`] / [`add_raw_slot`] were called on the builder.
+///
+/// Every reservation carries the owning track's native id so the registry
+/// can retract a dead track's slots ([`EncoderRegistry::retract`]): an
+/// unreserved-pending slot for a dead track gets dropped, and an assigned
+/// slot degrades to Builtin with a loud fallback, never silently routing
+/// another track's frames.
 pub(crate) struct EncoderRegistry {
-    pending: Mutex<VecDeque<RegistrySlot>>,
-    assigned: Mutex<HashMap<u64, RegistrySlot>>,
+    pending: Mutex<VecDeque<RegistryReservation>>,
+    assigned: Mutex<HashMap<u64, AssignedSlot>>,
+}
+
+struct RegistryReservation {
+    native_id: usize,
+    slot: RegistrySlot,
+}
+
+struct AssignedSlot {
+    native_id: usize,
+    slot: RegistrySlot,
+}
+
+impl Clone for AssignedSlot {
+    fn clone(&self) -> Self {
+        AssignedSlot {
+            native_id: self.native_id,
+            slot: self.slot.clone(),
+        }
+    }
 }
 
 impl EncoderRegistry {
@@ -421,24 +573,149 @@ impl EncoderRegistry {
         })
     }
 
-    /// Reserve a custom (pre-encoded) slot. Returns the queue the
-    /// [`EncodedVideoTrack`] will push frames into.
-    pub(crate) fn add_encoded_slot(&self) -> Arc<Mutex<VecDeque<EncodedVideoFrame>>> {
-        let q = Arc::new(Mutex::new(VecDeque::new()));
-        self.pending
-            .lock()
-            .unwrap()
-            .push_back(RegistrySlot::Custom(q.clone()));
-        q
+    /// Wire this registry into factory-create options: leaks a
+    /// [`RegistryState`] the native side frees via `free_registry_state_tramp`
+    /// when the last encoder goes away (or the caller frees manually after a
+    /// failed create), and points every encode/`use_builtin`/`has_custom`
+    /// trampoline at it.
+    pub(crate) fn install_into(
+        self: &Arc<Self>,
+        opts: &mut reactor_webrtc_sys::ReactorFactoryOptions,
+    ) {
+        let state = Box::into_raw(Box::new(RegistryState {
+            registry: Arc::clone(self),
+        }));
+        opts.encode_cb = Some(registry_encode_tramp);
+        opts.encode_userdata = state as *mut c_void;
+        opts.encode_free_ud = Some(free_registry_state_tramp);
+        opts.encode_use_builtin = Some(registry_use_builtin_tramp);
+        opts.encode_has_custom_slots = Some(registry_has_custom_tramp);
+        opts.encode_video_backend_for = Some(registry_backend_for_tramp);
+        opts.encode_rate_update = Some(registry_rate_update_tramp);
     }
 
-    /// Reserve a builtin (raw BGRA) slot. The C++ factory will delegate to
-    /// the builtin VP8/VP9/AV1 encoder for this transceiver.
-    pub(crate) fn add_raw_slot(&self) {
+    /// Reserve a custom (pre-encoded) slot for the track `native_id`.
+    /// Returns the queue the [`EncodedVideoTrack`] will push frames into
+    /// plus the slot's feedback listeners
+    /// ([`EncodedVideoTrack::on_encoder_feedback`]).
+    pub(crate) fn add_encoded_slot(
+        &self,
+        native_id: usize,
+    ) -> (
+        Arc<Mutex<VecDeque<EncodedVideoFrame>>>,
+        Arc<FeedbackListeners>,
+    ) {
+        let slot = CustomSlotState {
+            queue: Arc::new(Mutex::new(VecDeque::new())),
+            feedback: FeedbackListeners::new(),
+        };
+        let out = (slot.queue.clone(), slot.feedback.clone());
+        self.pending.lock().unwrap().push_back(RegistryReservation {
+            native_id,
+            slot: RegistrySlot::Custom(slot),
+        });
+        out
+    }
+
+    /// Reserve a builtin (raw BGRA) slot for the track `native_id`. The C++
+    /// factory delegates to the builtin VP8/VP9/AV1 encoder for this
+    /// transceiver.
+    pub(crate) fn add_raw_slot(&self, native_id: usize) {
+        self.add_raw_slot_with_backend(native_id, H264BackendPref::Auto);
+    }
+
+    /// Reserve a builtin (raw BGRA) slot with an explicit H264 backend
+    /// preference, for tracks created with `h264_backend` set.
+    pub(crate) fn add_raw_slot_with_backend(&self, native_id: usize, backend: H264BackendPref) {
+        self.pending.lock().unwrap().push_back(RegistryReservation {
+            native_id,
+            slot: RegistrySlot::Builtin(backend),
+        });
+    }
+
+    /// Reserve an inline-encoder slot for the track `native_id`. The
+    /// registry calls `cb` synchronously with every raw I420 frame for the
+    /// encoder instance that binds here; the returned feedback listeners
+    /// surface the rest (rate updates) through
+    /// [`VideoTrack::on_encoder_feedback`](crate::media::VideoTrack::on_encoder_feedback).
+    pub(crate) fn add_inline_slot(
+        &self,
+        native_id: usize,
+        cb: InlineEncoderCallback,
+    ) -> Arc<FeedbackListeners> {
+        let feedback = FeedbackListeners::new();
+        let out = feedback.clone();
+        let state = Arc::new(CustomEncoderState {
+            cb: Mutex::new(cb),
+            feedback,
+        });
+        self.pending.lock().unwrap().push_back(RegistryReservation {
+            native_id,
+            slot: RegistrySlot::Inline(state),
+        });
+        out
+    }
+
+    /// Drop everything reserved for a track that no longer exists.
+    /// Pending reservations are simply removed; an already-assigned slot is
+    /// degraded to Builtin with a loud fallback — libwebrtc may legitimately
+    /// recreate an encoder for a dead stream, and that must never consume
+    /// another track's slot (the old grey-silence failure). The last living
+    /// custom lane closing is a teardown, not a hazard: it stays quiet
+    /// instead of app woke-and-wail on every shutdown.
+    pub(crate) fn retract(&self, native_id: usize) {
         self.pending
             .lock()
             .unwrap()
-            .push_back(RegistrySlot::Builtin);
+            .retain(|r| r.native_id != native_id);
+        // Any other custom lane matters? Check pending first, then assigned
+        // (same traversal order as has_custom — no ABBA regression).
+        let pending_has_custom = self
+            .pending
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| !matches!(r.slot, RegistrySlot::Builtin(_)));
+        let any_live_custom =
+            pending_has_custom
+                || self.assigned.lock().unwrap().values().any(|a| {
+                    a.native_id != native_id && !matches!(a.slot, RegistrySlot::Builtin(_))
+                });
+        let mut assigned = self.assigned.lock().unwrap();
+        for a in assigned.values_mut() {
+            if a.native_id == native_id && !matches!(a.slot, RegistrySlot::Builtin(_)) {
+                if any_live_custom {
+                    eprintln!(
+                        "[reactor-webrtc] retracting encoder slot for dropped track {native_id:#x}: \
+                         degrading to builtin with other custom slots still routed"
+                    );
+                }
+                a.slot = RegistrySlot::Builtin(H264BackendPref::Auto);
+            }
+        }
+    }
+
+    /// Whether any custom (pre-encoded or inline) slot exists — pending or
+    /// already assigned. Drives the `has_custom_slots` predicate the native
+    /// factory consults when advertising codecs.
+    pub(crate) fn has_custom(&self) -> bool {
+        let is_custom = |s: &RegistrySlot| !matches!(s, RegistrySlot::Builtin(_));
+        // Drop pending's guard before touching `assigned`: holding both is an
+        // ABBA deadlock against use_builtin_for/encode_for under concurrent
+        // negotiation + encode.
+        let pending_has = self
+            .pending
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| is_custom(&r.slot));
+        pending_has
+            || self
+                .assigned
+                .lock()
+                .unwrap()
+                .values()
+                .any(|a| is_custom(&a.slot))
     }
 
     /// Called by `registry_use_builtin_tramp`. Assigns the next pending slot to
@@ -446,39 +723,136 @@ impl EncoderRegistry {
     /// C++ factory should delegate to the builtin encoder.
     pub(crate) fn use_builtin_for(&self, encoder_id: u64) -> bool {
         let mut assigned = self.assigned.lock().unwrap();
-        if let Some(slot) = assigned.get(&encoder_id) {
-            return matches!(slot, RegistrySlot::Builtin);
+        if let Some(a) = assigned.get(&encoder_id) {
+            return matches!(a.slot, RegistrySlot::Builtin(_));
         }
-        let slot = self
-            .pending
-            .lock()
-            .unwrap()
-            .pop_front()
-            .unwrap_or(RegistrySlot::Builtin);
-        let is_builtin = matches!(slot, RegistrySlot::Builtin);
-        assigned.insert(encoder_id, slot);
+        let next = {
+            let mut pending = self.pending.lock().unwrap();
+            pending.pop_front()
+        };
+        let Some(reservation) = next else {
+            // Empty queue: the positional fallback. Loud only when custom
+            // plumbing exists to lose — an entirely builtin factory must
+            // never hear this (its fallback is the intentional answer).
+            //
+            // `assigned` is already locked on this thread, so consult it (and
+            // `pending`, in the usual assigned→pending order) directly instead
+            // of going through has_custom(): std::sync::Mutex is non-recursive,
+            // and re-locking `assigned` here self-deadlocks this thread. That
+            // wedged the encoder queue whenever libwebrtc recreated an encoder
+            // with an empty reservation queue (normal on stream teardown with
+            // cadence frames in flight), cascading into
+            // VideoStreamEncoder::Stop and PeerConnection::Close never
+            // returning.
+            let is_custom = |s: &RegistrySlot| !matches!(s, RegistrySlot::Builtin(_));
+            let any_custom_left = assigned.values().any(|a| is_custom(&a.slot))
+                || self
+                    .pending
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|r| is_custom(&r.slot));
+            if any_custom_left {
+                eprintln!(
+                    "[reactor-webrtc] no encoder slot reservation left for encoder {encoder_id}: delegating to builtin — custom-encoded tracks after this point may not produce video"
+                );
+            }
+            return true;
+        };
+        let is_builtin = matches!(reservation.slot, RegistrySlot::Builtin(_));
+        assigned.insert(
+            encoder_id,
+            AssignedSlot {
+                native_id: reservation.native_id,
+                slot: reservation.slot,
+            },
+        );
         is_builtin
     }
 
-    /// Called by `registry_encode_tramp`. Pops the next pre-encoded frame for
-    /// this encoder instance, assigning its slot on first call if needed.
-    fn pop_for(&self, encoder_id: u64) -> Option<EncodedVideoFrame> {
+    /// Called by `registry_encode_tramp`. Produces the next encoded frame for
+    /// this encoder instance — draining the queue for pre-encoded slots,
+    /// invoking the user callback for inline slots — assigning its slot on
+    /// first call if needed.
+    fn encode_for(&self, encoder_id: u64, raw: &RawVideoFrame) -> Option<EncodedVideoFrame> {
         let mut assigned = self.assigned.lock().unwrap();
-        let slot = assigned.entry(encoder_id).or_insert_with(|| {
-            self.pending
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or(RegistrySlot::Builtin)
+        let a = assigned.entry(encoder_id).or_insert_with(|| {
+            let reservation = self.pending.lock().unwrap().pop_front();
+            match reservation {
+                Some(r) => AssignedSlot {
+                    native_id: r.native_id,
+                    slot: r.slot,
+                },
+                None => {
+                    eprintln!(
+                        "[reactor-webrtc] no encoder slot reservation left for encoder {encoder_id}: delegating to builtin"
+                    );
+                    AssignedSlot {
+                        native_id: 0,
+                        slot: RegistrySlot::Builtin(H264BackendPref::Auto),
+                    }
+                }
+            }
         });
-        match slot {
-            RegistrySlot::Custom(q) => {
-                let q = q.clone();
+        match &a.slot {
+            RegistrySlot::Custom(slot) => {
+                let (q, feedback) = (slot.queue.clone(), slot.feedback.clone());
                 drop(assigned);
+                if raw.request_key_frame {
+                    // Queue-mode has no other channel: clone, drop the guard,
+                    // then fire — never run the callback under the registry
+                    // lock (mirrors `rate_update`'s shape below).
+                    feedback.fire(EncoderFeedback::KeyFrameRequest);
+                }
                 let frame = q.lock().unwrap().pop_front();
                 frame
             }
-            _ => None,
+            RegistrySlot::Inline(state) => {
+                let state = state.clone();
+                drop(assigned);
+                let Ok(mut cb) = state.cb.lock() else {
+                    return None;
+                };
+                cb(raw)
+            }
+            RegistrySlot::Builtin(_) => None,
+        }
+    }
+
+    /// Called by `registry_rate_update_tramp`. Routes a rate-control update
+    /// to the encoder instance's slot's feedback listeners.
+    fn rate_update(&self, encoder_id: u64, bitrate_bps: u32, framerate_fps: f64) {
+        let assigned = self.assigned.lock().unwrap();
+        let slot = match assigned.get(&encoder_id) {
+            Some(s) => AssignedSlot {
+                native_id: s.native_id,
+                slot: s.slot.clone(),
+            },
+            None => return,
+        };
+        drop(assigned);
+        let feedback = match &slot.slot {
+            RegistrySlot::Custom(slot) => Some(slot.feedback.clone()),
+            RegistrySlot::Inline(state) => Some(state.feedback.clone()),
+            RegistrySlot::Builtin(_) => None,
+        };
+        if let Some(fb) = feedback {
+            fb.fire(EncoderFeedback::RateUpdate {
+                bitrate_bps,
+                framerate_fps,
+            });
+        }
+    }
+
+    /// Called by the native composite when building an H264 encoder for a
+    /// backend-routed instance — the slot's stored preference.
+    pub(crate) fn backend_for(&self, encoder_id: u64) -> H264BackendPref {
+        match self.assigned.lock().unwrap().get(&encoder_id) {
+            Some(a) => match &a.slot {
+                RegistrySlot::Builtin(pref) => *pref,
+                _ => H264BackendPref::Auto,
+            },
+            None => H264BackendPref::Auto,
         }
     }
 }
@@ -512,7 +886,7 @@ fn fill_output(
     0
 }
 
-extern "C" fn registry_encode_tramp(
+pub(crate) extern "C" fn registry_encode_tramp(
     ud: *mut c_void,
     raw: *const reactor_webrtc_sys::ReactorRawVideoFrame,
     out: *mut reactor_webrtc_sys::ReactorEncodedVideoOutput,
@@ -521,7 +895,8 @@ extern "C" fn registry_encode_tramp(
         return 1;
     };
     let st = unsafe { &*(ud as *const RegistryState) };
-    match st.registry.pop_for(r.encoder_id) {
+    let frame = raw_view(r);
+    match st.registry.encode_for(r.encoder_id, &frame) {
         None => 1,
         Some(encoded) => fill_output(encoded, out),
     }
@@ -529,80 +904,207 @@ extern "C" fn registry_encode_tramp(
 
 /// Called by C++ before creating each encoder instance. Returns 1 if the
 /// builtin VP8/VP9/AV1 encoder should be used for this slot, 0 for custom.
-extern "C" fn registry_use_builtin_tramp(ud: *mut c_void, encoder_id: u64) -> c_int {
+pub(crate) extern "C" fn registry_use_builtin_tramp(ud: *mut c_void, encoder_id: u64) -> c_int {
     let st = unsafe { &*(ud as *const RegistryState) };
     st.registry.use_builtin_for(encoder_id) as c_int
 }
 
-extern "C" fn free_registry_state_tramp(ud: *mut c_void) {
+pub(crate) extern "C" fn free_registry_state_tramp(ud: *mut c_void) {
     drop(unsafe { Box::from_raw(ud as *mut RegistryState) });
 }
 
-/// A factory-level custom video encoder. Pass to
-/// [`PeerConnectionFactory::with_custom_video_encoder`](crate::PeerConnectionFactory::with_custom_video_encoder).
-///
-/// The closure is called **synchronously** on the WebRTC encoder thread for every
-/// raw I420 frame. Return `Some(encoded)` to inject H.264 bytes into the RTP
-/// stack, or `None` to drop the frame.
-///
-/// For asynchronous hardware encoders (VideoToolbox, GStreamer, etc.), copy the
-/// I420 planes into your pipeline and block until output is ready. The closure
-/// must be `Send` because it is called from a WebRTC-internal thread.
-pub struct CustomVideoEncoder {
-    pub(crate) encode_fn: extern "C" fn(
-        *mut c_void,
-        *const reactor_webrtc_sys::ReactorRawVideoFrame,
-        *mut reactor_webrtc_sys::ReactorEncodedVideoOutput,
-    ) -> c_int,
-    pub(crate) userdata: *mut c_void,
-    pub(crate) free_ud: Option<extern "C" fn(*mut c_void)>,
-    /// Optional: called by the C++ factory before creating each encoder instance.
-    /// Non-null only when the registry contains a mix of custom and builtin slots.
-    pub(crate) use_builtin: Option<extern "C" fn(*mut c_void, u64) -> c_int>,
+/// Called by the native factory when enumerating advertised video codecs.
+/// Returns nonzero while any custom (pre-encoded or inline) slot exists.
+pub(crate) extern "C" fn registry_has_custom_tramp(ud: *mut c_void) -> c_int {
+    let st = unsafe { &*(ud as *const RegistryState) };
+    st.registry.has_custom() as c_int
 }
 
-// SAFETY: the callback is Mutex-guarded; userdata is a heap-pinned Box that
-// lives until the native factory calls free_ud.
-unsafe impl Send for CustomVideoEncoder {}
-unsafe impl Sync for CustomVideoEncoder {}
+/// Called by the native composite when it builds an H264 encoder for a
+/// backend-routed instance — returns the slot's stored preference as the
+/// wire code (0 = auto, 1 = VideoToolbox, 2 = OpenH264).
+pub(crate) extern "C" fn registry_backend_for_tramp(ud: *mut c_void, encoder_id: u64) -> c_int {
+    let st = unsafe { &*(ud as *const RegistryState) };
+    st.registry.backend_for(encoder_id).as_c_int()
+}
 
-impl CustomVideoEncoder {
-    /// Create a custom encoder that calls `cb` for every frame to be encoded.
-    pub fn new(
-        cb: impl FnMut(&RawVideoFrame<'_>) -> Option<EncodedVideoFrame> + Send + 'static,
-    ) -> Self {
-        // Leak the state: the factory holds it and frees via free_encoder_state_tramp.
-        let state = Box::into_raw(Box::new(CustomEncoderState {
-            cb: Mutex::new(Box::new(cb)),
-        }));
-        Self {
-            encode_fn: encode_tramp,
-            userdata: state as *mut c_void,
-            free_ud: Some(free_encoder_state_tramp),
-            use_builtin: None,
+/// Called by the native encoder on every rate-control (BWE) update.
+pub(crate) extern "C" fn registry_rate_update_tramp(
+    ud: *mut c_void,
+    encoder_id: u64,
+    bitrate_bps: u32,
+    framerate_fps: f64,
+) {
+    let st = unsafe { &*(ud as *const RegistryState) };
+    st.registry
+        .rate_update(encoder_id, bitrate_bps, framerate_fps);
+}
+
+// ── Per-track encoder selection ─────────────────────────────────────────────
+
+/// Geometry for a pre-encoded video track
+/// ([`TrackVideoEncoder::PreEncoded`]).
+///
+/// `width`/`height` set the resolution libwebrtc's encoder pipeline is
+/// configured for. They must match what your encoder actually produces. Pass
+/// 0 in [`EncodedVideoFrame`] fields to inherit them per frame.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct PreEncodedOptions {
+    /// Encoded width in pixels.
+    pub width: u32,
+    /// Encoded height in pixels.
+    pub height: u32,
+}
+
+impl PreEncodedOptions {
+    /// Pre-encoded track encoded at `width`×`height`.
+    pub fn new(width: u32, height: u32) -> Self {
+        Self { width, height }
+    }
+}
+
+/// How a video track produces its encoded bitstream, replacing libwebrtc's
+/// builtin encoder **for that track only**.
+///
+/// One mechanism, two feeding styles:
+///
+/// - [`PreEncoded`](TrackVideoEncoder::PreEncoded) — **asynchronous**: you
+///   push already-encoded bytes at your own pace, from any thread (a
+///   hardware encoder callback, a relay, a file dumper). A queue decouples
+///   your producer from the encoder thread. The track comes back as
+///   [`LocalVideoTrack::Encoded`] and you feed it with
+///   [`EncodedVideoTrack::push_encoded_frame`].
+/// - [`Inline`](TrackVideoEncoder::Inline) — **synchronous**: libwebrtc calls
+///   your closure on the encoder thread with every raw I420 frame; return
+///   `Some(encoded)` to inject bytes into the RTP stack or `None` to drop the
+///   frame. Right when your pipeline is raw-in/encoded-out and you want
+///   libwebrtc to drive the cadence. The track comes back as
+///   [`LocalVideoTrack::Raw`] and you feed it like any raw track.
+///
+/// Either way, the bytes **you** produce must match the codec negotiated for
+/// the track's transceiver — read [`RawVideoFrame::codec`] (inline) or set
+/// codec preferences to pin it.
+///
+/// # Slot assignment order — positional, with fresh upgrades
+///
+/// Slots route encoder instances ↔ tracks **positionally**: reservation order
+/// (track creation) must match the negotiation order of the transceivers
+/// carrying those tracks. Create encoder-carrying tracks **before** the
+/// peer connection they're attached to negotiates (before `create_offer`),
+/// or the registry may not yet see a reservation to bind to; ordering across
+/// **multiple** peer connections sharing one factory follows whichever
+/// negotiates first, not track creation order.
+///
+/// Dropping an encoder-carrying track retracts its pending slots and degrades
+/// any surviving assigned slot to Builtin (loud fallback, never another
+/// track's). libwebrtc may recreate encoder instances on internal errors or
+/// renegotiation past a dead track; that path degrades the same way rather
+/// than re-routing another live track's pipeline.
+#[non_exhaustive]
+pub enum TrackVideoEncoder {
+    /// You push already-encoded bytes at your own pace.
+    PreEncoded(PreEncodedOptions),
+    /// libwebrtc calls your encoder synchronously with every raw I420 frame.
+    Inline(InlineEncoderCallback),
+}
+
+/// Which H.264 backend a **raw** video track encodes with.
+///
+/// `None` (Auto, the default) picks the platform default: **VideoToolbox**
+/// on Apple, **OpenH264** — when registered via
+/// [`PeerConnectionFactoryBuilder::with_openh264`] — elsewhere. Without any
+/// usable backend, H264 is simply not negotiated (VP8/VP9/AV1 take over).
+///
+/// Choose explicitly to force a backend per track — a camera on VideoToolbox
+/// (hardware, battery-friendly) beside a screen share on OpenH264
+/// (bitrate/intra control, cross-platform parity). An explicit-but-unusable
+/// backend (VideoToolbox off Apple, OpenH264 unregistered) fails track
+/// creation with an error.
+///
+/// Meaningless — and rejected — on tracks with
+/// [`TrackVideoEncoder`] set, since the track's bytes come from your own
+/// pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum H264Backend {
+    /// Apple's hardware VideoToolbox (macOS/iOS).
+    VideoToolbox,
+    /// Cisco's software OpenH264 — requires registering the shared library
+    /// with [`PeerConnectionFactoryBuilder::with_openh264`].
+    #[cfg(feature = "openh264")]
+    OpenH264,
+    // Future: MediaFoundation (Windows hw), NvEnc (NVIDIA), …
+}
+
+/// Options for [`PeerConnectionFactory::create_video_track_with_options`].
+///
+/// All fields optional; `Default::default()` produces exactly what
+/// [`PeerConnectionFactory::create_video_track`] produces. The struct is
+/// `#[non_exhaustive]` — construct via `Default` and assign fields:
+///
+/// ```rust,ignore
+/// let mut opts = VideoTrackOptions::default();
+/// opts.encoder = Some(TrackVideoEncoder::PreEncoded(PreEncodedOptions::new(1280, 720)));
+/// ```
+#[derive(Default)]
+#[non_exhaustive]
+pub struct VideoTrackOptions {
+    /// Encoder override for this track. `None` (default) = libwebrtc's
+    /// builtin/software pipeline encodes.
+    pub encoder: Option<TrackVideoEncoder>,
+    /// Which H.264 backend encodes this track when it is raw and H264 wins
+    /// negotiation. Errors when set together with `encoder`.
+    pub h264_backend: Option<H264Backend>,
+    /// Per-track frame-metadata switch. `None` (default) inherits the
+    /// factory's kill switch
+    /// ([`PeerConnectionFactoryBuilder::with_metadata`]); `Some(false)`
+    /// disables trailers for this track only — pushes with `user_data` drop
+    /// it silently (the frame itself still flows) and the peer sees no
+    /// trailer whatever the connection negotiated. The SDP stays
+    /// session-level either way.
+    pub frame_metadata: Option<bool>,
+}
+
+/// One video track created by
+/// [`PeerConnectionFactory::create_video_track_with_options`].
+///
+/// - [`Raw`](LocalVideoTrack::Raw) — push BGRA frames; either libwebrtc
+///   encodes them itself (default) or they go through an
+///   [`Inline`](TrackVideoEncoder::Inline) callback.
+/// - [`Encoded`](LocalVideoTrack::Encoded) — push pre-encoded bytes;
+///   libwebrtc only packetises.
+pub enum LocalVideoTrack {
+    /// A raw (BGRA-in) video track.
+    Raw(crate::media::VideoTrack),
+    /// A pre-encoded (bytes-in) video track.
+    Encoded(EncodedVideoTrack),
+}
+
+impl LocalVideoTrack {
+    /// The underlying video track handle — attach this to a transceiver with
+    /// [`Transceiver::set_track`](crate::Transceiver::set_track).
+    pub fn track(&self) -> &crate::media::VideoTrack {
+        match self {
+            Self::Raw(t) => t,
+            Self::Encoded(e) => e.track(),
         }
     }
 
-    /// Create a custom encoder driven by an [`EncodedVideoTrack`] queue.
-    ///
-    /// Internal — called by [`PeerConnectionFactory::with_encoded_video_track`].
-    pub(crate) fn from_queue(queue: Arc<Mutex<VecDeque<EncodedVideoFrame>>>) -> Self {
-        Self::new(move |_raw| queue.lock().unwrap().pop_front())
+    /// Returns the inner [`EncodedVideoTrack`], or `None` if this is a raw track.
+    pub fn as_encoded(&self) -> Option<&EncodedVideoTrack> {
+        match self {
+            Self::Encoded(e) => Some(e),
+            Self::Raw(_) => None,
+        }
     }
 
-    /// Create a custom encoder backed by a shared [`EncoderRegistry`].
-    ///
-    /// Internal — used by [`EncodedVideoBuilder`](crate::EncodedVideoBuilder)
-    /// to route frames across multiple encoded and/or raw video tracks.
-    /// The `use_builtin` trampoline is passed to the C++ factory so it can
-    /// delegate individual encoder instances to the builtin VP8/VP9/AV1 pipeline.
-    pub(crate) fn from_registry(registry: Arc<EncoderRegistry>) -> Self {
-        let state = Box::into_raw(Box::new(RegistryState { registry }));
-        Self {
-            encode_fn: registry_encode_tramp,
-            userdata: state as *mut c_void,
-            free_ud: Some(free_registry_state_tramp),
-            use_builtin: Some(registry_use_builtin_tramp),
+    /// Returns the inner raw [`VideoTrack`](crate::media::VideoTrack), or
+    /// `None` if this is a pre-encoded track.
+    pub fn as_raw(&self) -> Option<&crate::media::VideoTrack> {
+        match self {
+            Self::Raw(t) => Some(t),
+            Self::Encoded(_) => None,
         }
     }
 }
@@ -612,7 +1114,9 @@ impl CustomVideoEncoder {
 /// A video track that accepts **pre-encoded** frames directly, bypassing the
 /// libwebrtc software encoder pipeline entirely.
 ///
-/// Obtain one via [`PeerConnectionFactory::with_encoded_video_track`], then:
+/// Obtain one via
+/// [`PeerConnectionFactory::create_video_track_with_options`] with
+/// [`TrackVideoEncoder::PreEncoded`], then:
 ///
 /// 1. Attach `EncodedVideoTrack::track()` to a send-only transceiver.
 /// 2. Call `push_encoded_frame` whenever your encoder (VideoToolbox, NVENC,
@@ -626,7 +1130,7 @@ impl CustomVideoEncoder {
 /// is cheap (pre-allocated; the I420 data is discarded by the encoder
 /// callback before it ever touches your encoded bytes).
 pub struct EncodedVideoTrack {
-    pub(crate) track: crate::media::Track,
+    pub(crate) track: crate::media::VideoTrack,
     pub(crate) queue: Arc<Mutex<VecDeque<EncodedVideoFrame>>>,
     // Pre-allocated BGRA buffer used to trigger the WebRTC encoder thread.
     // The dimensions are kept in sync with the track's configured resolution
@@ -634,12 +1138,13 @@ pub struct EncodedVideoTrack {
     dummy: Vec<u8>,
     width: u32,
     height: u32,
-    // FIFO metadata queue for push_encoded_frame_with_metadata: the sender
+    // FIFO metadata queue for push_frame_with_metadata: the sender
     // FrameTransform pops one entry per encoded frame in push order. A FIFO rather
     // than timestamp correlation because capture_time_ms is unreliable here —
     // VideoStreamEncoder clamps future timestamps back to post_time, which can
     // collide when two pushes land in the same millisecond.
     sender_meta_fifo: Arc<FifoMeta>,
+    feedback: Arc<FeedbackListeners>,
 }
 
 /// An [`EncodedVideoTrack`]'s outgoing metadata, in push order.
@@ -667,8 +1172,9 @@ unsafe impl Sync for EncodedVideoTrack {}
 
 impl EncodedVideoTrack {
     pub(crate) fn new(
-        track: crate::media::Track,
+        track: crate::media::VideoTrack,
         queue: Arc<Mutex<VecDeque<EncodedVideoFrame>>>,
+        feedback: Arc<FeedbackListeners>,
         width: u32,
         height: u32,
     ) -> Self {
@@ -679,6 +1185,7 @@ impl EncodedVideoTrack {
         // that correlates correctly.
         let source: Arc<dyn crate::sender_meta::SenderMetaSource> = sender_meta_fifo.clone();
         crate::sender_meta::register(track.native_id(), &source);
+        crate::encoded::register_feedback_binding(track.native_id(), &feedback);
         Self {
             track,
             queue,
@@ -686,13 +1193,24 @@ impl EncodedVideoTrack {
             width,
             height,
             sender_meta_fifo,
+            feedback,
         }
     }
 
-    /// The underlying video [`Track`](crate::Track). Pass this to
-    /// [`Transceiver::set_track`](crate::Transceiver::set_track) after creating
-    /// the send-only transceiver.
-    pub fn track(&self) -> &crate::media::Track {
+    /// Listen for encoder feedback for this track —
+    /// [`EncoderFeedback::KeyFrameRequest`] (answer with an IDR promptly) and
+    /// [`EncoderFeedback::RateUpdate`] (adapt your encoder's target). Latest
+    /// registration wins. The callback fires on WebRTC threads, like every
+    /// other sink in this API.
+    pub fn on_encoder_feedback(&self, cb: impl FnMut(EncoderFeedback) + Send + 'static) {
+        self.feedback.set(Box::new(cb));
+    }
+
+    /// The underlying video track handle — pass `track()` (or the
+    /// [`VideoTrack`](crate::VideoTrack) itself) to
+    /// [`Transceiver::set_track`](crate::Transceiver::set_track); it derefs to
+    /// [`&Track`](crate::Track).
+    pub fn track(&self) -> &crate::media::VideoTrack {
         &self.track
     }
 
@@ -703,9 +1221,9 @@ impl EncodedVideoTrack {
     /// any thread, including a hardware encoder callback.
     ///
     /// Set `frame.width` / `frame.height` to 0 to inherit from the track's
-    /// configured resolution (the value passed to
-    /// [`with_encoded_video_track`](crate::PeerConnectionFactory::with_encoded_video_track)).
-    pub fn push_encoded_frame(&self, frame: EncodedVideoFrame) {
+    /// configured resolution — the
+    /// [`PreEncodedOptions`] the track was created with.
+    pub fn push_frame(&self, frame: EncodedVideoFrame) -> crate::Result<()> {
         // Queue first so the frame is always present when the encoder thread
         // dequeues it (the two operations are not atomic, but the encoder
         // thread is asynchronous, so the queue push always wins the race).
@@ -713,8 +1231,12 @@ impl EncodedVideoTrack {
         // Push a dummy raw frame to wake the WebRTC encoder thread.
         // The I420 data is thrown away in the encoder callback — the actual
         // encoded bytes come from the queue above.
-        self.track
-            .push_video_frame(&self.dummy, self.width, self.height);
+        self.track.push_frame(crate::media::VideoFrame::new(
+            &self.dummy,
+            self.width,
+            self.height,
+        ))?;
+        Ok(())
     }
 
     /// Inject a pre-encoded frame with per-frame metadata embedded as a
@@ -729,19 +1251,63 @@ impl EncodedVideoTrack {
     /// [`sender_metadata_transform`](Self::sender_metadata_transform) to be
     /// called and the returned [`FrameTransform`](crate::FrameTransform) to
     /// be attached to the sender transceiver before the first SDP exchange.
-    pub fn push_encoded_frame_with_metadata(&self, frame: EncodedVideoFrame, user_data: &[u8]) {
+    pub fn push_frame_with_metadata(
+        &self,
+        frame: EncodedVideoFrame,
+        user_data: &[u8],
+    ) -> crate::Result<()> {
         let meta = crate::metadata::FrameMetadata {
             frame_id: self.track.next_frame_id(),
             capture_time_us: crate::time_micros().max(0) as u64,
             user_data: user_data.to_vec(),
         };
         // Enqueue metadata first so the FIFO entry is always present when the
-        // sender FrameTransform fires on the encoder thread.
-        if let Ok(mut fifo) = self.sender_meta_fifo.0.lock() {
-            fifo.push_back(meta);
+        // sender FrameTransform fires on the encoder thread. Off-track
+        // (frame_metadata off) drops user_data here, mirroring the raw path.
+        if self.track.metadata_enabled() {
+            if let Ok(mut fifo) = self.sender_meta_fifo.0.lock() {
+                fifo.push_back(meta);
+            }
         }
         self.queue.lock().unwrap().push_back(frame);
-        self.track
-            .push_video_frame(&self.dummy, self.width, self.height);
+        self.track.push_frame(crate::media::VideoFrame::new(
+            &self.dummy,
+            self.width,
+            self.height,
+        ))?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod registry_locking_tests {
+    use super::*;
+
+    /// A new encoder id arriving with an empty reservation queue takes the
+    /// positional fallback. That branch must not consult has_custom() while
+    /// holding the `assigned` lock: std::sync::Mutex is non-recursive, so the
+    /// re-lock self-deadlocked the encoder queue whenever libwebrtc
+    /// recreated an encoder during stream teardown, cascading into
+    /// VideoStreamEncoder::Stop and PeerConnection::Close never returning
+    /// (sampled as the CI pytest hang).
+    #[test]
+    fn use_builtin_for_empty_pending_does_not_self_deadlock() {
+        let registry = EncoderRegistry::new();
+        let _live = registry.add_encoded_slot(0xdead);
+        assert!(
+            !registry.use_builtin_for(1),
+            "the single pending reservation is custom"
+        );
+        // Pending is now empty while a custom slot stays assigned — exactly
+        // the state a teardown-time encoder recreate hits.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reg = Arc::clone(&registry);
+        std::thread::spawn(move || {
+            let _ = tx.send(reg.use_builtin_for(2));
+        });
+        let fell_back = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("use_builtin_for self-deadlocked on an empty pending queue");
+        assert!(fell_back, "no reservation left → builtin fallback");
     }
 }

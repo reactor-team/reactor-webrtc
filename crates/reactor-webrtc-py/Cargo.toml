@@ -20,3 +20,4 @@ tokio = { version = "1", features = ["rt-multi-thread"] }
 
 [features]
 default = []
+openh264 = ["reactor-webrtc/openh264"]

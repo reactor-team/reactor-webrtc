@@ -10,8 +10,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use reactor_webrtc::{
-    IceGatheringState, MediaKind, PeerConnectionFactory, PeerConnectionObserver, RtcConfiguration,
-    TransceiverDirection,
+    AudioTrackOptions, AudioTrackSource, IceGatheringState, MediaKind, PeerConnectionFactory,
+    PeerConnectionObserver, RtcConfiguration, TransceiverDirection,
 };
 
 fn wait_for(p: impl Fn() -> bool, timeout: Duration) -> bool {
@@ -27,7 +27,7 @@ fn wait_for(p: impl Fn() -> bool, timeout: Duration) -> bool {
 
 #[test]
 fn transceivers_mid_and_ice_gathering() {
-    let factory = PeerConnectionFactory::new().expect("factory");
+    let factory = PeerConnectionFactory::builder().build().expect("factory");
 
     let gathering_complete = Arc::new(AtomicBool::new(false));
     let observer = PeerConnectionObserver::new().on_ice_gathering_change({
@@ -97,7 +97,7 @@ fn transceivers_mid_and_ice_gathering() {
 /// own clock, which shows up as A/V drift.
 #[test]
 fn published_tracks_share_one_media_stream() {
-    let factory = PeerConnectionFactory::new().expect("factory");
+    let factory = PeerConnectionFactory::builder().build().expect("factory");
 
     // The bidirectional shape the SDK peer answers: the offerer sends a camera
     // and a mic (mids 0, 1) and asks to receive a processed pair (mids 2, 3), so
@@ -129,7 +129,11 @@ fn published_tracks_share_one_media_stream() {
         .create_video_track("out_video")
         .expect("video track");
     let audio = factory
-        .create_audio_track_with_local_source("out_audio")
+        .create_audio_track_with_options("out_audio", {
+            let mut options = AudioTrackOptions::default();
+            options.source = AudioTrackSource::LocalPush;
+            options
+        })
         .expect("audio track");
     // Publish by mid, the way the peer resolves a client's track mapping: the
     // mids the offer marked recvonly get a track, the rest stay receive-only.
@@ -139,7 +143,7 @@ fn published_tracks_share_one_media_stream() {
         if !published.contains(&mid.as_str()) {
             continue;
         }
-        let track = match tc.kind() {
+        let track: &reactor_webrtc::Track = match tc.kind() {
             MediaKind::Video => &video,
             MediaKind::Audio => &audio,
             MediaKind::Unknown => panic!("transceiver of unknown kind"),

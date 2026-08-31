@@ -28,18 +28,19 @@ use std::time::{Duration, Instant};
 use reactor_webrtc_sys::{
     reactor_webrtc_abi_version, reactor_webrtc_audio_track_add_sink,
     reactor_webrtc_audio_track_create, reactor_webrtc_data_channel_destroy,
-    reactor_webrtc_factory_create, reactor_webrtc_factory_create_with_adm,
-    reactor_webrtc_factory_destroy, reactor_webrtc_factory_push_audio_frame,
-    reactor_webrtc_factory_set_adm_playout_enabled, reactor_webrtc_media_stream_track_destroy,
-    reactor_webrtc_peer_connection_add_ice_candidate, reactor_webrtc_peer_connection_add_track,
-    reactor_webrtc_peer_connection_create, reactor_webrtc_peer_connection_create_answer,
+    reactor_webrtc_factory_create, reactor_webrtc_factory_destroy,
+    reactor_webrtc_factory_push_audio_frame, reactor_webrtc_factory_set_adm_playout_enabled,
+    reactor_webrtc_media_stream_track_destroy, reactor_webrtc_peer_connection_add_ice_candidate,
+    reactor_webrtc_peer_connection_add_track, reactor_webrtc_peer_connection_create,
+    reactor_webrtc_peer_connection_create_answer,
     reactor_webrtc_peer_connection_create_data_channel,
     reactor_webrtc_peer_connection_create_offer, reactor_webrtc_peer_connection_destroy,
     reactor_webrtc_peer_connection_set_local_description,
     reactor_webrtc_peer_connection_set_remote_description, reactor_webrtc_selftest,
     reactor_webrtc_video_track_add_sink, reactor_webrtc_video_track_create,
     reactor_webrtc_video_track_push_frame, MediaStreamTrack, PeerConnection,
-    PeerConnectionCallbacks, PeerConnectionFactory, ReactorRtcConfig,
+    PeerConnectionCallbacks, PeerConnectionFactory, ReactorAudioTrackOptions,
+    ReactorFactoryOptions, ReactorRtcConfig,
 };
 
 // PeerConnectionState::kConnected (enum order in peer_connection_interface.h).
@@ -164,6 +165,19 @@ fn observer_for(ctx: &PcCtx) -> PeerConnectionCallbacks {
     }
 }
 
+/// Create a factory through the options struct, returning the glue's failure
+/// reason on error.
+unsafe fn create_factory(
+    opts: &ReactorFactoryOptions,
+) -> Result<*mut PeerConnectionFactory, String> {
+    let mut err = [0 as c_char; 256];
+    let f = reactor_webrtc_factory_create(opts, err.as_mut_ptr(), err.len() as c_int);
+    if f.is_null() {
+        return Err(CStr::from_ptr(err.as_ptr()).to_string_lossy().into_owned());
+    }
+    Ok(f)
+}
+
 /// Create a PeerConnection, returning the glue's failure reason on error.
 unsafe fn create_pc(
     factory: *mut PeerConnectionFactory,
@@ -212,7 +226,7 @@ fn links_and_runs_libwebrtc() {
     // SAFETY: every symbol is implemented by the C++ glue compiled in build.rs
     // and resolved against our libwebrtc.a.
     unsafe {
-        assert_eq!(reactor_webrtc_abi_version(), 2, "ABI version mismatch");
+        assert_eq!(reactor_webrtc_abi_version(), 3, "ABI version mismatch");
 
         // Codec factories.
         let mut buf = [0u8; 1024];
@@ -225,8 +239,8 @@ fn links_and_runs_libwebrtc() {
         assert!(lower.contains("vp8"), "expected VP8, got: {codecs}");
 
         // PeerConnectionFactory + a PeerConnection we just create/destroy.
-        let factory = reactor_webrtc_factory_create();
-        assert!(!factory.is_null(), "PeerConnectionFactory creation failed");
+        let factory = create_factory(&ReactorFactoryOptions::default())
+            .expect("PeerConnectionFactory creation");
         let pc = create_pc(factory, ptr::null(), ptr::null()).expect("PeerConnection creation");
         reactor_webrtc_peer_connection_destroy(pc);
         reactor_webrtc_factory_destroy(factory);
@@ -240,23 +254,22 @@ fn openh264_factory_degrades_without_a_library() {
     // No real OpenH264 .so/.dylib/.dll is available in this environment (it's
     // fetched at runtime by `openh264::ensure_available`, which needs real
     // network access and isn't part of this link test). Feed a bogus path and
-    // confirm the factory still comes up — OpenH264VideoEncoderFactory/
-    // DecoderFactory (glue/openh264/openh264_codec.cc) are supposed to
-    // degrade to "H264 not advertised, everything else builtin" rather than
-    // fail construction — proving the FFI wiring itself (not the codec) is
-    // sound. A real end-to-end OpenH264 encode/decode loopback needs Part 1's
-    // verification step 1 (a real downloaded library) run manually.
+    // confirm the factory still comes up — the unified create
+    // (ReactorFactoryOptions.openh264_lib_path) degrades to "no OpenH264
+    // backend" rather than failing construction, proving the FFI wiring
+    // itself (not the codec) is sound. What that means for the SDP depends on
+    // the platform: on Apple the composite factory's VideoToolbox backend
+    // keeps H264 negotiable regardless; elsewhere nothing else offers H264
+    // without the library. A real end-to-end OpenH264 encode/decode loopback
+    // needs Part 1's verification step 1 (a real downloaded library) run
+    // manually.
     unsafe {
         let bad_path = CString::new("/nonexistent/libopenh264.so").unwrap();
-        let factory = reactor_webrtc_sys::reactor_webrtc_factory_create_with_openh264(
-            bad_path.as_ptr(),
-            0,
-            0,
-        );
-        assert!(
-            !factory.is_null(),
-            "factory creation should degrade, not fail, when OpenH264 can't load"
-        );
+        let factory = create_factory(&ReactorFactoryOptions {
+            openh264_lib_path: bad_path.as_ptr(),
+            ..Default::default()
+        })
+        .expect("factory creation should degrade, not fail, when OpenH264 can't load");
         let pc = create_pc(factory, ptr::null(), ptr::null())
             .expect("peer connection creation (openh264 factory, library absent)");
 
@@ -284,6 +297,15 @@ fn openh264_factory_degrades_without_a_library() {
             lower.contains("vp8"),
             "expected VP8 still negotiable, got: {sdp}"
         );
+        // OpenH264 is the only H264 backend off Apple: a failed load means no
+        // H264 in the SDP at all. On Apple the VideoToolbox backend keeps
+        // H264 negotiable no matter what happened to the OpenH264 load.
+        #[cfg(target_vendor = "apple")]
+        assert!(
+            lower.contains("h264"),
+            "H264 should stay negotiable via VideoToolbox on Apple, got: {sdp}"
+        );
+        #[cfg(not(target_vendor = "apple"))]
         assert!(
             !lower.contains("h264"),
             "H264 should not be negotiable when the library failed to load, got: {sdp}"
@@ -304,8 +326,11 @@ fn platform_adm_factory_lifecycle() {
     // aborts (uncatchable SIGABRT) when there's no audio device — as on headless
     // CI — so this is #[ignore]d there. Construct/destroy only; no capture.
     unsafe {
-        let factory = reactor_webrtc_factory_create_with_adm(1);
-        assert!(!factory.is_null(), "platform-ADM factory creation failed");
+        let factory = create_factory(&ReactorFactoryOptions {
+            use_platform_adm: 1,
+            ..Default::default()
+        })
+        .expect("platform-ADM factory creation failed");
         // set_adm_playout_enabled is a no-op for the platform ADM but must not crash.
         reactor_webrtc_factory_set_adm_playout_enabled(factory, 0);
         let pc = create_pc(factory, ptr::null(), ptr::null())
@@ -321,8 +346,8 @@ fn loopback_two_peers_exchange_media() {
     // SAFETY: as above; drives a full offer/answer + ICE exchange between two
     // in-process PeerConnections, then streams audio + video one way.
     unsafe {
-        let factory = reactor_webrtc_factory_create();
-        assert!(!factory.is_null(), "factory creation failed");
+        let factory =
+            create_factory(&ReactorFactoryOptions::default()).expect("factory creation failed");
 
         let ctx1 = Box::new(PcCtx::default());
         let ctx2 = Box::new(PcCtx::default());
@@ -347,7 +372,11 @@ fn loopback_two_peers_exchange_media() {
         );
 
         let aud_id = CString::new("reactor-audio").unwrap();
-        let atrack = reactor_webrtc_audio_track_create(factory, aud_id.as_ptr());
+        let atrack = reactor_webrtc_audio_track_create(
+            factory,
+            aud_id.as_ptr(),
+            &ReactorAudioTrackOptions::default(),
+        );
         assert!(!atrack.is_null(), "audio track creation failed");
         assert_eq!(
             reactor_webrtc_peer_connection_add_track(pc1, atrack),

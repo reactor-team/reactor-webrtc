@@ -9,14 +9,16 @@ camera and a microphone on one clock.
 
 The two tracks time themselves very differently.
 
-**Video** carries a timestamp per frame. `push_video_frame` reads the clock at
-the moment of the call and stamps the frame with it, so a gap between frames is
+**Video** carries a timestamp per frame. [`VideoTrack::push_frame`] reads
+the clock at the moment of the call and stamps the frame with it, so a gap between frames is
 self-describing: two frames 400 ms apart say so, and the receiver holds the
 first for 400 ms.
 
 **Audio** carries no timestamp of its own. The track's RTP timestamp is a
 sample counter — the engine advances it by however many samples each
-`push_pcm` hands over. That says how much audio exists, never when it happened.
+[`AudioTrack::push_frame`]
+(on a `LocalPush` track) hands over. That says how much audio exists, never
+when it happened.
 Two consequences follow:
 
 - A tick that pushes nothing is time the stream never accounts for. The packets
@@ -46,8 +48,8 @@ audio.push_pcm(pcm, 48_000, 1, capture_time_us=now)
 
 ```rust
 let now = reactor_webrtc::time_micros();
-video.push_video_frame_at(&bgra, width, height, now)?;
-audio.push_pcm_at(&pcm, 48_000, 1, now)?;
+video.push_frame_at(VideoFrame::new(&bgra, width, height), now)?;
+audio.push_frame_at(AudioFrame::new(&pcm, 48_000, 1), now)?;
 ```
 
 Without the timestamps each track inherits the moment it happened to reach the
@@ -73,7 +75,7 @@ video.push_video_frame(
 ```
 
 ```rust
-video.push_video_frame_with_metadata_at(&bgra, width, height, b"...", now);
+video.push_frame_with_metadata_at(VideoFrame::new(&bgra, width, height), b"...", now)?;
 ```
 
 The trailer is matched to its frame by capture millisecond, so two frames
@@ -108,8 +110,8 @@ The two tracks carry it very differently, and it is worth knowing which one is
 doing the work.
 
 **Video** puts the capture time straight into the RTP timestamp — video RTP
-timestamps *are* capture times, at 90 kHz. `push_video_frame_at` therefore
-changes what goes on the wire unconditionally.
+timestamps *are* capture times, at 90 kHz. `VideoTrack::push_frame_at`
+therefore changes what goes on the wire unconditionally.
 
 A frame that also carries [per-frame metadata](frame-metadata.md) carries the
 capture time a second way, and the two differ in what they preserve. The RTP

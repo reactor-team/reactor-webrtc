@@ -37,8 +37,8 @@ mod imp {
     use std::time::{Duration, Instant};
 
     use reactor_webrtc::{
-        MediaKind, PeerConnection, PeerConnectionFactory, PeerConnectionObserver,
-        PeerConnectionState, RtcConfiguration, Track,
+        PeerConnection, PeerConnectionFactory, PeerConnectionObserver, PeerConnectionState,
+        RemoteTrack, RtcConfiguration,
     };
 
     const W: usize = 320;
@@ -59,45 +59,44 @@ mod imp {
         let frames = Arc::new(AtomicU32::new(0));
         let blocks = Arc::new(AtomicU32::new(0));
 
-        let factory = PeerConnectionFactory::new().expect("factory");
+        let factory = PeerConnectionFactory::builder().build().expect("factory");
         let config = RtcConfiguration::default();
 
         // Receiver: write decoded media to the files.
-        let recv_tracks: Arc<Mutex<Vec<Track>>> = Arc::new(Mutex::new(Vec::new()));
+        let recv_tracks: Arc<Mutex<Vec<RemoteTrack>>> = Arc::new(Mutex::new(Vec::new()));
         let (recv_pc, recv_state) = make_peer(&factory, &config, {
             let vw = video_writer.clone();
             let aw = wav_writer.clone();
             let frames = frames.clone();
             let blocks = blocks.clone();
             let recv_tracks = recv_tracks.clone();
-            move |kind, mut track| {
-                match kind {
-                    MediaKind::Video => {
+            move |track| {
+                match &track {
+                    RemoteTrack::Video(v) => {
                         let vw = vw.clone();
                         let frames = frames.clone();
-                        track.on_video_frame(move |f| {
+                        v.on_frame(move |f| {
                             vw.lock()
                                 .unwrap()
                                 .write(f.bgra, f.width as usize, f.height as usize);
                             frames.fetch_add(1, Ordering::SeqCst);
                         });
                     }
-                    MediaKind::Audio => {
+                    RemoteTrack::Audio(a) => {
                         let aw = aw.clone();
                         let blocks = blocks.clone();
-                        track.on_audio_frame(move |f| {
+                        a.on_frame(move |f| {
                             aw.lock().unwrap().write(f.pcm, f.sample_rate, f.channels);
                             blocks.fetch_add(1, Ordering::SeqCst);
                         });
                     }
-                    MediaKind::Unknown => {}
                 }
                 recv_tracks.lock().unwrap().push(track);
             }
         });
 
         // Sender: a video + an audio track.
-        let (send_pc, send_state) = make_peer(&factory, &config, |_, _| {});
+        let (send_pc, send_state) = make_peer(&factory, &config, |_| {});
         let video = factory.create_video_track("video").expect("video track");
         let audio = factory.create_audio_track("audio").expect("audio track");
         send_pc.add_track(&video).expect("add video");
@@ -142,7 +141,9 @@ mod imp {
                     factory.push_audio_frame(&pcm, RATE, CHANNELS);
                     if tick % 3 == 0 {
                         fill_pattern(&mut bgra, tick);
-                        video.push_video_frame(&bgra, W as u32, H as u32);
+                        video
+                            .push_frame(reactor_webrtc::VideoFrame::new(&bgra, W as u32, H as u32))
+                            .expect("push frame");
                     }
                     tick = tick.wrapping_add(1);
                     thread::sleep(Duration::from_millis(10));
@@ -181,7 +182,7 @@ mod imp {
     fn make_peer(
         factory: &PeerConnectionFactory,
         config: &RtcConfiguration,
-        on_track: impl FnMut(MediaKind, Track) + Send + 'static,
+        on_track: impl FnMut(RemoteTrack) + Send + 'static,
     ) -> (PeerConnection, Arc<State>) {
         let state = Arc::new(State {
             ice: Mutex::new(VecDeque::new()),

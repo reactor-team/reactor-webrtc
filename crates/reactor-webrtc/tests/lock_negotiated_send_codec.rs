@@ -140,7 +140,7 @@ fn default_first_video_codec(factory: &PeerConnectionFactory) -> String {
 
 #[test]
 fn set_local_description_locks_the_answerer_send_codec_automatically() {
-    let factory = PeerConnectionFactory::new().expect("factory");
+    let factory = PeerConnectionFactory::builder().build().expect("factory");
 
     let default_first = default_first_video_codec(&factory);
     let (preferred, preferred_name) = if default_first.eq_ignore_ascii_case("VP9") {
@@ -210,7 +210,9 @@ fn set_local_description_locks_the_answerer_send_codec_automatically() {
                 for (i, b) in bgra.iter_mut().enumerate() {
                     *b = (i as u8).wrapping_add(t);
                 }
-                track.push_video_frame(&bgra, w, h);
+                track
+                    .push_frame(reactor_webrtc::VideoFrame::new(&bgra, w, h))
+                    .expect("push frame");
                 t = t.wrapping_add(7);
                 thread::sleep(Duration::from_millis(30));
             }
@@ -246,7 +248,7 @@ fn set_local_description_locks_the_answerer_send_codec_automatically() {
 /// rather than giving up because the first choice alone did not match.
 #[test]
 fn falls_back_to_the_next_preferred_codec_when_the_top_choice_was_not_negotiated() {
-    let factory = PeerConnectionFactory::new().expect("factory");
+    let factory = PeerConnectionFactory::builder().build().expect("factory");
 
     // pc1 stands in for a browser that never offers VP9 at all — as opposed
     // to set_codec_preferences on pc2 simply not asking for it.
@@ -321,7 +323,9 @@ fn falls_back_to_the_next_preferred_codec_when_the_top_choice_was_not_negotiated
                 for (i, b) in bgra.iter_mut().enumerate() {
                     *b = (i as u8).wrapping_add(t);
                 }
-                track.push_video_frame(&bgra, w, h);
+                track
+                    .push_frame(reactor_webrtc::VideoFrame::new(&bgra, w, h))
+                    .expect("push frame");
                 t = t.wrapping_add(7);
                 thread::sleep(Duration::from_millis(30));
             }

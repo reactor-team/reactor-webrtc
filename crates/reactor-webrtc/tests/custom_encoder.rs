@@ -1,7 +1,8 @@
-//! Custom video encoder — verifies that the application-supplied encoder
-//! callback is invoked with raw I420 frames when the sender pushes video.
+//! Custom video encoder (per-track inline) — verifies that the
+//! application-supplied encoder callback is invoked with raw I420 frames when
+//! the sender pushes video.
 //!
-//! The custom encoder drops every frame (returns `None`) so no encoded bytes
+//! The encoder drops every frame (returns `None`) so no encoded bytes
 //! reach the network; the test only checks that the callback fires.
 //!
 //! ```sh
@@ -17,15 +18,16 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use reactor_webrtc::{
-    CustomVideoEncoder, IceCandidate, MediaKind, PeerConnection, PeerConnectionFactory,
-    PeerConnectionObserver, PeerConnectionState, RtcConfiguration, Track, TransceiverDirection,
+    IceCandidate, LocalVideoTrack, MediaKind, PeerConnection, PeerConnectionFactory,
+    PeerConnectionObserver, PeerConnectionState, RtcConfiguration, TrackVideoEncoder,
+    TransceiverDirection, VideoTrackOptions,
 };
 
 #[derive(Default)]
 struct Ice {
     q: Mutex<VecDeque<IceCandidate>>,
     connected: AtomicBool,
-    recv: Mutex<Vec<Track>>,
+    recv: Mutex<Vec<reactor_webrtc::RemoteTrack>>,
 }
 
 fn make_peer(
@@ -48,7 +50,7 @@ fn make_peer(
         })
         .on_track({
             let s = ice.clone();
-            move |_kind, track| {
+            move |track| {
                 s.recv.lock().unwrap().push(track);
             }
         });
@@ -74,12 +76,12 @@ fn forward_ice(from: &Ice, to: &PeerConnection) {
 #[cfg_attr(target_os = "windows", ignore)]
 #[test]
 fn custom_encoder_receives_raw_frames() {
-    // Count how many times the custom encoder callback fires.
+    // Count how many times the encoder callback fires.
     let raw_count = Arc::new(AtomicU32::new(0));
 
-    let encoder = CustomVideoEncoder::new({
+    let cb = {
         let count = raw_count.clone();
-        move |frame| {
+        move |frame: &reactor_webrtc::RawVideoFrame<'_>| {
             // Verify frame fields are sensible.
             assert_eq!(frame.width, 320);
             assert_eq!(frame.height, 240);
@@ -89,13 +91,11 @@ fn custom_encoder_receives_raw_frames() {
             count.fetch_add(1, Ordering::SeqCst);
             None // drop — we don't produce encoded output
         }
-    });
+    };
 
-    // Both peers share the same factory (which uses the custom encoder).
-    // pc2 is recvonly so it never calls the custom encoder callback — only
-    // pc1's send path invokes it.
-    let factory =
-        PeerConnectionFactory::with_custom_video_encoder(encoder).expect("custom encoder factory");
+    // Both peers share one factory; the send-side video track carries the
+    // inline encoder. pc2 is recvonly, so the callback fires only on pc1.
+    let factory = PeerConnectionFactory::builder().build().expect("factory");
 
     let config = RtcConfiguration::default();
     let (pc1, s1) = make_peer(&factory, &config);
@@ -104,9 +104,16 @@ fn custom_encoder_receives_raw_frames() {
     let tx1 = pc1
         .add_transceiver(MediaKind::Video, TransceiverDirection::SendOnly)
         .expect("send transceiver");
-    let video = factory
-        .create_video_track("reactor-video")
-        .expect("video track");
+    let track = {
+        let mut options = VideoTrackOptions::default();
+        options.encoder = Some(TrackVideoEncoder::Inline(Box::new(cb)));
+        factory
+            .create_video_track_with_options("reactor-video", options)
+            .expect("video track")
+    };
+    let LocalVideoTrack::Raw(video) = track else {
+        panic!("inline encoder track must come back as a raw track");
+    };
     tx1.set_track(&video).expect("set track");
 
     // Offer/answer.
@@ -127,7 +134,9 @@ fn custom_encoder_receives_raw_frames() {
                 for (i, b) in bgra.iter_mut().enumerate() {
                     *b = (i as u8).wrapping_add(t);
                 }
-                video.push_video_frame(&bgra, w, h);
+                video
+                    .push_frame(reactor_webrtc::VideoFrame::new(&bgra, w, h))
+                    .expect("push frame");
                 t = t.wrapping_add(7);
                 thread::sleep(Duration::from_millis(30));
             }

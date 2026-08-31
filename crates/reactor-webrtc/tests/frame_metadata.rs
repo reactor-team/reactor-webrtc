@@ -9,15 +9,16 @@
 #![cfg(have_libwebrtc)]
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use reactor_webrtc::{
     EncodedVideoFrame, FrameAction, FrameDirection, FrameMetadata, FrameTransform, IceCandidate,
-    MediaKind, PeerConnection, PeerConnectionFactory, PeerConnectionObserver, PeerConnectionState,
-    RtcConfiguration, Track, TransceiverDirection,
+    LocalVideoTrack, MediaKind, PeerConnection, PeerConnectionFactory, PeerConnectionObserver,
+    PeerConnectionState, PreEncodedOptions, RtcConfiguration, TrackVideoEncoder,
+    TransceiverDirection, VideoTrackOptions,
 };
 
 // ── Shared test plumbing (mirrors the pattern in encoded_transform.rs) ────────
@@ -26,7 +27,7 @@ use reactor_webrtc::{
 struct Ice {
     q: Mutex<VecDeque<IceCandidate>>,
     connected: AtomicBool,
-    recv: Mutex<Vec<Track>>,
+    recv: Mutex<Vec<reactor_webrtc::RemoteTrack>>,
 }
 
 fn make_peer(
@@ -49,7 +50,7 @@ fn make_peer(
         })
         .on_track({
             let s = ice.clone();
-            move |_kind, track| {
+            move |track| {
                 s.recv.lock().unwrap().push(track);
             }
         });
@@ -148,7 +149,7 @@ fn varying_bgra(seed: u8) -> Vec<u8> {
 /// `capture_time_us`.
 #[test]
 fn frame_metadata_roundtrip() {
-    let factory = PeerConnectionFactory::new().expect("factory");
+    let factory = PeerConnectionFactory::builder().build().expect("factory");
     let config = RtcConfiguration::default();
 
     let (pc1, s1) = make_peer(&factory, &config);
@@ -176,7 +177,12 @@ fn frame_metadata_roundtrip() {
             let mut seed = 0u8;
             while !stop.load(Ordering::SeqCst) {
                 let bgra = varying_bgra(seed);
-                video.push_video_frame_with_metadata(&bgra, W, H, user_data);
+                video
+                    .push_frame_with_metadata(
+                        reactor_webrtc::VideoFrame::new(&bgra, W, H),
+                        user_data,
+                    )
+                    .expect("push frame");
                 seed = seed.wrapping_add(7);
                 thread::sleep(Duration::from_millis(33));
             }
@@ -191,10 +197,10 @@ fn frame_metadata_roundtrip() {
 
             // Wire up the receiver once the remote track arrives via on_track.
             if !recv_setup {
-                let mut tracks = s2.recv.lock().unwrap();
-                if let Some(track) = tracks.iter_mut().find(|t| t.kind() == MediaKind::Video) {
+                let tracks = s2.recv.lock().unwrap();
+                if let Some(video) = tracks.iter().find_map(|t| t.as_video()) {
                     let out = received.clone();
-                    track.on_video_frame(move |frame| {
+                    video.on_frame(move |frame| {
                         if let Some(meta) = frame.metadata {
                             out.lock().unwrap().push(meta);
                         }
@@ -255,7 +261,7 @@ fn encoded_frame_metadata_roundtrip() {
     // ── Phase 1: capture a VP8 key frame ─────────────────────────────────────
     let kf_bytes: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
     {
-        let factory = PeerConnectionFactory::new().expect("factory");
+        let factory = PeerConnectionFactory::builder().build().expect("factory");
         let (pc1, s1) = make_peer(&factory, &config);
         let (pc2, s2) = make_peer(&factory, &config);
 
@@ -289,7 +295,9 @@ fn encoded_frame_metadata_roundtrip() {
                 let mut seed = 0u8;
                 while !stop.load(Ordering::SeqCst) {
                     let bgra = varying_bgra(seed);
-                    video.push_video_frame(&bgra, W, H);
+                    video
+                        .push_frame(reactor_webrtc::VideoFrame::new(&bgra, W, H))
+                        .expect("push frame");
                     seed = seed.wrapping_add(7);
                     thread::sleep(Duration::from_millis(33));
                 }
@@ -314,9 +322,19 @@ fn encoded_frame_metadata_roundtrip() {
         .clone()
         .expect("no VP8 key frame captured in phase 1");
 
-    // ── Phase 2: replay with metadata via EncodedVideoTrack ──────────────────
-    let (factory2, enc_track) =
-        PeerConnectionFactory::with_encoded_video_track("enc-meta", W, H).expect("factory2");
+    // ── Phase 2: replay with metadata via a pre-encoded video track ──────────
+    let factory2 = PeerConnectionFactory::builder().build().expect("factory2");
+    let enc_track = {
+        let mut options = VideoTrackOptions::default();
+        options.encoder = Some(TrackVideoEncoder::PreEncoded(PreEncodedOptions::new(W, H)));
+        match factory2
+            .create_video_track_with_options("enc-meta", options)
+            .expect("encoded track")
+        {
+            LocalVideoTrack::Encoded(t) => t,
+            LocalVideoTrack::Raw(_) => panic!("expected a pre-encoded track"),
+        }
+    };
 
     let (pc3, s3) = make_peer(&factory2, &config);
     let (pc4, s4) = make_peer(&factory2, &config);
@@ -337,16 +355,18 @@ fn encoded_frame_metadata_roundtrip() {
     thread::scope(|scope| {
         scope.spawn(|| {
             while !stop.load(Ordering::SeqCst) {
-                enc_track.push_encoded_frame_with_metadata(
-                    EncodedVideoFrame {
-                        data: vp8_bytes.clone(),
-                        is_key_frame: true,
-                        width: W,
-                        height: H,
-                        rtp_timestamp: 0,
-                    },
-                    user_data,
-                );
+                enc_track
+                    .push_frame_with_metadata(
+                        EncodedVideoFrame {
+                            data: vp8_bytes.clone(),
+                            is_key_frame: true,
+                            width: W,
+                            height: H,
+                            rtp_timestamp: 0,
+                        },
+                        user_data,
+                    )
+                    .expect("push frame");
                 thread::sleep(Duration::from_millis(33));
             }
         });
@@ -359,10 +379,10 @@ fn encoded_frame_metadata_roundtrip() {
             forward_ice(&s4, &pc3);
 
             if !recv_setup {
-                let mut tracks = s4.recv.lock().unwrap();
-                if let Some(track) = tracks.iter_mut().find(|t| t.kind() == MediaKind::Video) {
+                let tracks = s4.recv.lock().unwrap();
+                if let Some(video) = tracks.iter().find_map(|t| t.as_video()) {
                     let out = received.clone();
-                    track.on_video_frame(move |frame| {
+                    video.on_frame(move |frame| {
                         if let Some(meta) = frame.metadata {
                             out.lock().unwrap().push(meta);
                         }
@@ -419,7 +439,7 @@ fn encoded_frame_metadata_roundtrip() {
 /// appended.
 #[test]
 fn legacy_peer_gets_no_trailer() {
-    let factory = PeerConnectionFactory::new().expect("factory");
+    let factory = PeerConnectionFactory::builder().build().expect("factory");
     let config = RtcConfiguration::default();
 
     let (pc1, s1) = make_peer(&factory, &config);
@@ -469,7 +489,12 @@ fn legacy_peer_gets_no_trailer() {
             let mut seed = 0u8;
             while !stop.load(Ordering::SeqCst) {
                 let bgra = varying_bgra(seed);
-                video.push_video_frame_with_metadata(&bgra, W, H, b"must-not-ship");
+                video
+                    .push_frame_with_metadata(
+                        reactor_webrtc::VideoFrame::new(&bgra, W, H),
+                        b"must-not-ship",
+                    )
+                    .expect("push frame");
                 seed = seed.wrapping_add(7);
                 thread::sleep(Duration::from_millis(33));
             }
@@ -508,7 +533,7 @@ fn legacy_peer_gets_no_trailer() {
 /// metadata.
 #[test]
 fn caller_transform_and_metadata_compose_on_one_sender() {
-    let factory = PeerConnectionFactory::new().expect("factory");
+    let factory = PeerConnectionFactory::builder().build().expect("factory");
     let config = RtcConfiguration::default();
 
     let (pc1, s1) = make_peer(&factory, &config);
@@ -551,7 +576,12 @@ fn caller_transform_and_metadata_compose_on_one_sender() {
             let mut seed = 0u8;
             while !stop.load(Ordering::SeqCst) {
                 let bgra = varying_bgra(seed);
-                video.push_video_frame_with_metadata(&bgra, W, H, b"composed");
+                video
+                    .push_frame_with_metadata(
+                        reactor_webrtc::VideoFrame::new(&bgra, W, H),
+                        b"composed",
+                    )
+                    .expect("push frame");
                 seed = seed.wrapping_add(7);
                 thread::sleep(Duration::from_millis(33));
             }
@@ -563,10 +593,10 @@ fn caller_transform_and_metadata_compose_on_one_sender() {
             forward_ice(&s1, &pc2);
             forward_ice(&s2, &pc1);
             if !recv_setup {
-                let mut tracks = s2.recv.lock().unwrap();
-                if let Some(track) = tracks.iter_mut().find(|t| t.kind() == MediaKind::Video) {
+                let tracks = s2.recv.lock().unwrap();
+                if let Some(video) = tracks.iter().find_map(|t| t.as_video()) {
                     let out = received.clone();
-                    track.on_video_frame(move |frame| {
+                    video.on_frame(move |frame| {
                         if let Some(meta) = frame.metadata {
                             out.lock().unwrap().push(meta);
                         }
@@ -607,7 +637,7 @@ fn caller_transform_and_metadata_compose_on_one_sender() {
 /// and off the wire, on a connection that is otherwise identical.
 #[test]
 fn disabled_frame_metadata_never_negotiates() {
-    let factory = PeerConnectionFactory::new().expect("factory");
+    let factory = PeerConnectionFactory::builder().build().expect("factory");
     let off = RtcConfiguration {
         frame_metadata: false,
         ..Default::default()
@@ -672,7 +702,7 @@ fn disabled_frame_metadata_never_negotiates() {
 /// arrived.
 #[test]
 fn answerer_attaching_its_track_after_the_offer_still_sends_metadata() {
-    let factory = PeerConnectionFactory::new().expect("factory");
+    let factory = PeerConnectionFactory::builder().build().expect("factory");
     let config = RtcConfiguration::default();
 
     let (offerer, s1) = make_peer(&factory, &config);
@@ -722,7 +752,12 @@ fn answerer_attaching_its_track_after_the_offer_still_sends_metadata() {
             let mut seed = 0u8;
             while !stop.load(Ordering::SeqCst) {
                 let bgra = varying_bgra(seed);
-                video.push_video_frame_with_metadata(&bgra, W, H, b"late-attach");
+                video
+                    .push_frame_with_metadata(
+                        reactor_webrtc::VideoFrame::new(&bgra, W, H),
+                        b"late-attach",
+                    )
+                    .expect("push frame");
                 seed = seed.wrapping_add(7);
                 thread::sleep(Duration::from_millis(33));
             }
@@ -734,10 +769,10 @@ fn answerer_attaching_its_track_after_the_offer_still_sends_metadata() {
             forward_ice(&s2, &offerer);
             forward_ice(&s1, &answerer);
             if !recv_setup {
-                let mut tracks = s1.recv.lock().unwrap();
-                if let Some(track) = tracks.iter_mut().find(|t| t.kind() == MediaKind::Video) {
+                let tracks = s1.recv.lock().unwrap();
+                if let Some(video) = tracks.iter().find_map(|t| t.as_video()) {
                     let out = received.clone();
-                    track.on_video_frame(move |frame| {
+                    video.on_frame(move |frame| {
                         if let Some(meta) = frame.metadata {
                             out.lock().unwrap().push(meta);
                         }
@@ -765,4 +800,357 @@ fn answerer_attaching_its_track_after_the_offer_still_sends_metadata() {
         "answerer_attaching_its_track_after_the_offer_still_sends_metadata ✅  — {} frames",
         metas.len()
     );
+}
+
+// ── Per-track flag + factory kill switch (REA-5614) ─────────────────────────
+
+/// Per-track gate: on one negotiated connection, the track created with
+/// `frame_metadata` off drops its `user_data` while its sibling's metadata
+/// flows. SDP stays session-level — both directions negotiate the capability.
+#[test]
+fn per_track_metadata_flag_gates_trailer() {
+    let factory = PeerConnectionFactory::builder().build().expect("factory");
+    let config = RtcConfiguration::default();
+    let (pc1, s1) = make_peer(&factory, &config);
+    let (pc2, s2) = make_peer(&factory, &config);
+
+    let meta_track = factory
+        .create_video_track("meta-on")
+        .expect("meta-on track");
+    let LocalVideoTrack::Raw(plain_track) = factory
+        .create_video_track_with_options("meta-off", {
+            let mut options = VideoTrackOptions::default();
+            options.frame_metadata = Some(false);
+            options
+        })
+        .expect("meta-off track")
+    else {
+        panic!("meta-off must come back raw");
+    };
+
+    for t in [&meta_track, &plain_track] {
+        let tx = pc1
+            .add_transceiver(MediaKind::Video, TransceiverDirection::SendOnly)
+            .expect("tx");
+        tx.set_track(t).expect("set track");
+    }
+
+    negotiate(&pc1, &pc2);
+    assert!(
+        pc1.frame_metadata_gate().is_open(),
+        "capability should still negotiate — session-level SDP is untouched"
+    );
+
+    let on_frames = Arc::new(AtomicU32::new(0));
+    let on_meta = Arc::new(AtomicU32::new(0));
+    let off_frames = Arc::new(AtomicU32::new(0));
+    let off_meta = Arc::new(AtomicU32::new(0));
+    let stop = AtomicBool::new(false);
+
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            while !stop.load(Ordering::SeqCst) {
+                let bgra = varying_bgra(0);
+                meta_track
+                    .push_frame_with_metadata(reactor_webrtc::VideoFrame::new(&bgra, W, H), b"on")
+                    .expect("push on");
+                plain_track
+                    .push_frame_with_metadata(reactor_webrtc::VideoFrame::new(&bgra, W, H), b"off")
+                    .expect("push off (user_data silently dropped)");
+                thread::sleep(Duration::from_millis(33));
+            }
+        });
+
+        let timed_out = Instant::now() + Duration::from_secs(20);
+        let mut wired = false;
+        loop {
+            forward_ice(&s1, &pc2);
+            forward_ice(&s2, &pc1);
+            if !wired {
+                let tracks = s2.recv.lock().unwrap();
+                if tracks.len() >= 2 {
+                    for (idx, t) in tracks.iter().enumerate() {
+                        if let Some(v) = t.as_video() {
+                            let (on_f, on_m, off_f, off_m) = (
+                                on_frames.clone(),
+                                on_meta.clone(),
+                                off_frames.clone(),
+                                off_meta.clone(),
+                            );
+                            v.on_frame(move |f| {
+                                if idx == 0 {
+                                    on_f.fetch_add(1, Ordering::SeqCst);
+                                    if f.metadata.is_some() {
+                                        on_m.fetch_add(1, Ordering::SeqCst);
+                                    }
+                                } else {
+                                    off_f.fetch_add(1, Ordering::SeqCst);
+                                    if f.metadata.is_some() {
+                                        off_m.fetch_add(1, Ordering::SeqCst);
+                                    }
+                                }
+                            });
+                        }
+                    }
+                    wired = true;
+                }
+            }
+            let done =
+                on_frames.load(Ordering::SeqCst) >= 2 && off_frames.load(Ordering::SeqCst) >= 2;
+            if done || Instant::now() > timed_out {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        stop.store(true, Ordering::SeqCst);
+    });
+
+    assert!(
+        on_frames.load(Ordering::SeqCst) > 0,
+        "no meta-on frames decoded"
+    );
+    assert!(
+        off_frames.load(Ordering::SeqCst) > 0,
+        "no meta-off frames decoded"
+    );
+    assert!(
+        on_meta.load(Ordering::SeqCst) > 0,
+        "meta-on track's metadata never arrived"
+    );
+    assert_eq!(
+        off_meta.load(Ordering::SeqCst),
+        0,
+        "the meta-off track must not emit metadata"
+    );
+    println!("per-track metadata flag ✅");
+}
+
+/// Factory kill switch: `with_metadata(false)` makes every connection behave
+/// like one configured with `frame_metadata` off — video flows, trailers
+/// don't, whatever any per-PC config says.
+#[test]
+fn factory_metadata_kill_switch_blocks_everything() {
+    let factory = PeerConnectionFactory::builder()
+        .with_metadata(false)
+        .build()
+        .expect("factory");
+
+    let config = RtcConfiguration::default(); // frame_metadata: true here — factory wins
+    let (pc1, s1) = make_peer(&factory, &config);
+    let (pc2, s2) = make_peer(&factory, &config);
+
+    let tx1 = pc1
+        .add_transceiver(MediaKind::Video, TransceiverDirection::SendOnly)
+        .expect("tx");
+    let video = factory
+        .create_video_track("meta-video")
+        .expect("video track");
+    tx1.set_track(&video).expect("set track");
+
+    // Plain offer/answer — `negotiate()` asserts the capability is advertised,
+    // and here the whole point is that it isn't.
+    {
+        let offer = pc1.create_offer().expect("offer");
+        assert!(
+            !offer.declares_frame_metadata(),
+            "kill switch must keep the capability out of the offer"
+        );
+        pc1.set_local_description(&offer).expect("pc1 local");
+        pc2.set_remote_description(&offer).expect("pc2 remote");
+        let answer = pc2.create_answer().expect("answer");
+        assert!(
+            !answer.declares_frame_metadata(),
+            "kill switch must keep the capability out of the answer"
+        );
+        pc2.set_local_description(&answer).expect("pc2 local");
+        pc1.set_remote_description(&answer).expect("pc1 remote");
+    }
+    assert!(
+        !pc1.frame_metadata_gate().is_open(),
+        "kill switch must keep the gate closed"
+    );
+
+    let frames = Arc::new(AtomicU32::new(0));
+    let metas = Arc::new(AtomicU32::new(0));
+    let stop = AtomicBool::new(false);
+
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            while !stop.load(Ordering::SeqCst) {
+                let bgra = varying_bgra(0);
+                video
+                    .push_frame_with_metadata(reactor_webrtc::VideoFrame::new(&bgra, W, H), b"x")
+                    .expect("push");
+                thread::sleep(Duration::from_millis(33));
+            }
+        });
+
+        let timed_out = Instant::now() + Duration::from_secs(20);
+        let mut wired = false;
+        loop {
+            forward_ice(&s1, &pc2);
+            forward_ice(&s2, &pc1);
+            if !wired {
+                let tracks = s2.recv.lock().unwrap();
+                if let Some(v) = tracks.iter().find_map(|t| t.as_video()) {
+                    let (f, m) = (frames.clone(), metas.clone());
+                    v.on_frame(move |frame| {
+                        f.fetch_add(1, Ordering::SeqCst);
+                        if frame.metadata.is_some() {
+                            m.fetch_add(1, Ordering::SeqCst);
+                        }
+                    });
+                    wired = true;
+                }
+            }
+            if frames.load(Ordering::SeqCst) >= 2 || Instant::now() > timed_out {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        stop.store(true, Ordering::SeqCst);
+    });
+
+    assert!(frames.load(Ordering::SeqCst) > 0, "video must still flow");
+    assert_eq!(
+        metas.load(Ordering::SeqCst),
+        0,
+        "kill switch leaked metadata"
+    );
+    println!("factory metadata kill switch ✅");
+}
+
+/// Codex #71: a transceiver negotiated with a metadata-disabled track must
+/// START emitting trailers after set_track swaps in a metadata-enabled one —
+/// replaceTrack without a renegotiation, matching how the source-swap path
+/// already behaves for a plain enabled→enabled replace.
+#[test]
+fn replace_track_starts_metadata_after_swap() {
+    let factory = PeerConnectionFactory::builder().build().expect("factory");
+    let config = RtcConfiguration::default();
+    let (pc1, s1) = make_peer(&factory, &config);
+    let (pc2, s2) = make_peer(&factory, &config);
+
+    let off_track = factory
+        .create_video_track_with_options("meta-off", {
+            let mut options = VideoTrackOptions::default();
+            options.frame_metadata = Some(false);
+            options
+        })
+        .expect("meta-off track");
+    let LocalVideoTrack::Raw(off_track) = off_track else {
+        panic!("must be raw");
+    };
+
+    let tx1 = pc1
+        .add_transceiver(MediaKind::Video, TransceiverDirection::SendOnly)
+        .expect("tx");
+    tx1.set_track(&off_track).expect("set track");
+
+    negotiate(&pc1, &pc2);
+    assert!(pc1.frame_metadata_gate().is_open());
+
+    // Swap the disallowed track for an allowed one — standalone, no new offer.
+    let on_track = factory
+        .create_video_track("meta-on")
+        .expect("meta-on track");
+    tx1.set_track(&on_track).expect("replace track");
+
+    let on_frames = Arc::new(AtomicU32::new(0));
+    let on_meta = Arc::new(AtomicU32::new(0));
+    let stop = AtomicBool::new(false);
+
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            while !stop.load(Ordering::SeqCst) {
+                let bgra = varying_bgra(0);
+                on_track
+                    .push_frame_with_metadata(reactor_webrtc::VideoFrame::new(&bgra, W, H), b"on")
+                    .expect("push on");
+                thread::sleep(Duration::from_millis(33));
+            }
+        });
+
+        let timed_out = Instant::now() + Duration::from_secs(20);
+        let mut wired = false;
+        loop {
+            forward_ice(&s1, &pc2);
+            forward_ice(&s2, &pc1);
+            if !wired {
+                let tracks = s2.recv.lock().unwrap();
+                if let Some(v) = tracks.iter().find_map(|t| t.as_video()) {
+                    let (f, m) = (on_frames.clone(), on_meta.clone());
+                    v.on_frame(move |frame| {
+                        f.fetch_add(1, Ordering::SeqCst);
+                        if frame.metadata.is_some() {
+                            m.fetch_add(1, Ordering::SeqCst);
+                        }
+                    });
+                    wired = true;
+                }
+            }
+            if on_meta.load(Ordering::SeqCst) >= 2 || Instant::now() > timed_out {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        stop.store(true, Ordering::SeqCst);
+    });
+
+    assert!(
+        on_frames.load(Ordering::SeqCst) > 0,
+        "no frames decoded after swap"
+    );
+    assert!(
+        on_meta.load(Ordering::SeqCst) > 0,
+        "metadata never flowed after swapping the disallowed track for an allowed one"
+    );
+    println!("replace-track metadata ✅");
+}
+
+/// AND-semantics: a track explicitly opting metadata ON cannot re-enable it
+/// when the factory was built with `with_metadata(false)` — the kill switch
+/// is a process-wide off, not a default.
+#[test]
+fn kill_switch_beats_per_track_opt_in() {
+    let factory = PeerConnectionFactory::builder()
+        .with_metadata(false)
+        .build()
+        .expect("factory");
+
+    let config = RtcConfiguration::default(); // frame_metadata: true
+    let (pc1, s1) = make_peer(&factory, &config);
+    let (pc2, s2) = make_peer(&factory, &config);
+
+    let tx1 = pc1
+        .add_transceiver(MediaKind::Video, TransceiverDirection::SendOnly)
+        .expect("tx");
+    // Explicit per-track Opt-IN against the kill switch.
+    let LocalVideoTrack::Raw(video) = factory
+        .create_video_track_with_options("meta-force-on", {
+            let mut options = VideoTrackOptions::default();
+            options.frame_metadata = Some(true);
+            options
+        })
+        .expect("meta-force-on track")
+    else {
+        panic!("must be raw");
+    };
+    tx1.set_track(&video).expect("set track");
+
+    {
+        let offer = pc1.create_offer().expect("offer");
+        assert!(
+            !offer.declares_frame_metadata(),
+            "kill switch must keep the capability out even with per-track Some(true)"
+        );
+        pc1.set_local_description(&offer).expect("pc1 local");
+        pc2.set_remote_description(&offer).expect("pc2 remote");
+        let answer = pc2.create_answer().expect("answer");
+        assert!(!answer.declares_frame_metadata());
+        pc2.set_local_description(&answer).expect("pc2 local");
+        pc1.set_remote_description(&answer).expect("pc1 remote");
+    }
+    assert!(!pc1.frame_metadata_gate().is_open());
+    println!("kill switch over per-track opt-in ✅");
 }

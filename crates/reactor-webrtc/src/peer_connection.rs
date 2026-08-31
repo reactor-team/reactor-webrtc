@@ -277,6 +277,10 @@ impl SessionDescription {
 }
 
 /// A trickled ICE candidate.
+///
+/// An empty [`IceCandidate::candidate`] string is the end-of-candidates
+/// marker (RFC 8838), not a candidate to parse; `sdp_mid` and
+/// `sdp_mline_index` still identify the m-line it ends.
 #[derive(Debug, Clone)]
 pub struct IceCandidate {
     pub candidate: String,
@@ -328,6 +332,10 @@ impl IceGatheringState {
 pub struct Transceiver {
     raw: *mut reactor_webrtc_sys::RtpTransceiver,
     pc_id: usize,
+    // Shared with the owning PeerConnection: what negotiation concluded about
+    // frame metadata. Consulted by set_track when replacing a disallowed
+    // track with an allowed one.
+    frame_metadata_gate: crate::FrameMetadataGate,
 }
 
 // SAFETY: the native transceiver is internally thread-safe.
@@ -335,8 +343,16 @@ unsafe impl Send for Transceiver {}
 unsafe impl Sync for Transceiver {}
 
 impl Transceiver {
-    pub(crate) fn from_raw(raw: *mut reactor_webrtc_sys::RtpTransceiver, pc_id: usize) -> Self {
-        Self { raw, pc_id }
+    pub(crate) fn from_raw(
+        raw: *mut reactor_webrtc_sys::RtpTransceiver,
+        pc_id: usize,
+        gate: crate::FrameMetadataGate,
+    ) -> Self {
+        Self {
+            raw,
+            pc_id,
+            frame_metadata_gate: gate,
+        }
     }
 
     /// The transceiver's media kind (audio/video).
@@ -402,12 +418,39 @@ impl Transceiver {
             reactor_webrtc_sys::reactor_webrtc_rtp_transceiver_set_track(self.raw, track.raw())
         };
         if ok == 1 {
+            let id = self.transceiver_id();
+            let sender_id = self.sender_track_id();
             // Re-wire the embed source when the gate is already open (replaceTrack
             // post-negotiation). Without this the old track's source stays in the
             // slot and pushes to the new track are silently dropped until the next
             // renegotiation re-runs install_frame_metadata_transforms.
-            if let Some(source) = crate::sender_meta::lookup(self.sender_track_id()) {
-                crate::sender_meta::update_embed_source(self.pc_id, self.transceiver_id(), source);
+            if let Some(source) = crate::sender_meta::lookup(sender_id) {
+                crate::sender_meta::update_embed_source(self.pc_id, id, source);
+            }
+            // Fresh embed only when both the negotiated gate is open and the new
+            // track is allowed to carry metadata — the mirror for, e.g., replacing
+            // a track created with frame_metadata off by one with it on. If the slot
+            // already runs an embed step this is a no-op rather than a second
+            // transformer.
+            if !self.frame_metadata_gate.is_open() || !crate::sender_meta::allowed(sender_id) {
+            } else if let Some(source) = crate::sender_meta::lookup(sender_id) {
+                if let Some(native) = crate::sender_meta::attach_embed(
+                    self.pc_id,
+                    id,
+                    source,
+                    self.frame_metadata_gate.clone(),
+                ) {
+                    if self
+                        .attach_native_transform(crate::sender_meta::Side::Send, &native)
+                        .is_err()
+                    {
+                        crate::sender_meta::release_install(
+                            self.pc_id,
+                            id,
+                            crate::sender_meta::Side::Send,
+                        );
+                    }
+                }
             }
             Ok(())
         } else {
@@ -501,6 +544,95 @@ impl Transceiver {
             reactor_webrtc_sys::reactor_webrtc_rtp_transceiver_lock_negotiated_send_codec(self.raw)
         };
         ok == 1
+    }
+
+    /// Set this transceiver's **per-sender** bitrate bounds — the ceiling that
+    /// actually caps the video encoder.
+    ///
+    /// This is a different knob from [`PeerConnection::set_bitrate`], and the
+    /// two are conjunctive: the lower one wins.
+    ///
+    /// - [`PeerConnection::set_bitrate`] bounds the *aggregate* congestion-control
+    ///   estimate for the whole connection — how much bandwidth the GCC algorithm
+    ///   believes it may allocate.
+    /// - This method bounds *this one stream's* share of that allocation.
+    ///
+    /// Without this call, the stream's ceiling is libwebrtc's resolution-keyed
+    /// default: 600 kbps up to 320x240, 1700 up to 640x480, 2000 up to 960x540,
+    /// and **2500 kbps for everything above that**. So 720p, 1080p and 4K all cap
+    /// at 2.5 Mbps no matter how high the congestion-control ceiling is raised —
+    /// setting `max_bps` here is the only way to lift it.
+    ///
+    /// Both bounds are optional; pass `None` to leave one at the libwebrtc
+    /// default. Values are in bits per second, and apply to the first encoding
+    /// (the single-stream case — simulcast layers are not addressed individually).
+    ///
+    /// **When the sender has encodings to write depends on where the transceiver
+    /// came from**, and it is the one sharp edge here:
+    ///
+    /// | Transceiver from | audio | video |
+    /// |---|---|---|
+    /// | [`PeerConnection::add_transceiver`] | has encodings | has encodings |
+    /// | applying a remote description | **none until the local description is applied** | has encodings |
+    ///
+    /// `add_transceiver` seeds a default encoding; one materialised from a
+    /// remote offer does not get one for audio until the answer is set locally.
+    /// Called before that, this returns "sender has no encodings".
+    ///
+    /// Only the *default* being lifted is video-specific — it is keyed on frame
+    /// size. The bounds themselves apply to an audio sender too, capping its
+    /// allocation. So an answerer that only wants to clear that default can
+    /// bound its video senders while building the answer, and one that also
+    /// wants an audio bound applies it after
+    /// [`PeerConnection::set_local_description`].
+    ///
+    /// Can be called again at any point to change the bounds mid-call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Webrtc`] when either bound is negative — `None`, not a
+    /// negative number, is how a bound is left unset — when `min_bps` exceeds
+    /// `max_bps`, when the transceiver has no sender or no encodings, or when
+    /// libwebrtc rejects the parameters.
+    pub fn set_send_bitrate(&self, min_bps: Option<i32>, max_bps: Option<i32>) -> Result<()> {
+        // `None` is how a caller says "leave this at the libwebrtc default", and
+        // it crosses the ABI as -1. A negative `Some` is therefore ambiguous with
+        // that sentinel, and resolving it as "unset" would take a typo — or an
+        // arithmetic slip like `budget - overhead` going below zero — and quietly
+        // remove a cap the caller had set, reporting success. Refuse it here, so
+        // it never reaches the boundary where the two become indistinguishable.
+        for (label, value) in [("min_bps", min_bps), ("max_bps", max_bps)] {
+            if let Some(v) = value {
+                if v < 0 {
+                    return Err(Error::Webrtc(format!(
+                        "{label} must be >= 0; pass None to leave it at the libwebrtc default \
+                         (got {v})"
+                    )));
+                }
+            }
+        }
+
+        let mut err = [0 as std::os::raw::c_char; 256];
+        let rc = unsafe {
+            reactor_webrtc_sys::reactor_webrtc_rtp_transceiver_set_send_bitrate(
+                self.raw,
+                min_bps.unwrap_or(-1),
+                max_bps.unwrap_or(-1),
+                err.as_mut_ptr(),
+                err.len() as std::os::raw::c_int,
+            )
+        };
+        if rc != 0 {
+            let reason = unsafe { std::ffi::CStr::from_ptr(err.as_ptr()) }
+                .to_string_lossy()
+                .into_owned();
+            return Err(Error::Webrtc(if reason.is_empty() {
+                "transceiver set_send_bitrate failed".into()
+            } else {
+                reason
+            }));
+        }
+        Ok(())
     }
 
     /// Attach an encoded-frame transform to this transceiver's **sender**
@@ -1234,22 +1366,26 @@ impl PeerConnection {
             // working, and attach_* returns a transformer to install only the first
             // time this side needs one.
             let id = tc.transceiver_id();
-            if let Some(source) = crate::sender_meta::lookup(tc.sender_track_id()) {
-                if let Some(native) = crate::sender_meta::attach_embed(
-                    pc_id,
-                    id,
-                    source,
-                    self.frame_metadata_gate.clone(),
-                ) {
-                    if tc
-                        .attach_native_transform(crate::sender_meta::Side::Send, &native)
-                        .is_err()
-                    {
-                        crate::sender_meta::release_install(
-                            pc_id,
-                            id,
-                            crate::sender_meta::Side::Send,
-                        );
+            // Per-track gate: a track created with frame_metadata off never
+            // gets a trailer writer, whatever the connection negotiated.
+            if crate::sender_meta::allowed(tc.sender_track_id()) {
+                if let Some(source) = crate::sender_meta::lookup(tc.sender_track_id()) {
+                    if let Some(native) = crate::sender_meta::attach_embed(
+                        pc_id,
+                        id,
+                        source,
+                        self.frame_metadata_gate.clone(),
+                    ) {
+                        if tc
+                            .attach_native_transform(crate::sender_meta::Side::Send, &native)
+                            .is_err()
+                        {
+                            crate::sender_meta::release_install(
+                                pc_id,
+                                id,
+                                crate::sender_meta::Side::Send,
+                            );
+                        }
                     }
                 }
             }
@@ -1319,6 +1455,11 @@ impl PeerConnection {
             }
         })
     }
+    /// Add a remote ICE candidate received out of band (trickle ICE).
+    ///
+    /// An empty [`IceCandidate::candidate`] string is the end-of-candidates
+    /// marker (RFC 8838) and succeeds as a no-op rather than failing the
+    /// candidate-string parse.
     pub fn add_ice_candidate(&self, candidate: &IceCandidate) -> Result<()> {
         let mid = CString::new(candidate.sdp_mid.clone().unwrap_or_default()).unwrap_or_default();
         let cand = CString::new(candidate.candidate.as_str())
@@ -1381,7 +1522,11 @@ impl PeerConnection {
         if raw.is_null() {
             Err(Error::Webrtc("add_transceiver failed".into()))
         } else {
-            Ok(Transceiver::from_raw(raw, self.raw as usize))
+            Ok(Transceiver::from_raw(
+                raw,
+                self.raw as usize,
+                self.frame_metadata_gate.clone(),
+            ))
         }
     }
 
@@ -1399,7 +1544,9 @@ impl PeerConnection {
                 let raw = unsafe {
                     reactor_webrtc_sys::reactor_webrtc_peer_connection_get_transceiver(self.raw, i)
                 };
-                (!raw.is_null()).then(|| Transceiver::from_raw(raw, self.raw as usize))
+                (!raw.is_null()).then(|| {
+                    Transceiver::from_raw(raw, self.raw as usize, self.frame_metadata_gate.clone())
+                })
             })
             .collect()
     }

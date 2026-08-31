@@ -873,7 +873,7 @@ static webrtc::scoped_refptr<webrtc::AudioProcessing> build_apm(int apm_flags) {
 extern "C" {
 
 // ABI version of this native build. The safe crate asserts compatibility.
-unsigned int reactor_webrtc_abi_version() { return 2; }
+unsigned int reactor_webrtc_abi_version() { return 3; }
 
 // Link/run self-test: build the builtin audio + video encoder factories and
 // enumerate the codecs they support. Writes a comma-separated, NUL-terminated
@@ -904,68 +904,6 @@ int reactor_webrtc_selftest(char* out, int cap) {
     out[cap - 1] = '\0';
   }
   return count;
-}
-
-// Create a PeerConnectionFactory: start the network/worker/signaling threads
-// and wire the builtin audio+video codec factories.
-//
-// `use_platform_adm`: 0 → our synthetic FrameAdm (push PCM, no hardware);
-// nonzero → pass a null ADM so the media engine creates the platform default
-// ADM (real mic/speaker, e.g. CoreAudio on macOS).
-// `apm_flags`: bitmask of REACTOR_APM_* flags (0 = all processing disabled).
-// Returns an opaque ReactorFactory* or nullptr.
-void* reactor_webrtc_factory_create_with_adm_apm(int use_platform_adm,
-                                                  int apm_flags) {
-  auto f = std::make_unique<ReactorFactory>();
-
-  f->network_thread = webrtc::Thread::CreateWithSocketServer();
-  f->worker_thread = webrtc::Thread::Create();
-  f->signaling_thread = webrtc::Thread::Create();
-  if (!f->network_thread->Start() || !f->worker_thread->Start() ||
-      !f->signaling_thread->Start()) {
-    return nullptr;
-  }
-
-  webrtc::scoped_refptr<webrtc::AudioDeviceModule> adm;
-  if (!use_platform_adm) {
-    f->adm = webrtc::make_ref_counted<FrameAdm>();
-    adm = f->adm;
-  }
-
-  auto apm = build_apm(apm_flags);
-
-#if defined(WEBRTC_MAC)
-  std::unique_ptr<webrtc::VideoEncoderFactory> video_encoder_factory =
-      reactor::CreateAppleHwVideoEncoderFactory();
-  std::unique_ptr<webrtc::VideoDecoderFactory> video_decoder_factory =
-      reactor::CreateAppleHwVideoDecoderFactory();
-#else
-  std::unique_ptr<webrtc::VideoEncoderFactory> video_encoder_factory =
-      webrtc::CreateBuiltinVideoEncoderFactory();
-  std::unique_ptr<webrtc::VideoDecoderFactory> video_decoder_factory =
-      webrtc::CreateBuiltinVideoDecoderFactory();
-#endif
-
-  f->factory = webrtc::CreatePeerConnectionFactory(
-      f->network_thread.get(), f->worker_thread.get(),
-      f->signaling_thread.get(), adm,
-      webrtc::CreateBuiltinAudioEncoderFactory(),
-      webrtc::CreateBuiltinAudioDecoderFactory(),
-      std::move(video_encoder_factory), std::move(video_decoder_factory),
-      /*audio_mixer=*/nullptr, /*audio_processing=*/apm);
-  if (!f->factory) {
-    return nullptr;
-  }
-  return f.release();
-}
-
-void* reactor_webrtc_factory_create_with_adm(int use_platform_adm) {
-  return reactor_webrtc_factory_create_with_adm_apm(use_platform_adm, 0);
-}
-
-// Create a factory with the synthetic (push-able) ADM and no APM processing.
-void* reactor_webrtc_factory_create() {
-  return reactor_webrtc_factory_create_with_adm_apm(0, 0);
 }
 
 // Enable/disable the synthetic ADM's playout pump (no-op for the platform ADM).
@@ -1145,7 +1083,11 @@ void reactor_webrtc_peer_connection_set_remote_description(
 }
 
 // Add a remote ICE candidate (from the peer's OnIceCandidate). `on_complete`
-// fires once with a null error on success.
+// fires once with a null error on success. An empty `candidate` string is the
+// end-of-candidates marker (RFC 8838): it succeeds without reaching
+// CreateIceCandidate, which rejects it, and this libwebrtc has nothing that
+// consumes a remote end-of-candidates indication (crbug.com/935898) — so the
+// marker is a no-op at the ICE layer.
 void reactor_webrtc_peer_connection_add_ice_candidate(
     void* pc, const char* sdp_mid, int sdp_mline_index, const char* candidate,
     void* userdata, void (*on_complete)(void* userdata, const char* error)) {
@@ -1154,10 +1096,14 @@ void reactor_webrtc_peer_connection_add_ice_candidate(
     if (on_complete) on_complete(userdata, "no peer connection");
     return;
   }
+  const std::string cand_str(candidate ? candidate : "");
+  if (cand_str.empty()) {
+    if (on_complete) on_complete(userdata, nullptr);
+    return;
+  }
   webrtc::SdpParseError err;
   std::unique_ptr<webrtc::IceCandidate> cand(webrtc::CreateIceCandidate(
-      sdp_mid ? sdp_mid : "", sdp_mline_index,
-      std::string(candidate ? candidate : ""), &err));
+      sdp_mid ? sdp_mid : "", sdp_mline_index, cand_str, &err));
   if (!cand) {
     if (on_complete) on_complete(userdata, err.description.c_str());
     return;
@@ -1318,31 +1264,57 @@ int reactor_webrtc_peer_connection_add_track(void* pc, void* track) {
   return rpc->pc->AddTrack(h->track, {kReactorStreamId}).ok() ? 1 : 0;
 }
 
-// Create a local audio track. Its samples come from the factory's ADM (push
-// PCM with reactor_webrtc_factory_push_audio_frame). Returns an owned
-// MediaStreamTrack handle or nullptr.
-void* reactor_webrtc_audio_track_create(void* factory, const char* id) {
-  auto* rf = reinterpret_cast<ReactorFactory*>(factory);
-  if (!rf || !rf->factory) return nullptr;
-  webrtc::scoped_refptr<webrtc::AudioSourceInterface> source =
-      rf->factory->CreateAudioSource(webrtc::AudioOptions());
-  auto handle = std::make_unique<ReactorMediaStreamTrack>();
-  handle->track = rf->factory->CreateAudioTrack(id ? id : "", source.get());
-  if (!handle->track) return nullptr;
-  return handle.release();
-}
+// Per-track audio-creation options. ABI-versioned: `size` MUST be
+// sizeof(ReactorAudioTrackOptions); future fields only ever get appended
+// (callers zero-fill, so appended defaults are the zero value).
+//
+// `source`: 0 = the factory's ADM — the platform mic, or the synthetic pipe
+//   shared by all ADM-sourced tracks (feed with
+//   reactor_webrtc_factory_push_audio_frame);
+//           1 = a per-track LocalAudioSource, independent of the ADM — feed
+//   with reactor_webrtc_audio_track_push_pcm. (The mic-vs-push
+//   coexistence scenario is this: platform ADM track for the mic next to a
+//   LocalAudioSource track for the music.)
+// The processing flags are constraints on the created source, tri-state:
+// -1 leaves the libwebrtc/APM default, 0 forces off, 1 forces on. They map
+// to cricket::AudioOptions and are meaningful only for ADM sources — a
+// LocalAudioSource never hears the room, so they are not applied there.
+struct ReactorAudioTrackOptions {
+  uint32_t size;
+  int      source;             // 0 = factory ADM, 1 = per-track local source
+  int      echo_cancellation;  // -1 unset | 0 off | 1 on
+  int      noise_suppression;  // -1 unset | 0 off | 1 on
+  int      auto_gain_control;  // -1 unset | 0 off | 1 on
+  int      high_pass_filter;   // -1 unset | 0 off | 1 on
+};
 
-// Create a local audio track backed by a per-track LocalAudioSource instead of
-// the factory-level ADM. Each call returns an independent source, so different
-// audio can be pushed to different peer connections. Feed via
-// reactor_webrtc_audio_track_push_pcm.
-void* reactor_webrtc_audio_track_create_with_local_source(void* factory,
-                                                          const char* id) {
+// Create a local audio track per `opts` (required; returns nullptr on a null
+// or undersized struct — there is no error channel here by design).
+void* reactor_webrtc_audio_track_create(void* factory, const char* id,
+                                         const ReactorAudioTrackOptions* opts) {
   auto* rf = reinterpret_cast<ReactorFactory*>(factory);
   if (!rf || !rf->factory) return nullptr;
-  auto source = LocalAudioSource::Create();
+  if (!opts || opts->size < sizeof(ReactorAudioTrackOptions)) return nullptr;
+  if (opts->source < 0 || opts->source > 1) return nullptr;
+
+  webrtc::AudioOptions ao;
+  auto tristate = [](int v) -> std::optional<bool> {
+    return v < 0 ? std::nullopt : std::optional<bool>(v != 0);
+  };
+  ao.echo_cancellation = tristate(opts->echo_cancellation);
+  ao.noise_suppression = tristate(opts->noise_suppression);
+  ao.auto_gain_control = tristate(opts->auto_gain_control);
+  ao.highpass_filter   = tristate(opts->high_pass_filter);
+
   auto handle = std::make_unique<ReactorMediaStreamTrack>();
-  handle->audio_source = source;
+  webrtc::scoped_refptr<webrtc::AudioSourceInterface> source;
+  if (opts->source == 1) {
+    auto local = LocalAudioSource::Create();
+    handle->audio_source = local;
+    source = local;
+  } else {
+    source = rf->factory->CreateAudioSource(ao);
+  }
   handle->track = rf->factory->CreateAudioTrack(id ? id : "", source.get());
   if (!handle->track) return nullptr;
   return handle.release();
@@ -1364,7 +1336,7 @@ void reactor_webrtc_audio_track_push_pcm_ts(void* track, const int16_t* pcm,
 }
 
 // Push interleaved int16 PCM directly to a local audio track that was created
-// with reactor_webrtc_audio_track_create_with_local_source. No-op on tracks
+// with a LocalAudioSource (ReactorAudioTrackOptions.source == 1). No-op on tracks
 // backed by the factory ADM.
 void reactor_webrtc_audio_track_push_pcm(void* track, const int16_t* pcm,
                                          int samples_per_channel,
@@ -1645,6 +1617,116 @@ int reactor_webrtc_rtp_transceiver_lock_negotiated_send_codec(void* transceiver)
   return 0;  // none of the preferred codecs were actually negotiated for this sender
 }
 
+// Set this transceiver's *per-sender* bitrate bounds — the ceiling that
+// actually caps the video encoder, which is NOT the same knob as
+// reactor_webrtc_peer_connection_set_bitrate.
+//
+// The two are conjunctive and the lower one wins:
+//
+//   - PeerConnection::SetBitrate (BitrateSettings) bounds the aggregate
+//     congestion-control estimate for the whole connection — how much
+//     bandwidth GCC believes it may allocate.
+//   - RtpEncodingParameters::max_bitrate_bps, set here, bounds this one
+//     stream's share of that allocation.
+//
+// Without this call the stream's ceiling is libwebrtc's resolution-keyed
+// default (GetMaxDefaultVideoBitrateKbps in webrtc_video_engine.cc), which is
+// 2500 kbps for anything above 960x540 — so 720p, 1080p and 4K all cap at
+// 2.5 Mbps no matter how high the congestion-control ceiling is raised.
+// Setting max_bps here is the only way to lift that.
+//
+// Use -1 for either bound to leave it unset (libwebrtc default). Values are in
+// bits per second and apply to encodings[0]; simulcast senders are out of
+// scope here — this deliberately touches only the first encoding, which is the
+// single-stream case every caller has today.
+//
+// When the sender has encodings to write depends on where the transceiver came
+// from. AddTransceiver seeds a default encoding, so both kinds are writable at
+// once; one materialised from a remote description does not get one for AUDIO
+// until the local description is applied, though VIDEO does. Called before
+// that, this reports "sender has no encodings".
+//
+// Only the *default* being lifted is video-specific (it is keyed on frame
+// size); the bounds themselves apply to an audio sender too, capping its
+// allocation. So an answerer wanting only to clear that default can bound its
+// video senders while building the answer, and one that also wants an audio
+// bound applies it after set_local_description.
+//
+// Can be called again at any point; libwebrtc applies new bounds to a running
+// encoder.
+//
+// Returns 0 on success, -1 on error (message written to err/err_cap).
+int reactor_webrtc_rtp_transceiver_set_send_bitrate(void* transceiver,
+                                                    int min_bps,
+                                                    int max_bps,
+                                                    char* err,
+                                                    int err_cap) {
+  auto* h = reinterpret_cast<ReactorTransceiver*>(transceiver);
+  if (!h || !h->tc) {
+    write_error(err, err_cap, "no transceiver");
+    return -1;
+  }
+  auto sender = h->tc->sender();
+  if (!sender) {
+    write_error(err, err_cap, "transceiver has no sender");
+    return -1;
+  }
+
+  // -1 is the ABI's only spelling of "leave this bound at the libwebrtc
+  // default". Any other negative is a caller error — a typo, or an arithmetic
+  // slip like `budget - overhead` going below zero — and must not be read as
+  // "clear the cap": silently removing a limit somebody set is the opposite of
+  // what was asked, and it reports success while doing it.
+  if (min_bps < -1 || max_bps < -1) {
+    write_error(err, err_cap,
+                std::string{"a bitrate bound must be >= 0, or -1 to leave it at the libwebrtc "
+                            "default (got min_bps="} +
+                    std::to_string(min_bps) + ", max_bps=" + std::to_string(max_bps) + ")");
+    return -1;
+  }
+
+  // libwebrtc rejects the whole SetParameters call when min > max, with a
+  // message that does not name the offending pair. Catch it here so the caller
+  // gets something actionable.
+  if (min_bps >= 0 && max_bps >= 0 && min_bps > max_bps) {
+    write_error(err, err_cap, "min_bps exceeds max_bps");
+    return -1;
+  }
+
+  // GetParameters() must be the immediate source of the struct handed back to
+  // SetParameters() — libwebrtc stamps it with a transaction id and rejects
+  // anything stale or synthesized.
+  webrtc::RtpParameters params = sender->GetParameters();
+  if (params.encodings.empty()) {
+    // Almost always one specific mistake, so the message names it rather than
+    // leaving the caller to find out what "no encodings" means: an audio sender
+    // has none until the local description is applied, where a video one has
+    // them as soon as the transceiver exists.
+    write_error(err, err_cap,
+                h->tc->media_type() == webrtc::MediaType::AUDIO
+                    ? "sender has no encodings: an audio transceiver from a remote description "
+                      "has none until the local description is applied. Call this again after "
+                      "set_local_description"
+                    : "sender has no encodings");
+    return -1;
+  }
+
+  // Only -1 becomes nullopt, and nullopt is what restores the libwebrtc
+  // default. Zero is a value like any other and goes through: a caller who
+  // wrote 0 asked for something, and libwebrtc's own answer to it says more
+  // than a reinterpretation here would.
+  const auto bound = [](int v) { return v < 0 ? std::nullopt : std::optional<int>(v); };
+  params.encodings[0].min_bitrate_bps = bound(min_bps);
+  params.encodings[0].max_bitrate_bps = bound(max_bps);
+
+  auto result = sender->SetParameters(params);
+  if (!result.ok()) {
+    write_error(err, err_cap, result.message());
+    return -1;
+  }
+  return 0;
+}
+
 // Identity of the *transceiver* itself, as an opaque value — not an owning
 // handle.
 //
@@ -1775,17 +1857,82 @@ typedef int (*reactor_video_encode_cb)(void*                      userdata,
 // the custom one. May be null (always use custom). `encoder_id` matches the
 // value stamped on every subsequent ReactorRawVideoFrame from that encoder.
 typedef int (*reactor_use_builtin_cb)(void* userdata, uint64_t encoder_id);
+
+// Called when the factory enumerates the advertised video codecs
+// (Video{En,De}coderFactory::GetSupportedFormats). Return nonzero while any
+// custom (pre-encoded / inline) slot exists — pending OR already assigned —
+// so H264/H265 are claimed only when user code may actually produce those
+// bitstreams; a factory without custom slots keeps the plain builtin
+// advertisement. May be null (never claim via custom plumbing).
+typedef int (*reactor_has_custom_slots_cb)(void* userdata);
+
+// Called when an H264 encoder is built for a backend-routed (non-custom)
+// encoder instance. Return which H264 backend the track prefers:
+//   0 = platform default (VideoToolbox on Apple, OpenH264 elsewhere),
+//   1 = VideoToolbox,  2 = OpenH264.
+// A forced preference for an unavailable backend falls back to the platform
+// default; when no backend can encode H264 at all the encoder factory
+// returns null (H264 simply can't be used then). May be null (always auto).
+typedef int (*reactor_video_backend_cb)(void* userdata, uint64_t encoder_id);
+
+// Called on every rate-control update for a custom-slotted encoder instance —
+// this is the bandwidth estimation feedback custom encoders need to adapt
+// their own bitrate targeting (ReactorVideoEncoder's builtin counterpart
+// receives the same call internally). Routed by `encoder_id` like every other
+// encoder hook. May be null.
+typedef void (*reactor_rate_update_cb)(void* userdata, uint64_t encoder_id,
+                                       uint32_t bitrate_bps,
+                                       double framerate_fps);
+
+// Unified factory-create options. ABI-versioned: `size` MUST be
+// sizeof(ReactorFactoryOptions) as known to the caller; the glue rejects
+// undersized structs, and future fields only ever get appended at the end
+// (callers zero-fill, so appended defaults are the zero value).
+struct ReactorFactoryOptions {
+  uint32_t size;                 // sizeof(ReactorFactoryOptions)
+  int      use_platform_adm;     // 0 → synthetic FrameAdm, nonzero → platform ADM
+  int      apm_flags;            // REACTOR_APM_* bitmask (0 = all processing off)
+  // OpenH264 backend (real H.264 encode/decode): dlopen'd once by the create.
+  // null = no OpenH264. A library that fails to load degrades to "no OpenH264
+  // backend" (H264 simply not offered by it) rather than failing the create.
+  // Builds without REACTOR_WEBRTC_OPENH264 reject a non-null path via `err`.
+  const char* openh264_lib_path;
+  // Custom video-encode plumbing (registry / inline encoder). Encode falls
+  // back to the composite's backend routing per encoder instance when
+  // `encode_use_builtin` says so. All null = encode via backends only.
+  reactor_video_encode_cb      encode_cb;
+  void*                        encode_userdata;
+  reactor_webrtc_userdata_free encode_free_ud;      // may be null
+  reactor_use_builtin_cb       encode_use_builtin;  // null = always custom
+  // Gates the H264/H265 advertisement on custom slots existing (see the
+  // typedef). May be null — then H264/H265 are never claimed via custom
+  // plumbing regardless of `encode_cb`.
+  reactor_has_custom_slots_cb  encode_has_custom_slots;
+  // Per-encoder-instance H264 backend preference (0 = auto, 1 = VideoToolbox,
+  // 2 = OpenH264). May be null — all instances use the platform default.
+  reactor_video_backend_cb     encode_video_backend_for;
+  // Rate-control (BWE) updates for custom-slotted encoder instances — the
+  // bitrate/framerate the congestion controller wants. May be null.
+  reactor_rate_update_cb       encode_rate_update;
+};
 }
 
 struct ReactorEncoderState {
-  reactor_video_encode_cb       cb;
+  reactor_video_encode_cb        cb;
   void*                          userdata;
   reactor_webrtc_userdata_free   free_ud;
-  reactor_use_builtin_cb         use_builtin; // null = always use custom
+  reactor_use_builtin_cb         use_builtin;      // null = always use custom
+  reactor_has_custom_slots_cb    has_custom_slots; // null = never claim custom codecs
+  reactor_video_backend_cb       video_backend_for; // null = all instances auto
+  reactor_rate_update_cb         rate_update;       // null = suppress rate feedback
 
   ReactorEncoderState(reactor_video_encode_cb c, void* u, reactor_webrtc_userdata_free f,
-                      reactor_use_builtin_cb ub = nullptr)
-      : cb(c), userdata(u), free_ud(f), use_builtin(ub) {}
+                      reactor_use_builtin_cb ub = nullptr,
+                      reactor_has_custom_slots_cb hcs = nullptr,
+                      reactor_video_backend_cb vbf = nullptr,
+                      reactor_rate_update_cb ru = nullptr)
+      : cb(c), userdata(u), free_ud(f), use_builtin(ub),
+        has_custom_slots(hcs), video_backend_for(vbf), rate_update(ru) {}
   ~ReactorEncoderState() { if (free_ud) free_ud(userdata); }
   // Disable copy+move: free_ud would fire twice (once on the copy, once on
   // the original) which would double-free `userdata`.
@@ -1905,7 +2052,15 @@ class ReactorVideoEncoder : public webrtc::VideoEncoder {
     return WEBRTC_VIDEO_CODEC_OK;
   }
 
-  void SetRates(const RateControlParameters&) override {}
+  void SetRates(const RateControlParameters& parameters) override {
+    // The congestion controller's current estimate. Custom encoders own their
+    // bitrate adaptation; without this they encode blind to BWE (the builtin
+    // encoders take the same call and adjust internally).
+    if (!state_->rate_update) return;
+    state_->rate_update(state_->userdata, id_,
+                        parameters.target_bitrate.get_sum_bps(),
+                        parameters.framerate_fps);
+  }
 
   EncoderInfo GetEncoderInfo() const override {
     EncoderInfo info;
@@ -1915,36 +2070,91 @@ class ReactorVideoEncoder : public webrtc::VideoEncoder {
   }
 };
 
-class ReactorVideoEncoderFactory : public webrtc::VideoEncoderFactory {
-  std::shared_ptr<ReactorEncoderState>        state_;
-  std::atomic<uint64_t>                       next_id_{0};
+// The single video encoder factory every PeerConnectionFactory gets. Routes
+// per encoder instance first, then per format:
+//   1. custom slot (registry / inline encoder) → ReactorVideoEncoder;
+//   2. H264 with a real backend → OpenH264, then Apple VideoToolbox;
+//   3. everything else → the builtin VP8/VP9/AV1 encoder.
+// `openh264` is only non-null when the library actually loaded; `apple_h264`
+// only on Apple platforms.
+class ReactorCompositeVideoEncoderFactory : public webrtc::VideoEncoderFactory {
+  std::shared_ptr<ReactorEncoderState>       state_;  // may be null
   std::unique_ptr<webrtc::VideoEncoderFactory> builtin_;
+  std::unique_ptr<webrtc::VideoEncoderFactory> openh264_;    // may be null
+  std::unique_ptr<webrtc::VideoEncoderFactory> apple_h264_;  // may be null
+  std::atomic<uint64_t>                       next_id_{0};
+
+  static bool HasFormat(const std::vector<webrtc::SdpVideoFormat>& formats,
+                        const webrtc::SdpVideoFormat& f) {
+    for (const auto& x : formats)
+      if (x.IsSameCodec(f)) return true;
+    return false;
+  }
 
  public:
-  explicit ReactorVideoEncoderFactory(std::shared_ptr<ReactorEncoderState> s)
-      : state_(std::move(s)),
-        builtin_(webrtc::CreateBuiltinVideoEncoderFactory()) {}
+  ReactorCompositeVideoEncoderFactory(
+      std::shared_ptr<ReactorEncoderState> state,
+      std::unique_ptr<webrtc::VideoEncoderFactory> openh264,
+      std::unique_ptr<webrtc::VideoEncoderFactory> apple_h264)
+      : state_(std::move(state)),
+        builtin_(webrtc::CreateBuiltinVideoEncoderFactory()),
+        openh264_(std::move(openh264)),
+        apple_h264_(std::move(apple_h264)) {}
 
   std::vector<webrtc::SdpVideoFormat> GetSupportedFormats() const override {
-    return {
-        webrtc::SdpVideoFormat::VP8(),
-        webrtc::SdpVideoFormat::VP9Profile0(),
-        webrtc::SdpVideoFormat("H264", {{"level-asymmetry-allowed", "1"},
-                                         {"packetization-mode", "1"},
-                                         {"profile-level-id", "42e01f"}}),
-        webrtc::SdpVideoFormat::AV1Profile0(),
-        webrtc::SdpVideoFormat::H265(),
+    auto formats = builtin_->GetSupportedFormats();
+    auto merge = [&](const webrtc::VideoEncoderFactory* f) {
+      for (const auto& fmt : f->GetSupportedFormats())
+        if (!HasFormat(formats, fmt)) formats.push_back(fmt);
     };
+    if (openh264_) merge(openh264_.get());
+    if (apple_h264_) merge(apple_h264_.get());
+    // Custom slots deliver their own bitstream: advertise H264 (and H265, as
+    // the historical custom path did) so negotiation can select them — but
+    // only while a custom slot exists; a factory with none keeps the plain
+    // builtin advertisement.
+    if (state_ && state_->has_custom_slots &&
+        state_->has_custom_slots(state_->userdata) != 0) {
+      const webrtc::SdpVideoFormat h264(
+          "H264", {{"level-asymmetry-allowed", "1"},
+                   {"packetization-mode", "1"},
+                   {"profile-level-id", "42e01f"}});
+      if (!HasFormat(formats, h264)) formats.push_back(h264);
+      const webrtc::SdpVideoFormat h265 = webrtc::SdpVideoFormat::H265();
+      if (!HasFormat(formats, h265)) formats.push_back(h265);
+    }
+    return formats;
   }
 
   std::unique_ptr<webrtc::VideoEncoder> Create(
       const webrtc::Environment& env,
       const webrtc::SdpVideoFormat& format) override {
     uint64_t id = next_id_.fetch_add(1, std::memory_order_relaxed);
-    if (state_->use_builtin && state_->use_builtin(state_->userdata, id)) {
-      return builtin_->Create(env, format);
+    if (state_ &&
+        !(state_->use_builtin && state_->use_builtin(state_->userdata, id))) {
+      return std::make_unique<ReactorVideoEncoder>(state_, id);
     }
-    return std::make_unique<ReactorVideoEncoder>(state_, id);
+    if (format.name == "H264") {
+      int pref = 0;  // 0 = auto, 1 = VideoToolbox, 2 = OpenH264
+      if (state_ && state_->video_backend_for) {
+        pref = state_->video_backend_for(state_->userdata, id);
+      }
+      std::unique_ptr<webrtc::VideoEncoder> enc;
+      if (pref == 1 && apple_h264_) enc = apple_h264_->Create(env, format);
+      if (pref == 2 && openh264_) enc = openh264_->Create(env, format);
+      if (enc) return enc;
+      // Auto (or an unavailable forced backend): platform default chain —
+      // VideoToolbox on Apple, OpenH264 elsewhere. Nothing available → the
+      // builtin factory returns null (H264 can't be encoded this session).
+#if defined(WEBRTC_MAC)
+      if (apple_h264_) return apple_h264_->Create(env, format);
+      if (openh264_) return openh264_->Create(env, format);
+#else
+      if (openh264_) return openh264_->Create(env, format);
+      if (apple_h264_) return apple_h264_->Create(env, format);
+#endif
+    }
+    return builtin_->Create(env, format);
   }
 };
 
@@ -1967,41 +2177,61 @@ class ReactorNullVideoDecoder : public webrtc::VideoDecoder {
   }
 };
 
-// Wraps the builtin video decoder factory and adds decoders for H264 and
-// H265, which this libwebrtc build (compiled without WEBRTC_USE_H264) does not
-// include in the builtin factory. VP8, VP9, and AV1 are handled by the
-// builtin factory as usual. On macOS/iOS, H264 decodes for real via
-// VideoToolbox (see apple_hw/apple_hw_codec.h); everywhere else -- and H265
-// everywhere, VideoToolbox H265 decode isn't wired here -- falls back to a
-// null decoder that still claims support (so SDP negotiation succeeds with
-// peers that only offer those codecs) but discards every received frame.
-class ReactorCustomDecoderFactory : public webrtc::VideoDecoderFactory {
+// The single video decoder factory every PeerConnectionFactory gets. VP8/VP9/
+// AV1 stay builtin; H264 decodes for real via OpenH264 (when the library
+// loaded) or Apple VideoToolbox; anything else falls to the null decoder,
+// which is only *advertised* under `allow_null_h26x` — the historical custom
+// path behavior that lets SDP negotiation succeed with peers that only offer
+// H264/H265 (received frames are discarded). Backend-only factories do not
+// advertise backend-less codecs, so nothing silently goes black.
+class ReactorCompositeVideoDecoderFactory : public webrtc::VideoDecoderFactory {
   std::unique_ptr<webrtc::VideoDecoderFactory> builtin_;
-#if defined(WEBRTC_MAC)
-  std::unique_ptr<webrtc::VideoDecoderFactory> apple_h264_;
-#endif
+  std::unique_ptr<webrtc::VideoDecoderFactory> openh264_;    // may be null
+  std::unique_ptr<webrtc::VideoDecoderFactory> apple_h264_;  // may be null
+  std::shared_ptr<ReactorEncoderState> state_;               // may be null
 
   static bool IsBuiltinCodec(const webrtc::SdpVideoFormat& f) {
     return f.name == "VP8" || f.name == "VP9" || f.name == "AV1";
   }
 
- public:
-  ReactorCustomDecoderFactory()
-      : builtin_(webrtc::CreateBuiltinVideoDecoderFactory())
-#if defined(WEBRTC_MAC)
-        ,
-        apple_h264_(reactor::CreateAppleHwVideoDecoderFactory())
-#endif
-  {
+  static bool HasFormat(const std::vector<webrtc::SdpVideoFormat>& formats,
+                        const webrtc::SdpVideoFormat& f) {
+    for (const auto& x : formats)
+      if (x.IsSameCodec(f)) return true;
+    return false;
   }
+
+ public:
+  ReactorCompositeVideoDecoderFactory(
+      std::unique_ptr<webrtc::VideoDecoderFactory> openh264,
+      std::unique_ptr<webrtc::VideoDecoderFactory> apple_h264,
+      std::shared_ptr<ReactorEncoderState> state)
+      : builtin_(webrtc::CreateBuiltinVideoDecoderFactory()),
+        openh264_(std::move(openh264)),
+        apple_h264_(std::move(apple_h264)),
+        state_(std::move(state)) {}
 
   std::vector<webrtc::SdpVideoFormat> GetSupportedFormats() const override {
     auto formats = builtin_->GetSupportedFormats();
-    formats.push_back(webrtc::SdpVideoFormat(
-        "H264", {{"level-asymmetry-allowed", "1"},
-                 {"packetization-mode", "1"},
-                 {"profile-level-id", "42e01f"}}));
-    formats.push_back(webrtc::SdpVideoFormat::H265());
+    auto merge = [&](const webrtc::VideoDecoderFactory* f) {
+      for (const auto& fmt : f->GetSupportedFormats())
+        if (!HasFormat(formats, fmt)) formats.push_back(fmt);
+    };
+    if (openh264_) merge(openh264_.get());
+    if (apple_h264_) merge(apple_h264_.get());
+    // Historical custom-path behavior: claim H264 (even backend-less) and
+    // H265 so offers listing only those codecs still negotiate, discarding
+    // received frames — but only while a custom slot exists.
+    if (state_ && state_->has_custom_slots &&
+        state_->has_custom_slots(state_->userdata) != 0) {
+      const webrtc::SdpVideoFormat h264(
+          "H264", {{"level-asymmetry-allowed", "1"},
+                   {"packetization-mode", "1"},
+                   {"profile-level-id", "42e01f"}});
+      if (!HasFormat(formats, h264)) formats.push_back(h264);
+      const webrtc::SdpVideoFormat h265 = webrtc::SdpVideoFormat::H265();
+      if (!HasFormat(formats, h265)) formats.push_back(h265);
+    }
     return formats;
   }
 
@@ -2009,66 +2239,73 @@ class ReactorCustomDecoderFactory : public webrtc::VideoDecoderFactory {
       const webrtc::Environment& env,
       const webrtc::SdpVideoFormat& format) override {
     if (IsBuiltinCodec(format)) return builtin_->Create(env, format);
-#if defined(WEBRTC_MAC)
-    if (format.name == "H264") return apple_h264_->Create(env, format);
-#endif
+    if (format.name == "H264") {
+      if (openh264_) return openh264_->Create(env, format);
+      if (apple_h264_) return apple_h264_->Create(env, format);
+    }
     return std::make_unique<ReactorNullVideoDecoder>("ReactorNull_" + format.name);
   }
 };
 
-// Create a PeerConnectionFactory that routes all video encoding through `cb`.
-// `cb` is called synchronously inside VideoEncoder::Encode() with the raw I420
-// frame; fill `*out` and return 0 to inject bytes into the RTP stack, or
-// return non-zero to drop. `free_ud` is called when all encoder instances are
-// gone (follows the same lifetime contract as frame_transformer_create).
-void* reactor_webrtc_factory_create_with_custom_video_encoder(
-    int use_platform_adm, reactor_video_encode_cb cb, void* userdata,
-    reactor_webrtc_userdata_free free_ud, reactor_use_builtin_cb use_builtin,
-    int apm_flags) {
-  auto state = std::make_shared<ReactorEncoderState>(cb, userdata, free_ud, use_builtin);
-
-  auto f = std::make_unique<ReactorFactory>();
-  f->network_thread   = webrtc::Thread::CreateWithSocketServer();
-  f->worker_thread    = webrtc::Thread::Create();
-  f->signaling_thread = webrtc::Thread::Create();
-  if (!f->network_thread->Start() || !f->worker_thread->Start() ||
-      !f->signaling_thread->Start()) {
+// The single factory-create entry point. Threads, ADM, APM and the audio
+// codec factories are identical for every configuration; the video codec
+// surface is always the composite pair (see above), configured by:
+//   - `opts->openh264_lib_path` — dlopen'd once here when built with OpenH264.
+//     A failed load degrades to "no OpenH264 backend" (H264 simply not
+//     offered by it) instead of failing the create — the previous
+//     with_openh264 semantic, asserted by tests/link.rs.
+//   - `opts->encode_cb` — custom encode plumbing; per-instance builtin
+//     delegation via `encode_use_builtin`.
+// Errors (null `opts`/undersized `size`, or an openh264 path in a build
+// without OpenH264 support) are written to `err` and return nullptr.
+void* reactor_webrtc_factory_create(const ReactorFactoryOptions* opts,
+                                    char* err, int err_cap) {
+  if (!opts || opts->size < sizeof(ReactorFactoryOptions)) {
+    write_error(err, err_cap,
+                "invalid ReactorFactoryOptions (null or undersized)");
     return nullptr;
   }
 
-  webrtc::scoped_refptr<webrtc::AudioDeviceModule> adm;
-  if (!use_platform_adm) {
-    f->adm = webrtc::make_ref_counted<FrameAdm>();
-    adm    = f->adm;
-  }
-
-  auto apm = build_apm(apm_flags);
-
-  f->factory = webrtc::CreatePeerConnectionFactory(
-      f->network_thread.get(), f->worker_thread.get(),
-      f->signaling_thread.get(), adm,
-      webrtc::CreateBuiltinAudioEncoderFactory(),
-      webrtc::CreateBuiltinAudioDecoderFactory(),
-      std::make_unique<ReactorVideoEncoderFactory>(state),
-      std::make_unique<ReactorCustomDecoderFactory>(),
-      /*audio_mixer=*/nullptr, /*audio_processing=*/apm);
-  if (!f->factory) return nullptr;
-  return f.release();
-}
-
+  std::unique_ptr<webrtc::VideoEncoderFactory> openh264_enc;
+  std::unique_ptr<webrtc::VideoDecoderFactory> openh264_dec;
 #ifdef REACTOR_WEBRTC_OPENH264
-// Create a factory with real H.264 encode/decode backed by a dynamically
-// loaded OpenH264 shared library at `lib_path` (see
-// crates/reactor-webrtc-sys/src/openh264.rs::ensure_available). VP8/VP9/AV1
-// stay on the builtin factories; only H264 routes through OpenH264. If the
-// library fails to load, H264 is simply not advertised in SDP (see
-// glue/openh264/openh264_codec.h) rather than the factory constructor
-// failing outright.
-void* reactor_webrtc_factory_create_with_openh264(const char* lib_path,
-                                                   int use_platform_adm,
-                                                   int apm_flags) {
-  auto lib = reactor::OpenH264Library::Open(lib_path ? lib_path : "");
-  std::shared_ptr<reactor::OpenH264Library> shared_lib(lib.release());
+  if (opts->openh264_lib_path) {
+    std::shared_ptr<reactor::OpenH264Library> oh_lib(
+        reactor::OpenH264Library::Open(opts->openh264_lib_path).release());
+    if (oh_lib && oh_lib->ok()) {
+      openh264_enc = reactor::CreateOpenH264VideoEncoderFactory(oh_lib);
+      openh264_dec = reactor::CreateOpenH264VideoDecoderFactory(oh_lib);
+    }
+    // !ok(): degrade to "no OpenH264 backend"; SDP-side asserted by link.rs.
+  }
+#else
+  if (opts->openh264_lib_path) {
+    write_error(err, err_cap,
+                "openh264_lib_path set but this build lacks OpenH264 support");
+    return nullptr;
+  }
+#endif
+
+  std::unique_ptr<webrtc::VideoEncoderFactory> apple_enc;
+  std::unique_ptr<webrtc::VideoDecoderFactory> apple_dec;
+#if defined(WEBRTC_MAC)
+  apple_enc = reactor::CreateAppleHwVideoEncoderFactory();
+  apple_dec = reactor::CreateAppleHwVideoDecoderFactory();
+#endif
+
+  // Encoder-callback ownership is taken HERE — after every fallible step
+  // above: an earlier return (bad options, OpenH264 path in a non-OpenH264
+  // build, thread start) never constructs the state and never frees its
+  // userdata, so the binding's own error cleanup owns exactly that region.
+  // From here on, any failure destroys `state`, whose destructor is the one
+  // place userdata gets freed — the binding must not free it a second time.
+  std::shared_ptr<ReactorEncoderState> state;
+  if (opts->encode_cb) {
+    state = std::make_shared<ReactorEncoderState>(
+        opts->encode_cb, opts->encode_userdata, opts->encode_free_ud,
+        opts->encode_use_builtin, opts->encode_has_custom_slots,
+        opts->encode_video_backend_for, opts->encode_rate_update);
+  }
 
   auto f = std::make_unique<ReactorFactory>();
   f->network_thread   = webrtc::Thread::CreateWithSocketServer();
@@ -2076,29 +2313,34 @@ void* reactor_webrtc_factory_create_with_openh264(const char* lib_path,
   f->signaling_thread = webrtc::Thread::Create();
   if (!f->network_thread->Start() || !f->worker_thread->Start() ||
       !f->signaling_thread->Start()) {
+    write_error(err, err_cap, "failed to start network/worker/signaling threads");
     return nullptr;
   }
 
   webrtc::scoped_refptr<webrtc::AudioDeviceModule> adm;
-  if (!use_platform_adm) {
+  if (!opts->use_platform_adm) {
     f->adm = webrtc::make_ref_counted<FrameAdm>();
     adm    = f->adm;
   }
 
-  auto apm = build_apm(apm_flags);
+  auto apm = build_apm(opts->apm_flags);
 
   f->factory = webrtc::CreatePeerConnectionFactory(
       f->network_thread.get(), f->worker_thread.get(),
       f->signaling_thread.get(), adm,
       webrtc::CreateBuiltinAudioEncoderFactory(),
       webrtc::CreateBuiltinAudioDecoderFactory(),
-      reactor::CreateOpenH264VideoEncoderFactory(shared_lib),
-      reactor::CreateOpenH264VideoDecoderFactory(shared_lib),
+      std::make_unique<ReactorCompositeVideoEncoderFactory>(
+          state, std::move(openh264_enc), std::move(apple_enc)),
+      std::make_unique<ReactorCompositeVideoDecoderFactory>(
+          std::move(openh264_dec), std::move(apple_dec), state),
       /*audio_mixer=*/nullptr, /*audio_processing=*/apm);
-  if (!f->factory) return nullptr;
+  if (!f->factory) {
+    write_error(err, err_cap, "CreatePeerConnectionFactory returned null");
+    return nullptr;
+  }
   return f.release();
 }
-#endif  // REACTOR_WEBRTC_OPENH264
 
 // Replace the encoded payload of the frame currently in the callback. Copies.
 void reactor_webrtc_encoded_frame_set_data(void* frame, const uint8_t* data,

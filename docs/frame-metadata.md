@@ -26,9 +26,9 @@ on the way in. There is nothing to attach: push with `user_data`, read
 <summary>🦀 Example using Rust</summary>
 
 ```rust
-track.push_video_frame_with_metadata(&bgra, width, height, b"anything you like");
+track.push_frame_with_metadata(VideoFrame::new(&bgra, width, height), b"anything you like")?;
 
-track.on_video_frame(|frame| {
+track.on_frame(|frame| {
     if let Some(metadata) = &frame.metadata {
         println!(
             "{} {} {:?}",
@@ -56,12 +56,12 @@ track.on_video_frame(on_frame)
 </details>
 
 `EncodedVideoTrack` takes the same `user_data` argument on
-`push_encoded_frame_with_metadata` (Rust) / `push_encoded_frame(...,
+`push_frame_with_metadata` (Rust) / `push_encoded_frame(...,
 user_data=...)` (Python).
 
 Beside your bytes the trailer carries two fields the library fills in:
 `frame_id`, a per-track counter, and `capture_time_us`, when the frame was
-captured. A push that declares a capture time (`push_video_frame_with_metadata_at`
+captured. A push that declares a capture time (`push_frame_with_metadata_at`
 in Rust, `capture_time_us=` in Python — see [A/V sync](av-sync.md)) is carried
 across **exactly**, so the receiver reads the number the sender put on the frame;
 several tracks stamped from one clock read therefore arrive carrying that one
@@ -143,7 +143,13 @@ if pc.frame_metadata_gate().is_open():
 of a connection entirely: offers don't advertise it, answers stay silent
 even when the offer declared it, the gate never opens, and `user_data` is
 dropped. The result is indistinguishable from a connection built before the
-capability existed.
+capability existed. Two more scopes cover the case at the edges of a whole
+process or a single stream: `PeerConnectionFactory::builder().
+with_metadata(false)` kills it factory-wide (every connection behaves as if
+configured off, whatever `RtcConfiguration` says), and
+`VideoTrackOptions::frame_metadata: Some(false)` keeps it off one track
+only — its pushes drop `user_data` silently while the sibling tracks'
+trailers flow.
 
 <details>
 <summary>🦀 Example using Rust</summary>

@@ -6,8 +6,9 @@
 //! PCM in `on_audio_frame`.
 //!
 //! This is the zero-integration path: no custom encoder, no codec knowledge
-//! required. Swap `PeerConnectionFactory::new()` for `::with_platform_adm()`
-//! to capture from a real microphone instead of synthetic audio.
+//! required. Swap `PeerConnectionFactory::builder().build()` for
+//! `PeerConnectionFactory::builder().with_platform_adm().build()` to capture
+//! from a real microphone instead of synthetic audio.
 //!
 //! ```sh
 //! REACTOR_WEBRTC_LIB_DIR=webrtc-build/out/mac-arm64-release/dist \
@@ -37,8 +38,8 @@ fn run() {
     use std::time::{Duration, Instant};
 
     use reactor_webrtc::{
-        IceCandidate, MediaKind, PeerConnection, PeerConnectionFactory, PeerConnectionObserver,
-        PeerConnectionState, RtcConfiguration, Track,
+        IceCandidate, PeerConnection, PeerConnectionFactory, PeerConnectionObserver,
+        PeerConnectionState, RemoteTrack, RtcConfiguration,
     };
 
     // ── shared state per peer ─────────────────────────────────────────────────
@@ -50,7 +51,7 @@ fn run() {
         video_frames: AtomicU32,
         audio_frames: AtomicU32,
         // Keep received track handles alive so their sinks don't drop.
-        tracks: Mutex<Vec<Track>>,
+        tracks: Mutex<Vec<RemoteTrack>>,
     }
 
     fn make_peer(
@@ -73,13 +74,13 @@ fn run() {
             })
             .on_track({
                 let s = shared.clone();
-                move |kind, mut track| {
-                    match kind {
-                        MediaKind::Video => {
+                move |track| {
+                    match &track {
+                        RemoteTrack::Video(video_track) => {
                             // Callback fires on the libwebrtc decode thread with
                             // each decoded BGRA frame.
                             let s = s.clone();
-                            track.on_video_frame(move |f| {
+                            video_track.on_frame(move |f| {
                                 // f.bgra is a Vec<u8>: width × height × 4 bytes.
                                 // Feed it to your renderer (Metal, wgpu, SDL2, …).
                                 println!(
@@ -91,10 +92,10 @@ fn run() {
                                 s.video_frames.fetch_add(1, Ordering::SeqCst);
                             });
                         }
-                        MediaKind::Audio => {
+                        RemoteTrack::Audio(audio_track) => {
                             // Callback fires with interleaved i16 PCM samples.
                             let s = s.clone();
-                            track.on_audio_frame(move |f| {
+                            audio_track.on_frame(move |f| {
                                 // f.pcm: interleaved i16, f.channels channels,
                                 // f.sample_rate Hz, len = samples_per_channel × channels.
                                 println!(
@@ -106,7 +107,6 @@ fn run() {
                                 s.audio_frames.fetch_add(1, Ordering::SeqCst);
                             });
                         }
-                        MediaKind::Unknown => {}
                     }
                     s.tracks.lock().unwrap().push(track);
                 }
@@ -126,9 +126,10 @@ fn run() {
     // ── factory and peers ─────────────────────────────────────────────────────
 
     // Synthetic ADM: no real audio hardware. Push PCM manually below.
-    // Switch to PeerConnectionFactory::with_platform_adm() to capture from
-    // the real microphone and play decoded audio through the speaker.
-    let factory = PeerConnectionFactory::new().expect("factory");
+    // Switch to PeerConnectionFactory::builder().with_platform_adm().build()
+    // to capture from the real microphone and play decoded audio through the
+    // speaker.
+    let factory = PeerConnectionFactory::builder().build().expect("factory");
     let config = RtcConfiguration::default();
 
     let (pc1, s1) = make_peer(&factory, &config);
@@ -194,7 +195,9 @@ fn run() {
                 for (i, b) in bgra.iter_mut().enumerate() {
                     *b = ((i as u32 + phase as u32 * 7) % 256) as u8;
                 }
-                video.push_video_frame(&bgra, w, h);
+                video
+                    .push_frame(reactor_webrtc::VideoFrame::new(&bgra, w, h))
+                    .expect("push frame");
                 phase = phase.wrapping_add(1);
 
                 // --- audio: push 10ms of PCM (×3 to match ~30ms video cadence) ---

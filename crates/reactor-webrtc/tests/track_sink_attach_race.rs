@@ -22,15 +22,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use reactor_webrtc::{
-    IceCandidate, MediaKind, PeerConnection, PeerConnectionFactory, PeerConnectionObserver,
-    PeerConnectionState, RtcConfiguration, Track,
+    IceCandidate, PeerConnection, PeerConnectionFactory, PeerConnectionObserver,
+    PeerConnectionState, RemoteTrack, RtcConfiguration, VideoTrack,
 };
 
 #[derive(Default)]
 struct Shared {
     ice: Mutex<VecDeque<IceCandidate>>,
     connected: AtomicBool,
-    remote_video: Mutex<Option<Arc<Track>>>,
+    remote_video: Mutex<Option<Arc<VideoTrack>>>,
 }
 
 fn make_peer(
@@ -53,9 +53,9 @@ fn make_peer(
         })
         .on_track({
             let s = shared.clone();
-            move |kind, track| {
-                if kind == MediaKind::Video {
-                    *s.remote_video.lock().unwrap() = Some(Arc::new(track));
+            move |track| {
+                if let RemoteTrack::Video(v) = track {
+                    *s.remote_video.lock().unwrap() = Some(Arc::new(v));
                 }
             }
         });
@@ -76,7 +76,7 @@ fn forward_ice(from: &Shared, to: &PeerConnection) {
 
 #[test]
 fn concurrent_on_video_frame_attach_survives_live_frame_delivery() {
-    let factory = PeerConnectionFactory::new().expect("factory");
+    let factory = PeerConnectionFactory::builder().build().expect("factory");
     let config = RtcConfiguration::default();
 
     let (pc1, s1) = make_peer(&factory, &config);
@@ -107,7 +107,9 @@ fn concurrent_on_video_frame_attach_survives_live_frame_delivery() {
             let (w, h) = (320u32, 240u32);
             let bgra = vec![0x55u8; (w * h * 4) as usize];
             while !stop.load(Ordering::SeqCst) {
-                video.push_video_frame(&bgra, w, h);
+                video
+                    .push_frame(reactor_webrtc::VideoFrame::new(&bgra, w, h))
+                    .expect("push frame");
                 thread::sleep(Duration::from_millis(2));
             }
         });
@@ -138,7 +140,7 @@ fn concurrent_on_video_frame_attach_survives_live_frame_delivery() {
                 inner.spawn(move || {
                     while Instant::now() < deadline {
                         let received = received.clone();
-                        remote.on_video_frame(move |f| {
+                        remote.on_frame(move |f| {
                             if !f.bgra.is_empty() {
                                 received.fetch_add(1, Ordering::SeqCst);
                             }

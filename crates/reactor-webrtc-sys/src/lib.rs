@@ -120,6 +120,102 @@ pub struct ReactorEncodedVideoOutput {
     pub free_data: Option<extern "C" fn(data: *const u8, len: usize)>,
 }
 
+/// Options for [`reactor_webrtc_factory_create`]. ABI-versioned: `size` must be
+/// `std::mem::size_of::<ReactorFactoryOptions>()`, so the glue can reject
+/// callers built against an older struct — future fields are only appended,
+/// and zero is always the absent/default value.
+/// Layout must match `ReactorFactoryOptions` in the C++ glue.
+#[repr(C)]
+pub struct ReactorFactoryOptions {
+    pub size: u32,
+    /// 0 → synthetic ADM (push PCM via `reactor_webrtc_factory_push_audio_frame`);
+    /// nonzero → the platform default ADM (real mic/speaker, e.g. CoreAudio).
+    pub use_platform_adm: c_int,
+    /// OR of REACTOR_APM_* bits (0 = all processing disabled).
+    pub apm_flags: c_int,
+    /// OpenH264 backend library path (NUL-terminated); null = no OpenH264.
+    /// Only honored in builds with OpenH264 support — otherwise create fails.
+    pub openh264_lib_path: *const c_char,
+    /// Custom encode plumbing (registry / inline encoder); null = backends only.
+    pub encode_cb: Option<
+        extern "C" fn(
+            userdata: *mut c_void,
+            raw: *const ReactorRawVideoFrame,
+            out: *mut ReactorEncodedVideoOutput,
+        ) -> c_int,
+    >,
+    pub encode_userdata: *mut c_void,
+    /// Called when the last encoder instance using `encode_userdata` is gone.
+    pub encode_free_ud: Option<extern "C" fn(userdata: *mut c_void)>,
+    /// Per-encoder-instance escape to the backend path; null = always custom.
+    pub encode_use_builtin: Option<extern "C" fn(userdata: *mut c_void, encoder_id: u64) -> c_int>,
+    /// Called during codec enumeration: nonzero while custom slots exist —
+    /// gates the H264/H265 claim so plain factories keep the builtin-only
+    /// advertisement. null = never claim via custom plumbing.
+    pub encode_has_custom_slots: Option<extern "C" fn(userdata: *mut c_void) -> c_int>,
+    /// Per-encoder-instance H264 backend preference for backend-routed
+    /// instances: 0 = platform default (VideoToolbox on Apple, OpenH264
+    /// elsewhere), 1 = VideoToolbox, 2 = OpenH264. null = all auto.
+    pub encode_video_backend_for:
+        Option<extern "C" fn(userdata: *mut c_void, encoder_id: u64) -> c_int>,
+    /// Rate-control (BWE) updates for custom-slotted encoder instances: the
+    /// target bitrate (bps) and framerate the congestion controller wants.
+    /// null = suppress rate feedback.
+    pub encode_rate_update: Option<
+        extern "C" fn(userdata: *mut c_void, encoder_id: u64, bitrate_bps: u32, framerate_fps: f64),
+    >,
+}
+
+impl Default for ReactorFactoryOptions {
+    fn default() -> Self {
+        Self {
+            size: std::mem::size_of::<Self>() as u32,
+            use_platform_adm: 0,
+            apm_flags: 0,
+            openh264_lib_path: std::ptr::null(),
+            encode_cb: None,
+            encode_userdata: std::ptr::null_mut(),
+            encode_free_ud: None,
+            encode_use_builtin: None,
+            encode_has_custom_slots: None,
+            encode_video_backend_for: None,
+            encode_rate_update: None,
+        }
+    }
+}
+
+/// Options for [`reactor_webrtc_audio_track_create`]. ABI-versioned: `size`
+/// must be `std::mem::size_of::<ReactorAudioTrackOptions>()`; future fields
+/// are only appended, and zero is always the absent/default value.
+/// Layout must match `ReactorAudioTrackOptions` in the C++ glue.
+#[repr(C)]
+pub struct ReactorAudioTrackOptions {
+    pub size: u32,
+    /// 0 = factory ADM (platform mic, or the shared synthetic pipe fed by
+    /// [`reactor_webrtc_factory_push_audio_frame`]); 1 = per-track local
+    /// source (feed with [`reactor_webrtc_audio_track_push_pcm`]).
+    pub source: c_int,
+    /// Tri-state source constraints: -1 unset (libwebrtc/APM default),
+    /// 0 = forced off, 1 = forced on.
+    pub echo_cancellation: c_int,
+    pub noise_suppression: c_int,
+    pub auto_gain_control: c_int,
+    pub high_pass_filter: c_int,
+}
+
+impl Default for ReactorAudioTrackOptions {
+    fn default() -> Self {
+        Self {
+            size: std::mem::size_of::<Self>() as u32,
+            source: 0,
+            echo_cancellation: -1,
+            noise_suppression: -1,
+            auto_gain_control: -1,
+            high_pass_filter: -1,
+        }
+    }
+}
+
 /// A single entry in the stats snapshot delivered by
 /// [`reactor_webrtc_peer_connection_get_stats`]. The `kind` field selects
 /// which subset of fields is populated; all others are zero-initialised.
@@ -272,52 +368,17 @@ extern "C" {
     pub fn reactor_webrtc_selftest(out: *mut c_char, cap: c_int) -> c_int;
 
     // ── Factory ──────────────────────────────────────────────────────────────
-    /// Create a factory with the synthetic (push-able) ADM — no audio hardware.
-    pub fn reactor_webrtc_factory_create() -> *mut PeerConnectionFactory;
-    /// Create a factory choosing the audio device backend. `use_platform_adm`:
-    /// 0 → synthetic ADM (push PCM via [`reactor_webrtc_factory_push_audio_frame`]);
-    /// nonzero → the platform default ADM (real mic/speaker, e.g. CoreAudio).
-    /// `apm_flags` is an OR of REACTOR_APM_* bits (0 = all processing disabled).
-    pub fn reactor_webrtc_factory_create_with_adm_apm(
-        use_platform_adm: c_int,
-        apm_flags: c_int,
-    ) -> *mut PeerConnectionFactory;
-    pub fn reactor_webrtc_factory_create_with_adm(
-        use_platform_adm: c_int,
+    /// The single factory-create entry point (options-based, ABI-versioned).
+    /// Always installs the composite video codec factory pair:
+    /// custom-slot routing → OpenH264 → Apple VideoToolbox → builtin.
+    /// On failure returns null and writes a reason into `err` (NUL-terminated,
+    /// truncated to `err_cap`); both `err`/`err_cap` may be null/0 to ignore.
+    pub fn reactor_webrtc_factory_create(
+        opts: *const ReactorFactoryOptions,
+        err: *mut c_char,
+        err_cap: c_int,
     ) -> *mut PeerConnectionFactory;
     pub fn reactor_webrtc_factory_destroy(factory: *mut PeerConnectionFactory);
-
-    /// Create a factory that routes all video encoding through `on_encode`.
-    /// `on_encode` is called synchronously within `VideoEncoder::Encode()` with
-    /// the raw I420 frame; fill `*out` and return 0 to inject encoded bytes into
-    /// the RTP stack, or return non-zero to drop the frame. `userdata` lifetime
-    /// follows the same contract as `reactor_webrtc_frame_transformer_create`.
-    /// `apm_flags` is an OR of REACTOR_APM_* bits (0 = all processing disabled).
-    pub fn reactor_webrtc_factory_create_with_custom_video_encoder(
-        use_platform_adm: c_int,
-        on_encode: extern "C" fn(
-            userdata: *mut c_void,
-            raw: *const ReactorRawVideoFrame,
-            out: *mut ReactorEncodedVideoOutput,
-        ) -> c_int,
-        userdata: *mut c_void,
-        free_ud: Option<extern "C" fn(userdata: *mut c_void)>,
-        use_builtin: Option<extern "C" fn(userdata: *mut c_void, encoder_id: u64) -> c_int>,
-        apm_flags: c_int,
-    ) -> *mut PeerConnectionFactory;
-
-    /// Create a factory with real H.264 encode/decode backed by a dynamically
-    /// loaded OpenH264 shared library (`lib_path`, e.g. from
-    /// [`crate::openh264::ensure_available`]). VP8/VP9/AV1 remain builtin.
-    /// `lib_path` must be a NUL-terminated UTF-8/ANSI path. Returns null if the
-    /// library fails to `dlopen`/`LoadLibraryW`, or on any other factory
-    /// construction failure. `apm_flags` is an OR of REACTOR_APM_* bits.
-    #[cfg(feature = "openh264")]
-    pub fn reactor_webrtc_factory_create_with_openh264(
-        lib_path: *const c_char,
-        use_platform_adm: c_int,
-        apm_flags: c_int,
-    ) -> *mut PeerConnectionFactory;
 
     /// Create a peer connection. `config` carries the ICE servers and policies
     /// (may be null for the defaults). `callbacks` may be null. Returns null on
@@ -556,6 +617,24 @@ extern "C" {
     pub fn reactor_webrtc_rtp_transceiver_lock_negotiated_send_codec(
         transceiver: *mut RtpTransceiver,
     ) -> c_int;
+    /// Set this transceiver's **per-sender** bitrate bounds, on `encodings[0]`.
+    ///
+    /// This is not the same ceiling as
+    /// [`reactor_webrtc_peer_connection_set_bitrate`]: that one bounds the
+    /// aggregate congestion-control estimate for the connection, this one bounds
+    /// one stream's share of it. They are conjunctive — the lower wins — and
+    /// without this call the stream's ceiling is libwebrtc's resolution-keyed
+    /// default (2500 kbps for anything above 960x540).
+    ///
+    /// Pass `-1` for either bound to leave it unset. Returns 0 on success, -1 on
+    /// error, with the message written into `err`.
+    pub fn reactor_webrtc_rtp_transceiver_set_send_bitrate(
+        transceiver: *mut RtpTransceiver,
+        min_bps: c_int,
+        max_bps: c_int,
+        err: *mut c_char,
+        err_cap: c_int,
+    ) -> c_int;
     /// Identity of the transceiver itself, as an opaque value — **not** an owning
     /// handle. Stable for the transceiver's life, unlike the handle pointer, which
     /// is a fresh allocation per `transceivers()` call. Usable as a key before any
@@ -617,26 +696,21 @@ extern "C" {
     pub fn reactor_webrtc_media_stream_track_destroy(track: *mut MediaStreamTrack);
 
     // ── Audio tracks ─────────────────────────────────────────────────────────
-    /// Create a local audio track. Its samples come from the factory's ADM —
-    /// push PCM with [`reactor_webrtc_factory_push_audio_frame`]. Returns an
-    /// owned [`MediaStreamTrack`] handle or null.
+    /// Create a local audio track per `opts` (required; null returns null).
+    /// `source = 0` sources from the factory's ADM (push PCM with
+    /// [`reactor_webrtc_factory_push_audio_frame`]); `source = 1` creates a
+    /// per-track local source (push with [`reactor_webrtc_audio_track_push_pcm`],
+    /// independent audio per track). Returns an owned [`MediaStreamTrack`]
+    /// handle or null.
     pub fn reactor_webrtc_audio_track_create(
         factory: *mut PeerConnectionFactory,
         id: *const c_char,
+        opts: *const ReactorAudioTrackOptions,
     ) -> *mut MediaStreamTrack;
-    /// Create a local audio track with a per-track audio source, independent of
-    /// the factory ADM. Each call returns a track whose audio is fed exclusively
-    /// via [`reactor_webrtc_audio_track_push_pcm`], allowing different audio to
-    /// be delivered to different peer connections. Returns an owned
-    /// [`MediaStreamTrack`] handle or null.
-    pub fn reactor_webrtc_audio_track_create_with_local_source(
-        factory: *mut PeerConnectionFactory,
-        id: *const c_char,
-    ) -> *mut MediaStreamTrack;
-    /// Push interleaved i16 PCM directly to a local audio track that was created
-    /// with [`reactor_webrtc_audio_track_create_with_local_source`]. No-op for
-    /// tracks backed by the factory ADM. `samples_per_channel` is the frame
-    /// count (e.g. 480 for 10ms @ 48kHz).
+    /// Push interleaved i16 PCM directly to a track created with
+    /// `source = 1` (a per-track local source). No-op for tracks backed by the
+    /// factory ADM. `samples_per_channel` is the frame count (e.g. 480 for
+    /// 10ms @ 48kHz).
     pub fn reactor_webrtc_audio_track_push_pcm(
         track: *mut MediaStreamTrack,
         pcm: *const i16,

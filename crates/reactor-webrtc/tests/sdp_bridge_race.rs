@@ -38,8 +38,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use reactor_webrtc::{
-    IceCandidate, MediaKind, PeerConnection, PeerConnectionFactory, PeerConnectionObserver,
-    PeerConnectionState, RtcConfiguration,
+    IceCandidate, PeerConnection, PeerConnectionFactory, PeerConnectionObserver,
+    PeerConnectionState, RemoteTrack, RtcConfiguration,
 };
 
 #[derive(Default)]
@@ -47,7 +47,7 @@ struct Shared {
     ice: Mutex<VecDeque<IceCandidate>>,
     connected: AtomicBool,
     video_frames: AtomicU32,
-    recv: Mutex<Vec<reactor_webrtc::Track>>,
+    recv: Mutex<Vec<reactor_webrtc::RemoteTrack>>,
 }
 
 fn make_peer(
@@ -70,10 +70,10 @@ fn make_peer(
         })
         .on_track({
             let s = shared.clone();
-            move |kind, track| {
-                if kind == MediaKind::Video {
+            move |track| {
+                if let RemoteTrack::Video(v) = &track {
                     let s = s.clone();
-                    track.on_video_frame(move |f| {
+                    v.on_frame(move |f| {
                         if !f.bgra.is_empty() {
                             s.video_frames.fetch_add(1, Ordering::SeqCst);
                         }
@@ -100,7 +100,7 @@ fn forward_ice(from: &Shared, to: &PeerConnection) {
 #[test]
 #[ignore = "reproducer meant to be run as several concurrent processes — see module docs"]
 fn sdp_bridge_survives_repeated_connects_with_media() {
-    let factory = PeerConnectionFactory::new().expect("factory");
+    let factory = PeerConnectionFactory::builder().build().expect("factory");
     let config = RtcConfiguration::default();
     let deadline = Instant::now() + Duration::from_secs(45);
     let mut iterations = 0u32;
@@ -140,7 +140,9 @@ fn sdp_bridge_survives_repeated_connects_with_media() {
                 let (w, h) = (320u32, 240u32);
                 let bgra = vec![0x40u8; (w * h * 4) as usize];
                 while !stop.load(Ordering::SeqCst) && Instant::now() < pump_deadline {
-                    video.push_video_frame(&bgra, w, h);
+                    video
+                        .push_frame(reactor_webrtc::VideoFrame::new(&bgra, w, h))
+                        .expect("push frame");
                     thread::sleep(Duration::from_millis(15));
                 }
             });

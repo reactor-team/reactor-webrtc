@@ -85,7 +85,7 @@ fn generated_credentials_are_not_ours() {
     // four characters, far too small to carry a routing token, but that is an
     // upstream detail and this repo bumps the prebuilt regularly. Failing here
     // because libwebrtc improved would be noise.
-    let factory = PeerConnectionFactory::new().expect("factory");
+    let factory = PeerConnectionFactory::builder().build().expect("factory");
     let (pc, _) = make_peer(&factory, &RtcConfiguration::default());
     pc.create_data_channel("probe").expect("data channel");
     let offer = pc.create_offer().expect("create offer");
@@ -103,7 +103,7 @@ fn generated_credentials_are_not_ours() {
 
 #[test]
 fn a_substituted_local_description_is_accepted() {
-    let factory = PeerConnectionFactory::new().expect("factory");
+    let factory = PeerConnectionFactory::builder().build().expect("factory");
     let (pc, _) = make_peer(&factory, &RtcConfiguration::default());
     pc.create_data_channel("probe").expect("data channel");
 
@@ -124,7 +124,7 @@ fn a_substituted_ufrag_actually_reaches_the_ice_transport() {
     // description is set; the answerer therefore signs every connectivity check
     // with the substituted ufrag and password. If the offerer's transport had kept
     // the generated pair, no check would ever authenticate and ICE would stall.
-    let factory = PeerConnectionFactory::new().expect("factory");
+    let factory = PeerConnectionFactory::builder().build().expect("factory");
     let config = RtcConfiguration::default();
     let (pc1, s1) = make_peer(&factory, &config);
     let (pc2, s2) = make_peer(&factory, &config);
@@ -185,7 +185,7 @@ fn a_renegotiation_description_has_no_candidate_level_ufrag() {
     //
     // It does not emit it. This test exists so that a prebuilt bump which changes
     // that is caught here rather than in the field.
-    let factory = PeerConnectionFactory::new().expect("factory");
+    let factory = PeerConnectionFactory::builder().build().expect("factory");
     let config = RtcConfiguration::default();
     let (pc1, s1) = make_peer(&factory, &config);
     let (pc2, s2) = make_peer(&factory, &config);
