@@ -723,11 +723,79 @@ impl From<rw::IceCandidatePairState> for IceCandidatePairState {
     }
 }
 
+/// Media kind of an RTP stream (`RTCRtpStreamStats::kind`).
+#[pyclass(eq, eq_int)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum StreamKind {
+    Unknown,
+    Audio,
+    Video,
+}
+
+impl From<rw::StreamKind> for StreamKind {
+    fn from(s: rw::StreamKind) -> Self {
+        match s {
+            rw::StreamKind::Unknown => Self::Unknown,
+            rw::StreamKind::Audio => Self::Audio,
+            rw::StreamKind::Video => Self::Video,
+        }
+    }
+}
+
+/// Type of an ICE candidate (`RTCIceCandidateStats::candidate_type`).
+///
+/// `RELAY` means the media is going through a TURN server.
+#[pyclass(eq, eq_int)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum IceCandidateType {
+    Unknown,
+    Host,
+    Srflx,
+    Prflx,
+    Relay,
+}
+
+impl From<rw::IceCandidateType> for IceCandidateType {
+    fn from(s: rw::IceCandidateType) -> Self {
+        match s {
+            rw::IceCandidateType::Unknown => Self::Unknown,
+            rw::IceCandidateType::Host => Self::Host,
+            rw::IceCandidateType::Srflx => Self::Srflx,
+            rw::IceCandidateType::Prflx => Self::Prflx,
+            rw::IceCandidateType::Relay => Self::Relay,
+        }
+    }
+}
+
+/// Transport a relayed candidate uses to reach its TURN server.
+#[pyclass(eq, eq_int)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RelayProtocol {
+    /// Not relayed, or not reported.
+    NotRelayed,
+    Udp,
+    Tcp,
+    Tls,
+}
+
+impl From<rw::RelayProtocol> for RelayProtocol {
+    fn from(s: rw::RelayProtocol) -> Self {
+        match s {
+            rw::RelayProtocol::NotRelayed => Self::NotRelayed,
+            rw::RelayProtocol::Udp => Self::Udp,
+            rw::RelayProtocol::Tcp => Self::Tcp,
+            rw::RelayProtocol::Tls => Self::Tls,
+        }
+    }
+}
+
 /// Subset of `RTCInboundRtpStreamStats`.
 #[pyclass(get_all)]
 #[derive(Clone)]
 pub struct InboundRtpStats {
     pub ssrc: u32,
+    /// Audio or video.
+    pub kind: StreamKind,
     pub packets_received: u32,
     pub bytes_received: u64,
     /// Jitter in seconds.
@@ -736,6 +804,13 @@ pub struct InboundRtpStats {
     pub nack_count: u32,
     /// Cumulative decode time in seconds.
     pub total_decode_time_s: f64,
+    /// Decoded frames per second; `0.0` if not measured. Video only.
+    pub frames_per_second: f64,
+    pub frames_decoded: u32,
+    pub frames_dropped: u32,
+    /// Decoded frame size; `0` for audio, and before the first frame.
+    pub frame_width: u32,
+    pub frame_height: u32,
 }
 
 #[pymethods]
@@ -749,12 +824,18 @@ impl From<rw::InboundRtpStats> for InboundRtpStats {
     fn from(s: rw::InboundRtpStats) -> Self {
         Self {
             ssrc: s.ssrc,
+            kind: StreamKind::from(s.kind),
             packets_received: s.packets_received,
             bytes_received: s.bytes_received,
             jitter_s: s.jitter_s,
             packets_lost: s.packets_lost,
             nack_count: s.nack_count,
             total_decode_time_s: s.total_decode_time_s,
+            frames_per_second: s.frames_per_second,
+            frames_decoded: s.frames_decoded,
+            frames_dropped: s.frames_dropped,
+            frame_width: s.frame_width,
+            frame_height: s.frame_height,
         }
     }
 }
@@ -764,13 +845,32 @@ impl From<rw::InboundRtpStats> for InboundRtpStats {
 #[derive(Clone)]
 pub struct OutboundRtpStats {
     pub ssrc: u32,
-    pub packets_sent: u32,
+    /// Audio or video.
+    pub kind: StreamKind,
+    /// 64-bit because libwebrtc reports it that way; a 32-bit counter wrapped
+    /// silently on a long-lived connection.
+    pub packets_sent: u64,
     pub bytes_sent: u64,
     /// Target encoder bitrate in bps.
     pub target_bitrate_bps: f64,
     /// Round-trip time in seconds; `0.0` if not yet measured.
+    ///
+    /// From the receiver's RTCP report about us, so it stays `0.0` until the far
+    /// end has sent one — a zero is "not measured yet", not a zero-latency link.
     pub round_trip_time_s: f64,
-    pub retransmitted_packets_sent: u32,
+    /// Cumulative round-trip time in seconds, from the same report.
+    pub total_round_trip_time_s: f64,
+    /// Fraction of this stream the receiver reports as lost, `0.0`-`1.0`.
+    pub fraction_lost: f64,
+    /// Packets the receiver reports as lost. Signed, per RFC 3550.
+    pub packets_lost: i32,
+    pub retransmitted_packets_sent: u64,
+    /// Encoded frames per second; `0.0` if not measured. Video only.
+    pub frames_per_second: f64,
+    pub frames_sent: u32,
+    /// Encoded frame size; `0` for audio, and before the first frame.
+    pub frame_width: u32,
+    pub frame_height: u32,
 }
 
 #[pymethods]
@@ -784,11 +884,19 @@ impl From<rw::OutboundRtpStats> for OutboundRtpStats {
     fn from(s: rw::OutboundRtpStats) -> Self {
         Self {
             ssrc: s.ssrc,
+            kind: StreamKind::from(s.kind),
             packets_sent: s.packets_sent,
             bytes_sent: s.bytes_sent,
             target_bitrate_bps: s.target_bitrate_bps,
             round_trip_time_s: s.round_trip_time_s,
+            total_round_trip_time_s: s.total_round_trip_time_s,
+            fraction_lost: s.fraction_lost,
+            packets_lost: s.packets_lost,
             retransmitted_packets_sent: s.retransmitted_packets_sent,
+            frames_per_second: s.frames_per_second,
+            frames_sent: s.frames_sent,
+            frame_width: s.frame_width,
+            frame_height: s.frame_height,
         }
     }
 }
@@ -799,8 +907,28 @@ impl From<rw::OutboundRtpStats> for OutboundRtpStats {
 pub struct IceCandidatePairStats {
     /// Current RTT in seconds; `0.0` if not yet measured.
     pub current_round_trip_time_s: f64,
+    /// Cumulative RTT in seconds across every check on this pair.
+    pub total_round_trip_time_s: f64,
     pub priority: u64,
     pub state: IceCandidatePairState,
+    /// Whether ICE selected this pair. Read this rather than inferring the
+    /// selected pair from `state` and `priority`.
+    pub nominated: bool,
+    pub writable: bool,
+    /// Congestion-control estimates in bps; `0.0` when the engine has none yet.
+    pub available_outgoing_bitrate_bps: f64,
+    pub available_incoming_bitrate_bps: f64,
+    /// Everything this pair carried - RTCP and data channel included, so wider
+    /// than the per-stream RTP counters.
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+    pub packets_sent: u64,
+    pub packets_received: u64,
+    /// Type of this pair's *local* candidate. `RELAY` says the session is going
+    /// through TURN.
+    pub local_candidate_type: IceCandidateType,
+    /// Transport to the TURN server, when relayed.
+    pub local_relay_protocol: RelayProtocol,
 }
 
 #[pymethods]
@@ -814,8 +942,19 @@ impl From<rw::IceCandidatePairStats> for IceCandidatePairStats {
     fn from(s: rw::IceCandidatePairStats) -> Self {
         Self {
             current_round_trip_time_s: s.current_round_trip_time_s,
+            total_round_trip_time_s: s.total_round_trip_time_s,
             priority: s.priority,
             state: IceCandidatePairState::from(s.state),
+            nominated: s.nominated,
+            writable: s.writable,
+            available_outgoing_bitrate_bps: s.available_outgoing_bitrate_bps,
+            available_incoming_bitrate_bps: s.available_incoming_bitrate_bps,
+            bytes_sent: s.bytes_sent,
+            bytes_received: s.bytes_received,
+            packets_sent: s.packets_sent,
+            packets_received: s.packets_received,
+            local_candidate_type: IceCandidateType::from(s.local_candidate_type),
+            local_relay_protocol: RelayProtocol::from(s.local_relay_protocol),
         }
     }
 }
@@ -2778,6 +2917,9 @@ fn reactor_webrtc(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TransceiverDirection>()?;
     m.add_class::<VideoCodec>()?;
     m.add_class::<IceCandidatePairState>()?;
+    m.add_class::<StreamKind>()?;
+    m.add_class::<IceCandidateType>()?;
+    m.add_class::<RelayProtocol>()?;
     m.add_class::<InboundRtpStats>()?;
     m.add_class::<OutboundRtpStats>()?;
     m.add_class::<IceCandidatePairStats>()?;

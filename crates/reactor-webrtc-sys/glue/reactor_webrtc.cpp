@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstddef>  // offsetof, for the ReactorStatEntry layout assertions
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -109,22 +110,83 @@ struct ReactorStatEntry {
   int32_t  kind;
   uint32_t ssrc;
   // 4-byte integer fields
+  // Inbound RTP only. RTCReceivedRtpStreamStats reports this as uint32_t, so
+  // 32 bits is exact here — unlike the pair's own counter below, which is 64-bit
+  // and gets its own field rather than being narrowed into this one.
   uint32_t packets_received;
   int32_t  packets_lost;
   uint32_t nack_count;
-  uint32_t packets_sent;
   int32_t  pair_state;  // 0=waiting 1=in_progress 2=failed 3=succeeded 4=cancelled
-  uint32_t retransmitted_packets_sent;
-  // 8-byte fields (natural alignment)
+  // Media kind of an RTP stream (kinds 0 and 1): -1=unknown 0=audio 1=video.
+  // RTCRtpStreamStats::kind. Without it a reader has only the ssrc, and cannot
+  // tell which of several receive streams is the video one — which is the
+  // difference between reporting "the video stream's jitter" and "the worst
+  // jitter of anything arriving".
+  int32_t  stream_kind;
+  // Candidate pair (kind 2). RTCIceCandidatePairStats::nominated — the pair ICE
+  // actually selected, rather than one a reader has to infer from priority.
+  int32_t  nominated;      // 0/1
+  int32_t  writable;       // 0/1
+  // Local candidate of the pair, resolved through local_candidate_id:
+  // -1=unknown 0=host 1=srflx 2=prflx 3=relay. This is what says whether a
+  // session is being relayed through TURN.
+  int32_t  local_candidate_type;
+  // Transport of a relayed local candidate: -1=unknown/none 0=udp 1=tcp 2=tls.
+  int32_t  local_relay_protocol;
+  // Video, inbound (kind 0) and outbound (kind 1).
+  uint32_t frame_width;
+  uint32_t frame_height;
+  uint32_t frames_decoded;   // kind 0
+  uint32_t frames_dropped;   // kind 0
+  uint32_t frames_sent;      // kind 1
+  // 16 x 4 = 64 bytes to here, so the 8-byte block below starts aligned with no
+  // padding. 8-byte fields. The static_assert below is what keeps the arithmetic in these
+  // comments true, rather than the comments.
   uint64_t bytes_received;
   uint64_t bytes_sent;
   uint64_t priority;
+  // 64-bit because libwebrtc reports them that way, and narrowing them wraps
+  // silently: RTCSentRtpStreamStats::packets_sent,
+  // RTCOutboundRtpStreamStats::retransmitted_packets_sent and the candidate
+  // pair's packets_sent/packets_received are all std::optional<uint64_t>. At a
+  // thousand packets a second a u32 wraps in about seven weeks of connection and
+  // then reports a cumulative counter that went backwards.
+  //
+  // `packets_sent` carries the send stream's count for kind 1 and the pair's for
+  // kind 2; `pair_packets_received` is separate because kind 0 already has a
+  // 32-bit `packets_received` that is exact for an RTP stream.
+  uint64_t packets_sent;
+  uint64_t retransmitted_packets_sent;
+  uint64_t pair_packets_received;
   double   jitter;                  // seconds
   double   total_decode_time;       // seconds
   double   target_bitrate;          // bps
-  double   round_trip_time;         // seconds, 0 if not measured
+  // Send-path RTT, seconds, 0 if not measured. Reached from the outbound
+  // stream's remote_id: RTCOutboundRtpStreamStats lost its own round_trip_time
+  // in M7907 and it now lives on RTCRemoteInboundRtpStreamStats.
+  double   round_trip_time;
+  double   total_round_trip_time;   // seconds, kinds 1 and 2
+  double   fraction_lost;           // 0..1, kind 1, from the receiver's report
   double   current_round_trip_time; // seconds, 0 if not measured
+  double   available_outgoing_bitrate; // bps, kind 2, 0 if not estimated
+  double   available_incoming_bitrate; // bps, kind 2, 0 if not estimated
+  double   frames_per_second;          // kinds 0 and 1, 0 if not measured
 };
+
+// The layout guard, and the reason it is a size and not a comment: this struct
+// is hand-mirrored by `repr(C) struct ReactorStatEntry` in
+// crates/reactor-webrtc-sys/src/lib.rs, and a field added to one copy and not
+// the other shifts every field after it. Nothing else catches that — the two are
+// compiled from the same checkout, so no ABI version number is involved, and the
+// symptom is a plausible-looking number read out of the wrong offset.
+//
+// The Rust side carries the same assertion against the same number. If you are
+// here because one of them failed: you changed the struct on one side only.
+static_assert(sizeof(struct ReactorStatEntry) == 192,
+              "ReactorStatEntry changed size — update the repr(C) mirror in "
+              "reactor-webrtc-sys/src/lib.rs and both assertions");
+static_assert(offsetof(struct ReactorStatEntry, bytes_received) == 64,
+              "ReactorStatEntry's 4-byte block changed size — see above");
 
 // PeerConnectionObserver events, forwarded to the safe crate. Any pointer may
 // be null (the field is `Option<extern "C" fn>` on the Rust side).
@@ -779,9 +841,53 @@ static int parse_pair_state(const S& m) {
   return 0;  // "waiting" or unknown
 }
 
+// Parse RTCRtpStreamStats::kind to the integer encoding used in
+// ReactorStatEntry::stream_kind.
+template <typename S>
+static int parse_stream_kind(const S& m) {
+  if (!m) return -1;
+  const std::string& s = *m;
+  if (s == "audio") return 0;
+  if (s == "video") return 1;
+  return -1;
+}
+
+// Parse RTCIceCandidateStats::candidate_type to
+// ReactorStatEntry::local_candidate_type.
+template <typename S>
+static int parse_candidate_type(const S& m) {
+  if (!m) return -1;
+  const std::string& s = *m;
+  if (s == "host")  return 0;
+  if (s == "srflx") return 1;
+  if (s == "prflx") return 2;
+  if (s == "relay") return 3;
+  return -1;
+}
+
+// Parse RTCIceCandidateStats::relay_protocol to
+// ReactorStatEntry::local_relay_protocol. Absent on a candidate that is not
+// relayed, which is -1 rather than a protocol nobody is using.
+template <typename S>
+static int parse_relay_protocol(const S& m) {
+  if (!m) return -1;
+  const std::string& s = *m;
+  if (s == "udp") return 0;
+  if (s == "tcp") return 1;
+  if (s == "tls") return 2;
+  return -1;
+}
+
 // Collects a WebRTC stats report and serialises the RTCInboundRtpStreamStats,
 // RTCOutboundRtpStreamStats, and RTCIceCandidatePairStats entries into the
 // flat C ABI array expected by the safe crate.
+//
+// Two of the fields are not on the stat being visited and are resolved through
+// the report by id: a candidate pair's local candidate type, and an outbound
+// stream's round-trip time. Both are flattened onto the entry rather than
+// exposed as their own `kind`, so a reader never has to perform the join —
+// there is exactly one sensible way to do it and the C ABI is a bad place to
+// make a caller express it.
 class StatsCallback : public webrtc::RTCStatsCollectorCallback {
  public:
   StatsCallback(void* userdata,
@@ -795,34 +901,98 @@ class StatsCallback : public webrtc::RTCStatsCollectorCallback {
     if (report) {
       for (const webrtc::RTCStats& stats : *report) {
         ReactorStatEntry e{};
+        // `e{}` zeroes everything, and zero is a *meaningful value* for the
+        // three enum fields — audio, host, udp. Unknown is -1, so they have to
+        // start there or an entry that never learned its kind claims to be an
+        // audio stream over a host candidate.
+        e.stream_kind          = -1;
+        e.local_candidate_type = -1;
+        e.local_relay_protocol = -1;
         if (stats.type() == webrtc::RTCInboundRtpStreamStats::kType) {
           const auto& s = stats.cast_to<webrtc::RTCInboundRtpStreamStats>();
           e.kind              = 0;
           e.ssrc              = stat_val(s.ssrc);
+          e.stream_kind       = parse_stream_kind(s.kind);
           e.packets_received  = stat_val(s.packets_received);
           e.bytes_received    = stat_val(s.bytes_received);
           e.jitter            = stat_val(s.jitter);
           e.packets_lost      = stat_val(s.packets_lost);
           e.nack_count        = stat_val(s.nack_count);
           e.total_decode_time = stat_val(s.total_decode_time);
+          e.frames_per_second = stat_val(s.frames_per_second);
+          e.frames_decoded    = stat_val(s.frames_decoded);
+          e.frames_dropped    = stat_val(s.frames_dropped);
+          e.frame_width       = stat_val(s.frame_width);
+          e.frame_height      = stat_val(s.frame_height);
           entries.push_back(e);
         } else if (stats.type() == webrtc::RTCOutboundRtpStreamStats::kType) {
           const auto& s = stats.cast_to<webrtc::RTCOutboundRtpStreamStats>();
           e.kind                       = 1;
           e.ssrc                       = stat_val(s.ssrc);
+          e.stream_kind                = parse_stream_kind(s.kind);
           e.packets_sent               = stat_val(s.packets_sent);
           e.bytes_sent                 = stat_val(s.bytes_sent);
           e.target_bitrate             = stat_val(s.target_bitrate);
-          // round_trip_time was removed from RTCOutboundRtpStreamStats in M7907;
-          // RTT for the send path is now in RTCRemoteInboundRtpStreamStats.
           e.retransmitted_packets_sent = stat_val(s.retransmitted_packets_sent);
+          e.frames_per_second          = stat_val(s.frames_per_second);
+          e.frames_sent                = stat_val(s.frames_sent);
+          e.frame_width                = stat_val(s.frame_width);
+          e.frame_height               = stat_val(s.frame_height);
+          // round_trip_time was removed from RTCOutboundRtpStreamStats in M7907
+          // and the send path's RTT moved to RTCRemoteInboundRtpStreamStats —
+          // the receiver's report about us. remote_id points straight at it, so
+          // this is a lookup rather than a second pass over the report.
+          //
+          // It stays absent until the far end has sent an RTCP receiver report,
+          // so a zero here means "not measured yet", exactly as it does on the
+          // candidate pair.
+          if (s.remote_id) {
+            const webrtc::RTCStats* remote = report->Get(*s.remote_id);
+            if (remote != nullptr &&
+                remote->type() == webrtc::RTCRemoteInboundRtpStreamStats::kType) {
+              const auto& r =
+                  remote->cast_to<webrtc::RTCRemoteInboundRtpStreamStats>();
+              e.round_trip_time       = stat_val(r.round_trip_time);
+              e.total_round_trip_time = stat_val(r.total_round_trip_time);
+              e.fraction_lost         = stat_val(r.fraction_lost);
+              // The receiver's own loss count, which is the send path's. The
+              // inbound branch above fills the same field from our side.
+              e.packets_lost          = stat_val(r.packets_lost);
+            }
+          }
           entries.push_back(e);
         } else if (stats.type() == webrtc::RTCIceCandidatePairStats::kType) {
           const auto& s = stats.cast_to<webrtc::RTCIceCandidatePairStats>();
           e.kind                    = 2;
           e.current_round_trip_time = stat_val(s.current_round_trip_time);
+          e.total_round_trip_time   = stat_val(s.total_round_trip_time);
           e.priority                = stat_val(s.priority);
           e.pair_state              = parse_pair_state(s.state);
+          e.nominated               = stat_val(s.nominated) ? 1 : 0;
+          e.writable                = stat_val(s.writable) ? 1 : 0;
+          e.available_outgoing_bitrate = stat_val(s.available_outgoing_bitrate);
+          e.available_incoming_bitrate = stat_val(s.available_incoming_bitrate);
+          // Everything the pair carried, RTCP and data channel included — a
+          // wider measure than the per-stream RTP counters, and the one the
+          // browser's getStats() derives its bitrates from.
+          e.bytes_sent              = stat_val(s.bytes_sent);
+          e.bytes_received          = stat_val(s.bytes_received);
+          e.packets_sent            = stat_val(s.packets_sent);
+          e.pair_packets_received   = stat_val(s.packets_received);
+          // The candidate type lives on a separate stat, reached by id. It is
+          // what says whether this session is relayed through TURN.
+          if (s.local_candidate_id) {
+            const webrtc::RTCStats* cand = report->Get(*s.local_candidate_id);
+            // Checked, not assumed: cast_to asserts on the type, so an id that
+            // named something else would abort the process rather than leave the
+            // field unknown.
+            if (cand != nullptr &&
+                cand->type() == webrtc::RTCLocalIceCandidateStats::kType) {
+              const auto& c = cand->cast_to<webrtc::RTCLocalIceCandidateStats>();
+              e.local_candidate_type = parse_candidate_type(c.candidate_type);
+              e.local_relay_protocol = parse_relay_protocol(c.relay_protocol);
+            }
+          }
           entries.push_back(e);
         }
       }

@@ -17,8 +17,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use reactor_webrtc::{
-        IceCandidate, IceCandidatePairState, PeerConnection, PeerConnectionFactory,
-        PeerConnectionObserver, PeerConnectionState, RtcConfiguration,
+        IceCandidate, IceCandidatePairState, IceCandidateType, PeerConnection,
+        PeerConnectionFactory, PeerConnectionObserver, PeerConnectionState, RelayProtocol,
+        RtcConfiguration,
     };
 
     struct Peer {
@@ -157,12 +158,106 @@ mod tests {
         );
         for p in &report.candidate_pairs {
             println!(
-                "  pair  state={:?}  rtt={:.3}ms  priority={}",
+                "  pair  state={:?}  nominated={}  rtt={:.3}ms  priority={}  \
+                 candidate={:?}  relay={:?}  bytes={}↑/{}↓  avail={:.0}↑/{:.0}↓ bps",
                 p.state,
+                p.nominated,
                 p.current_round_trip_time_s * 1000.0,
                 p.priority,
+                p.local_candidate_type,
+                p.local_relay_protocol,
+                p.bytes_sent,
+                p.bytes_received,
+                p.available_outgoing_bitrate_bps,
+                p.available_incoming_bitrate_bps,
             );
         }
+    }
+
+    /// The fields REA-6019 added, on the pair ICE actually chose.
+    ///
+    /// Asserted on the *nominated* pair rather than on "any pair": a loopback
+    /// connection gathers several, and the ones ICE did not select have no byte
+    /// counters and no bitrate estimate. Asserting across all of them would pass
+    /// on a pair that carried nothing.
+    #[test]
+    fn the_nominated_pair_reports_its_candidate_type_and_counters() {
+        let factory = PeerConnectionFactory::builder().build().expect("factory");
+        let cfg = RtcConfiguration::default();
+
+        let (pc1, s1) = make_peer(&factory, &cfg);
+        let (pc2, s2) = make_peer(&factory, &cfg);
+        let _dc = pc1.create_data_channel("stats-probe").expect("dc");
+
+        negotiate(&pc1, &pc2);
+        let ok = wait_for(&s1, &s2, &pc1, &pc2, || {
+            s1.connected.load(Ordering::SeqCst) && s2.connected.load(Ordering::SeqCst)
+        });
+        assert!(ok, "timed out waiting for connection");
+
+        // Nomination and the first byte counters land a tick or two after the
+        // connection event, so this polls for the nominated pair rather than
+        // reading one snapshot and hoping.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let pair = loop {
+            let report = pc1.get_stats().expect("get_stats");
+            if let Some(p) = report
+                .candidate_pairs
+                .into_iter()
+                .find(|p| p.nominated && p.bytes_sent > 0)
+            {
+                break Some(p);
+            }
+            if Instant::now() >= deadline {
+                break None;
+            }
+            thread::sleep(Duration::from_millis(50));
+        };
+        let pair = pair.expect("no nominated candidate pair with traffic appeared");
+
+        // The whole point of the field: before it, "selected" had to be inferred
+        // from state plus priority.
+        assert_eq!(
+            pair.state,
+            IceCandidatePairState::Succeeded,
+            "the nominated pair must be a succeeded one"
+        );
+        assert!(pair.writable, "a nominated pair carrying bytes is writable");
+
+        // Loopback goes host-to-host, and nothing is relayed — which is exactly
+        // the answer a caller needs to be able to distinguish from a TURN path.
+        assert_eq!(pair.local_candidate_type, IceCandidateType::Host);
+        assert_eq!(pair.local_relay_protocol, RelayProtocol::NotRelayed);
+
+        // Pair-level counters. Wider than the per-stream RTP ones: the data
+        // channel's traffic is in here, and this connection has no media at all.
+        assert!(pair.bytes_sent > 0, "nominated pair sent nothing");
+        // Wired to the pair's own 64-bit counters, not to the inbound stream's
+        // 32-bit `packets_received`. Reading the wrong field reports zero here,
+        // because this connection carries no RTP at all.
+        assert!(
+            pair.packets_sent > 0,
+            "nominated pair reported no packets sent"
+        );
+        assert!(
+            pair.packets_received > 0,
+            "nominated pair reported no packets received"
+        );
+        assert!(
+            pair.total_round_trip_time_s >= 0.0,
+            "cumulative rtt must not be negative"
+        );
+
+        println!(
+            "the_nominated_pair_reports_its_candidate_type_and_counters ✅\n  \
+             candidate={:?} relay={:?} bytes={}↑/{}↓ avail={:.0}↑/{:.0}↓ bps",
+            pair.local_candidate_type,
+            pair.local_relay_protocol,
+            pair.bytes_sent,
+            pair.bytes_received,
+            pair.available_outgoing_bitrate_bps,
+            pair.available_incoming_bitrate_bps,
+        );
     }
 
     #[test]
