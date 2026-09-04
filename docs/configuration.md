@@ -409,3 +409,90 @@ Two things worth knowing before you reach for it:
   headroom for the moments that would otherwise be clipped.
 - **The bounds apply to the first encoding.** For a simulcast sender that is
   the first layer, not the whole ladder — per-layer control is not exposed.
+
+## Reading connection statistics
+
+`get_stats` is a `PeerConnection` method, callable at any point after the
+connection is created. It returns a snapshot, not a subscription: poll it if you
+want a series. In Python it is one of the awaitable methods (see
+[`architecture.md`](architecture.md#threading-model)); the Rust API is
+synchronous and blocks the calling thread until the engine delivers the report.
+
+The report carries a **subset** of libwebrtc's, in three lists:
+
+| List | libwebrtc type | What it describes |
+| -- | -- | -- |
+| `inbound_rtp` | `RTCInboundRtpStreamStats` | one receive stream each |
+| `outbound_rtp` | `RTCOutboundRtpStreamStats` | one send stream each |
+| `candidate_pairs` | `RTCIceCandidatePairStats` | one ICE candidate pair each |
+
+<details>
+<summary>🦀 Example using Rust</summary>
+
+```rust
+let report = pc.get_stats()?;
+
+// The selected pair — read `nominated`, don't infer it from state + priority.
+if let Some(pair) = report.candidate_pairs.iter().find(|p| p.nominated) {
+    println!(
+        "{:?} candidate, rtt {:.1}ms, {} bytes in",
+        pair.local_candidate_type,
+        pair.current_round_trip_time_s * 1000.0,
+        pair.bytes_received,
+    );
+}
+
+// `kind` is what lets you ask about the video stream specifically.
+for s in report.inbound_rtp.iter().filter(|s| s.kind == StreamKind::Video) {
+    println!("{}x{} @ {:.1}fps", s.frame_width, s.frame_height, s.frames_per_second);
+}
+```
+
+</details>
+
+<details>
+<summary>🐍 Example using Python</summary>
+
+```python
+report = await pc.get_stats()
+
+pair = next((p for p in report.candidate_pairs if p.nominated), None)
+if pair is not None:
+    print(pair.local_candidate_type, pair.current_round_trip_time_s * 1000)
+
+for s in report.inbound_rtp:
+    if s.kind == reactor_webrtc.StreamKind.Video:
+        print(s.frame_width, s.frame_height, s.frames_per_second)
+```
+
+</details>
+
+Four things worth knowing before you read a number off this.
+
+- **Zero means "not measured yet" far more often than it means zero.** RTT, the
+  available-bitrate estimates and `frames_per_second` all start at `0.0` and
+  stay there until the engine has something to report — a candidate pair that
+  has not completed a check, a congestion controller with no media to estimate
+  against, a stream that has not decoded a second's worth of frames. A caller
+  that treats those as measurements reports a zero-latency link on a connection
+  that has not finished connecting.
+
+- **Read `nominated`, not `state` and `priority`.** A connection gathers many
+  pairs — a plain loopback produces eighteen — and exactly one is nominated.
+  Only that one has byte counters and a bitrate estimate; the rest are zeroes,
+  so a reader that aggregates across pairs is averaging in candidates that
+  carried nothing.
+
+- **The pair's byte counters are wider than the streams'.** `bytes_sent` and
+  `bytes_received` on a candidate pair cover everything it carried — RTCP and
+  data-channel traffic included — where the per-stream counters are RTP payload
+  for that stream alone. Neither is wrong; they answer different questions, and
+  a bitrate derived from one will not match a bitrate derived from the other.
+
+- **`OutboundRtpStats::round_trip_time_s` comes from the far end.** libwebrtc
+  moved the send path's RTT out of `RTCOutboundRtpStreamStats` in M7907; it now
+  lives in the receiver's RTCP report about us
+  (`RTCRemoteInboundRtpStreamStats`), which this crate follows for you. It stays
+  `0.0` until the far end has sent one, so expect nothing for the first second
+  or so of a connection. `fraction_lost` and `packets_lost` on a send stream
+  come from the same report and are the receiver's numbers, not ours.

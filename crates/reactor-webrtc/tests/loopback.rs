@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use reactor_webrtc::{
     IceCandidate, PeerConnection, PeerConnectionFactory, PeerConnectionObserver,
-    PeerConnectionState, RemoteTrack, RtcConfiguration,
+    PeerConnectionState, RemoteTrack, RtcConfiguration, StreamKind,
 };
 
 #[derive(Default)]
@@ -149,6 +149,13 @@ fn safe_loopback_exchanges_media() {
         });
 
         // Trickle ICE and wait for connect + received media.
+        //
+        // Also waits for the send path's RTT to appear, which is the one field
+        // here that arrives on the far end's schedule rather than ours: it comes
+        // from the receiver's RTCP report about us (see the assertions below), so
+        // it needs roughly a report interval of media on the wire. Waiting for
+        // the value itself rather than for a frame count keeps this as short as
+        // the connection allows, and the 20s cap still bounds it.
         let start = Instant::now();
         loop {
             forward_ice(&s1, &pc2);
@@ -157,7 +164,11 @@ fn safe_loopback_exchanges_media() {
                 s1.connected.load(Ordering::SeqCst) && s2.connected.load(Ordering::SeqCst);
             let media = s2.video_frames.load(Ordering::SeqCst) > 0
                 && s2.audio_frames.load(Ordering::SeqCst) > 0;
-            if (connected && media) || start.elapsed() > Duration::from_secs(20) {
+            let rtt_reported = connected
+                && pc1
+                    .get_stats()
+                    .is_ok_and(|r| r.outbound_rtp.iter().any(|s| s.round_trip_time_s > 0.0));
+            if (connected && media && rtt_reported) || start.elapsed() > Duration::from_secs(20) {
                 break;
             }
             thread::sleep(Duration::from_millis(50));
@@ -176,6 +187,102 @@ fn safe_loopback_exchanges_media() {
     assert!(v > 0, "pc2 received no video frames");
     assert!(a > 0, "pc2 received no audio frames");
     println!("safe loopback connected ✅ — pc2 received {v} video + {a} audio frame(s)");
+
+    // ── The per-stream stats fields, which only exist once media has flowed ──
+    //
+    // Riding along on this fixture rather than standing up a second one: this is
+    // the suite's only test with real audio *and* video on the wire, and the
+    // fields below are exactly the ones a data-channel-only connection cannot
+    // produce — `tests/stats.rs` covers the candidate-pair half against such a
+    // connection and reports `inbound_rtp: 0`.
+    //
+    // The stats collector lags the frames by a tick, so this polls rather than
+    // reading one snapshot.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let (inbound, outbound) = loop {
+        let received = pc2.get_stats().expect("pc2 get_stats");
+        let sent = pc1.get_stats().expect("pc1 get_stats");
+        if received.inbound_rtp.len() >= 2 && sent.outbound_rtp.len() >= 2 {
+            break (received.inbound_rtp, sent.outbound_rtp);
+        }
+        if Instant::now() >= deadline {
+            break (received.inbound_rtp, sent.outbound_rtp);
+        }
+        thread::sleep(Duration::from_millis(100));
+    };
+
+    // The field this whole change exists for. Without it a reader has only the
+    // ssrc, and cannot tell which of these two streams is the video one — so
+    // "the video stream's jitter" is not a question that can be asked.
+    let video_in = inbound
+        .iter()
+        .find(|s| s.kind == StreamKind::Video)
+        .expect("no inbound stream reported itself as video");
+    let audio_in = inbound
+        .iter()
+        .find(|s| s.kind == StreamKind::Audio)
+        .expect("no inbound stream reported itself as audio");
+    assert!(
+        outbound.iter().any(|s| s.kind == StreamKind::Video),
+        "no outbound stream reported itself as video"
+    );
+    assert!(
+        outbound.iter().any(|s| s.kind == StreamKind::Audio),
+        "no outbound stream reported itself as audio"
+    );
+
+    // Frames actually decoded, which is the counter that says the model is
+    // producing. `frames_per_second` is deliberately not asserted: it is a
+    // windowed average and this test pushes for a couple of seconds, so a zero
+    // there is a short run rather than a broken field.
+    assert!(
+        video_in.frames_decoded > 0,
+        "the video stream decoded no frames despite {v} arriving at the sink"
+    );
+    assert!(
+        video_in.frame_width > 0 && video_in.frame_height > 0,
+        "decoded video reported no frame size"
+    );
+    // Audio has no frames and no size, and must not claim otherwise.
+    assert_eq!(audio_in.frames_decoded, 0);
+    assert_eq!(audio_in.frame_width, 0);
+
+    // The send path's RTT, and the reason it gets an assertion of its own: it is
+    // not on the stat it appears on. libwebrtc moved it out of
+    // RTCOutboundRtpStreamStats in M7907, so the glue follows `remote_id` to the
+    // receiver's own report to find it — a lookup that would silently match
+    // nothing and leave a plausible `0.0` behind. This field read `0.0` on every
+    // call between that milestone bump and REA-6019 for exactly that reason, so
+    // "it compiles" is not evidence here.
+    let rtt_ms = outbound
+        .iter()
+        .map(|s| s.round_trip_time_s * 1000.0)
+        .fold(0.0, f64::max);
+    assert!(
+        rtt_ms > 0.0,
+        "no send stream reported a round-trip time; the remote_id lookup in \
+         OnStatsDelivered matched nothing"
+    );
+
+    println!(
+        "per-stream stats ✅\n  \
+         inbound  video: {}x{} @{:.1}fps  frames={} dropped={} jitter={:.1}ms\n  \
+         inbound  audio: jitter={:.1}ms packets={}\n  \
+         outbound rtt={:.3}ms fraction_lost={:.4}",
+        video_in.frame_width,
+        video_in.frame_height,
+        video_in.frames_per_second,
+        video_in.frames_decoded,
+        video_in.frames_dropped,
+        video_in.jitter_s * 1000.0,
+        audio_in.jitter_s * 1000.0,
+        audio_in.packets_received,
+        outbound
+            .iter()
+            .map(|s| s.round_trip_time_s * 1000.0)
+            .fold(0.0, f64::max),
+        outbound.iter().map(|s| s.fraction_lost).fold(0.0, f64::max),
+    );
     // RAII teardown: tracks, peer connections, factory all drop here.
 }
 

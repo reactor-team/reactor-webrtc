@@ -1,5 +1,62 @@
 # Changelog
 
+## 0.15.0 — the stats report says which stream is which
+
+`get_stats` reported a subset of libwebrtc's report, and the subset was narrower
+than a client needs. Building `get_stats()` for the Reactor Python and C++ SDKs
+turned up four fields those SDKs could not fill and one absence that forced them
+to answer a different question than the browser does.
+
+Additive. Nothing removed, nothing renamed.
+
+### Added
+
+**`kind` on both stream types** (`RTCRtpStreamStats::kind`, as `StreamKind`).
+The one that changes an answer rather than adding one. Without it a reader has
+only the SSRC and cannot tell which of several receive streams is the video one
+— so "the video stream's jitter" was not a question that could be asked, and
+consumers aggregated across every stream instead.
+
+**Most of the candidate pair.** `nominated` is the pair ICE actually selected;
+before it, "selected" had to be inferred from `state` plus `priority`. Also
+`writable`, `total_round_trip_time_s`, the pair's own `bytes_sent` /
+`bytes_received` / `packets_sent` / `packets_received`, and
+`available_outgoing_bitrate_bps` / `available_incoming_bitrate_bps` — the
+congestion controller's own estimates, which nothing else substitutes for.
+
+**`local_candidate_type` and `local_relay_protocol`** (`IceCandidateType`,
+`RelayProtocol`), resolved through the pair's `local_candidate_id`.
+`IceCandidateType::Relay` is what says a session is going through TURN, which is
+the first thing worth knowing when latency is bad. It lives on a stat type the
+glue did not visit at all.
+
+**Frame counters.** `frames_per_second`, `frame_width` / `frame_height`, plus
+`frames_decoded` / `frames_dropped` inbound and `frames_sent` outbound.
+
+### Fixed
+
+**`OutboundRtpStats::round_trip_time_s` was a hard `0.0`.** libwebrtc moved the
+send path's RTT out of `RTCOutboundRtpStreamStats` in M7907 and into the
+receiver's report about us (`RTCRemoteInboundRtpStreamStats`); the field stayed
+declared and stopped being assigned. Every caller reading it since that
+milestone bump got a zero, which reads as a zero-latency link rather than as a
+missing measurement.
+
+Now followed through `remote_id`, along with `total_round_trip_time_s`,
+`fraction_lost` and `packets_lost` from the same report — the send path's loss
+numbers, equally absent before. It still reports `0.0` until the far end has
+sent an RTCP receiver report, so a zero means "not measured yet"; the loopback
+test waits for the value rather than for a frame count, because a lookup that
+matches nothing is exactly the failure this had.
+
+### Notes
+
+The report's C ABI struct grew, and `glue/reactor_webrtc.cpp` is compiled from
+source on every build, so no ABI version changed. What does need care is the
+hand-written `repr(C)` mirror in `reactor-webrtc-sys`: both copies now carry a
+size assertion against the same number, so editing one without the other fails
+the build instead of shifting every field after it.
+
 ## 0.14.1 — say when a sender has encodings to write
 
 `set_send_bitrate` documented itself as callable "before or after negotiation".

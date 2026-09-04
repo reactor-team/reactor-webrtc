@@ -239,6 +239,24 @@ pub struct ReactorStatEntry {
     /// ICE pair state: 0=waiting 1=in_progress 2=failed 3=succeeded 4=cancelled
     pub pair_state: i32,
     pub retransmitted_packets_sent: u32,
+    /// Media kind of an RTP stream (kinds 0 and 1): -1=unknown 0=audio 1=video
+    pub stream_kind: i32,
+    /// Candidate pair (kind 2): the pair ICE selected. 0/1
+    pub nominated: i32,
+    /// Candidate pair (kind 2). 0/1
+    pub writable: i32,
+    /// Local candidate of the pair: -1=unknown 0=host 1=srflx 2=prflx 3=relay
+    pub local_candidate_type: i32,
+    /// Transport of a relayed local candidate: -1=unknown/none 0=udp 1=tcp 2=tls
+    pub local_relay_protocol: i32,
+    pub frame_width: u32,
+    pub frame_height: u32,
+    /// kind 0
+    pub frames_decoded: u32,
+    /// kind 0
+    pub frames_dropped: u32,
+    /// kind 1
+    pub frames_sent: u32,
     pub bytes_received: u64,
     pub bytes_sent: u64,
     pub priority: u64,
@@ -248,11 +266,36 @@ pub struct ReactorStatEntry {
     pub total_decode_time: f64,
     /// target bitrate in bps (outbound RTP)
     pub target_bitrate: f64,
-    /// round-trip time in seconds (outbound RTP), 0 if not measured
+    /// Send-path round-trip time in seconds (outbound RTP), 0 if not measured.
+    /// Comes from the receiver's report about us, so it stays 0 until the far
+    /// end has sent one.
     pub round_trip_time: f64,
+    /// cumulative round-trip time in seconds (kinds 1 and 2)
+    pub total_round_trip_time: f64,
+    /// fraction of the send path lost, 0..1 (kind 1)
+    pub fraction_lost: f64,
     /// current round-trip time in seconds (candidate pair), 0 if not measured
     pub current_round_trip_time: f64,
+    /// congestion controller's send estimate in bps (kind 2), 0 if none
+    pub available_outgoing_bitrate: f64,
+    /// congestion controller's receive estimate in bps (kind 2), 0 if none
+    pub available_incoming_bitrate: f64,
+    /// frames per second (kinds 0 and 1), 0 if not measured
+    pub frames_per_second: f64,
 }
+
+// The other half of the layout guard in
+// glue/reactor_webrtc.cpp — read the comment there. These two numbers are the
+// only thing standing between a field added on one side and a plausible-looking
+// number read out of the wrong offset.
+const _: () = {
+    assert!(
+        core::mem::size_of::<ReactorStatEntry>() == 176,
+        "ReactorStatEntry changed size — update the C struct in \
+         glue/reactor_webrtc.cpp and both assertions"
+    );
+    assert!(core::mem::align_of::<ReactorStatEntry>() == 8);
+};
 
 /// PeerConnectionObserver callbacks, forwarded from the C++ glue. Every field
 /// is optional (`None` = a null function pointer on the C side). `userdata` is

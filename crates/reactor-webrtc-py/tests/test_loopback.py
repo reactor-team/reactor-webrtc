@@ -428,6 +428,43 @@ class TestStats:
         assert isinstance(report1, rw.StatsReport)
         assert len(report1.candidate_pairs) > 0, "expected at least one candidate pair"
 
+    async def test_nominated_pair_reports_its_candidate_type(self, factory):
+        """The REA-6019 fields, on the pair ICE actually chose.
+
+        Asserted on the nominated pair rather than on "any pair": a loopback
+        gathers many, and the ones ICE did not select carry no bytes. `nominated`
+        is the field that makes that distinction possible at all — before it, a
+        caller had to infer the selected pair from state plus priority.
+        """
+        p1 = make_peer(factory)
+        p2 = make_peer(factory)
+        p1.pc.create_data_channel("probe")
+
+        ok = await connect(p1, p2)
+        assert ok, "peers did not connect within timeout"
+
+        # Nomination and the first counters land a tick after the connection
+        # event, so poll rather than reading one snapshot.
+        pair = None
+        for _ in range(100):
+            report = await p1.pc.get_stats()
+            pair = next(
+                (p for p in report.candidate_pairs if p.nominated and p.bytes_sent > 0),
+                None,
+            )
+            if pair is not None:
+                break
+            await asyncio.sleep(0.05)
+        assert pair is not None, "no nominated candidate pair with traffic appeared"
+
+        assert pair.state == rw.IceCandidatePairState.Succeeded
+        assert pair.writable
+        # Loopback is host-to-host, which is the answer a caller needs to be
+        # able to tell apart from a TURN path.
+        assert pair.local_candidate_type == rw.IceCandidateType.Host
+        assert pair.local_relay_protocol == rw.RelayProtocol.NotRelayed
+        assert pair.bytes_sent > 0
+
     async def test_candidate_pair_stats_fields(self, factory):
         """IceCandidatePairStats fields have sane types and values."""
         p1 = make_peer(factory)

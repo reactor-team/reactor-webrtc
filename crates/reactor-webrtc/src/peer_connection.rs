@@ -812,10 +812,91 @@ impl IceCandidatePairState {
     }
 }
 
+/// Media kind of an RTP stream (`RTCRtpStreamStats::kind`).
+///
+/// The field that lets a reader tell which of several receive streams is the
+/// video one. Without it there is only the SSRC, and "the video stream's jitter"
+/// becomes "the worst jitter of anything arriving" — a different statistic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamKind {
+    /// The engine did not report a kind.
+    Unknown,
+    Audio,
+    Video,
+}
+
+impl StreamKind {
+    fn from_raw(v: c_int) -> Self {
+        match v {
+            0 => StreamKind::Audio,
+            1 => StreamKind::Video,
+            _ => StreamKind::Unknown,
+        }
+    }
+}
+
+/// Type of an ICE candidate (`RTCIceCandidateStats::candidate_type`).
+///
+/// [`IceCandidateType::Relay`] means the media is going through a TURN server,
+/// which is the first thing worth knowing when latency is bad.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IceCandidateType {
+    /// The engine did not report one, or the pair named no local candidate.
+    Unknown,
+    /// A local interface address.
+    Host,
+    /// Server-reflexive: discovered through STUN.
+    Srflx,
+    /// Peer-reflexive: learned from an incoming connectivity check.
+    Prflx,
+    /// Relayed through TURN.
+    Relay,
+}
+
+impl IceCandidateType {
+    fn from_raw(v: c_int) -> Self {
+        match v {
+            0 => IceCandidateType::Host,
+            1 => IceCandidateType::Srflx,
+            2 => IceCandidateType::Prflx,
+            3 => IceCandidateType::Relay,
+            _ => IceCandidateType::Unknown,
+        }
+    }
+}
+
+/// Transport a relayed candidate uses to reach its TURN server
+/// (`RTCIceCandidateStats::relay_protocol`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayProtocol {
+    /// Not relayed, or not reported. Distinct from a protocol: a `Host`
+    /// candidate has no relay to reach.
+    ///
+    /// Spelled out rather than `None` because the Python binding mirrors these
+    /// variant names, and `RelayProtocol.None` is not addressable from Python.
+    NotRelayed,
+    Udp,
+    Tcp,
+    Tls,
+}
+
+impl RelayProtocol {
+    fn from_raw(v: c_int) -> Self {
+        match v {
+            0 => RelayProtocol::Udp,
+            1 => RelayProtocol::Tcp,
+            2 => RelayProtocol::Tls,
+            _ => RelayProtocol::NotRelayed,
+        }
+    }
+}
+
 /// `RTCInboundRtpStreamStats` subset.
 #[derive(Debug, Clone)]
 pub struct InboundRtpStats {
     pub ssrc: u32,
+    /// Audio or video. See [`StreamKind`].
+    pub kind: StreamKind,
     pub packets_received: u32,
     pub bytes_received: u64,
     /// Jitter in seconds.
@@ -824,19 +905,45 @@ pub struct InboundRtpStats {
     pub nack_count: u32,
     /// Cumulative decode time in seconds.
     pub total_decode_time_s: f64,
+    /// Decoded frames per second; `0.0` if not measured. Video only.
+    pub frames_per_second: f64,
+    pub frames_decoded: u32,
+    pub frames_dropped: u32,
+    /// Decoded frame size; `0` for audio, and before the first frame.
+    pub frame_width: u32,
+    pub frame_height: u32,
 }
 
 /// `RTCOutboundRtpStreamStats` subset.
 #[derive(Debug, Clone)]
 pub struct OutboundRtpStats {
     pub ssrc: u32,
+    /// Audio or video. See [`StreamKind`].
+    pub kind: StreamKind,
     pub packets_sent: u32,
     pub bytes_sent: u64,
     /// Target encoder bitrate in bps.
     pub target_bitrate_bps: f64,
     /// Round-trip time in seconds; `0.0` if not yet measured.
+    ///
+    /// From the receiver's RTCP report about us
+    /// (`RTCRemoteInboundRtpStreamStats`), which is where libwebrtc moved it in
+    /// M7907 — so it stays `0.0` until the far end has sent one, and a zero is
+    /// "not measured yet" rather than a zero-latency link.
     pub round_trip_time_s: f64,
+    /// Cumulative round-trip time in seconds, from the same report.
+    pub total_round_trip_time_s: f64,
+    /// Fraction of this stream the receiver reports as lost, `0.0`–`1.0`.
+    pub fraction_lost: f64,
+    /// Packets the receiver reports as lost. Signed, per RFC 3550.
+    pub packets_lost: i32,
     pub retransmitted_packets_sent: u32,
+    /// Encoded frames per second; `0.0` if not measured. Video only.
+    pub frames_per_second: f64,
+    pub frames_sent: u32,
+    /// Encoded frame size; `0` for audio, and before the first frame.
+    pub frame_width: u32,
+    pub frame_height: u32,
 }
 
 /// `RTCIceCandidatePairStats` subset.
@@ -844,8 +951,28 @@ pub struct OutboundRtpStats {
 pub struct IceCandidatePairStats {
     /// Current RTT in seconds; `0.0` if not yet measured.
     pub current_round_trip_time_s: f64,
+    /// Cumulative RTT in seconds across every check on this pair.
+    pub total_round_trip_time_s: f64,
     pub priority: u64,
     pub state: IceCandidatePairState,
+    /// Whether ICE selected this pair. The one to read rather than inferring
+    /// the selected pair from `state` and `priority`.
+    pub nominated: bool,
+    pub writable: bool,
+    /// Congestion-control estimates in bps; `0.0` when the engine has none yet.
+    pub available_outgoing_bitrate_bps: f64,
+    pub available_incoming_bitrate_bps: f64,
+    /// Everything this pair carried — RTCP and data channel included, so wider
+    /// than the per-stream RTP counters.
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+    pub packets_sent: u32,
+    pub packets_received: u32,
+    /// Type of this pair's *local* candidate. [`IceCandidateType::Relay`] is
+    /// what says the session is going through TURN.
+    pub local_candidate_type: IceCandidateType,
+    /// Transport to the TURN server, when relayed.
+    pub local_relay_protocol: RelayProtocol,
 }
 
 /// A snapshot of the stats delivered by [`PeerConnection::get_stats`].
@@ -1105,25 +1232,50 @@ extern "C" fn stats_cb(ud: *mut c_void, entries: *const ReactorStatEntry, count:
         match e.kind {
             0 => report.inbound_rtp.push(InboundRtpStats {
                 ssrc: e.ssrc,
+                kind: StreamKind::from_raw(e.stream_kind),
                 packets_received: e.packets_received,
                 bytes_received: e.bytes_received,
                 jitter_s: e.jitter,
                 packets_lost: e.packets_lost,
                 nack_count: e.nack_count,
                 total_decode_time_s: e.total_decode_time,
+                frames_per_second: e.frames_per_second,
+                frames_decoded: e.frames_decoded,
+                frames_dropped: e.frames_dropped,
+                frame_width: e.frame_width,
+                frame_height: e.frame_height,
             }),
             1 => report.outbound_rtp.push(OutboundRtpStats {
                 ssrc: e.ssrc,
+                kind: StreamKind::from_raw(e.stream_kind),
                 packets_sent: e.packets_sent,
                 bytes_sent: e.bytes_sent,
                 target_bitrate_bps: e.target_bitrate,
                 round_trip_time_s: e.round_trip_time,
+                total_round_trip_time_s: e.total_round_trip_time,
+                fraction_lost: e.fraction_lost,
+                packets_lost: e.packets_lost,
                 retransmitted_packets_sent: e.retransmitted_packets_sent,
+                frames_per_second: e.frames_per_second,
+                frames_sent: e.frames_sent,
+                frame_width: e.frame_width,
+                frame_height: e.frame_height,
             }),
             2 => report.candidate_pairs.push(IceCandidatePairStats {
                 current_round_trip_time_s: e.current_round_trip_time,
+                total_round_trip_time_s: e.total_round_trip_time,
                 priority: e.priority,
                 state: IceCandidatePairState::from_raw(e.pair_state),
+                nominated: e.nominated != 0,
+                writable: e.writable != 0,
+                available_outgoing_bitrate_bps: e.available_outgoing_bitrate,
+                available_incoming_bitrate_bps: e.available_incoming_bitrate,
+                bytes_sent: e.bytes_sent,
+                bytes_received: e.bytes_received,
+                packets_sent: e.packets_sent,
+                packets_received: e.packets_received,
+                local_candidate_type: IceCandidateType::from_raw(e.local_candidate_type),
+                local_relay_protocol: RelayProtocol::from_raw(e.local_relay_protocol),
             }),
             _ => {}
         }

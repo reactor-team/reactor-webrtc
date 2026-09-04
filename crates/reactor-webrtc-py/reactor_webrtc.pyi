@@ -163,27 +163,83 @@ class IceCandidatePairState:
     Succeeded: IceCandidatePairState
     Cancelled: IceCandidatePairState
 
+class StreamKind:
+    """Media kind of an RTP stream. `Unknown` when the engine reported none."""
+
+    Unknown: StreamKind
+    Audio: StreamKind
+    Video: StreamKind
+
+class IceCandidateType:
+    """Type of an ICE candidate. `Relay` means the media goes through TURN."""
+
+    Unknown: IceCandidateType
+    Host: IceCandidateType
+    Srflx: IceCandidateType
+    Prflx: IceCandidateType
+    Relay: IceCandidateType
+
+class RelayProtocol:
+    """Transport a relayed candidate uses to reach its TURN server.
+
+    `NotRelayed` when the candidate is not relayed, which is distinct from a
+    protocol: a host candidate has no relay to reach.
+    """
+
+    NotRelayed: RelayProtocol
+    Udp: RelayProtocol
+    Tcp: RelayProtocol
+    Tls: RelayProtocol
+
 class InboundRtpStats:
     ssrc: int
+    kind: StreamKind
     packets_received: int
     bytes_received: int
     jitter_s: float
     packets_lost: int
     nack_count: int
     total_decode_time_s: float
+    frames_per_second: float
+    frames_decoded: int
+    frames_dropped: int
+    frame_width: int
+    frame_height: int
 
 class OutboundRtpStats:
     ssrc: int
+    kind: StreamKind
     packets_sent: int
     bytes_sent: int
     target_bitrate_bps: float
+    #: From the receiver's RTCP report about us, so 0.0 until one arrives.
     round_trip_time_s: float
+    total_round_trip_time_s: float
+    fraction_lost: float
+    packets_lost: int
     retransmitted_packets_sent: int
+    frames_per_second: float
+    frames_sent: int
+    frame_width: int
+    frame_height: int
 
 class IceCandidatePairStats:
     current_round_trip_time_s: float
+    total_round_trip_time_s: float
     priority: int
     state: IceCandidatePairState
+    #: Whether ICE selected this pair. Read this rather than inferring it.
+    nominated: bool
+    writable: bool
+    available_outgoing_bitrate_bps: float
+    available_incoming_bitrate_bps: float
+    #: Everything the pair carried, RTCP and data channel included.
+    bytes_sent: int
+    bytes_received: int
+    packets_sent: int
+    packets_received: int
+    local_candidate_type: IceCandidateType
+    local_relay_protocol: RelayProtocol
 
 class StatsReport:
     inbound_rtp: list[InboundRtpStats]

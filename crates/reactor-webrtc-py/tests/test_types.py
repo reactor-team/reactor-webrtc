@@ -137,6 +137,55 @@ class TestSessionDescription:
         assert "offer" in repr(sdp)
 
 
+class TestStatsEnums:
+    """The three enums REA-6019 added, and the one thing that can go wrong with
+    an enum crossing into Python: a variant whose name is a Python keyword.
+
+    `RelayProtocol`'s "not relayed" case is spelled `NotRelayed` for exactly
+    that reason — `RelayProtocol.None` does not parse, so a variant named `None`
+    would be unreachable from Python while compiling fine in Rust.
+    """
+
+    def test_stream_kind_variants_are_addressable(self):
+        assert rw.StreamKind.Audio != rw.StreamKind.Video
+        assert rw.StreamKind.Unknown == rw.StreamKind.Unknown
+        for v in (rw.StreamKind.Unknown, rw.StreamKind.Audio, rw.StreamKind.Video):
+            assert isinstance(v, rw.StreamKind)
+
+    def test_candidate_type_variants_are_addressable(self):
+        assert rw.IceCandidateType.Host != rw.IceCandidateType.Relay
+        for v in (
+            rw.IceCandidateType.Unknown,
+            rw.IceCandidateType.Host,
+            rw.IceCandidateType.Srflx,
+            rw.IceCandidateType.Prflx,
+            rw.IceCandidateType.Relay,
+        ):
+            assert isinstance(v, rw.IceCandidateType)
+
+    def test_relay_protocol_not_relayed_is_reachable_by_name(self):
+        # getattr rather than attribute syntax would hide the failure this
+        # guards: the point is that the name is a legal Python identifier.
+        assert rw.RelayProtocol.NotRelayed != rw.RelayProtocol.Udp
+        for v in (
+            rw.RelayProtocol.NotRelayed,
+            rw.RelayProtocol.Udp,
+            rw.RelayProtocol.Tcp,
+            rw.RelayProtocol.Tls,
+        ):
+            assert isinstance(v, rw.RelayProtocol)
+
+    def test_no_variant_is_named_with_a_python_keyword(self):
+        import keyword
+
+        for enum in (rw.StreamKind, rw.IceCandidateType, rw.RelayProtocol):
+            for name in dir(enum):
+                assert not keyword.iskeyword(name), (
+                    f"{enum.__name__}.{name} is a Python keyword and cannot be "
+                    f"written as an attribute"
+                )
+
+
 class TestPeerConnectionState:
     def test_equality(self):
         assert rw.PeerConnectionState.Connected == rw.PeerConnectionState.Connected
