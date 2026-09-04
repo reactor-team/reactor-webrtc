@@ -110,12 +110,13 @@ struct ReactorStatEntry {
   int32_t  kind;
   uint32_t ssrc;
   // 4-byte integer fields
+  // Inbound RTP only. RTCReceivedRtpStreamStats reports this as uint32_t, so
+  // 32 bits is exact here — unlike the pair's own counter below, which is 64-bit
+  // and gets its own field rather than being narrowed into this one.
   uint32_t packets_received;
   int32_t  packets_lost;
   uint32_t nack_count;
-  uint32_t packets_sent;
   int32_t  pair_state;  // 0=waiting 1=in_progress 2=failed 3=succeeded 4=cancelled
-  uint32_t retransmitted_packets_sent;
   // Media kind of an RTP stream (kinds 0 and 1): -1=unknown 0=audio 1=video.
   // RTCRtpStreamStats::kind. Without it a reader has only the ssrc, and cannot
   // tell which of several receive streams is the video one — which is the
@@ -138,12 +139,25 @@ struct ReactorStatEntry {
   uint32_t frames_decoded;   // kind 0
   uint32_t frames_dropped;   // kind 0
   uint32_t frames_sent;      // kind 1
-  // 8-byte fields. The block above is 18 x 4 = 72 bytes, so this starts
-  // 8-aligned with no padding; the static_assert below is what keeps that true
-  // rather than the arithmetic in this comment.
+  // 16 x 4 = 64 bytes to here, so the 8-byte block below starts aligned with no
+  // padding. 8-byte fields. The static_assert below is what keeps the arithmetic in these
+  // comments true, rather than the comments.
   uint64_t bytes_received;
   uint64_t bytes_sent;
   uint64_t priority;
+  // 64-bit because libwebrtc reports them that way, and narrowing them wraps
+  // silently: RTCSentRtpStreamStats::packets_sent,
+  // RTCOutboundRtpStreamStats::retransmitted_packets_sent and the candidate
+  // pair's packets_sent/packets_received are all std::optional<uint64_t>. At a
+  // thousand packets a second a u32 wraps in about seven weeks of connection and
+  // then reports a cumulative counter that went backwards.
+  //
+  // `packets_sent` carries the send stream's count for kind 1 and the pair's for
+  // kind 2; `pair_packets_received` is separate because kind 0 already has a
+  // 32-bit `packets_received` that is exact for an RTP stream.
+  uint64_t packets_sent;
+  uint64_t retransmitted_packets_sent;
+  uint64_t pair_packets_received;
   double   jitter;                  // seconds
   double   total_decode_time;       // seconds
   double   target_bitrate;          // bps
@@ -168,10 +182,10 @@ struct ReactorStatEntry {
 //
 // The Rust side carries the same assertion against the same number. If you are
 // here because one of them failed: you changed the struct on one side only.
-static_assert(sizeof(struct ReactorStatEntry) == 176,
+static_assert(sizeof(struct ReactorStatEntry) == 192,
               "ReactorStatEntry changed size — update the repr(C) mirror in "
               "reactor-webrtc-sys/src/lib.rs and both assertions");
-static_assert(offsetof(struct ReactorStatEntry, bytes_received) == 72,
+static_assert(offsetof(struct ReactorStatEntry, bytes_received) == 64,
               "ReactorStatEntry's 4-byte block changed size — see above");
 
 // PeerConnectionObserver events, forwarded to the safe crate. Any pointer may
@@ -963,8 +977,8 @@ class StatsCallback : public webrtc::RTCStatsCollectorCallback {
           // browser's getStats() derives its bitrates from.
           e.bytes_sent              = stat_val(s.bytes_sent);
           e.bytes_received          = stat_val(s.bytes_received);
-          e.packets_sent            = static_cast<uint32_t>(stat_val(s.packets_sent));
-          e.packets_received        = static_cast<uint32_t>(stat_val(s.packets_received));
+          e.packets_sent            = stat_val(s.packets_sent);
+          e.pair_packets_received   = stat_val(s.packets_received);
           // The candidate type lives on a separate stat, reached by id. It is
           // what says whether this session is relayed through TURN.
           if (s.local_candidate_id) {

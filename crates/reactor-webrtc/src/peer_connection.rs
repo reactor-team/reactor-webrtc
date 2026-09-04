@@ -920,7 +920,11 @@ pub struct OutboundRtpStats {
     pub ssrc: u32,
     /// Audio or video. See [`StreamKind`].
     pub kind: StreamKind,
-    pub packets_sent: u32,
+    /// 64-bit because `RTCSentRtpStreamStats` reports it that way. It was `u32`
+    /// until 0.15.0, which wrapped silently after ~4.3 billion packets — about
+    /// seven weeks at a thousand packets a second — and then reported a
+    /// cumulative counter that had gone backwards.
+    pub packets_sent: u64,
     pub bytes_sent: u64,
     /// Target encoder bitrate in bps.
     pub target_bitrate_bps: f64,
@@ -937,7 +941,8 @@ pub struct OutboundRtpStats {
     pub fraction_lost: f64,
     /// Packets the receiver reports as lost. Signed, per RFC 3550.
     pub packets_lost: i32,
-    pub retransmitted_packets_sent: u32,
+    /// 64-bit for the same reason as [`OutboundRtpStats::packets_sent`].
+    pub retransmitted_packets_sent: u64,
     /// Encoded frames per second; `0.0` if not measured. Video only.
     pub frames_per_second: f64,
     pub frames_sent: u32,
@@ -966,8 +971,8 @@ pub struct IceCandidatePairStats {
     /// than the per-stream RTP counters.
     pub bytes_sent: u64,
     pub bytes_received: u64,
-    pub packets_sent: u32,
-    pub packets_received: u32,
+    pub packets_sent: u64,
+    pub packets_received: u64,
     /// Type of this pair's *local* candidate. [`IceCandidateType::Relay`] is
     /// what says the session is going through TURN.
     pub local_candidate_type: IceCandidateType,
@@ -1273,7 +1278,8 @@ extern "C" fn stats_cb(ud: *mut c_void, entries: *const ReactorStatEntry, count:
                 bytes_sent: e.bytes_sent,
                 bytes_received: e.bytes_received,
                 packets_sent: e.packets_sent,
-                packets_received: e.packets_received,
+                // The pair's own 64-bit counter, not kind 0's 32-bit one.
+                packets_received: e.pair_packets_received,
                 local_candidate_type: IceCandidateType::from_raw(e.local_candidate_type),
                 local_relay_protocol: RelayProtocol::from_raw(e.local_relay_protocol),
             }),

@@ -232,6 +232,17 @@ mod tests {
         // Pair-level counters. Wider than the per-stream RTP ones: the data
         // channel's traffic is in here, and this connection has no media at all.
         assert!(pair.bytes_sent > 0, "nominated pair sent nothing");
+        // Wired to the pair's own 64-bit counters, not to the inbound stream's
+        // 32-bit `packets_received`. Reading the wrong field reports zero here,
+        // because this connection carries no RTP at all.
+        assert!(
+            pair.packets_sent > 0,
+            "nominated pair reported no packets sent"
+        );
+        assert!(
+            pair.packets_received > 0,
+            "nominated pair reported no packets received"
+        );
         assert!(
             pair.total_round_trip_time_s >= 0.0,
             "cumulative rtt must not be negative"

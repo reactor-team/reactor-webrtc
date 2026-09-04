@@ -847,7 +847,9 @@ pub struct OutboundRtpStats {
     pub ssrc: u32,
     /// Audio or video.
     pub kind: StreamKind,
-    pub packets_sent: u32,
+    /// 64-bit because libwebrtc reports it that way; a 32-bit counter wrapped
+    /// silently on a long-lived connection.
+    pub packets_sent: u64,
     pub bytes_sent: u64,
     /// Target encoder bitrate in bps.
     pub target_bitrate_bps: f64,
@@ -862,7 +864,7 @@ pub struct OutboundRtpStats {
     pub fraction_lost: f64,
     /// Packets the receiver reports as lost. Signed, per RFC 3550.
     pub packets_lost: i32,
-    pub retransmitted_packets_sent: u32,
+    pub retransmitted_packets_sent: u64,
     /// Encoded frames per second; `0.0` if not measured. Video only.
     pub frames_per_second: f64,
     pub frames_sent: u32,
@@ -920,8 +922,8 @@ pub struct IceCandidatePairStats {
     /// than the per-stream RTP counters.
     pub bytes_sent: u64,
     pub bytes_received: u64,
-    pub packets_sent: u32,
-    pub packets_received: u32,
+    pub packets_sent: u64,
+    pub packets_received: u64,
     /// Type of this pair's *local* candidate. `RELAY` says the session is going
     /// through TURN.
     pub local_candidate_type: IceCandidateType,

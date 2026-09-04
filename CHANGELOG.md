@@ -7,7 +7,8 @@ than a client needs. Building `get_stats()` for the Reactor Python and C++ SDKs
 turned up four fields those SDKs could not fill and one absence that forced them
 to answer a different question than the browser does.
 
-Additive. Nothing removed, nothing renamed.
+Additive except for two counters that widen from `u32` to `u64` — see Fixed.
+Nothing removed, nothing renamed.
 
 ### Added
 
@@ -34,6 +35,21 @@ glue did not visit at all.
 `frames_decoded` / `frames_dropped` inbound and `frames_sent` outbound.
 
 ### Fixed
+
+**Three packet counters were narrowed to 32 bits and wrapped silently.**
+libwebrtc reports `RTCSentRtpStreamStats::packets_sent`,
+`RTCOutboundRtpStreamStats::retransmitted_packets_sent` and the candidate
+pair's `packets_sent` / `packets_received` as `uint64_t`; the C ABI struct
+declared all of them `uint32_t`. A connection carrying a thousand packets a
+second passes 2^32 in about seven weeks, after which a cumulative counter
+appears to go backwards — the one thing a cumulative counter must not do.
+
+`OutboundRtpStats::packets_sent` and
+`OutboundRtpStats::retransmitted_packets_sent` are therefore now `u64`. That is
+this release's only breaking change, and it is a widening: `let n: u64 =
+stats.packets_sent` keeps working, `let n: u32` does not.
+`InboundRtpStats::packets_received` stays `u32`, because
+`RTCReceivedRtpStreamStats` genuinely reports 32 bits there.
 
 **`OutboundRtpStats::round_trip_time_s` was a hard `0.0`.** libwebrtc moved the
 send path's RTT out of `RTCOutboundRtpStreamStats` in M7907 and into the

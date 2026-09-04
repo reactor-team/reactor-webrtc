@@ -232,13 +232,14 @@ impl Default for ReactorAudioTrackOptions {
 pub struct ReactorStatEntry {
     pub kind: i32,
     pub ssrc: u32,
+    /// Inbound RTP only, and 32-bit because `RTCReceivedRtpStreamStats` reports
+    /// it that way. The candidate pair's own counter is 64-bit and lives in
+    /// `pair_packets_received`.
     pub packets_received: u32,
     pub packets_lost: i32,
     pub nack_count: u32,
-    pub packets_sent: u32,
     /// ICE pair state: 0=waiting 1=in_progress 2=failed 3=succeeded 4=cancelled
     pub pair_state: i32,
-    pub retransmitted_packets_sent: u32,
     /// Media kind of an RTP stream (kinds 0 and 1): -1=unknown 0=audio 1=video
     pub stream_kind: i32,
     /// Candidate pair (kind 2): the pair ICE selected. 0/1
@@ -260,6 +261,13 @@ pub struct ReactorStatEntry {
     pub bytes_received: u64,
     pub bytes_sent: u64,
     pub priority: u64,
+    /// 64-bit because libwebrtc reports these that way; narrowing them wraps
+    /// silently on a long-lived connection. Send stream's count for kind 1, the
+    /// pair's for kind 2.
+    pub packets_sent: u64,
+    pub retransmitted_packets_sent: u64,
+    /// Candidate pair (kind 2) only — see `packets_received`.
+    pub pair_packets_received: u64,
     /// jitter in seconds (inbound RTP)
     pub jitter: f64,
     /// total decode time in seconds (inbound RTP)
@@ -290,7 +298,7 @@ pub struct ReactorStatEntry {
 // number read out of the wrong offset.
 const _: () = {
     assert!(
-        core::mem::size_of::<ReactorStatEntry>() == 176,
+        core::mem::size_of::<ReactorStatEntry>() == 192,
         "ReactorStatEntry changed size — update the C struct in \
          glue/reactor_webrtc.cpp and both assertions"
     );
