@@ -7,6 +7,10 @@
 //! [`reactor-webrtc`]: https://docs.rs/reactor-webrtc
 #![allow(non_camel_case_types)]
 
+#[cfg(test)]
+#[path = "../build_platform.rs"]
+mod build_platform;
+
 use std::os::raw::{c_char, c_int, c_void};
 
 #[cfg(feature = "openh264")]

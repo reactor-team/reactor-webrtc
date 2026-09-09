@@ -1,0 +1,132 @@
+diff --git a/build/config/compiler_cpu_abi.gn b/build/config/compiler_cpu_abi.gn
+--- a/build/config/compiler_cpu_abi.gn
++++ b/build/config/compiler_cpu_abi.gn
+@@ -3,6 +3,7 @@
+ # found in the LICENSE file.
+ 
+ import("//build/config/chromeos/args.gni")
++import("//build/config/reactor_musl.gni")
+ import("//build/toolchain/toolchain.gni")
+ 
+ if (current_cpu == "arm" || current_cpu == "arm64") {
+@@ -49,8 +50,13 @@
+   # simplicity we always explicitly set the architecture.
+   if (current_cpu == "x64") {
+     if (is_clang && !is_android && !is_fuchsia && !is_chromeos_device) {
+-      cpu_abi_cflags += [ "--target=x86_64-unknown-linux-gnu" ]
+-      cpu_abi_ldflags += [ "--target=x86_64-unknown-linux-gnu" ]
++      if (reactor_musl) {
++        cpu_abi_cflags += [ "--target=x86_64-unknown-linux-musl" ]
++        cpu_abi_ldflags += [ "--target=x86_64-unknown-linux-musl" ]
++      } else {
++        cpu_abi_cflags += [ "--target=x86_64-unknown-linux-gnu" ]
++        cpu_abi_ldflags += [ "--target=x86_64-unknown-linux-gnu" ]
++      }
+     } else {
+       cpu_abi_cflags += [ "-m64" ]
+       cpu_abi_ldflags += [ "-m64" ]
+@@ -84,8 +90,13 @@
+     ]
+   } else if (current_cpu == "arm64") {
+     if (is_clang && !is_android && !is_fuchsia && !is_chromeos_device) {
+-      cpu_abi_cflags += [ "--target=aarch64-linux-gnu" ]
+-      cpu_abi_ldflags += [ "--target=aarch64-linux-gnu" ]
++      if (reactor_musl) {
++        cpu_abi_cflags += [ "--target=aarch64-linux-musl" ]
++        cpu_abi_ldflags += [ "--target=aarch64-linux-musl" ]
++      } else {
++        cpu_abi_cflags += [ "--target=aarch64-linux-gnu" ]
++        cpu_abi_ldflags += [ "--target=aarch64-linux-gnu" ]
++      }
+     }
+     if (target_os == "chromeos" && cros_target_cpu_arch != "" &&
+         is_a_target_toolchain) {
+diff --git a/build/config/sysroot.gni b/build/config/sysroot.gni
+--- a/build/config/sysroot.gni
++++ b/build/config/sysroot.gni
+@@ -6,6 +6,7 @@
+ # of the sysroot. If no sysroot applies, the variable will be an empty string.
+ 
+ import("//build/toolchain/sysroot.gni")
++import("//build/config/reactor_musl.gni")
+ 
+ declare_args() {
+   # The path of the sysroot that is applied when compiling using the target
+@@ -21,7 +22,10 @@
+ }
+ 
+ if (sysroot == "") {
+-  if (current_os == target_os && current_cpu == target_cpu &&
++  if (reactor_musl) {
++    assert(reactor_musl_sysroot != "", "Set reactor_musl_sysroot for musl builds")
++    sysroot = reactor_musl_sysroot
++  } else if (current_os == target_os && current_cpu == target_cpu &&
+       target_sysroot != "") {
+     sysroot = target_sysroot
+   } else if (is_android) {
+diff --git a/buildtools/third_party/libc++/__config_site b/buildtools/third_party/libc++/__config_site
+--- a/buildtools/third_party/libc++/__config_site
++++ b/buildtools/third_party/libc++/__config_site
+@@ -26,7 +26,12 @@
+ #define _LIBCPP_HAS_MONOTONIC_CLOCK 1
+ #define _LIBCPP_HAS_TERMINAL 1
+ 
+-#ifdef ANDROID_HOST_MUSL
++// features.h identifies the libc used by the current sysroot. This header is
++// also shipped to consumers, so the glue uses the same configuration.
++#if defined(__linux__) && !defined(__ANDROID__)
++#include <features.h>
++#endif
++#if defined(ANDROID_HOST_MUSL) || (defined(__linux__) && !defined(__GLIBC__) && !defined(__ANDROID__))
+ #define _LIBCPP_HAS_MUSL_LIBC 1
+ #else
+ #define _LIBCPP_HAS_MUSL_LIBC 0
+diff --git a/build/config/reactor_musl.gni b/build/config/reactor_musl.gni
+new file mode 100644
+--- /dev/null
++++ b/build/config/reactor_musl.gni
+@@ -0,0 +1,5 @@
++# Reactor's musl target is a separate toolchain; host tools remain glibc.
++declare_args() {
++  reactor_musl = false
++  reactor_musl_sysroot = ""
++}
+diff --git a/build/toolchain/linux/reactor_musl/BUILD.gn b/build/toolchain/linux/reactor_musl/BUILD.gn
+new file mode 100644
+--- /dev/null
++++ b/build/toolchain/linux/reactor_musl/BUILD.gn
+@@ -0,0 +1,21 @@
++import("//build/toolchain/gcc_toolchain.gni")
++
++foreach(cpu, [ "x64", "arm64" ]) {
++  clang_toolchain("clang_$cpu") {
++    toolchain_args = {
++      current_os = "linux"
++      current_cpu = cpu
++      reactor_musl = true
++    }
++  }
++}
++
++# Distinct even for x64 -> x64: protobuf generators must run on the glibc
++# build host, while all objects in the shipped archives must use musl.
++clang_toolchain("host") {
++  toolchain_args = {
++    current_os = "linux"
++    current_cpu = host_cpu
++    reactor_musl = false
++  }
++}
+diff --git a/build/config/compiler/BUILD.gn b/build/config/compiler/BUILD.gn
+--- a/build/config/compiler/BUILD.gn
++++ b/build/config/compiler/BUILD.gn
+@@ -664,7 +664,8 @@
+     # https://github.com/llvm/llvm-project/issues/149511
+     # Reactor: also exclude arm64 — the prebuilt libwebrtc.a is consumed on
+     # arm64 hosts by GNU ld, which does not support CREL relocations yet.
+-    if (is_linux && use_lld && current_cpu != "arm" && current_cpu != "arm64" &&
++    if (is_linux && use_lld && !reactor_musl && current_cpu != "arm" &&
++        current_cpu != "arm64" &&
+         current_cpu != "s390x") {
+       cflags += [ "-Wa,--crel,--allow-experimental-crel" ]
+     }

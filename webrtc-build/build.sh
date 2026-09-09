@@ -4,12 +4,13 @@
 # ninja → assemble the static lib. See ./README.md.
 #
 # Usage: build.sh <os> <arch> [debug|release]
-#   os:   mac | ios | android | linux | win | visionos
+#   os:   mac | ios | android | linux | linux-musl | win | visionos
 #   arch: arm64 | x64 | arm | x86
 #
 # Env:
 #   IOS_ENV=device|simulator   (ios only; default device)
 #   NINJA_TARGET=webrtc        (override the ninja target if needed)
+#   NINJA_JOBS=<count>          (limit parallel compiler processes)
 set -euo pipefail
 
 OS="${1:?usage: build.sh <os> <arch> [profile]}"
@@ -28,6 +29,12 @@ SRC="$HERE/src"                       # gclient root (.gclient + src/)
 VARIANT=""
 case "$OS" in ios|visionos) VARIANT="-${IOS_ENV:-device}" ;; esac
 OUT="$HERE/out/$OS-$ARCH$VARIANT-$PROFILE"
+# Keep the array nonempty for Bash 3.2's `set -u` behavior on macOS.
+NINJA_ARGS=(-C "$OUT")
+if [ -n "${NINJA_JOBS:-}" ]; then
+  [[ "$NINJA_JOBS" =~ ^[1-9][0-9]*$ ]] || { echo "NINJA_JOBS must be a positive integer" >&2; exit 2; }
+  NINJA_ARGS+=(-j "$NINJA_JOBS")
+fi
 
 # ── arch → gn target_cpu ──────────────────────────────────────────────────────
 case "$ARCH" in
@@ -43,11 +50,22 @@ case "$OS" in
   mac|macos)  GN_OS=mac ;;
   ios)        GN_OS=ios ;;
   android)    GN_OS=android ;;
-  linux)      GN_OS=linux ;;
+  linux|linux-musl) GN_OS=linux ;;
   win|windows) GN_OS=win ;;
   visionos)   GN_OS=ios ;;    # toolchain-dependent; treated as an iOS variant for now
   *) echo "build.sh: unknown os '$OS'" >&2; exit 2 ;;
 esac
+
+if [ "$OS" = linux-musl ]; then
+  if [ "$(uname -s)" != Linux ] || [ "$(uname -m)" != x86_64 ]; then
+    echo "linux-musl builds require an x86_64 Linux host for Chromium's compiler" >&2
+    exit 2
+  fi
+  case "$CPU" in x64|arm64) ;; *) echo "musl supports x64 and arm64" >&2; exit 2 ;; esac
+  : "${REACTOR_MUSL_SYSROOT:?Run prepare-musl-sysroot.sh and set REACTOR_MUSL_SYSROOT}"
+  REACTOR_MUSL_SYSROOT="$(cd "$REACTOR_MUSL_SYSROOT" && pwd)"
+  [ -f "$REACTOR_MUSL_SYSROOT/usr/include/features.h" ] || { echo "missing musl sysroot headers" >&2; exit 1; }
+fi
 
 # ── gn args (the heart of the build) ──────────────────────────────────────────
 # Base args shared by every target, then per-OS additions. Rationale:
@@ -135,6 +153,17 @@ gn_args() {
       args+=("use_custom_libcxx=false" "symbol_level=1")
       ;;
   esac
+  if [ "$OS" = linux-musl ]; then
+    args+=(
+      "reactor_musl=true"
+      "reactor_musl_sysroot=\"$REACTOR_MUSL_SYSROOT\""
+      "custom_toolchain=\"//build/toolchain/linux/reactor_musl:clang_$CPU\""
+      "host_toolchain=\"//build/toolchain/linux/reactor_musl:host\""
+      # Ship native objects readable by the consumer's lld, not LLVM-version-
+      # specific ThinLTO bitcode. The host still uses Chromium's bundled clang.
+      "use_thin_lto=false"
+    )
+  fi
   echo "${args[*]}"
 }
 
@@ -148,13 +177,15 @@ if [ ! -d "$DEPOT" ]; then
 fi
 export PATH="$DEPOT:$PATH"
 export DEPOT_TOOLS_UPDATE="${DEPOT_TOOLS_UPDATE:-1}"
+# A fresh depot_tools checkout has no Python bootstrap for `fetch` yet.
+"$DEPOT/ensure_bootstrap"
 
 # ── 2. fetch + sync WebRTC at the pinned ref ──────────────────────────────────
 mkdir -p "$SRC"
 cd "$SRC"
 if [ ! -d src ]; then
   echo "==> fetch webrtc (large; first run downloads ~tens of GB)"
-  fetch --nohooks webrtc
+  fetch --nohooks --no-history webrtc
 fi
 if [ "$GN_OS" = "android" ] && ! grep -q "target_os" .gclient 2>/dev/null; then
   echo "target_os=['android','linux']" >> .gclient
@@ -170,6 +201,20 @@ fi
 # gclient sync refuses a dirty tree, so reset it first. Step 3 re-applies the
 # patches after the sync.
 if [ -d src/.git ]; then git -C src reset --hard >/dev/null 2>&1 || true; fi
+# Restore the subrepos touched by the musl patch before switching targets or
+# syncing a new revision. Remove only the two files that patch introduces.
+for repo in build buildtools; do
+  if [ -d "src/$repo/.git" ]; then
+    git -C "src/$repo" reset --hard >/dev/null
+  fi
+done
+# In this pinned revision jni_zero is tracked by the parent third_party repo,
+# not a separate checkout. Restore exactly the files changed by patch 0002.
+if [ -d src/third_party/.git ]; then
+  git -C src/third_party restore --source=HEAD --staged --worktree -- \
+    jni_zero/codegen/header_common.py jni_zero/jni_zero.gni
+fi
+rm -f src/build/config/reactor_musl.gni src/build/toolchain/linux/reactor_musl/BUILD.gn
 echo "==> gclient sync -> src@$REF (--with_branch_heads)"
 gclient sync --with_branch_heads --no-history --shallow -r "src@$REF" -D
 RESOLVED="$(git -C src rev-parse HEAD)"
@@ -183,7 +228,11 @@ git reset --hard "$RESOLVED" >/dev/null
 [ -d build/.git ]              && git -C build              reset --hard >/dev/null 2>&1 || true
 [ -d third_party/jni_zero/.git ] && git -C third_party/jni_zero reset --hard >/dev/null 2>&1 || true
 shopt -s nullglob
-for p in "$HERE"/patches/*.patch; do
+patches=("$HERE"/patches/*.patch)
+if [ "$OS" = linux-musl ]; then
+  patches+=("$HERE"/patches/linux-musl/*.patch)
+fi
+for p in "${patches[@]}"; do
   echo "==> applying patch $(basename "$p")"
   # Try git apply (works for files tracked by the main WebRTC repo); fall back
   # to patch(1) for files in third_party sub-repos (e.g. jni_zero).
@@ -193,7 +242,7 @@ shopt -u nullglob
 
 # Cross-compiling linux/arm64 from an x86_64 host needs the arm64 sysroot, which
 # the default sync (host arch only) does not fetch.
-if [ "$GN_OS" = linux ] && [ "$CPU" != "$(uname -m | sed 's/x86_64/x64/;s/aarch64/arm64/')" ]; then
+if [ "$OS" = linux ] && [ "$CPU" != "$(uname -m | sed 's/x86_64/x64/;s/aarch64/arm64/')" ]; then
   echo "==> installing linux sysroot for $CPU (cross)"
   python3 build/linux/sysroot_scripts/install-sysroot.py --arch="$CPU" \
     || python3 build/linux/sysroot_scripts/install_sysroot.py --arch="$CPU"
@@ -207,7 +256,7 @@ gn gen "$OUT" --args="$ARGS"
 
 # ── 5. build the monolithic static lib ────────────────────────────────────────
 echo "==> ninja -C $OUT ${NINJA_TARGET:-webrtc}"
-ninja -C "$OUT" "${NINJA_TARGET:-webrtc}"
+ninja "${NINJA_ARGS[@]}" "${NINJA_TARGET:-webrtc}"
 
 # For linux/arm64 cross-compile: explicitly build the arm64 libc++ / libc++abi
 # static libs.  Chromium's GN only adds common_deps (which contains libc++) as
@@ -219,9 +268,9 @@ ninja -C "$OUT" "${NINJA_TARGET:-webrtc}"
 # side-effect.  Build them explicitly here so package.sh can find and repack
 # them into the self-contained prebuilt.
 if [ "$GN_OS" = "linux" ] && \
-   [ "$CPU" != "$(uname -m | sed 's/x86_64/x64/;s/aarch64/arm64/')" ]; then
-  echo "==> building arm64 bundled libc++/libc++abi (cross-compile: not built automatically)"
-  ninja -C "$OUT" \
+   { [ "$OS" = linux-musl ] || [ "$CPU" != "$(uname -m | sed 's/x86_64/x64/;s/aarch64/arm64/')" ]; }; then
+  echo "==> building target bundled libc++/libc++abi (cross-compile: not built automatically)"
+  ninja "${NINJA_ARGS[@]}" \
     "obj/buildtools/third_party/libc++/libc++.a" \
     "obj/buildtools/third_party/libc++abi/libc++abi.a"
 fi

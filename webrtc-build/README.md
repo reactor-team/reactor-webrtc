@@ -176,3 +176,42 @@ Per-target toolchain notes (why each differs) live at the top of `build.sh`
     [`patches/README.md`](patches/README.md)).
 
 > Upstream WebRTC build docs inform this recipe.
+
+## Linux musl (Alpine)
+
+The `linux-musl` target uses the pinned Chromium compiler on an x86_64 Linux
+host and an Alpine 3.22 sysroot for the target. It supports x64 and arm64.
+Host generators use a separate glibc toolchain even when compiling x64; only
+the libraries being shipped use musl. No glibc compatibility package is needed
+on the consuming Alpine system.
+
+```bash
+./webrtc-build/prepare-musl-sysroot.sh arm64 "$PWD/musl-sysroot"
+NINJA_JOBS=2 REACTOR_MUSL_SYSROOT="$PWD/musl-sysroot" ./webrtc-build/build.sh linux-musl arm64 release
+./webrtc-build/package.sh linux-musl arm64 release
+```
+
+`NINJA_JOBS` limits compiler parallelism on memory-constrained hosts.
+The sysroot helper requires Docker and installs target packages without running
+package scripts, so preparing an arm64 sysroot on x64 needs no emulator.
+The workflow runs unit tests and real audio/video/data-channel loopbacks on
+musl, using QEMU for arm64 after building the binaries. Those tests
+and the SDK wheel builder install Clang 22.1.8.1 through PyPA's checksum-verified
+`manylinux-install-clang` helper; Alpine 3.22's distro Clang is too old for the
+bundled libc++ headers.
+
+Archives are named `reactor-webrtc-linux-musl-<x64|arm64>-<profile>.tar.zst`.
+They contain `lib/linux_libc` set to `musl`; new glibc archives use `gnu`.
+`reactor-webrtc-sys` requires a matching marker for musl targets, including
+locally supplied archives. Historical archives without the marker are treated
+as glibc. For a shared library loaded by Python, use
+`RUSTFLAGS="-C target-feature=-crt-static -C linker=clang -C link-arg=-fuse-ld=lld"` and a native
+musl Rust target.
+
+Publish the **release** p6 prebuilts before merging the companion Python SDK
+wheel change. The SDK can consume these archives with its existing 0.15 crate
+using `REACTOR_WEBRTC_LIB_DIR`, so a new crate release is not required for that
+wheel pipeline. A later crate release will include automatic musl selection.
+
+The optional Cisco OpenH264 download is unchanged; this change covers the
+built-in codecs used by the client SDK, which does not enable that feature.

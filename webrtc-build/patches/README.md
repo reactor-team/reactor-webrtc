@@ -216,3 +216,23 @@ goes looking for a patch that doesn't exist:
   dependency), not a patch.
 - **Bundled libc++ packaging** (linux/android, ABI namespace `__Cr`) — handled by
   `package.sh` + `build.rs`, see the parent `README.md` → "Bundled libc++".
+
+### linux-musl/0001 — separate Linux musl toolchain
+
+`linux-musl/0001-toolchain.patch`, applied only for `linux-musl`, adds a musl toolchain and an explicit glibc
+host toolchain. It chooses the musl target triple and Alpine sysroot only for
+target objects, and disables CREL there so the archive is consumable by Alpine's
+linker. The bundled libc++ configuration reads the libc headers, so both the
+library and downstream C++ glue agree on `_LIBCPP_HAS_MUSL_LIBC`.
+Other targets do not apply this patch. Rebuilding another target resets the
+modified subrepos and removes the two generated GN files first.
+
+The patch is based on the exact build/buildtools revisions in the pinned
+WebRTC `DEPS`; it introduces no dependency on Alpine's Chromium patch series.
+
+### linux-musl/0002 — libc prctl header
+
+`linux-musl/0002-prctl-headers.patch` removes the redundant kernel
+`linux/prctl.h` include in the thread naming implementation. Musl's
+`sys/prctl.h` already provides the constants and function declaration; including
+both headers redefines `prctl_mm_map`.

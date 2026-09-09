@@ -62,7 +62,7 @@ fi
 # __config — and skipped by the *.h filter above) plus the generated
 # __config_site that pins the ABI namespace.
 case "$OS" in
-  linux|android)
+  linux|linux-musl|android)
     echo "==> staging bundled libc++ headers (ABI namespace __Cr)"
     for d in \
       third_party/libc++/src/include \
@@ -109,6 +109,12 @@ esac
 # members to base classes. Mismatching causes silent heap corruption (glibc aborts
 # with "malloc(): invalid size (unsorted)"). Included in the archive below.
 echo "$PROFILE" > "$STAGE/lib/build_profile"
+
+# Record the libc ABI so consumers reject an archive for the wrong Linux target.
+case "$OS" in
+  linux) echo gnu > "$STAGE/lib/linux_libc" ;;
+  linux-musl) echo musl > "$STAGE/lib/linux_libc" ;;
+esac
 
 # ── Archive + checksum ────────────────────────────────────────────────────────
 mkdir -p "$DIST"
