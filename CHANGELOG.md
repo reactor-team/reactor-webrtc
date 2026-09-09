@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.16.0 — Alpine / musl support
+
+Release `reactor-webrtc-sys`, `reactor-webrtc`, and `reactor-webrtc-py` in
+lockstep at 0.16.0. Use the `webrtc-7907-a5ddff60-p6` native build, including
+the fallback embedded in the published sys crate.
 
 - Add Linux musl prebuilts for x86_64 and aarch64 (`linux-musl-x64` and
   `linux-musl-arm64`). The p6 build uses an Alpine 3.22 sysroot, packages
