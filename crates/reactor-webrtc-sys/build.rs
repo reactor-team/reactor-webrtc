@@ -24,6 +24,8 @@
 //! The prebuilt archives themselves are produced and published by
 //! `../../webrtc-build` (depot_tools + gn/ninja, pinned to ./WEBRTC_VERSION).
 
+mod build_platform;
+
 use std::env;
 use std::path::{Path, PathBuf};
 
@@ -52,7 +54,13 @@ fn main() {
         // directly handles the case where REACTOR_WEBRTC_LIB_DIR stays the same
         // but its contents are updated.
         let lib = Path::new(&dir).join("lib");
-        for name in &["libwebrtc.a", "libc++.a", "libc++abi.a", "build_profile"] {
+        for name in &[
+            "libwebrtc.a",
+            "libc++.a",
+            "libc++abi.a",
+            "build_profile",
+            "linux_libc",
+        ] {
             println!("cargo:rerun-if-changed={}", lib.join(name).display());
         }
         link(Path::new(&dir));
@@ -121,6 +129,15 @@ fn link(root: &Path) {
                 .unwrap_or_else(|_| root.join("include"));
             (root.to_path_buf(), inc)
         };
+
+    // A musl target must never silently consume the old glibc-only archives,
+    // including archives supplied through either explicit override.
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
+        let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+        let marker = std::fs::read_to_string(lib_dir.join("linux_libc"));
+        let archive_libc = marker.as_deref().map(str::trim).unwrap_or("gnu");
+        assert_eq!(archive_libc, target_env, "libwebrtc libc mismatch at {}: build a matching prebuilt (linux_libc marker required for musl)", lib_dir.display());
+    }
 
     let is_debug_prebuilt = std::fs::read_to_string(lib_dir.join("build_profile"))
         .ok()
@@ -499,38 +516,8 @@ fn prebuilt_platform() -> Option<&'static str> {
     let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let abi = env::var("CARGO_CFG_TARGET_ABI").unwrap_or_default();
 
-    match os.as_str() {
-        "macos" => match arch.as_str() {
-            "aarch64" => Some("mac-arm64"),
-            "x86_64" => Some("mac-x64"),
-            _ => None,
-        },
-        "ios" => {
-            // aarch64-apple-ios           → device (abi = "")
-            // aarch64-apple-ios-sim       → simulator (abi = "sim")
-            // x86_64-apple-ios            → simulator (x64 is always sim)
-            let is_sim = abi == "sim" || arch == "x86_64";
-            Some(if is_sim {
-                "ios-arm64-simulator"
-            } else {
-                "ios-arm64-device"
-            })
-        }
-        "linux" => match arch.as_str() {
-            "x86_64" => Some("linux-x64"),
-            "aarch64" => Some("linux-arm64"),
-            _ => None,
-        },
-        "android" => match arch.as_str() {
-            "aarch64" => Some("android-arm64"),
-            _ => None,
-        },
-        "windows" => match arch.as_str() {
-            "x86_64" => Some("win-x64"),
-            _ => None,
-        },
-        _ => None,
-    }
+    let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    build_platform::prebuilt_platform(&os, &arch, &abi, &target_env)
 }
 
 /// Download and parse the `.sha256` sidecar file for a prebuilt asset.

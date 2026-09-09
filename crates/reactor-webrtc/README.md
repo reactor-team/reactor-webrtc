@@ -311,7 +311,8 @@ Two more ways to get real H.264, available on any platform:
 |----------|-------------|-------|
 | macOS | arm64, x64 | VideoToolbox H.264, in the default factory |
 | iOS | arm64 (device + simulator) | VideoToolbox H.264, in the default factory |
-| Linux | x64, arm64 | bundled libc++ (ABI `__Cr`); H.264 via `openh264` feature |
+| Linux (glibc) | x64, arm64 | bundled libc++ (ABI `__Cr`); H.264 via `openh264` feature |
+| Linux (musl / Alpine) | x64, arm64 | bundled libc++; Cisco OpenH264 downloads require glibc |
 | Android | arm64 | NDK + bundled libc++; MediaCodec H.264 via `with_android_hw_h264` (needs `libwebrtc.jar` on the app's classpath) |
 | Windows | x64 | MSVC STL; H.264 via `openh264` feature |
 

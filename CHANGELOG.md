@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Add Linux musl prebuilts for x86_64 and aarch64 (`linux-musl-x64` and
+  `linux-musl-arm64`). The p6 build uses an Alpine 3.22 sysroot, packages
+  matching libc++ archives, and runs the Rust library tests on musl before upload.
+- Select Linux prebuilts by Cargo's target environment as well as architecture.
+  Reject a prebuilt with the wrong libc instead of attempting to link it.
+
 ## 0.15.0 — the stats report says which stream is which
 
 `get_stats` reported a subset of libwebrtc's report, and the subset was narrower

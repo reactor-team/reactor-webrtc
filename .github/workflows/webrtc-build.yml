@@ -75,6 +75,8 @@ jobs:
           # linux/arm64 is cross-compiled from x86_64 (no linux-arm64 bundled clang).
           # ubuntu-24.04 is explicit x86_64; ubuntu-latest maps to arm64 in this org.
           linux_arm='{"os":"linux","arch":"arm64","runner":"ubuntu-24.04"}'
+          musl_x64='{"os":"linux-musl","arch":"x64","runner":"ubuntu-24.04","musl_arch":"x86_64"}'
+          musl_arm='{"os":"linux-musl","arch":"arm64","runner":"ubuntu-24.04","musl_arch":"aarch64"}'
           android='{"os":"android","arch":"arm64","runner":"ubuntu-latest"}'
           # Windows must always use release profile: is_debug=true compiles with /MTd
           # (debug static CRT), which references _calloc_dbg/_free_dbg from libucrtd.
@@ -93,10 +95,10 @@ jobs:
           case "$t" in
             mac)      inc="$mac_arm" ;;
             apple)    inc="$mac_arm,$mac_x64,$ios_dev,$ios_sim" ;;
-            linux)    inc="$linux_x64,$linux_arm" ;;
+            linux)    inc="$linux_x64,$linux_arm,$musl_x64,$musl_arm" ;;
             android)  inc="$android" ;;
             win)      inc="$win" ;;
-            full)     inc="$mac_arm,$mac_x64,$ios_dev,$ios_sim,$linux_x64,$linux_arm,$android,$win" ;;
+            full)     inc="$mac_arm,$mac_x64,$ios_dev,$ios_sim,$linux_x64,$linux_arm,$musl_x64,$musl_arm,$android,$win" ;;
             linux-x64) inc="$linux_x64" ;;
             linux-arm) inc="$linux_arm" ;;
             *)        inc="$mac_arm" ;;
@@ -145,6 +147,12 @@ jobs:
           xcodebuild -version
           echo "SDK: $(xcrun --sdk macosx --show-sdk-version) at $(xcrun --show-sdk-path)"
 
+      - name: Prepare Alpine target sysroot
+        if: matrix.os == 'linux-musl'
+        run: |
+          ./webrtc-build/prepare-musl-sysroot.sh "${{ matrix.arch }}" "$GITHUB_WORKSPACE/musl-sysroot"
+          echo "REACTOR_MUSL_SYSROOT=$GITHUB_WORKSPACE/musl-sysroot" >> "$GITHUB_ENV"
+
       # POSIX targets: bash build.sh + package.sh.
       - name: Build libwebrtc
         if: matrix.os != 'win'
@@ -169,6 +177,21 @@ jobs:
           # our LF patch series won't apply. Force LF for the webrtc checkout.
           git config --global core.autocrlf false
           ./webrtc-build/build.ps1 -Arch ${{ matrix.arch }} -Profile $env:PROFILE
+
+      # The compiler runs on glibc; the linked result must execute on musl.
+      - uses: docker/setup-qemu-action@v3
+        if: matrix.os == 'linux-musl' && matrix.arch == 'arm64'
+        with:
+          platforms: arm64
+
+      - name: Test musl prebuilt in Alpine
+        if: matrix.os == 'linux-musl'
+        run: |
+          docker run --rm --platform "linux/${{ matrix.arch == 'x64' && 'amd64' || 'arm64' }}" \
+            -v "$PWD:/io" -w /io \
+            -e REACTOR_WEBRTC_LIB_DIR="/io/webrtc-build/out/linux-musl-${{ matrix.arch }}-$PROFILE/dist" \
+            "quay.io/pypa/musllinux_1_2_${{ matrix.musl_arch }}" \
+            bash /io/webrtc-build/test-musl.sh
 
       - name: Upload prebuilt
         if: success()
