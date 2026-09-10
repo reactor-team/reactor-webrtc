@@ -801,7 +801,15 @@ pub struct InboundRtpStats {
     /// Jitter in seconds.
     pub jitter_s: f64,
     pub packets_lost: i32,
+    /// Retransmissions this endpoint asked the sender for. Repair traffic moves
+    /// before loss does, so this climbs while the stream still plays.
     pub nack_count: u32,
+    /// Keyframe requests this endpoint sent because its decoder could not
+    /// continue — repair having been outrun rather than keeping up.
+    pub pli_count: u32,
+    /// Full Intra Refresh requests this endpoint sent. Same purpose as
+    /// `pli_count`; which one a decoder sends depends on the codec.
+    pub fir_count: u32,
     /// Cumulative decode time in seconds.
     pub total_decode_time_s: f64,
     /// Decoded frames per second; `0.0` if not measured. Video only.
@@ -830,6 +838,8 @@ impl From<rw::InboundRtpStats> for InboundRtpStats {
             jitter_s: s.jitter_s,
             packets_lost: s.packets_lost,
             nack_count: s.nack_count,
+            pli_count: s.pli_count,
+            fir_count: s.fir_count,
             total_decode_time_s: s.total_decode_time_s,
             frames_per_second: s.frames_per_second,
             frames_decoded: s.frames_decoded,
@@ -865,6 +875,17 @@ pub struct OutboundRtpStats {
     /// Packets the receiver reports as lost. Signed, per RFC 3550.
     pub packets_lost: i32,
     pub retransmitted_packets_sent: u64,
+    /// Retransmissions the receiver asked for, where
+    /// `retransmitted_packets_sent` is what was sent in answer. The two differ
+    /// when a request went unanswered, and they count different things.
+    pub nack_count: u32,
+    /// Keyframe requests the receiver sent because its decoder could not
+    /// continue — the step past `nack_count`, and the bitrate spike a viewer
+    /// sees as the picture snapping back.
+    pub pli_count: u32,
+    /// Full Intra Refresh requests the receiver sent. Same purpose as
+    /// `pli_count`; which one a decoder sends depends on the codec.
+    pub fir_count: u32,
     /// Encoded frames per second; `0.0` if not measured. Video only.
     pub frames_per_second: f64,
     pub frames_sent: u32,
@@ -893,6 +914,9 @@ impl From<rw::OutboundRtpStats> for OutboundRtpStats {
             fraction_lost: s.fraction_lost,
             packets_lost: s.packets_lost,
             retransmitted_packets_sent: s.retransmitted_packets_sent,
+            nack_count: s.nack_count,
+            pli_count: s.pli_count,
+            fir_count: s.fir_count,
             frames_per_second: s.frames_per_second,
             frames_sent: s.frames_sent,
             frame_width: s.frame_width,

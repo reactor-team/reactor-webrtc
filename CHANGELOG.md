@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.17.0 — the feedback a stream carried
+
+`get_stats` reported what a stream delivered and what went missing from it, but
+not what either endpoint asked for when packets did not arrive. That request
+traffic is the earliest reading available: a retransmission that arrives in time
+repairs the stream, so a path deteriorating shows up here while the picture is
+still intact and loss has not moved yet.
+
+Additive. Nothing removed, nothing renamed.
+
+### Added
+
+**`nack_count`, `pli_count` and `fir_count` on both stream types.** Which way
+they point follows from the type. On `InboundRtpStats` this endpoint sent them,
+about media it was not receiving. On `OutboundRtpStats` the far end sent them,
+about media this endpoint was sending — and there only `nack_count` had even an
+indirect stand-in, in `retransmitted_packets_sent`, which counts the packets
+sent in answer rather than the requests and cannot tell a request that went
+unanswered from one that did.
+
+The two levels are worth reading apart. A NACK asks for one packet again. A
+Picture Loss Indication says the decoder cannot continue and needs a fresh
+keyframe, which is the step from a path that is repairing itself to a picture
+breaking up — and answering one costs a keyframe, so it is a bitrate spike with
+a cause attached. `fir_count` serves the same purpose as `pli_count`, and which
+one a decoder sends depends on the codec, so a reader after "the stream had to
+be restarted" wants the two together.
+
+### Changed
+
+**The layout guard pins offsets, not just the size.** The C struct and its
+`repr(C)` mirror are hand-written, and the size assertion they already carried
+misses a transposition: two fields of the same width swapped on one side only
+leaves the size unchanged, and the symptom is one counter reporting another's
+value. Both sides now assert the offsets of the three feedback counters as well.
+
 ## 0.16.0 — Alpine / musl support
 
 Release `reactor-webrtc-sys`, `reactor-webrtc`, and `reactor-webrtc-py` in

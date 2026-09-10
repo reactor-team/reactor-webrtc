@@ -467,7 +467,7 @@ for s in report.inbound_rtp:
 
 </details>
 
-Four things worth knowing before you read a number off this.
+Five things worth knowing before you read a number off this.
 
 - **Zero means "not measured yet" far more often than it means zero.** RTT, the
   available-bitrate estimates and `frames_per_second` all start at `0.0` and
@@ -496,3 +496,18 @@ Four things worth knowing before you read a number off this.
   `0.0` until the far end has sent one, so expect nothing for the first second
   or so of a connection. `fraction_lost` and `packets_lost` on a send stream
   come from the same report and are the receiver's numbers, not ours.
+
+- **The feedback counters move before loss does.** `nack_count`, `pli_count`
+  and `fir_count` are on both stream types, and which way they point follows
+  from the type: on `inbound_rtp` this endpoint sent them, on `outbound_rtp` the
+  far end sent them about what it was receiving from you. They are the earliest
+  reading available, because a retransmission that arrives in time repairs the
+  stream — so a path going bad shows up here while loss is still zero and the
+  picture is still intact. Read the two levels apart: a NACK asks for one packet
+  again, while a PLI says the decoder cannot continue and the stream has to
+  restart from a keyframe. `fir_count` serves the same purpose as `pli_count`
+  and which one a decoder sends depends on the codec, so sum the two.
+
+  On a send stream these are the requests, where `retransmitted_packets_sent` is
+  what went out in answer to them — different quantities, and they diverge when
+  a request goes unanswered.

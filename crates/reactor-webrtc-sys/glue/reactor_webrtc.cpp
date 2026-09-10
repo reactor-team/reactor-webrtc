@@ -115,7 +115,17 @@ struct ReactorStatEntry {
   // and gets its own field rather than being narrowed into this one.
   uint32_t packets_received;
   int32_t  packets_lost;
+  // Feedback the stream carried, kinds 0 and 1. Both directions report all
+  // three, and which way they point follows from the kind: on an inbound stream
+  // this endpoint sent them, and on an outbound one it received them from the
+  // far end. Repair traffic moves before loss does — a retransmission that
+  // arrives in time hides the loss that prompted it — so these climb while a
+  // stream still plays. A NACK asks for one packet again; a PLI says the
+  // decoder cannot continue and needs a fresh keyframe, which is the step from
+  // a path repairing itself to a picture breaking up.
   uint32_t nack_count;
+  uint32_t pli_count;
+  uint32_t fir_count;
   int32_t  pair_state;  // 0=waiting 1=in_progress 2=failed 3=succeeded 4=cancelled
   // Media kind of an RTP stream (kinds 0 and 1): -1=unknown 0=audio 1=video.
   // RTCRtpStreamStats::kind. Without it a reader has only the ssrc, and cannot
@@ -139,9 +149,11 @@ struct ReactorStatEntry {
   uint32_t frames_decoded;   // kind 0
   uint32_t frames_dropped;   // kind 0
   uint32_t frames_sent;      // kind 1
-  // 16 x 4 = 64 bytes to here, so the 8-byte block below starts aligned with no
+  // 18 x 4 = 72 bytes to here, so the 8-byte block below starts aligned with no
   // padding. 8-byte fields. The static_assert below is what keeps the arithmetic in these
-  // comments true, rather than the comments.
+  // comments true, rather than the comments. Note that the count has to stay
+  // even for the arithmetic to work out: one more 4-byte field on its own would
+  // leave four bytes of filler here.
   uint64_t bytes_received;
   uint64_t bytes_sent;
   uint64_t priority;
@@ -182,11 +194,21 @@ struct ReactorStatEntry {
 //
 // The Rust side carries the same assertion against the same number. If you are
 // here because one of them failed: you changed the struct on one side only.
-static_assert(sizeof(struct ReactorStatEntry) == 192,
+static_assert(sizeof(struct ReactorStatEntry) == 200,
               "ReactorStatEntry changed size — update the repr(C) mirror in "
               "reactor-webrtc-sys/src/lib.rs and both assertions");
-static_assert(offsetof(struct ReactorStatEntry, bytes_received) == 64,
+static_assert(offsetof(struct ReactorStatEntry, bytes_received) == 72,
               "ReactorStatEntry's 4-byte block changed size — see above");
+// The size alone misses a transposition: two fields of the same width swapped
+// on one side only leaves it unchanged, and the symptom is one counter
+// reporting another's value. The three feedback counters sit next to each other
+// and share a width, so their offsets are pinned individually.
+static_assert(offsetof(struct ReactorStatEntry, nack_count) == 16,
+              "the feedback counters moved — see above");
+static_assert(offsetof(struct ReactorStatEntry, pli_count) == 20,
+              "the feedback counters moved — see above");
+static_assert(offsetof(struct ReactorStatEntry, fir_count) == 24,
+              "the feedback counters moved — see above");
 
 // PeerConnectionObserver events, forwarded to the safe crate. Any pointer may
 // be null (the field is `Option<extern "C" fn>` on the Rust side).
@@ -917,7 +939,10 @@ class StatsCallback : public webrtc::RTCStatsCollectorCallback {
           e.bytes_received    = stat_val(s.bytes_received);
           e.jitter            = stat_val(s.jitter);
           e.packets_lost      = stat_val(s.packets_lost);
+          // Feedback this endpoint sent about what it was not receiving.
           e.nack_count        = stat_val(s.nack_count);
+          e.pli_count         = stat_val(s.pli_count);
+          e.fir_count         = stat_val(s.fir_count);
           e.total_decode_time = stat_val(s.total_decode_time);
           e.frames_per_second = stat_val(s.frames_per_second);
           e.frames_decoded    = stat_val(s.frames_decoded);
@@ -934,6 +959,12 @@ class StatsCallback : public webrtc::RTCStatsCollectorCallback {
           e.bytes_sent                 = stat_val(s.bytes_sent);
           e.target_bitrate             = stat_val(s.target_bitrate);
           e.retransmitted_packets_sent = stat_val(s.retransmitted_packets_sent);
+          // Feedback the far end sent about what it was not receiving from us.
+          // These live on the outbound stats themselves rather than on the
+          // remote report below: the sender counts the RTCP it was handed.
+          e.nack_count                 = stat_val(s.nack_count);
+          e.pli_count                  = stat_val(s.pli_count);
+          e.fir_count                  = stat_val(s.fir_count);
           e.frames_per_second          = stat_val(s.frames_per_second);
           e.frames_sent                = stat_val(s.frames_sent);
           e.frame_width                = stat_val(s.frame_width);

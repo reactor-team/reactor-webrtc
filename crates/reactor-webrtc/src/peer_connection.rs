@@ -902,7 +902,22 @@ pub struct InboundRtpStats {
     /// Jitter in seconds.
     pub jitter_s: f64,
     pub packets_lost: i32,
+    /// Retransmissions this endpoint asked the sender for.
+    ///
+    /// Repair traffic moves before loss does — a retransmission that arrives in
+    /// time hides the loss that prompted it — so this climbs while the stream
+    /// still plays. Read it as the earliest sign a receive path is going bad.
     pub nack_count: u32,
+    /// Keyframe requests this endpoint sent because its decoder could not
+    /// continue. The step past [`InboundRtpStats::nack_count`]: a NACK asks for
+    /// one packet again, a Picture Loss Indication says repair has been outrun
+    /// and the stream has to restart from a fresh keyframe.
+    pub pli_count: u32,
+    /// Full Intra Refresh requests this endpoint sent. Serves the same purpose
+    /// as [`InboundRtpStats::pli_count`] and which one a decoder sends depends
+    /// on the codec, so a reader after "the stream had to be restarted" wants
+    /// the two together.
+    pub fir_count: u32,
     /// Cumulative decode time in seconds.
     pub total_decode_time_s: f64,
     /// Decoded frames per second; `0.0` if not measured. Video only.
@@ -943,6 +958,27 @@ pub struct OutboundRtpStats {
     pub packets_lost: i32,
     /// 64-bit for the same reason as [`OutboundRtpStats::packets_sent`].
     pub retransmitted_packets_sent: u64,
+    /// Retransmissions the receiver asked this endpoint for.
+    ///
+    /// The requests themselves, where
+    /// [`OutboundRtpStats::retransmitted_packets_sent`] is what was sent in
+    /// answer to them. The two differ when a request went unanswered, and they
+    /// count different things — one is requests, the other packets. Repair
+    /// traffic moves before loss does, so this is the earliest sign that the
+    /// path to a viewer is going bad.
+    pub nack_count: u32,
+    /// Keyframe requests the receiver sent because its decoder could not
+    /// continue. The step past [`OutboundRtpStats::nack_count`]: a NACK asks
+    /// for one packet again, a Picture Loss Indication says repair has been
+    /// outrun and the stream has to restart from a fresh keyframe. Answering
+    /// one costs a keyframe, which is the bitrate spike a viewer sees as the
+    /// picture snapping back.
+    pub pli_count: u32,
+    /// Full Intra Refresh requests the receiver sent. Serves the same purpose
+    /// as [`OutboundRtpStats::pli_count`] and which one a decoder sends depends
+    /// on the codec, so a reader after "the stream had to be restarted" wants
+    /// the two together.
+    pub fir_count: u32,
     /// Encoded frames per second; `0.0` if not measured. Video only.
     pub frames_per_second: f64,
     pub frames_sent: u32,
@@ -1243,6 +1279,8 @@ extern "C" fn stats_cb(ud: *mut c_void, entries: *const ReactorStatEntry, count:
                 jitter_s: e.jitter,
                 packets_lost: e.packets_lost,
                 nack_count: e.nack_count,
+                pli_count: e.pli_count,
+                fir_count: e.fir_count,
                 total_decode_time_s: e.total_decode_time,
                 frames_per_second: e.frames_per_second,
                 frames_decoded: e.frames_decoded,
@@ -1261,6 +1299,9 @@ extern "C" fn stats_cb(ud: *mut c_void, entries: *const ReactorStatEntry, count:
                 fraction_lost: e.fraction_lost,
                 packets_lost: e.packets_lost,
                 retransmitted_packets_sent: e.retransmitted_packets_sent,
+                nack_count: e.nack_count,
+                pli_count: e.pli_count,
+                fir_count: e.fir_count,
                 frames_per_second: e.frames_per_second,
                 frames_sent: e.frames_sent,
                 frame_width: e.frame_width,
