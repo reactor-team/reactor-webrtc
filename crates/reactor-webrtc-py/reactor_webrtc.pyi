@@ -198,7 +198,12 @@ class InboundRtpStats:
     bytes_received: int
     jitter_s: float
     packets_lost: int
+    #: Retransmissions this endpoint asked for. Climbs before loss reaches the
+    #: picture, because a repair that arrives in time hides the loss behind it.
     nack_count: int
+    #: Keyframe requests this endpoint sent, its decoder unable to continue.
+    pli_count: int
+    fir_count: int
     total_decode_time_s: float
     frames_per_second: float
     frames_decoded: int
@@ -218,6 +223,12 @@ class OutboundRtpStats:
     fraction_lost: float
     packets_lost: int
     retransmitted_packets_sent: int
+    #: Retransmissions the receiver asked for, against
+    #: retransmitted_packets_sent, which is what was sent in answer.
+    nack_count: int
+    #: Keyframe requests the receiver sent, its decoder unable to continue.
+    pli_count: int
+    fir_count: int
     frames_per_second: float
     frames_sent: int
     frame_width: int

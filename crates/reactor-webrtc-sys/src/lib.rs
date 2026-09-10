@@ -241,7 +241,14 @@ pub struct ReactorStatEntry {
     /// `pair_packets_received`.
     pub packets_received: u32,
     pub packets_lost: i32,
+    /// Feedback the stream carried (kinds 0 and 1). Which way it points follows
+    /// from the kind: on an inbound stream this endpoint sent it, on an outbound
+    /// one it received it from the far end.
     pub nack_count: u32,
+    /// Picture Loss Indications — see `nack_count` (kinds 0 and 1).
+    pub pli_count: u32,
+    /// Full Intra Refresh requests — see `nack_count` (kinds 0 and 1).
+    pub fir_count: u32,
     /// ICE pair state: 0=waiting 1=in_progress 2=failed 3=succeeded 4=cancelled
     pub pair_state: i32,
     /// Media kind of an RTP stream (kinds 0 and 1): -1=unknown 0=audio 1=video
@@ -297,16 +304,37 @@ pub struct ReactorStatEntry {
 }
 
 // The other half of the layout guard in
-// glue/reactor_webrtc.cpp — read the comment there. These two numbers are the
-// only thing standing between a field added on one side and a plausible-looking
+// glue/reactor_webrtc.cpp — read the comment there. These numbers are the only
+// thing standing between a field added on one side and a plausible-looking
 // number read out of the wrong offset.
+//
+// The size alone does not catch everything: two fields of the same width
+// swapped on one side only leaves it unchanged, and the symptom is one counter
+// reporting another's value. So the offsets of the fields that share a width
+// with their neighbours are pinned too, on both sides.
 const _: () = {
     assert!(
-        core::mem::size_of::<ReactorStatEntry>() == 192,
+        core::mem::size_of::<ReactorStatEntry>() == 200,
         "ReactorStatEntry changed size — update the C struct in \
          glue/reactor_webrtc.cpp and both assertions"
     );
     assert!(core::mem::align_of::<ReactorStatEntry>() == 8);
+    assert!(
+        core::mem::offset_of!(ReactorStatEntry, bytes_received) == 72,
+        "ReactorStatEntry's 4-byte block changed size — see above"
+    );
+    assert!(
+        core::mem::offset_of!(ReactorStatEntry, nack_count) == 16,
+        "the feedback counters moved — see above"
+    );
+    assert!(
+        core::mem::offset_of!(ReactorStatEntry, pli_count) == 20,
+        "the feedback counters moved — see above"
+    );
+    assert!(
+        core::mem::offset_of!(ReactorStatEntry, fir_count) == 24,
+        "the feedback counters moved — see above"
+    );
 };
 
 /// PeerConnectionObserver callbacks, forwarded from the C++ glue. Every field
