@@ -236,3 +236,18 @@ WebRTC `DEPS`; it introduces no dependency on Alpine's Chromium patch series.
 `linux/prctl.h` include in the thread naming implementation. Musl's
 `sys/prctl.h` already provides the constants and function declaration; including
 both headers redefines `prctl_mm_map`.
+
+### Android JAR relocation (p7)
+
+Patch 0002 also sets `dist_jar("libwebrtc").renaming_rules` from the same
+`android_jni_package_prefix` argument used by JNI generation. Chromium's pinned
+R8 relocator rewrites `org.webrtc` and `org.jni_zero` classes and runtime bytecode
+references. Setting the JNI argument alone never renamed the original Java classes;
+p6 shipped a JAR that could not satisfy its native class lookups.
+
+The Android build explicitly builds `sdk/android:libwebrtc`. `package.sh` requires
+that exact output and validates it against `args.gn` before staging any archive.
+The validator checks both bootstrap classes, rejects remaining upstream-package
+classes and runtime linkage references, and fails on a missing JAR. Debug-only
+local-variable type tables and literal log tags are not linkage references.
+Run `mise run test:android-jar` for the packaging regression suite.
