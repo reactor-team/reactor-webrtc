@@ -50,6 +50,7 @@ jobs:
       - run: mise run fmt:check
       - run: mise run clippy
       - run: mise run lint:shell
+      - run: mise run test:android-jar
       - run: mise run lint:mise-tools-root
       - name: mise.lock drift (vs merge-base)
         run: mise run lint:mise-lock

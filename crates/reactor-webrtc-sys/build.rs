@@ -36,7 +36,7 @@ const PREBUILT_BASE: &str = "https://github.com/reactor-team/reactor-webrtc/rele
 // Fallback tag used when WEBRTC_VERSION is not accessible (e.g. builds from a
 // published crate on crates.io). Keep in sync with WEBRTC_VERSION when cutting
 // a release; publish.yml also regenerates it before cargo publish.
-const PREBUILT_TAG_FALLBACK: &str = "webrtc-7907-a5ddff60-p6";
+const PREBUILT_TAG_FALLBACK: &str = "webrtc-7907-a5ddff60-p7";
 
 fn main() {
     println!("cargo:rerun-if-env-changed=REACTOR_WEBRTC_LIB_DIR");

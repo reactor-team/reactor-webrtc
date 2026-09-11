@@ -28,6 +28,16 @@ NAME="reactor-webrtc-${OS}-${ARCH}${VARIANT}-${PROFILE}"
 
 [ -f "$STAGE/lib/libwebrtc.a" ] || { echo "package.sh: build first (no libwebrtc.a)" >&2; exit 1; }
 
+# ── Android: bundle the generated Java JAR ────────────────────────────────────
+# Use the exact dist_jar output; arbitrary find results can select a stale JAR.
+# Native JNI prefixing alone does not relocate bytecode.
+if [ "$OS" = "android" ]; then
+  JAR_PATH="$OUT/lib.java/sdk/android/libwebrtc.jar"
+  python3 "$HERE/check-android-jar.py" "$JAR_PATH" "$OUT/args.gn"
+  cp "$JAR_PATH" "$STAGE/lib/libwebrtc.jar"
+  echo "   JAR: $JAR_PATH → $STAGE/lib/libwebrtc.jar"
+fi
+
 # ── Headers: mirror WebRTC's public .h tree (preserving paths) ────────────────
 # The static lib has no "install headers" step upstream; our glue needs the
 # source headers. Copy *.h/*.inc preserving directory structure.
@@ -39,21 +49,6 @@ rsync -am \
   --exclude='*' \
   --exclude='out/**' --exclude='.git/**' --exclude='test/**' \
   "$SRC/" "$STAGE/include/"
-
-# ── Android: bundle the generated Java JAR ────────────────────────────────────
-# The Android build produces a dist_jar("libwebrtc") target whose output is at
-# lib.java/sdk/android/libwebrtc.jar (path set in sdk/android/BUILD.gn).
-# With android_jni_package_prefix="inc.reactor" the Java classes are namespaced
-# as inc.reactor.org.webrtc.* so consumers don't depend on livekit.org.webrtc.*.
-if [ "$OS" = "android" ]; then
-  JAR_PATH="$(find "$OUT/lib.java" -name "libwebrtc.jar" 2>/dev/null | head -1)"
-  if [ -n "$JAR_PATH" ]; then
-    cp "$JAR_PATH" "$STAGE/lib/libwebrtc.jar"
-    echo "   JAR: $JAR_PATH → $STAGE/lib/libwebrtc.jar"
-  else
-    echo "   WARNING: libwebrtc.jar not found under $OUT/lib.java — Java classes missing from archive" >&2
-  fi
-fi
 
 # ── Bundled libc++ headers (linux/android) ────────────────────────────────────
 # Those targets link WebRTC's bundled libc++, whose ABI namespace is __Cr (not

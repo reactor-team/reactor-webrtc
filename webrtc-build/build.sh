@@ -257,6 +257,10 @@ gn gen "$OUT" --args="$ARGS"
 # ── 5. build the monolithic static lib ────────────────────────────────────────
 echo "==> ninja -C $OUT ${NINJA_TARGET:-webrtc}"
 ninja "${NINJA_ARGS[@]}" "${NINJA_TARGET:-webrtc}"
+# The static archive target does not guarantee the distributable Java target.
+if [ "$OS" = android ]; then
+  ninja "${NINJA_ARGS[@]}" sdk/android:libwebrtc
+fi
 
 # For linux/arm64 cross-compile: explicitly build the arm64 libc++ / libc++abi
 # static libs.  Chromium's GN only adds common_deps (which contains libc++) as

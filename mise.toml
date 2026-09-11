@@ -111,7 +111,7 @@ run = [
 
 [tasks.lint]
 description = "[Quality] Run all linters"
-depends = ["fmt:check", "clippy", "lint:shell", "lint:mise-lock", "lint:mise-tools-root"]
+depends = ["fmt:check", "clippy", "lint:shell", "lint:mise-lock", "lint:mise-tools-root", "test:android-jar"]
 
 # The mise antidrift lints run as plain python3 (tomllib is stdlib on >=3.11);
 # lint:mise-lock parses only mise.lock, taking declared tools + platforms from
@@ -141,3 +141,7 @@ run = "hk install --mise"
 [tasks.uninstall-hooks]
 description = "[Setup] Remove the hk-managed git hooks (main repo and worktrees)"
 run = "hk uninstall"
+
+[tasks."test:android-jar"]
+description = "[Testing] Android JNI JAR packaging regressions"
+run = "python3 webrtc-build/test-android-jar.py"

@@ -74,3 +74,22 @@ index 532b59115295..2713c942b6bf 100644
        } else {
          if (is_robolectric) {
            not_needed(invoker, [ "jar_file" ])
+diff --git a/sdk/android/BUILD.gn b/sdk/android/BUILD.gn
+--- a/sdk/android/BUILD.gn
++++ b/sdk/android/BUILD.gn
+@@ -33,6 +33,15 @@
+     direct_deps_only = true
+     use_unprocessed_jars = true
+     requires_android = true
++
++    # Reactor: JNI package-prefix changes native lookups, not Java bytecode.
++    # Relocate both WebRTC and its JNI runtime with the same GN argument.
++    if (android_jni_package_prefix != "") {
++      renaming_rules = [
++        "org.webrtc.**->${android_jni_package_prefix}.org.webrtc",
++        "org.jni_zero.**->${android_jni_package_prefix}.org.jni_zero",
++      ]
++    }
+
+     deps = [
+       ":audio_api_java",

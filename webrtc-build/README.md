@@ -215,3 +215,14 @@ wheel pipeline. A later crate release will include automatic musl selection.
 
 The optional Cisco OpenH264 download is unchanged; this change covers the
 built-in codecs used by the client SDK, which does not enable that feature.
+
+### Android Java/native namespace validation
+
+Android archives require a `libwebrtc.jar` whose `org.webrtc` and `org.jni_zero`
+classes are relocated to the configured `android_jni_package_prefix` (currently
+`inc.reactor`). The build uses Chromium's pinned R8 relocation support; packaging
+fails before creating the archive if the exact JAR is absent or incompatible.
+`mise run test:android-jar` runs the fast regression tests without a WebRTC checkout.
+A corrected p7 prebuilt must be built and published through the normal release
+workflow before Kotlin consumers can update their dependency; this source change
+does not repair already-published p6 archives.
