@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.17.1 — Android Java namespace and iOS linking fixes
+
+Release `reactor-webrtc-sys`, `reactor-webrtc`, and `reactor-webrtc-py` in
+lockstep at 0.17.1. The default native build is `webrtc-7907-a5ddff60-p7`,
+including the fallback embedded in the published sys crate.
+
+- Relocate Android WebRTC and JNI Zero Java classes to match the native JNI
+  package prefix. Require and validate the matching JAR before packaging.
+- Link `Network.framework` on iOS to resolve WebRTC network-monitor symbols.
+
+
 ## 0.17.0 — the feedback a stream carried
 
 `get_stats` reported what a stream delivered and what went missing from it, but
