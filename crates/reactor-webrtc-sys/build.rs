@@ -210,7 +210,12 @@ fn compile_glue(include_dir: &Path, is_debug_prebuilt: bool) {
             build
                 .define("WEBRTC_POSIX", None)
                 .define("WEBRTC_LINUX", None)
-                .define("WEBRTC_ANDROID", None);
+                .define("WEBRTC_ANDROID", None)
+                // Chromium's Android archive uses 32-bit relative vtable
+                // entries. Glue-created ADMs, observers and codec factories
+                // cross this ABI boundary; absolute entries compile and link
+                // but crash on the first virtual call from libwebrtc.
+                .flag("-fexperimental-relative-c++-abi-vtables");
         }
         "linux" => {
             build

@@ -49,3 +49,18 @@ A JNI helper linked against the FFI must export its own no-op `JNI_OnLoad`
 (returning JNI_VERSION_1_6), otherwise Android can resolve the dependency's
 `JNI_OnLoad` and invoke WebRTC initialization twice. Only the FFI initializes
 WebRTC. The passing bootstrap probe uses that arrangement.
+
+## C++ ABI after bootstrap
+
+The Android archive uses Clang's relative C++ vtable ABI. `reactor-webrtc-sys`
+compiles its glue with `-fexperimental-relative-c++-abi-vtables` to match it.
+A matching JAR alone is insufficient: compiling the glue with absolute vtables
+links successfully but crashes when `WebRtcVoiceEngine` invokes `AddRef` on the
+glue-created synthetic audio device.
+
+Regression proof on Android 15 arm64 (NDK 29, API 26, official p7 archive): a JNI
+probe loads the matching JAR and native FFI, creates a client with synthetic ADM,
+and destroys it. The uncorrected 0.17.1 build crashes at
+`WebRtcVoiceEngine::WebRtcVoiceEngine + 692`; the same probe passes with the
+relative-vtable flag. The helper exports a no-op `JNI_OnLoad`; the FFI alone
+owns WebRTC initialization. Native LOAD segments remain aligned to 16 KB.
