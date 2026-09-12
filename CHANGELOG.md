@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.17.2 — Android C++ ABI compatibility
+
+Match the glue to libwebrtc’s relative-vtable ABI on Android, preventing a
+crash during synthetic audio-device creation. All three crates advance to
+0.17.2; the default native archive remains `webrtc-7907-a5ddff60-p7`.
+
 ## 0.17.1 — Android Java namespace and iOS linking fixes
 
 Release `reactor-webrtc-sys`, `reactor-webrtc`, and `reactor-webrtc-py` in
