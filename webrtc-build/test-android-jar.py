@@ -60,6 +60,17 @@ class AndroidJarTest(unittest.TestCase):
         self.write_jar(descriptor="Linc/reactor/org/webrtc/WebRtcClassLoader;")
         self.assertEqual(checker.check(self.jar, PREFIX), 2)
 
+    def test_generated_jni_wrapper_must_be_included(self):
+        self.write_jar(descriptor="Linc/reactor/org/webrtc/JniCommonJni;")
+        with self.assertRaisesRegex(
+            ValueError, "Missing Android runtime class.*JniCommonJni"
+        ):
+            checker.check(self.jar, PREFIX)
+        name = "inc/reactor/org/webrtc/JniCommonJni"
+        with zipfile.ZipFile(self.jar, "a") as archive:
+            archive.writestr(name + ".class", class_file(name))
+        self.assertEqual(checker.check(self.jar, PREFIX), 3)
+
     def test_p6_unrelocated_jar(self):
         self.write_jar(prefix="")
         with self.assertRaisesRegex(ValueError, "Missing native bootstrap"):

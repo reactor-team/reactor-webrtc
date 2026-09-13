@@ -64,11 +64,12 @@ get instead.)
 
 ---
 
-### 0002 — Android JNI package prefix + compat aliases
+### 0002 — Android JNI package prefix, compat aliases and complete Java distribution
 
-`0002-android-jni-package-prefix.patch` · touches `third_party/jni_zero/jni_zero.gni` (+28 lines) and `third_party/jni_zero/codegen/header_common.py` (+16 lines)
+`0002-android-jni-package-prefix.patch` · touches `third_party/jni_zero/jni_zero.gni`,
+`third_party/jni_zero/codegen/header_common.py`, and `sdk/android/BUILD.gn`.
 
-**What.** Two inseparable changes applied as one patch:
+**What.** Three coordinated changes applied as one patch:
 
 1. Adds a `declare_args() { android_jni_package_prefix = "" }` GN variable to
    `jni_zero.gni` and wires it as `--package-prefix <value>` into both the
@@ -86,6 +87,12 @@ get instead.)
    #define org_webrtc_Foo_clazz inc_reactor_org_webrtc_Foo_clazz
    ```
 
+3. Configures `dist_jar("libwebrtc")` in `sdk/android/BUILD.gn` to relocate
+   WebRTC and JNI Zero Java bytecode using the same prefix (p7), and sets
+   `direct_deps_only = false` to include transitive generated `*Jni` wrappers
+   (p8). The package validator checks both namespace relocation and closure
+   of runtime references within those two owned namespaces.
+
 **Why.** WebRTC's Android SDK ships Java classes under `org.webrtc.*`. Setting
 `android_jni_package_prefix = "inc.reactor"` in `build.sh` produces
 `inc.reactor.org.webrtc.*` Java classes in `libwebrtc.jar` and the matching
@@ -97,7 +104,8 @@ identifier from `org_webrtc_*` to `inc_reactor_org_webrtc_*`, but four static
 `.cc` files in `sdk/android/src/jni/` (`encoded_image.cc`, `stats_observer.cc`,
 `ice_candidate.cc`, `media_stream.cc`) reference the old names directly and fail
 to compile. Patching all four is brittle; emitting the alias in the generator
-fixes the root cause once. The two halves only make sense together.
+fixes the root cause once. The generated names and compatibility aliases must remain paired. The Java
+distribution must also include matching bytecode and its generated wrappers.
 
 **How it works.** `jni_zero.py` already supports `--package-prefix` natively
 (it is used by Cronet for `"internal"`). The missing piece was a GN-level arg
@@ -105,13 +113,16 @@ to activate it project-wide. This patch adds that arg; `build.sh` sets it to
 `"inc.reactor"` for the Android target. The same mechanism Cronet uses
 (`_cronet_renaming_extra_args`) is the model.
 
-**Note.** This patch targets files inside `third_party/jni_zero/`, which lives
-in a separate gclient sub-repo. `build.sh` applies it with `patch -p1` (fallback
-from `git apply`) from `src/` after `gclient sync` resets jni_zero to its
-pinned state.
+**Note.** This patch spans `sdk/android/BUILD.gn` in the source checkout and
+`third_party/jni_zero/`, tracked by the pinned third-party checkout. `build.sh`
+restores the touched files before syncing and reapplies the patch from `src/`,
+using `patch -p1` as the fallback from `git apply`.
 
 **Verify.** After an Android build, `jar tf out/android-*/lib.java/sdk/android/libwebrtc.jar`
-should list `inc/reactor/org/webrtc/PeerConnection.class` (and equivalents).
+should list `inc/reactor/org/webrtc/PeerConnection.class`, generated wrappers
+such as `inc/reactor/org/webrtc/JniCommonJni.class`, and JNI Zero runtime classes.
+`check-android-jar.py` must pass before packaging; test the resulting JAR in an
+R8-minified Android consumer as well.
 `nm libwebrtc.a | grep Java_` should show `Java_inc_reactor_org_webrtc_*` symbols.
 Android build completes without `use of undeclared identifier 'org_webrtc_*_clazz'` errors.
 
@@ -251,3 +262,12 @@ The validator checks both bootstrap classes, rejects remaining upstream-package
 classes and runtime linkage references, and fails on a missing JAR. Debug-only
 local-variable type tables and literal log tags are not linkage references.
 Run `mise run test:android-jar` for the packaging regression suite.
+
+### Android runtime closure (p8)
+
+`libwebrtc` includes transitive Java dependencies, including generated `*Jni`
+wrappers. The upstream direct-only dist JAR omitted those wrappers: relocation
+passed, but an R8 consumer failed on `JniCommonJni`, `VideoDecoderWrapperJni`,
+and other missing types. Package validation now checks that runtime references
+within the relocated WebRTC/JNI Zero namespace resolve to classes in the JAR.
+The Android native build must produce and validate this JAR before publishing p8.
