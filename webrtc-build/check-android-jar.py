@@ -89,6 +89,7 @@ def check(jar, prefix):
             if expected not in names:
                 raise ValueError(f"Missing native bootstrap class: {expected}")
         classes = [name for name in names if name.endswith(".class")]
+        available = set(classes)
         for name in classes:
             if name.startswith(("org/webrtc/", "org/jni_zero/")):
                 raise ValueError(f"Unrelocated Java class: {name}")
@@ -109,6 +110,22 @@ def check(jar, prefix):
                     if marker in value.replace(full, b""):
                         raise ValueError(
                             f"Unrelocated bytecode reference in {name}: {value!r}"
+                        )
+                # Check closure of owned runtime types, not only their relocation.
+                # External Android/JDK/annotation dependencies belong to the consumer.
+                references = re.findall(rb"L([^;<>]+);", value)
+                if value.startswith(path_prefix.encode()):
+                    references.append(value)
+                for reference in references:
+                    name_ref = reference.decode("utf-8")
+                    if (
+                        name_ref.startswith(
+                            (path_prefix + "org/webrtc/", path_prefix + "org/jni_zero/")
+                        )
+                        and name_ref + ".class" not in available
+                    ):
+                        raise ValueError(
+                            f"Missing Android runtime class {name_ref} referenced by {name}"
                         )
         return len(classes)
 

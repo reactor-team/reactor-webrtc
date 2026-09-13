@@ -77,8 +77,12 @@ index 532b59115295..2713c942b6bf 100644
 diff --git a/sdk/android/BUILD.gn b/sdk/android/BUILD.gn
 --- a/sdk/android/BUILD.gn
 +++ b/sdk/android/BUILD.gn
-@@ -33,6 +33,15 @@
-     direct_deps_only = true
+@@ -33,6 +33,18 @@
+-    direct_deps_only = true
++    # Generated *Jni wrappers are transitive Java dependencies. Excluding them
++    # produces a JAR which compiles before publication but cannot pass R8 or
++    # execute Java-to-native callbacks after installation.
++    direct_deps_only = false
      use_unprocessed_jars = true
      requires_android = true
 +

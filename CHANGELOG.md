@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.17.3 — Complete Android JNI distribution
+
+Include generated JNI wrapper classes in the Android WebRTC JAR and reject
+missing runtime classes before packaging. This fixes R8 missing-class errors
+and missing Java-to-native callback wrappers in downstream Android apps.
+
+All three crates advance to 0.17.3. The default native archive, including the
+fallback embedded in the published sys crate, is `webrtc-7907-a5ddff60-p8`.
+
 ## 0.17.2 — Android C++ ABI compatibility
 
 Match the glue to libwebrtc’s relative-vtable ABI on Android, preventing a
