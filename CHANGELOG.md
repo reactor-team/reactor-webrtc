@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.17.4 — Android JNI registration packaging
+
+Include the generated `GEN_JNI` registration class in the Android WebRTC JAR,
+so R8 consumers can resolve all JNI wrappers. All three crates advance to
+0.17.4 and the default native archive is `webrtc-7907-a5ddff60-p9`.
+
 ## 0.17.3 — Complete Android JNI distribution
 
 Include generated JNI wrapper classes in the Android WebRTC JAR and reject

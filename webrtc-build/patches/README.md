@@ -90,7 +90,7 @@ get instead.)
 3. Configures `dist_jar("libwebrtc")` in `sdk/android/BUILD.gn` to relocate
    WebRTC and JNI Zero Java bytecode using the same prefix (p7), and sets
    `direct_deps_only = false` to include transitive generated `*Jni` wrappers
-   (p8). The package validator checks both namespace relocation and closure
+   (p9). The package validator checks both namespace relocation and closure
    of runtime references within those two owned namespaces.
 
 **Why.** WebRTC's Android SDK ships Java classes under `org.webrtc.*`. Setting
@@ -248,7 +248,7 @@ WebRTC `DEPS`; it introduces no dependency on Alpine's Chromium patch series.
 `sys/prctl.h` already provides the constants and function declaration; including
 both headers redefines `prctl_mm_map`.
 
-### Android JAR relocation and JNI registration (p8)
+### Android JAR relocation and JNI registration (p9)
 
 Patch 0002 also sets `dist_jar("libwebrtc").renaming_rules` from the same
 `android_jni_package_prefix` argument used by JNI generation. Chromium's pinned
@@ -267,11 +267,11 @@ classes and runtime linkage references, and fails on a missing JAR. Debug-only
 local-variable type tables and literal log tags are not linkage references.
 Run `mise run test:android-jar` for the packaging regression suite.
 
-### Android runtime closure (p8)
+### Android runtime closure (p9)
 
 `libwebrtc` includes transitive Java dependencies, including generated `*Jni`
 wrappers. The upstream direct-only dist JAR omitted those wrappers: relocation
 passed, but an R8 consumer failed on `JniCommonJni`, `VideoDecoderWrapperJni`,
 and other missing types. Package validation now checks that runtime references
 within the relocated WebRTC/JNI Zero namespace resolve to classes in the JAR.
-The Android native build must produce and validate this JAR before publishing p8.
+The Android native build must produce and validate this JAR before publishing p9.
