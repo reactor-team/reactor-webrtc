@@ -248,7 +248,7 @@ WebRTC `DEPS`; it introduces no dependency on Alpine's Chromium patch series.
 `sys/prctl.h` already provides the constants and function declaration; including
 both headers redefines `prctl_mm_map`.
 
-### Android JAR relocation (p7)
+### Android JAR relocation and JNI registration (p8)
 
 Patch 0002 also sets `dist_jar("libwebrtc").renaming_rules` from the same
 `android_jni_package_prefix` argument used by JNI generation. Chromium's pinned
@@ -258,6 +258,10 @@ p6 shipped a JAR that could not satisfy its native class lookups.
 
 The Android build explicitly builds `sdk/android:libwebrtc`. `package.sh` requires
 that exact output and validates it against `args.gn` before staging any archive.
+The dist target includes the `libjingle_peerconnection_so__jni_registration`
+srcjar, which emits the relocated `inc/reactor/org/jni_zero/GEN_JNI.class` required
+by generated `*Jni` wrappers. Omitting that srcjar makes the archive fail R8 with
+missing `GEN_JNI` even though Java compilation succeeds.
 The validator checks both bootstrap classes, rejects remaining upstream-package
 classes and runtime linkage references, and fails on a missing JAR. Debug-only
 local-variable type tables and literal log tags are not linkage references.
