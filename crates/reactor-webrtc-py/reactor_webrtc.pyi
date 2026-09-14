@@ -62,6 +62,18 @@ class RtcConfiguration:
     Reasons to: a peer whose encoded payloads must be byte-identical to what the
     encoder produced, a deployment that has not rolled the capability out to both
     ends yet, or ruling frame metadata out while bisecting something else."""
+    sctp_snap: bool
+    """Accelerate the SCTP handshake with SNAP (draft-hancke-tsvwg-snap).
+
+    `False` by default. With it on, the offer carries this side's SCTP INIT
+    parameters in the data m-section (`a=sctp-init:`), so the data channel skips
+    SCTP's cookie exchange — two round trips off the time to the first message.
+    Data channels only; media is untouched.
+
+    Both ends must opt in: the answerer mirrors the attribute only when its own
+    flag is on, and a peer that does not understand it ignores it and negotiates
+    SCTP the usual way. The DTLS half of the same saving is
+    `PeerConnectionFactoryBuilder.with_dtls_in_stun`."""
     def __init__(
         self,
         ice_servers: list[IceServer] = ...,
@@ -74,6 +86,7 @@ class RtcConfiguration:
         ice_check_interval_strong_connectivity_ms: int = 0,
         tcp_candidate_policy: TcpCandidatePolicy = ...,
         frame_metadata: bool = True,
+        sctp_snap: bool = False,
     ) -> None: ...
 
 # ── Signaling types ───────────────────────────────────────────────────────────
@@ -701,6 +714,14 @@ class PeerConnectionFactoryBuilder:
         ...
     def with_metadata(self, enabled: bool) -> None:
         """Factory-wide frame-metadata kill switch (default enabled)."""
+        ...
+    def with_dtls_in_stun(self, enabled: bool) -> None:
+        """Run the DTLS handshake inside the ICE binding requests — SPED
+        (draft-hancke-webrtc-sped), default disabled. Saves about one round trip
+        when the peer supports it; falls back to the normal post-ICE handshake
+        when it does not. Factory-wide: libwebrtc reads it from the factory's
+        environment. The SCTP half of the same saving is
+        `RtcConfiguration.sctp_snap`."""
         ...
     def with_openh264(self, lib_path: str) -> None:
         """Register the OpenH264 backend from a downloaded library path

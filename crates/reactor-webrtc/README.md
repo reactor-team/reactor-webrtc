@@ -60,7 +60,7 @@ pc.set_local_description(&offer)?;
 | `SessionDescription` | SDP offer or answer; `ice_ufrags`, `with_ice_credentials`, `declares_frame_metadata`, `with_frame_metadata` |
 | `FrameMetadataGate` | What the remote declared about per-frame metadata |
 | `IceCandidate` | Trickled ICE candidate |
-| `RtcConfiguration` | ICE servers/policy, port range, bundle policy, TCP candidates, ICE timeouts — see [`docs/configuration.md`](../../docs/configuration.md) |
+| `RtcConfiguration` | ICE servers/policy, port range, bundle policy, TCP candidates, ICE timeouts, faster setup (`sctp_snap`) — see [`docs/configuration.md`](../../docs/configuration.md) |
 | `AdmMode` | `Synthetic` (push PCM) or `Platform` (real mic/speaker) |
 | `ApmConfig` | AEC3, noise suppression, AGC, high-pass filter |
 
