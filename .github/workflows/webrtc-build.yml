@@ -6,7 +6,7 @@
 #   • push / pull_request touching WEBRTC_VERSION, webrtc-build/** (non-markdown),
 #     or this workflow file → full target matrix, debug profile.
 #   • workflow_dispatch → pick `targets` and `profile`; set `publish=true` to
-#     cut a GitHub Release (release prebuilts are always manual).
+#     cut a GitHub Release (release prebuilts are also published after qualifying merges).
 #
 # Host coverage (cross-compile aware):
 #   • macos-15 (Apple Silicon + Xcode 16) → mac arm64, mac x64, iOS device + sim.
@@ -64,7 +64,11 @@ jobs:
     outputs:
       matrix: ${{ steps.gen.outputs.matrix }}
       profile: ${{ steps.gen.outputs.profile }}
+      publish_release: ${{ steps.gen.outputs.publish_release }}
     steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
       - id: gen
         run: |
           mac_arm='{"os":"mac","arch":"arm64","runner":"macos-15"}'
@@ -83,13 +87,30 @@ jobs:
           # Rust's +crt-static links the release CRT (/MT) which lacks those symbols,
           # causing LNK2019. Release builds use /MT throughout — no CRT mismatch.
           win='{"os":"win","arch":"x64","runner":"windows-latest","profile":"release"}'
-          # CI (push / pull_request) → full target matrix, debug profile.
+          # CI (push / pull_request) → full target matrix. Qualifying pushes to
+          # main use release once, and that same build feeds artifacts + publish.
           # workflow_dispatch → use the selected inputs.
           t="${{ github.event.inputs.targets }}"
           prof="${{ github.event.inputs.profile }}"
+          publish_release=false
+          if [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            changed="$(git diff --name-only "${{ github.event.before }}" "${{ github.sha }}")"
+            if printf '%s\n' "$changed" | grep -Eq '^(WEBRTC_VERSION|webrtc-build/patches/)'; then
+              publish_release=true
+            fi
+          fi
           if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
-            t=full
+            # Keep pull-request iteration focused on the failing Android
+            # packaging path. Main pushes still build the complete matrix.
+            if [ "${{ github.event_name }}" = "pull_request" ]; then
+              t=android
+            else
+              t=full
+            fi
             prof=debug
+            if [ "$publish_release" = true ]; then
+              prof=release
+            fi
           fi
           t="${t:-mac}"
           case "$t" in
@@ -105,6 +126,7 @@ jobs:
           esac
           echo "matrix={\"include\":[$inc]}" >> "$GITHUB_OUTPUT"
           echo "profile=${prof:-release}" >> "$GITHUB_OUTPUT"
+          echo "publish_release=$publish_release" >> "$GITHUB_OUTPUT"
 
   build:
     needs: setup
@@ -123,6 +145,21 @@ jobs:
       IOS_ENV: ${{ matrix.ios_env }}
     steps:
       - uses: actions/checkout@v7
+
+      # Reuse depot_tools and Chromium/CIPD downloads between runs. The source
+      # checkout itself is intentionally not cached: it is tens of GB and is
+      # reset/synced by build.sh/build.ps1 on every target.
+      - name: Cache WebRTC tool downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            webrtc-build/depot_tools
+            ~/.cipd
+            ~/.cache/depot_tools
+          key: webrtc-tools-${{ runner.os }}-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('WEBRTC_VERSION', 'webrtc-build/patches/**') }}
+          restore-keys: |
+            webrtc-tools-${{ runner.os }}-${{ matrix.os }}-${{ matrix.arch }}-
+            webrtc-tools-${{ runner.os }}-
 
       - name: Free disk space (Linux)
         if: runner.os == 'Linux'
@@ -520,8 +557,13 @@ jobs:
 
   # Publish the per-target prebuilts as a GitHub Release (opt-in via dispatch).
   publish:
-    needs: [build, sys, webrtc, build-wheel, test-py]
-    if: github.event_name == 'workflow_dispatch' && inputs.publish
+    needs: [setup, build, sys, webrtc, build-wheel, test-py]
+    # Manual releases and qualifying merges consume the exact same build
+    # artifacts produced by `build`; this job never invokes build.sh again.
+    if: >-
+      (github.event_name == 'workflow_dispatch' && inputs.publish) ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+       needs.setup.outputs.publish_release == 'true')
     runs-on: ubuntu-latest
     # Cutting a release ships prebuilt native binaries that downstream packages
     # link against, so the publish is gated on the `release` environment: its

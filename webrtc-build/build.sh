@@ -216,7 +216,19 @@ if [ -d src/third_party/.git ]; then
 fi
 rm -f src/build/config/reactor_musl.gni src/build/toolchain/linux/reactor_musl/BUILD.gn
 echo "==> gclient sync -> src@$REF (--with_branch_heads)"
-gclient sync --with_branch_heads --no-history --shallow -r "src@$REF" -D
+sync_ok=false
+for attempt in 1 2 3; do
+  if gclient sync --with_branch_heads --no-history --shallow -r "src@$REF" -D; then
+    sync_ok=true
+    break
+  fi
+  if [ "$attempt" -lt 3 ]; then
+    delay=$((attempt * 20))
+    echo "==> gclient sync failed (attempt $attempt/3); retrying in ${delay}s" >&2
+    sleep "$delay"
+  fi
+done
+$sync_ok || { echo "gclient sync failed after 3 attempts" >&2; exit 1; }
 RESOLVED="$(git -C src rev-parse HEAD)"
 echo "==> resolved WebRTC commit: $RESOLVED  (lock this in WEBRTC_VERSION:WEBRTC_COMMIT)"
 
@@ -236,9 +248,20 @@ for p in "${patches[@]}"; do
   echo "==> applying patch $(basename "$p")"
   # Try git apply (works for files tracked by the main WebRTC repo); fall back
   # to patch(1) for files in third_party sub-repos (e.g. jni_zero).
-  git apply --3way "$p" 2>/dev/null || patch -p1 < "$p"
+  if [ "$(basename "$p")" = "0002-android-jni-package-prefix.patch" ]; then
+    filtered="$(mktemp)"
+    sed '/^diff --git a\/sdk\/android\/BUILD.gn/,$d' "$p" > "$filtered"
+    patch -p1 -F 2 < "$filtered"
+    rm -f "$filtered"
+  else
+    git apply --3way "$p" 2>/dev/null || patch -p1 -F 2 < "$p"
+  fi
 done
 shopt -u nullglob
+
+if [ "$OS" = android ]; then
+  python3 "$HERE/configure-android-jni-build.py" sdk/android/BUILD.gn
+fi
 
 # Cross-compiling linux/arm64 from an x86_64 host needs the arm64 sysroot, which
 # the default sync (host arch only) does not fetch.

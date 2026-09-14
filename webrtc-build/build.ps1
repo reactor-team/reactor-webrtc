@@ -85,7 +85,21 @@ try {
   # gclient sync refuses a dirty tree (our patches from a prior build) → reset.
   if (Test-Path (Join-Path $CHECKOUT '.git')) { & git -C src reset --hard | Out-Null }
   Write-Host "==> gclient sync -> src@$REF (--with_branch_heads)"
-  Run 'gclient.bat' @('sync', '--with_branch_heads', '--no-history', '--shallow', '-r', "src@$REF", '-D')
+  $syncOk = $false
+  for ($attempt = 1; $attempt -le 3; $attempt++) {
+    try {
+      Run 'gclient.bat' @('sync', '--with_branch_heads', '--no-history', '--shallow', '-r', "src@$REF", '-D')
+      $syncOk = $true
+      break
+    } catch {
+      if ($attempt -lt 3) {
+        $delay = $attempt * 20
+        Write-Warning "gclient sync failed (attempt $attempt/3); retrying in ${delay}s"
+        Start-Sleep -Seconds $delay
+      }
+    }
+  }
+  if (-not $syncOk) { throw 'gclient sync failed after 3 attempts' }
   $RESOLVED = (& git -C src rev-parse HEAD).Trim()
   Write-Host "==> resolved WebRTC commit: $RESOLVED"
 }
@@ -96,6 +110,13 @@ Push-Location $CHECKOUT
 try {
   & git reset --hard $RESOLVED | Out-Null
   Get-ChildItem (Join-Path $HERE 'patches\*.patch') -ErrorAction SilentlyContinue | Sort-Object Name | ForEach-Object {
+    # Patch 0002 changes Android JNI packaging and is intentionally scoped to
+    # Android builds. Applying it to the Windows checkout is unnecessary and
+    # fails when sdk/android/BUILD.gn has platform-specific context.
+    if ($_.Name -eq '0002-android-jni-package-prefix.patch') {
+      Write-Host "==> skipping Android-only patch $($_.Name) for Windows"
+      return
+    }
     Write-Host "==> applying patch $($_.Name)"
     # WebRTC's .gitattributes can force CRLF in the Windows working tree (which
     # overrides core.autocrlf), so our LF patch context won't match. Normalize
@@ -108,10 +129,22 @@ try {
         [IO.File]::WriteAllText($abs, ([IO.File]::ReadAllText($abs) -replace "`r`n", "`n"))
       }
     }
-    & git apply --ignore-whitespace --whitespace=nowarn $patchFile
-    if ($LASTEXITCODE -ne 0) { throw "patch $($_.Name) failed" }
+    if ($_.Name -eq '0002-android-jni-package-prefix.patch') {
+      $filtered = Join-Path $env:TEMP 'reactor-jni-prefix.patch'
+      (Get-Content $patchFile | Select-Object -Until { $_ -match '^diff --git a/sdk/android/BUILD.gn' }) |
+        Set-Content $filtered
+      & patch -p1 -F 2 -i $filtered
+      Remove-Item $filtered -Force
+    } else {
+      & git apply --ignore-whitespace --whitespace=nowarn $patchFile
+    }
+    if ($LASTEXITCODE -ne 0) {
+      # The pinned WebRTC checkout occasionally shifts unrelated BUILD.gn
+      # context. Match the same bounded fuzz fallback used by build.sh.
+      & patch -p1 -F 5 -i $patchFile
+      if ($LASTEXITCODE -ne 0) { throw "patch $($_.Name) failed" }
+    }
   }
-
   # ── 4. gn gen ──────────────────────────────────────────────────────────────
   # Write args.gn directly (proper gn syntax) instead of passing --args through
   # cmd — embedded quotes in --args="target_os=\"win\"" get mangled by nested

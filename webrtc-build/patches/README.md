@@ -258,8 +258,9 @@ p6 shipped a JAR that could not satisfy its native class lookups.
 
 The Android build explicitly builds `sdk/android:libwebrtc`. `package.sh` requires
 that exact output and validates it against `args.gn` before staging any archive.
-The dist target includes the `libjingle_peerconnection_so__jni_registration`
-srcjar, which emits the relocated `inc/reactor/org/jni_zero/GEN_JNI.class` required
+The patch adds an `rtc_android_library` wrapper around the
+`libjingle_peerconnection_so__jni_registration` srcjar and includes that Java
+target in the dist target. It emits the relocated `inc/reactor/org/jni_zero/GEN_JNI.class` required
 by generated `*Jni` wrappers. Omitting that srcjar makes the archive fail R8 with
 missing `GEN_JNI` even though Java compilation succeeds.
 The validator checks both bootstrap classes, rejects remaining upstream-package
