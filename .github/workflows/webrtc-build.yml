@@ -148,21 +148,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # Reuse depot_tools and Chromium/CIPD downloads between runs. The source
-      # checkout itself is intentionally not cached: it is tens of GB and is
-      # reset/synced by build.sh/build.ps1 on every target.
-      - name: Cache WebRTC tool downloads
-        uses: actions/cache@v4
-        with:
-          path: |
-            webrtc-build/depot_tools
-            ~/.cipd
-            ~/.cache/depot_tools
-          key: webrtc-tools-${{ runner.os }}-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('WEBRTC_VERSION', 'webrtc-build/patches/**') }}
-          restore-keys: |
-            webrtc-tools-${{ runner.os }}-${{ matrix.os }}-${{ matrix.arch }}-
-            webrtc-tools-${{ runner.os }}-
-
       - name: Free disk space (Linux)
         if: runner.os == 'Linux'
         run: |
