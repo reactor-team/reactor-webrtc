@@ -19,15 +19,18 @@ use crate::{AdmMode, ApmConfig, PeerConnectionFactory, Result};
 ///     .build()?;
 /// ```
 ///
-/// The knobs are the process-physical singletons libwebrtc only accepts at
-/// factory-creation time: the audio device (ADM), the audio-processing chain
-/// (APM), and codec backends loaded once per process (OpenH264). Everything
-/// else — track kinds, per-track encoder choices, per-track metadata —
-/// belongs to track creation, not the builder.
+/// The knobs are what libwebrtc only accepts at factory-creation time: the
+/// process-physical singletons — the audio device (ADM), the audio-processing
+/// chain (APM), codec backends loaded once per process (OpenH264) — and the
+/// field trials baked into the factory's `Environment`
+/// ([`with_dtls_in_stun`](Self::with_dtls_in_stun)). Everything else — track
+/// kinds, per-track encoder choices, per-track metadata — belongs to track
+/// creation, not the builder.
 pub struct PeerConnectionFactoryBuilder {
     adm: AdmMode,
     apm: ApmConfig,
     metadata: bool,
+    dtls_in_stun: bool,
     #[cfg(feature = "openh264")]
     openh264: Option<std::path::PathBuf>,
 }
@@ -38,6 +41,7 @@ impl PeerConnectionFactoryBuilder {
             adm: AdmMode::Synthetic,
             apm: ApmConfig::default(),
             metadata: true,
+            dtls_in_stun: false,
             #[cfg(feature = "openh264")]
             openh264: None,
         }
@@ -97,6 +101,30 @@ impl PeerConnectionFactoryBuilder {
         self
     }
 
+    /// Run the DTLS handshake inside the ICE binding requests — SPED
+    /// ([`draft-hancke-webrtc-sped`](https://datatracker.ietf.org/doc/draft-hancke-webrtc-sped/)),
+    /// one of the three legs of WARP. Default `false`.
+    ///
+    /// Normally DTLS only starts once ICE has picked a pair; with this on, the
+    /// handshake records ride along in the connectivity checks, so the
+    /// transport is ready roughly one round trip earlier (and the handshake
+    /// inherits ICE's retransmissions, which helps on lossy paths).
+    ///
+    /// It is a factory knob, not a per-connection one, because libwebrtc gates
+    /// it on a field trial that lives in the factory's `Environment`. It also
+    /// needs the peer to support it: a peer that does not simply answers the
+    /// binding requests without the DTLS attributes, and the handshake falls
+    /// back to the normal post-ICE exchange. Certificates must be ECDSA
+    /// (libwebrtc's default) — an RSA handshake does not fit in STUN
+    /// attributes.
+    ///
+    /// The SCTP half of the same saving is
+    /// [`RtcConfiguration::sctp_snap`](crate::RtcConfiguration::sctp_snap).
+    pub fn with_dtls_in_stun(mut self, enabled: bool) -> Self {
+        self.dtls_in_stun = enabled;
+        self
+    }
+
     /// Register the OpenH264 backend for real H.264 encode/decode (see
     /// [`crate::openh264::ensure_available`] to obtain `lib_path`). This
     /// never fails because the library itself couldn't be loaded: a
@@ -133,6 +161,7 @@ impl PeerConnectionFactoryBuilder {
         let mut opts = reactor_webrtc_sys::ReactorFactoryOptions {
             use_platform_adm: matches!(self.adm, AdmMode::Platform) as std::os::raw::c_int,
             apm_flags: self.apm.to_flags(),
+            dtls_in_stun: self.dtls_in_stun as std::os::raw::c_int,
             #[cfg(feature = "openh264")]
             openh264_lib_path: openh264_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
             ..Default::default()

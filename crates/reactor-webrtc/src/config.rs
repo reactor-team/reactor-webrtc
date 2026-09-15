@@ -156,6 +156,26 @@ pub struct RtcConfiguration {
     /// to both ends yet, or ruling frame metadata out while bisecting something
     /// else.
     pub frame_metadata: bool,
+    /// Whether the SCTP handshake is accelerated with SNAP
+    /// ([`draft-hancke-tsvwg-snap`](https://datatracker.ietf.org/doc/draft-hancke-tsvwg-snap/)),
+    /// one of the three legs of WARP.
+    ///
+    /// Off by default. With it on, the offer carries this side's SCTP INIT
+    /// parameters in the data m-section (`a=sctp-init:`), so the data channel
+    /// skips SCTP's cookie exchange — two round trips off the time to the
+    /// first message. It only affects data channels; media is untouched.
+    ///
+    /// **Both ends must opt in**: the answerer mirrors the attribute only when
+    /// its own flag is on, and an offer carrying it is harmless to a peer that
+    /// does not understand it (the attribute is ignored and SCTP negotiates
+    /// the usual way). The draft is an individual submission, not a standard,
+    /// and browsers ship it behind a flag — so this pays off between peers you
+    /// control, not against the open web.
+    ///
+    /// The DTLS half of the same saving is
+    /// [`PeerConnectionFactoryBuilder::with_dtls_in_stun`](crate::PeerConnectionFactoryBuilder::with_dtls_in_stun),
+    /// a factory knob because libwebrtc reads it from the factory Environment.
+    pub sctp_snap: bool,
 }
 
 impl Default for RtcConfiguration {
@@ -179,6 +199,9 @@ impl Default for RtcConfiguration {
             // construction — a peer that does not understand the attribute ignores it
             // and the gate stays closed — so opting in is not the caller's job.
             frame_metadata: true,
+            // Off: the peer has to opt in too (it mirrors the attribute only
+            // when its own flag is on), and the draft is not a standard yet.
+            sctp_snap: false,
         }
     }
 }
@@ -214,6 +237,7 @@ pub(crate) struct NativeConfig {
     ice_connection_receiving_timeout_ms: c_int,
     ice_check_interval_strong_connectivity_ms: c_int,
     tcp_candidate_policy: c_int,
+    sctp_snap: c_int,
 }
 
 impl NativeConfig {
@@ -282,6 +306,7 @@ impl NativeConfig {
                 .ice_check_interval_strong_connectivity_ms
                 .unwrap_or(-1),
             tcp_candidate_policy: config.tcp_candidate_policy.to_wire(),
+            sctp_snap: config.sctp_snap as c_int,
         })
     }
 
@@ -299,6 +324,7 @@ impl NativeConfig {
             ice_check_interval_strong_connectivity_ms: self
                 .ice_check_interval_strong_connectivity_ms,
             tcp_candidate_policy: self.tcp_candidate_policy,
+            sctp_snap: self.sctp_snap,
         }
     }
 }
@@ -439,6 +465,22 @@ mod tests {
         .to_native()
         .expect("marshal");
         assert_eq!(none.config().ice_transport_type, 3);
+    }
+
+    #[test]
+    fn sends_sctp_snap_as_an_explicit_flag() {
+        // Off unless asked: SNAP only pays off when the peer opted in too, so
+        // the default must never put a=sctp-init: on the wire.
+        let default = RtcConfiguration::default().to_native().expect("marshal");
+        assert_eq!(default.config().sctp_snap, 0);
+
+        let snap = RtcConfiguration {
+            sctp_snap: true,
+            ..Default::default()
+        }
+        .to_native()
+        .expect("marshal");
+        assert_eq!(snap.config().sctp_snap, 1);
     }
 
     #[test]

@@ -82,6 +82,7 @@ arrives as kwargs on the track creation:
 builder = rw.PeerConnectionFactoryBuilder()
 builder.with_platform_adm()          # real mic + AEC3/NS/AGC/high_pass
 builder.with_metadata(False)         # factory-wide frame-metadata kill switch
+builder.with_dtls_in_stun(True)      # SPED: DTLS handshake inside the ICE checks
 factory = builder.build()
 
 # Raw video with an H.264 backend chosen per track:
@@ -200,10 +201,13 @@ for pair in report.candidate_pairs:
 | `RtcConfiguration.tcp_candidate_policy` | `Disabled` (default), `Enabled` |
 
 `RtcConfiguration` also takes a `min_port`/`max_port` pair (UDP port range),
-`ice_connection_receiving_timeout_ms`, and
-`ice_check_interval_strong_connectivity_ms`; `PeerConnection.set_bitrate`
-sets congestion-control bitrate limits after the connection is created. All
-covered in [`docs/configuration.md`](../../docs/configuration.md).
+`ice_connection_receiving_timeout_ms`,
+`ice_check_interval_strong_connectivity_ms`, and `sctp_snap` (SNAP: SCTP
+parameters in the SDP, so a data channel opens two round trips sooner — the
+peer must opt in too); `PeerConnectionFactoryBuilder.with_dtls_in_stun` is its
+factory-wide DTLS counterpart (SPED), and `PeerConnection.set_bitrate` sets
+congestion-control bitrate limits after the connection is created. All covered
+in [`docs/configuration.md`](../../docs/configuration.md).
 
 ## Per-frame metadata
 

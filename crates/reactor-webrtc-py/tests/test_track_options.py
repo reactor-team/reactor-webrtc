@@ -25,6 +25,14 @@ class TestBuilder:
     def test_factory_builder_accessor(self):
         assert isinstance(rw.PeerConnectionFactory.builder(), rw.PeerConnectionFactoryBuilder)
 
+    def test_builder_takes_the_dtls_in_stun_knob(self, factory):
+        # SPED is a factory-creation-time field trial; the fixture owns the one
+        # factory this process may have, so only the knob itself is exercised.
+        b = rw.PeerConnectionFactoryBuilder()
+        b.with_dtls_in_stun(True)
+        b.with_dtls_in_stun(False)
+        assert isinstance(b, rw.PeerConnectionFactoryBuilder)
+
 
 class TestVideoTrackOptions:
     def test_plain_options_returns_track(self, factory):

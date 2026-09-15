@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.18.0 — Faster connection setup (WARP: SPED + SNAP)
+
+Expose the two WARP connection-setup opt-ins our pinned libwebrtc already
+carries but the binding never reached. Both default to off, and both need the
+peer to opt in too — against a peer that has never heard of either, setup
+falls back to the normal path.
+
+- SNAP (`RtcConfiguration::sctp_snap`) puts this side's SCTP INIT parameters
+  in the data m-section, so a data channel skips the cookie exchange.
+- SPED (`PeerConnectionFactoryBuilder::with_dtls_in_stun`) carries the DTLS
+  handshake inside the ICE binding requests instead of waiting for ICE to
+  settle. It requires ECDSA certificates.
+
+The glue ABI version advances 3 -> 4. All three crates advance to 0.18.0; the
+default native archive remains `webrtc-7907-a5ddff60-p9`.
+
 ## 0.17.4 — Android JNI registration packaging
 
 Include the generated `GEN_JNI` registration class in the Android WebRTC JAR,

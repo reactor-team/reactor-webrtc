@@ -14,6 +14,7 @@ an existing `pc`.
 - [Bundle policy](#bundle-policy)
 - [TCP candidates](#tcp-candidates)
 - [ICE timeouts](#ice-timeouts)
+- [Faster connection setup (WARP: SPED + SNAP)](#faster-connection-setup-warp-sped--snap)
 - [Congestion-control bitrate limits](#congestion-control-bitrate-limits)
 - [Per-sender bitrate limits](#per-sender-bitrate-limits)
 
@@ -266,6 +267,68 @@ config = rw.RtcConfiguration(
     ice_connection_receiving_timeout_ms=3000,
     ice_check_interval_strong_connectivity_ms=250,
 )
+```
+
+</details>
+
+## Faster connection setup (WARP: SPED + SNAP)
+
+A stock WebRTC connection spends four round trips before media flows and six
+before a data channel opens. [WARP](https://datatracker.ietf.org/doc/draft-uberti-tsvwg-warp/)
+is the umbrella draft for cutting that to two; it is not a protocol of its own
+but three independent optimisations. Where each one stands here:
+
+| Leg | What it saves | Here |
+|-----|---------------|------|
+| **DTLS 1.3** | 1 RTT (1-RTT handshake instead of 2) | **On already** — it is libwebrtc's default maximum DTLS version and is used whenever the peer offers it. Nothing to configure. |
+| **SPED** ([draft-hancke-webrtc-sped](https://datatracker.ietf.org/doc/draft-hancke-webrtc-sped/)) | 1 RTT — the DTLS handshake rides inside the ICE binding requests instead of waiting for ICE to finish | Opt-in, **factory-wide**: `PeerConnectionFactoryBuilder::with_dtls_in_stun(true)`. |
+| **SNAP** ([draft-hancke-tsvwg-snap](https://datatracker.ietf.org/doc/draft-hancke-tsvwg-snap/)) | 2 RTTs on data channels — the SCTP INIT parameters travel in the SDP (`a=sctp-init:`), so SCTP skips its cookie exchange | Opt-in, **per connection**: `RtcConfiguration::sctp_snap`. |
+
+Both opt-ins are off by default, and for the same two reasons. They are
+individual Internet-Drafts, not standards — browsers ship them behind flags —
+and **both ends have to agree**: a peer that does not implement SPED just
+answers the binding requests without the DTLS attributes (the handshake falls
+back to the normal post-ICE one), and an answerer without SNAP does not mirror
+`a=sctp-init:` (SCTP negotiates the usual way). Nothing breaks against a peer
+that has never heard of either; you simply do not get the saving. So turn them
+on between peers you control — your own clients against your own SFU — rather
+than against the open web.
+
+Two further notes on SPED. It is a factory knob, not a per-connection one,
+because libwebrtc reads it from a field trial stored in the factory's
+environment, so it applies to every connection the factory creates. And it
+needs ECDSA certificates (libwebrtc's default): an RSA handshake does not fit
+in STUN attributes.
+
+<details>
+<summary>🦀 Example using Rust</summary>
+
+```rust
+use reactor_webrtc::{PeerConnectionFactory, RtcConfiguration};
+
+// SPED: decided once, for every connection this factory makes.
+let factory = PeerConnectionFactory::builder()
+    .with_dtls_in_stun(true)
+    .build()
+    .expect("factory");
+
+// SNAP: per connection, and only data channels are affected.
+let config = RtcConfiguration { sctp_snap: true, ..Default::default() };
+```
+
+</details>
+
+<details>
+<summary>🐍 Example using Python</summary>
+
+```python
+import reactor_webrtc as rw
+
+builder = rw.PeerConnectionFactoryBuilder()
+builder.with_dtls_in_stun(True)   # SPED, factory-wide
+factory = builder.build()
+
+config = rw.RtcConfiguration(sctp_snap=True)   # SNAP, per connection
 ```
 
 </details>

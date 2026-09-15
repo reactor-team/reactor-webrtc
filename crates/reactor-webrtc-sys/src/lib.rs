@@ -168,6 +168,11 @@ pub struct ReactorFactoryOptions {
     pub encode_rate_update: Option<
         extern "C" fn(userdata: *mut c_void, encoder_id: u64, bitrate_bps: u32, framerate_fps: f64),
     >,
+    /// Nonzero → run the DTLS handshake inside the ICE binding requests
+    /// (SPED, `draft-hancke-webrtc-sped`), by enabling libwebrtc's
+    /// `WebRTC-IceHandshakeDtls` field trial. Factory-wide because field
+    /// trials live in the factory's `Environment`, not in a peer connection.
+    pub dtls_in_stun: c_int,
 }
 
 impl Default for ReactorFactoryOptions {
@@ -184,6 +189,7 @@ impl Default for ReactorFactoryOptions {
             encode_has_custom_slots: None,
             encode_video_backend_for: None,
             encode_rate_update: None,
+            dtls_in_stun: 0,
         }
     }
 }
@@ -419,6 +425,11 @@ pub struct ReactorIceServer {
 /// |------------------------|-----------|
 /// | `0`                    | TCP ICE candidates disabled (default) |
 /// | `1`                    | TCP ICE candidates enabled |
+///
+/// | `sctp_snap` | behaviour |
+/// |-------------|-----------|
+/// | `0`         | SCTP negotiated on the wire, as usual (default) |
+/// | `1`         | SCTP INIT parameters carried in the SDP (SNAP) |
 #[repr(C)]
 pub struct ReactorRtcConfig {
     pub servers: *const ReactorIceServer,
@@ -437,6 +448,10 @@ pub struct ReactorRtcConfig {
     pub ice_check_interval_strong_connectivity_ms: c_int,
     /// TCP candidate policy. 0 = disabled (default), 1 = enabled.
     pub tcp_candidate_policy: c_int,
+    /// SCTP negotiation acceleration (SNAP, `draft-hancke-tsvwg-snap`):
+    /// nonzero puts the SCTP INIT parameters in the SDP. 0 = off (libwebrtc
+    /// default).
+    pub sctp_snap: c_int,
 }
 
 extern "C" {

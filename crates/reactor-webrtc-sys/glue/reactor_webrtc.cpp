@@ -50,7 +50,9 @@
 #include "api/create_peerconnection_factory.h"
 #include "api/data_channel_interface.h"
 #include "api/environment/environment.h"
+#include "api/environment/deprecated_global_field_trials.h"
 #include "api/environment/environment_factory.h"
+#include "api/field_trials_view.h"
 #include "api/frame_transformer_interface.h"
 #include "api/jsep.h"
 #include "api/make_ref_counted.h"
@@ -245,6 +247,7 @@ struct ReactorIceServer {
 //   continual_gathering_policy: 0=gather-once 1=gather-continually
 //   bundle_policy:              0=balanced 1=max-bundle 2=max-compat
 //   tcp_candidate_policy:       0=disabled 1=enabled
+//   sctp_snap:                  0=off 1=SCTP INIT parameters in the SDP
 // An unknown value falls back to 0.
 struct ReactorRtcConfig {
   const ReactorIceServer* servers;
@@ -259,6 +262,8 @@ struct ReactorRtcConfig {
   // ICE check interval on a well-connected path in ms. <=0 = libwebrtc default.
   int                     ice_check_interval_strong_connectivity_ms;
   int                     tcp_candidate_policy;
+  // SNAP (draft-hancke-tsvwg-snap): 0 = off (libwebrtc default).
+  int                     sctp_snap;
 };
 }  // extern "C"
 
@@ -825,6 +830,12 @@ void apply_rtc_config(const ReactorRtcConfig* in,
             break;
     default: break;  // 0 = disabled (libwebrtc default)
   }
+
+  // SNAP (draft-hancke-tsvwg-snap): both ends must set it — the offerer puts
+  // its SCTP INIT parameters in the data m-section ("a=sctp-init:"), and the
+  // answerer only mirrors them when its own flag is on. With it, the data
+  // channel skips the SCTP cookie exchange (two round trips).
+  cfg.enable_sctp_snap = in->sctp_snap != 0;
 }
 
 // Write a NUL-terminated copy of `msg` into `out`, truncated to `cap` bytes.
@@ -1074,7 +1085,7 @@ static webrtc::scoped_refptr<webrtc::AudioProcessing> build_apm(int apm_flags) {
 extern "C" {
 
 // ABI version of this native build. The safe crate asserts compatibility.
-unsigned int reactor_webrtc_abi_version() { return 3; }
+unsigned int reactor_webrtc_abi_version() { return 4; }
 
 // Link/run self-test: build the builtin audio + video encoder factories and
 // enumerate the codecs they support. Writes a comma-separated, NUL-terminated
@@ -2115,6 +2126,11 @@ struct ReactorFactoryOptions {
   // Rate-control (BWE) updates for custom-slotted encoder instances — the
   // bitrate/framerate the congestion controller wants. May be null.
   reactor_rate_update_cb       encode_rate_update;
+  // SPED (draft-hancke-webrtc-sped): nonzero runs the DTLS handshake inside
+  // the ICE binding requests, saving a round trip. libwebrtc gates it on the
+  // WebRTC-IceHandshakeDtls field trial, which only the factory's Environment
+  // can carry — hence a factory option rather than a per-connection one.
+  int                          dtls_in_stun;
 };
 }
 
@@ -2448,6 +2464,38 @@ class ReactorCompositeVideoDecoderFactory : public webrtc::VideoDecoderFactory {
   }
 };
 
+// The field trials this binding can turn on, as a FieldTrialsView the factory
+// Environment owns. webrtc::FieldTrials::Create would parse an equivalent
+// string, but that symbol is not exported by the packaged static lib — the
+// interface is, and it is one method.
+//
+// Everything this class does not own is delegated to the view the factory
+// would have used anyway: with no view of our own, EnvironmentFactory installs
+// a DeprecatedGlobalFieldTrials (see CreateWithDefaults), which reads the
+// process-global trial string. Answering "" for unknown keys instead would
+// make enabling one knob silently disable every trial the host configured —
+// so this view only ever *adds* a key.
+class ReactorFieldTrials : public webrtc::FieldTrialsView {
+ public:
+  explicit ReactorFieldTrials(bool dtls_in_stun) : dtls_in_stun_(dtls_in_stun) {}
+
+  std::string Lookup(absl::string_view key) const override {
+    // SPED: piggyback the DTLS handshake on the ICE binding requests.
+    if (dtls_in_stun_ && key == "WebRTC-IceHandshakeDtls") return "Enabled";
+    return global_.Lookup(key);
+  }
+
+  std::unique_ptr<webrtc::FieldTrialsView> CreateCopy() const override {
+    return std::make_unique<ReactorFieldTrials>(dtls_in_stun_);
+  }
+
+ private:
+  const bool dtls_in_stun_;
+  // The process-global trials, i.e. exactly the view the factory installs when
+  // the binding passes none. Stateless; it reads the global string on lookup.
+  webrtc::DeprecatedGlobalFieldTrials global_;
+};
+
 // The single factory-create entry point. Threads, ADM, APM and the audio
 // codec factories are identical for every configuration; the video codec
 // surface is always the composite pair (see above), configured by:
@@ -2465,6 +2513,15 @@ void* reactor_webrtc_factory_create(const ReactorFactoryOptions* opts,
     write_error(err, err_cap,
                 "invalid ReactorFactoryOptions (null or undersized)");
     return nullptr;
+  }
+
+  // SPED (draft-hancke-webrtc-sped): the DTLS handshake rides inside the ICE
+  // binding requests instead of waiting for ICE to finish. libwebrtc reads the
+  // switch off the factory's Environment, so it is decided here, once, for
+  // every peer connection this factory makes.
+  std::unique_ptr<webrtc::FieldTrialsView> trials;
+  if (opts->dtls_in_stun) {
+    trials = std::make_unique<ReactorFieldTrials>(/*dtls_in_stun=*/true);
   }
 
   std::unique_ptr<webrtc::VideoEncoderFactory> openh264_enc;
@@ -2535,7 +2592,8 @@ void* reactor_webrtc_factory_create(const ReactorFactoryOptions* opts,
           state, std::move(openh264_enc), std::move(apple_enc)),
       std::make_unique<ReactorCompositeVideoDecoderFactory>(
           std::move(openh264_dec), std::move(apple_dec), state),
-      /*audio_mixer=*/nullptr, /*audio_processing=*/apm);
+      /*audio_mixer=*/nullptr, /*audio_processing=*/apm,
+      /*audio_frame_processor=*/nullptr, std::move(trials));
   if (!f->factory) {
     write_error(err, err_cap, "CreatePeerConnectionFactory returned null");
     return nullptr;

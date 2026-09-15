@@ -181,6 +181,9 @@ pub struct RtcConfiguration {
     /// Whether this connection takes part in per-frame metadata. `True` by
     /// default; see the class docstring in the stub.
     pub frame_metadata: bool,
+    /// Whether the SCTP handshake is accelerated with SNAP
+    /// (draft-hancke-tsvwg-snap). `False` by default; both ends must opt in.
+    pub sctp_snap: bool,
 }
 
 #[pymethods]
@@ -198,6 +201,7 @@ impl RtcConfiguration {
         ice_check_interval_strong_connectivity_ms=0,
         tcp_candidate_policy=TcpCandidatePolicy::Disabled,
         frame_metadata=true,
+        sctp_snap=false,
     ))]
     fn new(
         ice_servers: Vec<IceServer>,
@@ -210,6 +214,7 @@ impl RtcConfiguration {
         ice_check_interval_strong_connectivity_ms: i32,
         tcp_candidate_policy: TcpCandidatePolicy,
         frame_metadata: bool,
+        sctp_snap: bool,
     ) -> PyResult<Self> {
         Ok(Self {
             ice_servers,
@@ -222,6 +227,7 @@ impl RtcConfiguration {
             ice_check_interval_strong_connectivity_ms,
             tcp_candidate_policy: rw::TcpCandidatePolicy::from(tcp_candidate_policy),
             frame_metadata,
+            sctp_snap,
         })
     }
     #[getter]
@@ -311,6 +317,15 @@ impl RtcConfiguration {
     fn set_frame_metadata(&mut self, value: bool) {
         self.frame_metadata = value;
     }
+
+    #[getter]
+    fn sctp_snap(&self) -> bool {
+        self.sctp_snap
+    }
+    #[setter]
+    fn set_sctp_snap(&mut self, value: bool) {
+        self.sctp_snap = value;
+    }
 }
 
 impl From<&RtcConfiguration> for rw::RtcConfiguration {
@@ -345,6 +360,7 @@ impl From<&RtcConfiguration> for rw::RtcConfiguration {
             },
             tcp_candidate_policy: c.tcp_candidate_policy,
             frame_metadata: c.frame_metadata,
+            sctp_snap: c.sctp_snap,
         }
     }
 }
@@ -2499,6 +2515,19 @@ impl PeerConnectionFactoryBuilder {
             .take()
             .ok_or_else(|| PyRuntimeError::new_err("builder already consumed by build()"))?;
         self.pending = Some(b.with_metadata(enabled));
+        Ok(())
+    }
+
+    /// Run the DTLS handshake inside the ICE binding requests — SPED
+    /// (draft-hancke-webrtc-sped). Default disabled; the peer must support it
+    /// too, and it falls back to the normal post-ICE handshake when it does
+    /// not.
+    fn with_dtls_in_stun(&mut self, enabled: bool) -> PyResult<()> {
+        let b = self
+            .pending
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("builder already consumed by build()"))?;
+        self.pending = Some(b.with_dtls_in_stun(enabled));
         Ok(())
     }
 

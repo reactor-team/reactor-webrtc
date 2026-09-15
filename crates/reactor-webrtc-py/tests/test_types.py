@@ -83,6 +83,15 @@ class TestRtcConfiguration:
         c.ice_servers = []
         assert c.ice_servers == []
 
+    def test_sctp_snap_defaults_off(self):
+        assert rw.RtcConfiguration().sctp_snap is False
+
+    def test_sctp_snap_kwarg_and_setter(self):
+        c = rw.RtcConfiguration(sctp_snap=True)
+        assert c.sctp_snap is True
+        c.sctp_snap = False
+        assert c.sctp_snap is False
+
 
 class TestIceCandidate:
     def test_required_candidate_field(self):
