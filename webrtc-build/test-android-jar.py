@@ -16,8 +16,33 @@ spec = importlib.util.spec_from_file_location(
 )
 checker = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(checker)
+CONFIGURE = HERE / "configure-android-jni-build.py"
 PREFIX = "inc.reactor"
 PATH_PREFIX = "inc/reactor/"
+
+# Trimmed to the structure configure-android-jni-build.py keys off; the real
+# sdk/android/BUILD.gn differs only in the length of the deps list.
+UPSTREAM_BUILD_GN = """\
+if (is_android) {
+  dist_jar("libwebrtc") {
+    _target_dir_name = get_label_info(":$target_name", "dir")
+    output = "${root_out_dir}/lib.java${_target_dir_name}/${target_name}.jar"
+    direct_deps_only = true
+    use_unprocessed_jars = true
+    requires_android = true
+
+    deps = [
+      ":base_java",
+      ":peerconnection_java",
+      "../../third_party/jni_zero:jni_zero_java",
+    ]
+  }
+
+  rtc_android_library("libjingle_peerconnection_java") {
+    sources = [ "src/java/org/webrtc/Empty.java" ]
+  }
+}
+"""
 
 
 def class_file(name, descriptor="Ljava/lang/Object;"):
@@ -117,6 +142,74 @@ class AndroidJarTest(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("Android JAR validation failed", result.stderr)
             self.assertFalse((scripts / "dist").exists())
+
+
+class AndroidBuildGnTest(unittest.TestCase):
+    """The GN edits that decide what lands in the published JAR."""
+
+    def configure(self, source=UPSTREAM_BUILD_GN):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.build_gn = Path(temp.name) / "BUILD.gn"
+        self.build_gn.write_text(source)
+        result = subprocess.run(
+            ["python3", str(CONFIGURE), str(self.build_gn)],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return self.build_gn.read_text()
+
+    def test_dist_jar_keeps_transitive_jni_wrappers(self):
+        self.assertIn("direct_deps_only = false", self.configure())
+
+    def test_dist_jar_relocates_both_owned_namespaces(self):
+        configured = self.configure()
+        self.assertIn(
+            '"org.webrtc.**->${android_jni_package_prefix}.org.webrtc"', configured
+        )
+        self.assertIn(
+            '"org.jni_zero.**->${android_jni_package_prefix}.org.jni_zero"', configured
+        )
+
+    def test_registration_srcjar_is_not_consumed_via_srcjar_deps(self):
+        # android_library() appends jar_excluded_patterns = [ "*/*GEN_JNI.class" ]
+        # to any target whose srcjar_deps mention "jni", and javac applies that
+        # exclusion — so GEN_JNI would be stripped before the dist JAR is merged.
+        configured = self.configure()
+        self.assertNotIn("srcjar_deps =", configured)
+        self.assertIn(
+            'srcjars = [ "$target_gen_dir/'
+            'libjingle_peerconnection_so__jni_registration.srcjar" ]',
+            configured,
+        )
+
+    def test_gen_jni_target_is_reachable_from_the_dist_jar(self):
+        configured = self.configure()
+        self.assertIn(
+            'rtc_android_library("reactor_jni_registration_java")', configured
+        )
+        dist_jar_deps = configured[configured.index('dist_jar("libwebrtc")') :]
+        self.assertIn('":reactor_jni_registration_java",', dist_jar_deps)
+
+    def test_gen_jni_compiles_against_the_dist_jar_classpath(self):
+        # GEN_JNI's native stubs are declared over the SDK's own Java types.
+        configured = self.configure()
+        registration = configured[
+            configured.index('rtc_android_library("reactor_jni_registration_java")') :
+            configured.index('dist_jar("libwebrtc")')
+        ]
+        for dep in (
+            '":libjingle_peerconnection_so__jni_registration",',
+            '":base_java",',
+            '":peerconnection_java",',
+            '"../../third_party/jni_zero:jni_zero_java",',
+        ):
+            self.assertIn(dep, registration)
+
+    def test_rerunning_is_a_no_op(self):
+        configured = self.configure()
+        self.assertEqual(self.configure(configured), configured)
 
 
 if __name__ == "__main__":

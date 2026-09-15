@@ -85,7 +85,21 @@ try {
   # gclient sync refuses a dirty tree (our patches from a prior build) → reset.
   if (Test-Path (Join-Path $CHECKOUT '.git')) { & git -C src reset --hard | Out-Null }
   Write-Host "==> gclient sync -> src@$REF (--with_branch_heads)"
-  Run 'gclient.bat' @('sync', '--with_branch_heads', '--no-history', '--shallow', '-r', "src@$REF", '-D')
+  $syncOk = $false
+  for ($attempt = 1; $attempt -le 3; $attempt++) {
+    try {
+      Run 'gclient.bat' @('sync', '--with_branch_heads', '--no-history', '--shallow', '-r', "src@$REF", '-D')
+      $syncOk = $true
+      break
+    } catch {
+      if ($attempt -lt 3) {
+        $delay = $attempt * 20
+        Write-Warning "gclient sync failed (attempt $attempt/3); retrying in ${delay}s"
+        Start-Sleep -Seconds $delay
+      }
+    }
+  }
+  if (-not $syncOk) { throw 'gclient sync failed after 3 attempts' }
   $RESOLVED = (& git -C src rev-parse HEAD).Trim()
   Write-Host "==> resolved WebRTC commit: $RESOLVED"
 }

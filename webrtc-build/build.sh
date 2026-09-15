@@ -216,7 +216,19 @@ if [ -d src/third_party/.git ]; then
 fi
 rm -f src/build/config/reactor_musl.gni src/build/toolchain/linux/reactor_musl/BUILD.gn
 echo "==> gclient sync -> src@$REF (--with_branch_heads)"
-gclient sync --with_branch_heads --no-history --shallow -r "src@$REF" -D
+sync_ok=false
+for attempt in 1 2 3; do
+  if gclient sync --with_branch_heads --no-history --shallow -r "src@$REF" -D; then
+    sync_ok=true
+    break
+  fi
+  if [ "$attempt" -lt 3 ]; then
+    delay=$((attempt * 20))
+    echo "==> gclient sync failed (attempt $attempt/3); retrying in ${delay}s" >&2
+    sleep "$delay"
+  fi
+done
+$sync_ok || { echo "gclient sync failed after 3 attempts" >&2; exit 1; }
 RESOLVED="$(git -C src rev-parse HEAD)"
 echo "==> resolved WebRTC commit: $RESOLVED  (lock this in WEBRTC_VERSION:WEBRTC_COMMIT)"
 
@@ -239,6 +251,13 @@ for p in "${patches[@]}"; do
   git apply --3way "$p" 2>/dev/null || patch -p1 < "$p"
 done
 shopt -u nullglob
+
+# sdk/android/BUILD.gn is edited structurally rather than by context diff: it
+# churns upstream every milestone. See configure-android-jni-build.py.
+if [ "$OS" = android ]; then
+  echo "==> configuring sdk/android/BUILD.gn for the Reactor JNI package prefix"
+  python3 "$HERE/configure-android-jni-build.py" sdk/android/BUILD.gn
+fi
 
 # Cross-compiling linux/arm64 from an x86_64 host needs the arm64 sysroot, which
 # the default sync (host arch only) does not fetch.
