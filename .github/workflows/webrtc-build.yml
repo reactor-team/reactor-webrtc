@@ -100,13 +100,7 @@ jobs:
             fi
           fi
           if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
-            # Keep pull-request iteration focused on the failing Android
-            # packaging path. Main pushes still build the complete matrix.
-            if [ "${{ github.event_name }}" = "pull_request" ]; then
-              t=android
-            else
-              t=full
-            fi
+            t=full
             prof=debug
             if [ "$publish_release" = true ]; then
               prof=release
