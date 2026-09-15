@@ -248,18 +248,14 @@ for p in "${patches[@]}"; do
   echo "==> applying patch $(basename "$p")"
   # Try git apply (works for files tracked by the main WebRTC repo); fall back
   # to patch(1) for files in third_party sub-repos (e.g. jni_zero).
-  if [ "$(basename "$p")" = "0002-android-jni-package-prefix.patch" ]; then
-    filtered="$(mktemp)"
-    sed '/^diff --git a\/sdk\/android\/BUILD.gn/,$d' "$p" > "$filtered"
-    patch -p1 -F 2 < "$filtered"
-    rm -f "$filtered"
-  else
-    git apply --3way "$p" 2>/dev/null || patch -p1 -F 2 < "$p"
-  fi
+  git apply --3way "$p" 2>/dev/null || patch -p1 < "$p"
 done
 shopt -u nullglob
 
+# sdk/android/BUILD.gn is edited structurally rather than by context diff: it
+# churns upstream every milestone. See configure-android-jni-build.py.
 if [ "$OS" = android ]; then
+  echo "==> configuring sdk/android/BUILD.gn for the Reactor JNI package prefix"
   python3 "$HERE/configure-android-jni-build.py" sdk/android/BUILD.gn
 fi
 

@@ -74,34 +74,3 @@ index 532b59115295..2713c942b6bf 100644
        } else {
          if (is_robolectric) {
            not_needed(invoker, [ "jar_file" ])
-diff --git a/sdk/android/BUILD.gn b/sdk/android/BUILD.gn
---- a/sdk/android/BUILD.gn
-+++ b/sdk/android/BUILD.gn
-@@ -33,8 +33,19 @@
--    direct_deps_only = true
-+    # Generated *Jni wrappers are transitive Java dependencies. Excluding them
-+    # produces a JAR which compiles before publication but cannot pass R8 or
-+    # execute Java-to-native callbacks after installation.
-+    direct_deps_only = false
-     use_unprocessed_jars = true
-     requires_android = true
- 
-+    # Reactor: JNI package-prefix changes native lookups, not Java bytecode.
-+    # Relocate both WebRTC and its JNI runtime with the same GN argument.
-+    if (android_jni_package_prefix != "") {
-+      renaming_rules = [
-+        "org.webrtc.**->${android_jni_package_prefix}.org.webrtc",
-+        "org.jni_zero.**->${android_jni_package_prefix}.org.jni_zero",
-+      ]
-+    }
- 
-     deps = [
-      ":audio_api_java",
- 
-@@ -79,3 +79,6 @@
-   rtc_android_library("libjingle_peerconnection_java") {
-     sources = [ "src/java/org/webrtc/Empty.java" ]
- 
-+    # Include the generated GEN_JNI registration sources in the aggregate
-+    # Java target already consumed by dist_jar("libwebrtc").
-+    srcjar_deps = [ ":libjingle_peerconnection_so__jni_registration" ]

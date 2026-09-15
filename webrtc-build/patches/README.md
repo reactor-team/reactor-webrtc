@@ -66,10 +66,13 @@ get instead.)
 
 ### 0002 — Android JNI package prefix, compat aliases and complete Java distribution
 
-`0002-android-jni-package-prefix.patch` · touches `third_party/jni_zero/jni_zero.gni`,
-`third_party/jni_zero/codegen/header_common.py`, and `sdk/android/BUILD.gn`.
+`0002-android-jni-package-prefix.patch` · touches `third_party/jni_zero/jni_zero.gni`
+and `third_party/jni_zero/codegen/header_common.py`. Its Android half lives in
+`../configure-android-jni-build.py`, which rewrites `sdk/android/BUILD.gn`
+structurally: that file churns upstream every milestone, so a context diff for
+it goes stale far faster than the jni_zero hunks.
 
-**What.** Three coordinated changes applied as one patch:
+**What.** Three coordinated changes, applied together for Android builds:
 
 1. Adds a `declare_args() { android_jni_package_prefix = "" }` GN variable to
    `jni_zero.gni` and wires it as `--package-prefix <value>` into both the
@@ -87,11 +90,13 @@ get instead.)
    #define org_webrtc_Foo_clazz inc_reactor_org_webrtc_Foo_clazz
    ```
 
-3. Configures `dist_jar("libwebrtc")` in `sdk/android/BUILD.gn` to relocate
-   WebRTC and JNI Zero Java bytecode using the same prefix (p7), and sets
+3. `configure-android-jni-build.py` configures `dist_jar("libwebrtc")` to
+   relocate WebRTC and JNI Zero Java bytecode using the same prefix (p7), sets
    `direct_deps_only = false` to include transitive generated `*Jni` wrappers
-   (p9). The package validator checks both namespace relocation and closure
-   of runtime references within those two owned namespaces.
+   (p8), and adds a `reactor_jni_registration_java` target that carries
+   `GEN_JNI` into the dist JAR (p9). The package validator checks both
+   namespace relocation and closure of runtime references within those two
+   owned namespaces.
 
 **Why.** WebRTC's Android SDK ships Java classes under `org.webrtc.*`. Setting
 `android_jni_package_prefix = "inc.reactor"` in `build.sh` produces
@@ -258,15 +263,28 @@ p6 shipped a JAR that could not satisfy its native class lookups.
 
 The Android build explicitly builds `sdk/android:libwebrtc`. `package.sh` requires
 that exact output and validates it against `args.gn` before staging any archive.
-The patch adds an `rtc_android_library` wrapper around the
-`libjingle_peerconnection_so__jni_registration` srcjar and includes that Java
-target in the dist target. It emits the relocated `inc/reactor/org/jni_zero/GEN_JNI.class` required
-by generated `*Jni` wrappers. Omitting that srcjar makes the archive fail R8 with
-missing `GEN_JNI` even though Java compilation succeeds.
+
+Every generated `*Jni` wrapper calls into `GEN_JNI`, which jni_zero emits into
+`libjingle_peerconnection_so__jni_registration.srcjar`. No Java target in
+`sdk/android/BUILD.gn` consumes that srcjar, so p8's JAR shipped wrappers whose
+`GEN_JNI` did not exist. `configure-android-jni-build.py` adds an
+`rtc_android_library("reactor_jni_registration_java")` that compiles the srcjar
+and is depended on by the dist target, producing the relocated
+`inc/reactor/org/jni_zero/GEN_JNI.class`.
+
+That library consumes the srcjar **by path** (`srcjars`), not through
+`srcjar_deps`: `android_library()` in `build/config/android/rules.gni` appends
+`jar_excluded_patterns = [ "*/*GEN_JNI.class" ]` to any target whose
+`srcjar_deps` mention `jni`, and javac itself applies that exclusion — via
+`srcjar_deps` the class never reaches even the unprocessed jar, and the dist
+JAR merges a hole. The generating action stays in `deps` so ninja still orders
+the two.
+
 The validator checks both bootstrap classes, rejects remaining upstream-package
 classes and runtime linkage references, and fails on a missing JAR. Debug-only
 local-variable type tables and literal log tags are not linkage references.
-Run `mise run test:android-jar` for the packaging regression suite.
+Run `mise run test:android-jar` for the packaging regression suite, which covers
+the validator and the `sdk/android/BUILD.gn` rewrite.
 
 ### Android runtime closure (p9)
 
