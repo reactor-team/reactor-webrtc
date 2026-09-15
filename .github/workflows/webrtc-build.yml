@@ -66,9 +66,11 @@ jobs:
       profile: ${{ steps.gen.outputs.profile }}
       publish_release: ${{ steps.gen.outputs.publish_release }}
     steps:
+      # Full history: the publish gate below diffs github.event.before, which a
+      # shallow clone does not contain once a push batches more than one commit.
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 2
+          fetch-depth: 0
       - id: gen
         run: |
           mac_arm='{"os":"mac","arch":"arm64","runner":"macos-15"}'
@@ -93,9 +95,15 @@ jobs:
           t="${{ github.event.inputs.targets }}"
           prof="${{ github.event.inputs.profile }}"
           publish_release=false
+          # What makes a prebuilt different from the last one: the pinned upstream
+          # revision, the patch series itself, and configure-android-jni-build.py
+          # (which carries the Android half of patch 0002). Deliberately NOT the
+          # patch READMEs: publish.sh uploads with --clobber under a tag derived
+          # from REACTOR_PATCH_LEVEL, so a docs-only push would overwrite assets
+          # consumers already pin by sha256.
           if [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref }}" = "refs/heads/main" ]; then
             changed="$(git diff --name-only "${{ github.event.before }}" "${{ github.sha }}")"
-            if printf '%s\n' "$changed" | grep -Eq '^(WEBRTC_VERSION|webrtc-build/patches/)'; then
+            if printf '%s\n' "$changed" | grep -Eq '^(WEBRTC_VERSION$|webrtc-build/patches/.*\.patch$|webrtc-build/configure-android-jni-build\.py$)'; then
               publish_release=true
             fi
           fi
