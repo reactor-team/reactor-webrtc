@@ -547,8 +547,10 @@ class TestStats:
         ok = await connect(p1, p2)
         assert ok, "peers did not connect within timeout"
 
-        # Timing frames are marked about once a second, so keep sending until
-        # the receiver reports one (or give up after ~15 s).
+        # Keep sending until the receiver reports a timing frame and 30 frames
+        # have gone through both ends (or give up after ~15 s). The first frame
+        # is often a timing frame already, and a single small frame on
+        # loopback can total a zero wait and a zero processing time.
         inbound = outbound = None
         for i in range(450):
             bgra = bytes([(i * 7) % 256]) * (320 * 240 * 4)
@@ -559,7 +561,13 @@ class TestStats:
                 sent = await p1.pc.get_stats()
                 inbound = next((s for s in recv.inbound_rtp if s.kind == rw.StreamKind.Video), None)
                 outbound = next((s for s in sent.outbound_rtp if s.kind == rw.StreamKind.Video), None)
-                if inbound is not None and inbound.timing_frame is not None and outbound is not None:
+                if (
+                    inbound is not None
+                    and outbound is not None
+                    and inbound.timing_frame is not None
+                    and inbound.frames_decoded >= 30
+                    and outbound.frames_encoded >= 30
+                ):
                     break
 
         assert inbound is not None and outbound is not None, "no video stream stats"
@@ -567,9 +575,7 @@ class TestStats:
         assert outbound.total_encode_time_s > 0.0
         assert outbound.total_packet_send_delay_s >= 0.0
         assert inbound.jitter_buffer_emitted_count > 0
-        # On loopback a frame can leave the jitter buffer as soon as it lands:
-        # the Windows runner reports a total of exactly zero.
-        assert inbound.jitter_buffer_delay_s >= 0.0
+        assert inbound.jitter_buffer_delay_s > 0.0
         assert inbound.total_processing_delay_s > 0.0
 
         t = inbound.timing_frame
