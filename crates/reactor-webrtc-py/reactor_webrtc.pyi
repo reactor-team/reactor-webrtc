@@ -229,15 +229,16 @@ class InboundRtpStats:
     jitter_buffer_emitted_count: int
     #: Cumulative first-packet-to-decoded seconds, over frames_decoded.
     total_processing_delay_s: float
-    #: The latest timing frame, or None until the sender marks one. Video only.
+    #: The slowest timing frame of the last second, or None if none arrived in
+    #: it. Video only.
     timing_frame: Optional[TimingFrameInfo]
 
 class TimingFrameInfo:
     """One frame stamped at each stage of its trip, as the receiver reports it.
 
-    ``sender`` timestamps are on the sender's clock and ``receiver`` ones on ours,
-    so only differences within one group mean anything. Consecutive reads can
-    report the same frame again; compare ``rtp_timestamp``.
+    Of the timing frames in the last second, it is the one that took longest. ``sender`` and ``receiver`` group the timestamps by the side that
+    took them; only differences within one group are times. Consecutive reads
+    can report the same frame again; compare ``rtp_timestamp``.
     """
 
     rtp_timestamp: int
@@ -245,7 +246,7 @@ class TimingFrameInfo:
     receiver: TimingFrameReceiverTimestamps
 
 class TimingFrameSenderTimestamps:
-    """The sender's timestamps of a TimingFrameInfo, on the sender's clock."""
+    """The timestamps the sender took for a TimingFrameInfo."""
 
     encode_start_ms: int
     encode_finish_ms: int
@@ -253,7 +254,7 @@ class TimingFrameSenderTimestamps:
     pacer_exit_ms: int
 
 class TimingFrameReceiverTimestamps:
-    """The receiver's timestamps of a TimingFrameInfo, on our clock."""
+    """The timestamps the receiver (this side) took for a TimingFrameInfo."""
 
     receive_start_ms: int
     receive_finish_ms: int

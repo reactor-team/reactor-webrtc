@@ -585,8 +585,10 @@ Six things worth knowing before you read a number off this.
 
   `timing_frame` on a video `inbound_rtp` is a single frame libwebrtc stamped at
   each stage, including the packetizer and the pacer, which no total covers. The
-  sender marks about one a second, and consecutive reads can return the same
-  one again, so compare `rtp_timestamp` before counting it twice. Its stamps
-  come in two groups: `sender` on the sender's clock and `receiver` on yours.
-  Only differences within one group are times, and a difference across the two
-  is not the network.
+  sender marks about one a second, and of those that arrived in the last
+  second libwebrtc reports the one that took longest — the worst recent frame,
+  not a typical one; with none in that second, it is absent. Consecutive reads can return the same one again,
+  so compare `rtp_timestamp` before counting it twice. Its stamps come in two
+  groups, `sender` and `receiver`, by the side that took them. Only
+  differences within one group are times, and a difference across the two is
+  not the network.

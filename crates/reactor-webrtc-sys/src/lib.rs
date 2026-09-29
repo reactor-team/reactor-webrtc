@@ -324,13 +324,13 @@ pub struct ReactorStatEntry {
     pub frames_encoded: u64,
     /// frames that left the jitter buffer (kind 0)
     pub jitter_buffer_emitted_count: u64,
-    /// 1 if the `timing_*` fields hold the latest timing frame (kind 0, video)
+    /// 1 if the `timing_*` fields hold a timing frame (kind 0, video): the one
+    /// that took longest in the last second
     pub timing_frame_present: u64,
     /// RTP timestamp of that timing frame, to tell one sample from the next
     pub timing_frame_rtp_timestamp: u64,
-    /// Timing frame stamps in milliseconds. Sender stamps are on the sender's
-    /// clock and receiver stamps on ours, so only differences within one side
-    /// mean anything.
+    /// Timing frame stamps in milliseconds. Only differences within one side's
+    /// stamps mean anything.
     pub timing_encode_start_ms: i64,
     pub timing_encode_finish_ms: i64,
     pub timing_packetization_finish_ms: i64,

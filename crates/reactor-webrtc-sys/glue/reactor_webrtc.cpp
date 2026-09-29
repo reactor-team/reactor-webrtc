@@ -199,11 +199,11 @@ struct ReactorStatEntry {
   double   total_processing_delay;     // seconds, kind 0, over frames_decoded
   uint64_t frames_encoded;             // kind 1
   uint64_t jitter_buffer_emitted_count; // kind 0
-  // The latest timing frame (kind 0, video): one frame libwebrtc stamped at
-  // each stage, carried in the video-timing RTP header extension and reported
-  // as goog_timing_frame_info. Sender stamps are on the sender's clock and
-  // receiver stamps on ours, so only differences within one side mean
-  // anything. All zero when timing_frame_present is 0.
+  // A timing frame (kind 0, video): one frame libwebrtc stamped at each
+  // stage, carried in the video-timing RTP header extension and reported as
+  // goog_timing_frame_info — the one that took longest in the last second.
+  // Only differences within one side's stamps mean anything. All zero when
+  // timing_frame_present is 0.
   uint64_t timing_frame_present;       // 0/1
   uint64_t timing_frame_rtp_timestamp; // tells one sample from the next
   int64_t  timing_encode_start_ms;

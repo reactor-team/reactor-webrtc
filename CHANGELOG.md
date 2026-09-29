@@ -10,11 +10,12 @@ never carried, so a caller can see where a frame's time goes on each side.
 - `InboundRtpStats` gains `jitter_buffer_delay_s`,
   `jitter_buffer_target_delay_s`, `jitter_buffer_emitted_count` and
   `total_processing_delay_s`.
-- `InboundRtpStats::timing_frame` carries the latest `TimingFrameInfo`: one
-  video frame stamped at encode, packetization, pacer exit, receive and decode,
-  from libwebrtc's `video-timing` header extension. It is the only per-frame
-  view of the packetizer and the pacer. Its timestamps are grouped by clock:
-  `sender` (`TimingFrameSenderTimestamps`) and `receiver`
+- `InboundRtpStats::timing_frame` carries a `TimingFrameInfo`: one video frame
+  stamped at encode, packetization, pacer exit, receive and decode, from
+  libwebrtc's `video-timing` header extension — of those in the last second,
+  the one that took longest. It is the only per-frame view of the
+  packetizer and the pacer. Its timestamps are grouped by the side that took
+  them: `sender` (`TimingFrameSenderTimestamps`) and `receiver`
   (`TimingFrameReceiverTimestamps`).
 
 The new fields are public struct fields, so code that builds these structs by

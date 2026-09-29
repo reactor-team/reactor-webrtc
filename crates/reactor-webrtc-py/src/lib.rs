@@ -845,15 +845,16 @@ pub struct InboundRtpStats {
     /// Cumulative first-packet-to-decoded time in seconds, over
     /// `frames_decoded`.
     pub total_processing_delay_s: f64,
-    /// The latest timing frame, or `None` if the sender hasn't marked one yet.
-    /// Video only.
+    /// The slowest timing frame of the last second, or `None` if none arrived
+    /// in it. Video only.
     pub timing_frame: Option<TimingFrameInfo>,
 }
 
 /// One frame libwebrtc stamped at each stage of its trip, as the receiver
-/// reports it. `sender` timestamps are on the sender's clock and `receiver` ones
-/// on ours, so only differences within one group mean anything. Consecutive
-/// reads can report the same frame again; compare `rtp_timestamp`.
+/// reports it: of the timing frames in the last second, the one that took
+/// longest. `sender` and `receiver` group the timestamps by the side that
+/// took them; only differences within one group are times. Consecutive reads
+/// can report the same frame again; compare `rtp_timestamp`.
 #[pyclass(get_all)]
 #[derive(Clone)]
 pub struct TimingFrameInfo {
@@ -862,7 +863,7 @@ pub struct TimingFrameInfo {
     pub receiver: TimingFrameReceiverTimestamps,
 }
 
-/// The sender's timestamps of a `TimingFrameInfo`, on the sender's clock.
+/// The timestamps the sender took for a `TimingFrameInfo`.
 #[pyclass(get_all)]
 #[derive(Clone)]
 pub struct TimingFrameSenderTimestamps {
@@ -872,7 +873,7 @@ pub struct TimingFrameSenderTimestamps {
     pub pacer_exit_ms: i64,
 }
 
-/// The receiver's timestamps of a `TimingFrameInfo`, on our clock.
+/// The timestamps the receiver (this side) took for a `TimingFrameInfo`.
 #[pyclass(get_all)]
 #[derive(Clone)]
 pub struct TimingFrameReceiverTimestamps {

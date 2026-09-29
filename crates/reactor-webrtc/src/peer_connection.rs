@@ -940,7 +940,8 @@ pub struct InboundRtpStats {
     /// Cumulative time from a frame's first packet arriving to it being
     /// decoded, in seconds, over [`InboundRtpStats::frames_decoded`].
     pub total_processing_delay_s: f64,
-    /// The latest timing frame, if the sender has marked one yet. Video only.
+    /// The slowest timing frame of the last second, or `None` if none arrived
+    /// in it. Video only.
     pub timing_frame: Option<TimingFrameInfo>,
 }
 
@@ -948,15 +949,20 @@ pub struct InboundRtpStats {
 /// receiver (`goog_timing_frame_info`).
 ///
 /// The sender marks about one frame a second (and any unusually large one) and
-/// carries its stamps in the `video-timing` RTP header extension; the receiver
-/// adds its own. It is the only per-frame view of the packetizer and the pacer.
+/// carries its stamps in the `video-timing` RTP header extension, on the last
+/// packet of the frame; the receiver adds its own. It is the only per-frame
+/// view of the packetizer and the pacer. Of the timing frames that arrived in
+/// the last second, libwebrtc reports the one that took longest, so this is
+/// the worst recent frame, not a typical one.
 ///
-/// The timestamps come in two groups because they are on two clocks: `sender` on
-/// the sender's, `receiver` on ours. Only differences within one group mean
-/// anything: `sender.encode_finish_ms - sender.encode_start_ms` is encode time,
-/// `receiver.decode_start_ms - receiver.receive_finish_ms` is how long the
-/// frame waited in the jitter buffer. A difference across the two groups is not
-/// a network time.
+/// The timestamps come in two groups, by the side that took them. All of them
+/// are on our clock: libwebrtc moves the sender's onto it once it has estimated
+/// the offset between the two clocks, and until then reports them as negative
+/// values that are still right relative to each other. So differences within
+/// one group are times: `sender.encode_finish_ms - sender.encode_start_ms` is
+/// encode time, `receiver.decode_start_ms - receiver.receive_finish_ms` is how
+/// long the frame waited in the jitter buffer. A difference across the two
+/// groups is not a network time.
 ///
 /// The same frame can be reported by several consecutive reads; compare
 /// [`TimingFrameInfo::rtp_timestamp`] to tell a new sample from a repeat.
@@ -967,7 +973,7 @@ pub struct TimingFrameInfo {
     pub receiver: TimingFrameReceiverTimestamps,
 }
 
-/// The sender's timestamps of a [`TimingFrameInfo`], on the sender's clock.
+/// The timestamps the sender took for a [`TimingFrameInfo`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimingFrameSenderTimestamps {
     pub encode_start_ms: i64,
@@ -978,7 +984,7 @@ pub struct TimingFrameSenderTimestamps {
     pub pacer_exit_ms: i64,
 }
 
-/// The receiver's timestamps of a [`TimingFrameInfo`], on our clock.
+/// The timestamps the receiver (this side) took for a [`TimingFrameInfo`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimingFrameReceiverTimestamps {
     pub receive_start_ms: i64,
