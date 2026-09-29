@@ -307,6 +307,38 @@ pub struct ReactorStatEntry {
     pub available_incoming_bitrate: f64,
     /// frames per second (kinds 0 and 1), 0 if not measured
     pub frames_per_second: f64,
+    /// cumulative encode time in seconds (kind 1), over `frames_encoded`
+    pub total_encode_time: f64,
+    /// cumulative time packets waited in the pacer, in seconds (kind 1),
+    /// summed over packets rather than frames
+    pub total_packet_send_delay: f64,
+    /// cumulative jitter buffer delay in seconds (kind 0), over
+    /// `jitter_buffer_emitted_count`
+    pub jitter_buffer_delay: f64,
+    /// cumulative jitter buffer target delay in seconds (kind 0)
+    pub jitter_buffer_target_delay: f64,
+    /// cumulative receive-to-decoded delay in seconds (kind 0), over
+    /// `frames_decoded`
+    pub total_processing_delay: f64,
+    /// frames encoded (kind 1)
+    pub frames_encoded: u64,
+    /// frames that left the jitter buffer (kind 0)
+    pub jitter_buffer_emitted_count: u64,
+    /// 1 if the `timing_*` fields hold a timing frame (kind 0, video): the one
+    /// that took longest in the last second
+    pub timing_frame_present: u64,
+    /// RTP timestamp of that timing frame, to tell one sample from the next
+    pub timing_frame_rtp_timestamp: u64,
+    /// Timing frame stamps in milliseconds. Only differences within one side's
+    /// stamps mean anything.
+    pub timing_encode_start_ms: i64,
+    pub timing_encode_finish_ms: i64,
+    pub timing_packetization_finish_ms: i64,
+    pub timing_pacer_exit_ms: i64,
+    pub timing_receive_start_ms: i64,
+    pub timing_receive_finish_ms: i64,
+    pub timing_decode_start_ms: i64,
+    pub timing_decode_finish_ms: i64,
 }
 
 // The other half of the layout guard in
@@ -320,7 +352,7 @@ pub struct ReactorStatEntry {
 // with their neighbours are pinned too, on both sides.
 const _: () = {
     assert!(
-        core::mem::size_of::<ReactorStatEntry>() == 200,
+        core::mem::size_of::<ReactorStatEntry>() == 336,
         "ReactorStatEntry changed size — update the C struct in \
          glue/reactor_webrtc.cpp and both assertions"
     );
@@ -340,6 +372,18 @@ const _: () = {
     assert!(
         core::mem::offset_of!(ReactorStatEntry, fir_count) == 24,
         "the feedback counters moved — see above"
+    );
+    assert!(
+        core::mem::offset_of!(ReactorStatEntry, total_encode_time) == 200,
+        "the per-stage totals moved — see above"
+    );
+    assert!(
+        core::mem::offset_of!(ReactorStatEntry, timing_frame_present) == 256,
+        "the timing frame fields moved — see above"
+    );
+    assert!(
+        core::mem::offset_of!(ReactorStatEntry, timing_encode_start_ms) == 272,
+        "the timing frame stamps moved — see above"
     );
 };
 
