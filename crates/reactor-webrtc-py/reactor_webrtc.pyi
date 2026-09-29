@@ -223,6 +223,32 @@ class InboundRtpStats:
     frames_dropped: int
     frame_width: int
     frame_height: int
+    #: Cumulative seconds in the jitter buffer, over jitter_buffer_emitted_count.
+    jitter_buffer_delay_s: float
+    jitter_buffer_target_delay_s: float
+    jitter_buffer_emitted_count: int
+    #: Cumulative first-packet-to-decoded seconds, over frames_decoded.
+    total_processing_delay_s: float
+    #: The latest timing frame, or None until the sender marks one. Video only.
+    timing_frame: Optional[TimingFrameInfo]
+
+class TimingFrameInfo:
+    """One frame stamped at each stage of its trip, as the receiver reports it.
+
+    Sender stamps are on the sender's clock and receiver stamps on ours, so only
+    differences within one side mean anything. Consecutive reads can report the
+    same frame again; compare ``rtp_timestamp``.
+    """
+
+    rtp_timestamp: int
+    encode_start_ms: int
+    encode_finish_ms: int
+    packetization_finish_ms: int
+    pacer_exit_ms: int
+    receive_start_ms: int
+    receive_finish_ms: int
+    decode_start_ms: int
+    decode_finish_ms: int
 
 class OutboundRtpStats:
     ssrc: int
@@ -246,6 +272,11 @@ class OutboundRtpStats:
     frames_sent: int
     frame_width: int
     frame_height: int
+    frames_encoded: int
+    #: Cumulative encode seconds, over frames_encoded.
+    total_encode_time_s: float
+    #: Cumulative seconds packets waited in the pacer; per packet, not per frame.
+    total_packet_send_delay_s: float
 
 class IceCandidatePairStats:
     current_round_trip_time_s: float

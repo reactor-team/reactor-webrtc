@@ -530,7 +530,7 @@ for s in report.inbound_rtp:
 
 </details>
 
-Five things worth knowing before you read a number off this.
+Six things worth knowing before you read a number off this.
 
 - **Zero means "not measured yet" far more often than it means zero.** RTT, the
   available-bitrate estimates and `frames_per_second` all start at `0.0` and
@@ -574,3 +574,19 @@ Five things worth knowing before you read a number off this.
   On a send stream these are the requests, where `retransmitted_packets_sent` is
   what went out in answer to them — different quantities, and they diverge when
   a request goes unanswered.
+
+- **Per-stage times are cumulative totals.** `total_encode_time_s`,
+  `total_decode_time_s`, `jitter_buffer_delay_s` and `total_processing_delay_s`
+  keep growing for the life of the stream. Read two snapshots and divide the
+  change in the total by the change in its count — `frames_encoded`,
+  `frames_decoded`, `jitter_buffer_emitted_count` — for the average over that
+  interval. `total_packet_send_delay_s`, the time spent in the pacer, is summed
+  over packets rather than frames, so divide it by `packets_sent`.
+
+  `timing_frame` on a video `inbound_rtp` is a single frame libwebrtc stamped at
+  each stage, including the packetizer and the pacer, which no total covers. The
+  sender marks about one a second, and consecutive reads can return the same
+  one again, so compare `rtp_timestamp` before counting it twice. Its sender
+  stamps are on the sender's clock and its receiver stamps on yours: only
+  differences within one side are times, and a difference across the two is
+  not the network.

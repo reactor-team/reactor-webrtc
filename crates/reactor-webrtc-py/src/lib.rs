@@ -835,6 +835,60 @@ pub struct InboundRtpStats {
     /// Decoded frame size; `0` for audio, and before the first frame.
     pub frame_width: u32,
     pub frame_height: u32,
+    /// Cumulative time frames spent in the jitter buffer, in seconds, over
+    /// `jitter_buffer_emitted_count`.
+    pub jitter_buffer_delay_s: f64,
+    /// Cumulative delay the jitter buffer was aiming for, in seconds.
+    pub jitter_buffer_target_delay_s: f64,
+    /// Frames that have left the jitter buffer.
+    pub jitter_buffer_emitted_count: u64,
+    /// Cumulative first-packet-to-decoded time in seconds, over
+    /// `frames_decoded`.
+    pub total_processing_delay_s: f64,
+    /// The latest timing frame, or `None` if the sender hasn't marked one yet.
+    /// Video only.
+    pub timing_frame: Option<TimingFrameInfo>,
+}
+
+/// One frame libwebrtc stamped at each stage of its trip, as the receiver
+/// reports it. Sender stamps are on the sender's clock and receiver stamps on
+/// ours, so only differences within one side mean anything. Consecutive reads
+/// can report the same frame again; compare `rtp_timestamp`.
+#[pyclass(get_all)]
+#[derive(Clone)]
+pub struct TimingFrameInfo {
+    pub rtp_timestamp: u32,
+    pub encode_start_ms: i64,
+    pub encode_finish_ms: i64,
+    pub packetization_finish_ms: i64,
+    pub pacer_exit_ms: i64,
+    pub receive_start_ms: i64,
+    pub receive_finish_ms: i64,
+    pub decode_start_ms: i64,
+    pub decode_finish_ms: i64,
+}
+
+#[pymethods]
+impl TimingFrameInfo {
+    fn __repr__(&self) -> String {
+        format!("TimingFrameInfo(rtp_timestamp={})", self.rtp_timestamp)
+    }
+}
+
+impl From<rw::TimingFrameInfo> for TimingFrameInfo {
+    fn from(t: rw::TimingFrameInfo) -> Self {
+        Self {
+            rtp_timestamp: t.rtp_timestamp,
+            encode_start_ms: t.encode_start_ms,
+            encode_finish_ms: t.encode_finish_ms,
+            packetization_finish_ms: t.packetization_finish_ms,
+            pacer_exit_ms: t.pacer_exit_ms,
+            receive_start_ms: t.receive_start_ms,
+            receive_finish_ms: t.receive_finish_ms,
+            decode_start_ms: t.decode_start_ms,
+            decode_finish_ms: t.decode_finish_ms,
+        }
+    }
 }
 
 #[pymethods]
@@ -862,6 +916,11 @@ impl From<rw::InboundRtpStats> for InboundRtpStats {
             frames_dropped: s.frames_dropped,
             frame_width: s.frame_width,
             frame_height: s.frame_height,
+            jitter_buffer_delay_s: s.jitter_buffer_delay_s,
+            jitter_buffer_target_delay_s: s.jitter_buffer_target_delay_s,
+            jitter_buffer_emitted_count: s.jitter_buffer_emitted_count,
+            total_processing_delay_s: s.total_processing_delay_s,
+            timing_frame: s.timing_frame.map(TimingFrameInfo::from),
         }
     }
 }
@@ -908,6 +967,12 @@ pub struct OutboundRtpStats {
     /// Encoded frame size; `0` for audio, and before the first frame.
     pub frame_width: u32,
     pub frame_height: u32,
+    pub frames_encoded: u32,
+    /// Cumulative encode time in seconds, over `frames_encoded`.
+    pub total_encode_time_s: f64,
+    /// Cumulative time packets waited in the pacer, in seconds. Summed over
+    /// packets, not frames: divide by `packets_sent`.
+    pub total_packet_send_delay_s: f64,
 }
 
 #[pymethods]
@@ -937,6 +1002,9 @@ impl From<rw::OutboundRtpStats> for OutboundRtpStats {
             frames_sent: s.frames_sent,
             frame_width: s.frame_width,
             frame_height: s.frame_height,
+            frames_encoded: s.frames_encoded,
+            total_encode_time_s: s.total_encode_time_s,
+            total_packet_send_delay_s: s.total_packet_send_delay_s,
         }
     }
 }
@@ -2974,6 +3042,7 @@ fn reactor_webrtc(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<IceCandidateType>()?;
     m.add_class::<RelayProtocol>()?;
     m.add_class::<InboundRtpStats>()?;
+    m.add_class::<TimingFrameInfo>()?;
     m.add_class::<OutboundRtpStats>()?;
     m.add_class::<IceCandidatePairStats>()?;
     m.add_class::<StatsReport>()?;

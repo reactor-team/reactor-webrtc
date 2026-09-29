@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.19.0 — Per-stage latency in stats
+
+Expose the per-stage timings libwebrtc already computes but the stats copy
+never carried, so a caller can see where a frame's time goes on each side.
+
+- `OutboundRtpStats` gains `frames_encoded`, `total_encode_time_s` and
+  `total_packet_send_delay_s` (time in the pacer, summed over packets).
+- `InboundRtpStats` gains `jitter_buffer_delay_s`,
+  `jitter_buffer_target_delay_s`, `jitter_buffer_emitted_count` and
+  `total_processing_delay_s`.
+- `InboundRtpStats::timing_frame` carries the latest `TimingFrameInfo`: one
+  video frame stamped at encode, packetization, pacer exit, receive and decode,
+  from libwebrtc's `video-timing` header extension. It is the only per-frame
+  view of the packetizer and the pacer.
+
+The new fields are public struct fields, so code that builds these structs by
+hand needs them. The glue ABI version advances 4 -> 5. All three crates advance
+to 0.19.0; the default native archive remains `webrtc-7907-a5ddff60-p9`.
+
 ## 0.18.0 — Faster connection setup (WARP: SPED + SNAP)
 
 Expose the two WARP connection-setup opt-ins our pinned libwebrtc already

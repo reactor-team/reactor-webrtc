@@ -927,6 +927,53 @@ pub struct InboundRtpStats {
     /// Decoded frame size; `0` for audio, and before the first frame.
     pub frame_width: u32,
     pub frame_height: u32,
+    /// Cumulative time frames spent in the jitter buffer, in seconds. Divide
+    /// the change over an interval by the change in
+    /// [`InboundRtpStats::jitter_buffer_emitted_count`] for the average per
+    /// frame over that interval.
+    pub jitter_buffer_delay_s: f64,
+    /// Cumulative delay the jitter buffer was aiming for, in seconds, over the
+    /// same count.
+    pub jitter_buffer_target_delay_s: f64,
+    /// Frames that have left the jitter buffer.
+    pub jitter_buffer_emitted_count: u64,
+    /// Cumulative time from a frame's first packet arriving to it being
+    /// decoded, in seconds, over [`InboundRtpStats::frames_decoded`].
+    pub total_processing_delay_s: f64,
+    /// The latest timing frame, if the sender has marked one yet. Video only.
+    pub timing_frame: Option<TimingFrameInfo>,
+}
+
+/// One frame libwebrtc stamped at each stage of its trip, as reported by the
+/// receiver (`goog_timing_frame_info`).
+///
+/// The sender marks about one frame a second (and any unusually large one) and
+/// carries its stamps in the `video-timing` RTP header extension; the receiver
+/// adds its own. It is the only per-frame view of the packetizer and the pacer.
+///
+/// Sender stamps are on the sender's clock and receiver stamps on ours, so only
+/// differences within one side mean anything: `encode_finish_ms -
+/// encode_start_ms` is encode time, `decode_start_ms - receive_finish_ms` is
+/// how long the frame waited in the jitter buffer. A difference across the two
+/// sides is not a network time.
+///
+/// The same frame can be reported by several consecutive reads; compare
+/// [`TimingFrameInfo::rtp_timestamp`] to tell a new sample from a repeat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimingFrameInfo {
+    pub rtp_timestamp: u32,
+    /// Sender side.
+    pub encode_start_ms: i64,
+    pub encode_finish_ms: i64,
+    /// When the encoded frame had been cut into packets and handed to the pacer.
+    pub packetization_finish_ms: i64,
+    /// When the pacer sent the frame's last packet.
+    pub pacer_exit_ms: i64,
+    /// Receiver side.
+    pub receive_start_ms: i64,
+    pub receive_finish_ms: i64,
+    pub decode_start_ms: i64,
+    pub decode_finish_ms: i64,
 }
 
 /// `RTCOutboundRtpStreamStats` subset.
@@ -985,6 +1032,14 @@ pub struct OutboundRtpStats {
     /// Encoded frame size; `0` for audio, and before the first frame.
     pub frame_width: u32,
     pub frame_height: u32,
+    pub frames_encoded: u32,
+    /// Cumulative encode time in seconds, over
+    /// [`OutboundRtpStats::frames_encoded`].
+    pub total_encode_time_s: f64,
+    /// Cumulative time packets waited in the pacer before being sent, in
+    /// seconds. Summed over packets, not frames: divide by
+    /// [`OutboundRtpStats::packets_sent`].
+    pub total_packet_send_delay_s: f64,
 }
 
 /// `RTCIceCandidatePairStats` subset.
@@ -1287,6 +1342,21 @@ extern "C" fn stats_cb(ud: *mut c_void, entries: *const ReactorStatEntry, count:
                 frames_dropped: e.frames_dropped,
                 frame_width: e.frame_width,
                 frame_height: e.frame_height,
+                jitter_buffer_delay_s: e.jitter_buffer_delay,
+                jitter_buffer_target_delay_s: e.jitter_buffer_target_delay,
+                jitter_buffer_emitted_count: e.jitter_buffer_emitted_count,
+                total_processing_delay_s: e.total_processing_delay,
+                timing_frame: (e.timing_frame_present != 0).then_some(TimingFrameInfo {
+                    rtp_timestamp: e.timing_frame_rtp_timestamp as u32,
+                    encode_start_ms: e.timing_encode_start_ms,
+                    encode_finish_ms: e.timing_encode_finish_ms,
+                    packetization_finish_ms: e.timing_packetization_finish_ms,
+                    pacer_exit_ms: e.timing_pacer_exit_ms,
+                    receive_start_ms: e.timing_receive_start_ms,
+                    receive_finish_ms: e.timing_receive_finish_ms,
+                    decode_start_ms: e.timing_decode_start_ms,
+                    decode_finish_ms: e.timing_decode_finish_ms,
+                }),
             }),
             1 => report.outbound_rtp.push(OutboundRtpStats {
                 ssrc: e.ssrc,
@@ -1306,6 +1376,9 @@ extern "C" fn stats_cb(ud: *mut c_void, entries: *const ReactorStatEntry, count:
                 frames_sent: e.frames_sent,
                 frame_width: e.frame_width,
                 frame_height: e.frame_height,
+                frames_encoded: e.frames_encoded as u32,
+                total_encode_time_s: e.total_encode_time,
+                total_packet_send_delay_s: e.total_packet_send_delay,
             }),
             2 => report.candidate_pairs.push(IceCandidatePairStats {
                 current_round_trip_time_s: e.current_round_trip_time,
