@@ -348,28 +348,29 @@ mod tests {
         );
 
         let t = inbound.timing_frame.expect("timing frame");
+        let (s, r) = (t.sender, t.receiver);
         assert!(
-            t.encode_finish_ms >= t.encode_start_ms,
+            s.encode_finish_ms >= s.encode_start_ms,
             "encode ran backwards: {t:?}"
         );
         assert!(
-            t.packetization_finish_ms >= t.encode_finish_ms,
+            s.packetization_finish_ms >= s.encode_finish_ms,
             "packetized before encoded: {t:?}"
         );
         assert!(
-            t.pacer_exit_ms >= t.packetization_finish_ms,
+            s.pacer_exit_ms >= s.packetization_finish_ms,
             "paced before packetized: {t:?}"
         );
         assert!(
-            t.receive_finish_ms >= t.receive_start_ms,
+            r.receive_finish_ms >= r.receive_start_ms,
             "received backwards: {t:?}"
         );
         assert!(
-            t.decode_start_ms >= t.receive_finish_ms,
+            r.decode_start_ms >= r.receive_finish_ms,
             "decoded before received: {t:?}"
         );
         assert!(
-            t.decode_finish_ms >= t.decode_start_ms,
+            r.decode_finish_ms >= r.decode_start_ms,
             "decode ran backwards: {t:?}"
         );
 

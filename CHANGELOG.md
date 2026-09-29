@@ -13,7 +13,9 @@ never carried, so a caller can see where a frame's time goes on each side.
 - `InboundRtpStats::timing_frame` carries the latest `TimingFrameInfo`: one
   video frame stamped at encode, packetization, pacer exit, receive and decode,
   from libwebrtc's `video-timing` header extension. It is the only per-frame
-  view of the packetizer and the pacer.
+  view of the packetizer and the pacer. Its timestamps are grouped by clock:
+  `sender` (`TimingFrameSenderTimestamps`) and `receiver`
+  (`TimingFrameReceiverTimestamps`).
 
 The new fields are public struct fields, so code that builds these structs by
 hand needs them. The glue ABI version advances 4 -> 5. All three crates advance

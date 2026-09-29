@@ -851,17 +851,31 @@ pub struct InboundRtpStats {
 }
 
 /// One frame libwebrtc stamped at each stage of its trip, as the receiver
-/// reports it. Sender stamps are on the sender's clock and receiver stamps on
-/// ours, so only differences within one side mean anything. Consecutive reads
-/// can report the same frame again; compare `rtp_timestamp`.
+/// reports it. `sender` timestamps are on the sender's clock and `receiver` ones
+/// on ours, so only differences within one group mean anything. Consecutive
+/// reads can report the same frame again; compare `rtp_timestamp`.
 #[pyclass(get_all)]
 #[derive(Clone)]
 pub struct TimingFrameInfo {
     pub rtp_timestamp: u32,
+    pub sender: TimingFrameSenderTimestamps,
+    pub receiver: TimingFrameReceiverTimestamps,
+}
+
+/// The sender's timestamps of a `TimingFrameInfo`, on the sender's clock.
+#[pyclass(get_all)]
+#[derive(Clone)]
+pub struct TimingFrameSenderTimestamps {
     pub encode_start_ms: i64,
     pub encode_finish_ms: i64,
     pub packetization_finish_ms: i64,
     pub pacer_exit_ms: i64,
+}
+
+/// The receiver's timestamps of a `TimingFrameInfo`, on our clock.
+#[pyclass(get_all)]
+#[derive(Clone)]
+pub struct TimingFrameReceiverTimestamps {
     pub receive_start_ms: i64,
     pub receive_finish_ms: i64,
     pub decode_start_ms: i64,
@@ -879,14 +893,18 @@ impl From<rw::TimingFrameInfo> for TimingFrameInfo {
     fn from(t: rw::TimingFrameInfo) -> Self {
         Self {
             rtp_timestamp: t.rtp_timestamp,
-            encode_start_ms: t.encode_start_ms,
-            encode_finish_ms: t.encode_finish_ms,
-            packetization_finish_ms: t.packetization_finish_ms,
-            pacer_exit_ms: t.pacer_exit_ms,
-            receive_start_ms: t.receive_start_ms,
-            receive_finish_ms: t.receive_finish_ms,
-            decode_start_ms: t.decode_start_ms,
-            decode_finish_ms: t.decode_finish_ms,
+            sender: TimingFrameSenderTimestamps {
+                encode_start_ms: t.sender.encode_start_ms,
+                encode_finish_ms: t.sender.encode_finish_ms,
+                packetization_finish_ms: t.sender.packetization_finish_ms,
+                pacer_exit_ms: t.sender.pacer_exit_ms,
+            },
+            receiver: TimingFrameReceiverTimestamps {
+                receive_start_ms: t.receiver.receive_start_ms,
+                receive_finish_ms: t.receiver.receive_finish_ms,
+                decode_start_ms: t.receiver.decode_start_ms,
+                decode_finish_ms: t.receiver.decode_finish_ms,
+            },
         }
     }
 }
@@ -3043,6 +3061,8 @@ fn reactor_webrtc(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RelayProtocol>()?;
     m.add_class::<InboundRtpStats>()?;
     m.add_class::<TimingFrameInfo>()?;
+    m.add_class::<TimingFrameSenderTimestamps>()?;
+    m.add_class::<TimingFrameReceiverTimestamps>()?;
     m.add_class::<OutboundRtpStats>()?;
     m.add_class::<IceCandidatePairStats>()?;
     m.add_class::<StatsReport>()?;

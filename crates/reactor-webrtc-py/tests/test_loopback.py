@@ -580,9 +580,10 @@ class TestStats:
 
         t = inbound.timing_frame
         assert t is not None, "no timing frame reported within ~15 s"
-        assert t.encode_finish_ms >= t.encode_start_ms
-        assert t.pacer_exit_ms >= t.packetization_finish_ms >= t.encode_finish_ms
-        assert t.decode_finish_ms >= t.decode_start_ms >= t.receive_finish_ms >= t.receive_start_ms
+        s, r = t.sender, t.receiver
+        assert s.encode_finish_ms >= s.encode_start_ms
+        assert s.pacer_exit_ms >= s.packetization_finish_ms >= s.encode_finish_ms
+        assert r.decode_finish_ms >= r.decode_start_ms >= r.receive_finish_ms >= r.receive_start_ms
 
 
 # ── Frame metadata ────────────────────────────────────────────────────────────

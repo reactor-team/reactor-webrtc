@@ -235,16 +235,26 @@ class InboundRtpStats:
 class TimingFrameInfo:
     """One frame stamped at each stage of its trip, as the receiver reports it.
 
-    Sender stamps are on the sender's clock and receiver stamps on ours, so only
-    differences within one side mean anything. Consecutive reads can report the
-    same frame again; compare ``rtp_timestamp``.
+    ``sender`` timestamps are on the sender's clock and ``receiver`` ones on ours,
+    so only differences within one group mean anything. Consecutive reads can
+    report the same frame again; compare ``rtp_timestamp``.
     """
 
     rtp_timestamp: int
+    sender: TimingFrameSenderTimestamps
+    receiver: TimingFrameReceiverTimestamps
+
+class TimingFrameSenderTimestamps:
+    """The sender's timestamps of a TimingFrameInfo, on the sender's clock."""
+
     encode_start_ms: int
     encode_finish_ms: int
     packetization_finish_ms: int
     pacer_exit_ms: int
+
+class TimingFrameReceiverTimestamps:
+    """The receiver's timestamps of a TimingFrameInfo, on our clock."""
+
     receive_start_ms: int
     receive_finish_ms: int
     decode_start_ms: int
