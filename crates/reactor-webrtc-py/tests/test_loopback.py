@@ -567,7 +567,9 @@ class TestStats:
         assert outbound.total_encode_time_s > 0.0
         assert outbound.total_packet_send_delay_s >= 0.0
         assert inbound.jitter_buffer_emitted_count > 0
-        assert inbound.jitter_buffer_delay_s > 0.0
+        # On loopback a frame can leave the jitter buffer as soon as it lands:
+        # the Windows runner reports a total of exactly zero.
+        assert inbound.jitter_buffer_delay_s >= 0.0
         assert inbound.total_processing_delay_s > 0.0
 
         t = inbound.timing_frame
