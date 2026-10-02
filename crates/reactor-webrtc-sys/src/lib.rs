@@ -597,6 +597,11 @@ extern "C" {
     ) -> c_int;
     /// Current channel state: 0=Connecting 1=Open 2=Closing 3=Closed.
     pub fn reactor_webrtc_data_channel_state(data_channel: *mut DataChannel) -> c_int;
+    /// 1 when the channel delivers in order, 0 otherwise (or on error).
+    pub fn reactor_webrtc_data_channel_ordered(data_channel: *mut DataChannel) -> c_int;
+    /// 1 when the channel retransmits until delivery (no maxRetransmits and
+    /// no maxPacketLifeTime), 0 otherwise (or on error).
+    pub fn reactor_webrtc_data_channel_reliable(data_channel: *mut DataChannel) -> c_int;
     /// Set the buffered-amount-low threshold (bytes). The
     /// `on_buffered_amount_low` callback fires when `buffered_amount` drops to
     /// this value or below after a send.

@@ -1,6 +1,10 @@
 //! [`DcChunking`] — the factory-wide settings for large data-channel messages.
 
-use crate::{Error, Result};
+use std::sync::{Arc, Mutex};
+
+use reactor_webrtc_dc_chunking::sdp::{self, Params};
+
+use crate::{Error, Result, SessionDescription};
 
 /// Settings for chunked data channels, set on a factory with
 /// [`PeerConnectionFactoryBuilder::with_dc_chunking`](crate::PeerConnectionFactoryBuilder::with_dc_chunking).
@@ -70,6 +74,69 @@ impl DcChunking {
         config
             .validate()
             .map_err(|e| Error::Webrtc(format!("dc chunking: {e}")))
+    }
+}
+
+/// What one peer connection knows about data-channel chunking: its own
+/// settings, and the peer's parameters once the peer has declared chunking.
+/// Shared by the connection, its observer (for channels the peer opens) and
+/// every channel, so they all read the same negotiation.
+pub(crate) struct DcNegotiation {
+    settings: Option<DcChunking>,
+    remote: Mutex<Option<Params>>,
+}
+
+impl DcNegotiation {
+    pub(crate) fn new(settings: Option<DcChunking>) -> Arc<Self> {
+        Arc::new(Self {
+            settings,
+            remote: Mutex::new(None),
+        })
+    }
+
+    pub(crate) fn settings(&self) -> Option<&DcChunking> {
+        self.settings.as_ref()
+    }
+
+    /// The peer's parameters, once negotiated. `None` while this connection
+    /// does not take part or the peer has not declared chunking.
+    pub(crate) fn remote(&self) -> Option<Params> {
+        *self.remote.lock().unwrap()
+    }
+
+    /// An offer declares chunking whenever this connection takes part.
+    pub(crate) fn offer(&self, offer: SessionDescription) -> SessionDescription {
+        match &self.settings {
+            Some(s) => offer.with_dc_chunking(&Params::local(s.max_message_size)),
+            None => offer,
+        }
+    }
+
+    /// An answer declares it only when the offer did: offer/answer cannot
+    /// introduce a capability the offerer never asked for.
+    pub(crate) fn answer(&self, answer: SessionDescription) -> SessionDescription {
+        match (&self.settings, self.remote()) {
+            (Some(s), Some(_)) => answer.with_dc_chunking(&Params::local(s.max_message_size)),
+            _ => answer,
+        }
+    }
+
+    /// Record the peer's parameters from an applied remote description.
+    ///
+    /// Sticky: the first description that declares chunking settles it for
+    /// the life of the connection, and a later renegotiation that drops the
+    /// attribute does not undo it. Channels already open keep their framing
+    /// either way, and both ends must keep agreeing for new ones; the
+    /// offerer applies the answer before any SCTP data can flow, so both
+    /// sides have settled before the first channel opens.
+    pub(crate) fn on_remote_description(&self, remote: &SessionDescription) {
+        if self.settings.is_none() {
+            return;
+        }
+        let mut slot = self.remote.lock().unwrap();
+        if slot.is_none() {
+            *slot = sdp::parse(&remote.sdp);
+        }
     }
 }
 

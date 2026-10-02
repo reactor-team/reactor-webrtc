@@ -61,6 +61,9 @@ pub use encoded::{
     FrameDirection, FrameTransform, H264Backend, InlineEncoderCallback, LocalVideoTrack,
     PreEncodedOptions, RawVideoFrame, TrackVideoEncoder, VideoCodec, VideoTrackOptions,
 };
+/// What a peer declares in `a=x-reactor-dc-chunking` (see
+/// [`SessionDescription::with_dc_chunking`]).
+pub use reactor_webrtc_dc_chunking::Params as DcChunkingParams;
 
 /// Whether this build targets Apple (H.264 VideoToolbox backend exists).
 pub(crate) const HAVE_VIDEO_TOOLBOX: bool = cfg!(target_vendor = "apple");
@@ -296,7 +299,10 @@ impl PeerConnectionFactory {
         config: &RtcConfiguration,
         observer: PeerConnectionObserver,
     ) -> Result<PeerConnection> {
-        let state = observer.into_state(self.handle());
+        let dc_negotiation = dc_chunking::DcNegotiation::new(
+            self.dc_chunking.clone().filter(|_| config.dc_chunking),
+        );
+        let state = observer.into_state(self.handle(), Arc::clone(&dc_negotiation));
         let callbacks = state.callbacks();
         let native = config.to_native()?;
         // libwebrtc reports why it rejected the configuration (an empty TURN
@@ -326,7 +332,7 @@ impl PeerConnectionFactory {
             state,
             self.handle(),
             config.frame_metadata && self.metadata_enabled,
-            self.dc_chunking.clone().filter(|_| config.dc_chunking),
+            dc_negotiation,
         ))
     }
 
