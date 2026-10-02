@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.19.0 — Large data-channel messages (max_burst and chunking)
+
+A data-channel message used to take several round trips once it passed a few
+KB, and could not exceed 256 KiB on the wire or 16 MiB queued without
+libwebrtc closing the channel. Both limits go, for peers that opt in.
+
+- `PeerConnectionFactoryBuilder::with_dc_chunking(DcChunking)` sets dcsctp's
+  `max_burst` for every data channel of the factory (libwebrtc patch 0005,
+  default 256 instead of upstream's 4): a 100 KB message takes about one round
+  trip instead of five. It also offers chunking to every connection, through
+  a session-level `a=x-reactor-dc-chunking:1 max-message-size=<bytes>`
+  attribute that an answerer mirrors only when its own factory chunks.
+  `RtcConfiguration::dc_chunking` (default `true`) opts one connection out.
+- On a chunked channel (negotiated, ordered and fully reliable; see
+  `DataChannel::is_chunked`) `send` accepts messages up to 64 MiB, queues up
+  to 128 MiB beyond libwebrtc's buffer and feeds it 64 KiB frames, never
+  letting that buffer near the 16 MiB at which libwebrtc closes a channel.
+  `on_message` fires once per whole message. A refused send returns
+  `Error::DataChannel(DcSendError::{TooLarge, QueueFull})` and leaves the
+  channel open. New: `DataChannel::drain`, `close(drain_timeout)`, `ordered`,
+  `reliable`, `PeerConnection::dc_chunking` and `dc_chunking_negotiated`.
+- The framing, the SDP helpers and the send queue live in a new sans-I/O
+  crate, `reactor-webrtc-dc-chunking`, which builds for wasm32 so the browser
+  SDK can implement the same wire format.
+- Python: `PeerConnectionFactoryBuilder.with_dc_chunking(...)`,
+  `RtcConfiguration(dc_chunking=...)`, the new `DataChannel` methods
+  (`drain` is awaitable), and `DataChannelMessageTooLarge` /
+  `DataChannelQueueFull`, both `RuntimeError` subclasses.
+
+Breaking (0.x): `DataChannel`'s callback setters take `&self`, and
+`on_open`, `on_close` and `on_state_change` are independent instead of
+replacing one another. The glue ABI version advances 4 -> 5. All crates
+advance to 0.19.0, and the default native archive is
+`webrtc-7907-a5ddff60-p10`.
+
+Known limitation: dcsctp can stall for tens of seconds recovering from the
+first loss episode of a large transfer that overruns a queue on the path, at
+any `max_burst`.
+
 ## 0.18.0 — Faster connection setup (WARP: SPED + SNAP)
 
 Expose the two WARP connection-setup opt-ins our pinned libwebrtc already
