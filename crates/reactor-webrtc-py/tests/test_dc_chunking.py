@@ -1,0 +1,182 @@
+"""Data-channel chunking through the Python bindings.
+
+The factory here is built with ``with_dc_chunking``; this file overrides the
+session ``factory`` fixture, so (run one file per process, as the mise task
+does) it is the only factory alive. A "plain" peer is a connection that opts
+out with ``RtcConfiguration(dc_chunking=False)``.
+"""
+
+import asyncio
+import threading
+import time
+
+import pytest
+import reactor_webrtc as rw
+
+MIB = 1024 * 1024
+TIMEOUT = 20.0
+
+
+@pytest.fixture(scope="session")
+def factory() -> rw.PeerConnectionFactory:
+    builder = rw.PeerConnectionFactoryBuilder()
+    builder.with_dc_chunking()
+    return builder.build()
+
+
+class Peer:
+    def __init__(self, factory: rw.PeerConnectionFactory, config: rw.RtcConfiguration):
+        self.ice: list = []
+        self.channels: list = []
+        obs = rw.PeerConnectionObserver()
+        obs.on_ice_candidate = self.ice.append
+        obs.on_data_channel = self.channels.append
+        self.pc = factory.create_peer_connection(config, obs)
+
+
+async def wait_for(condition, timeout: float = TIMEOUT) -> None:
+    deadline = time.monotonic() + timeout
+    while not condition():
+        assert time.monotonic() < deadline, "timed out"
+        await asyncio.sleep(0.02)
+
+
+async def connect(factory, chunk_a: bool = True, chunk_b: bool = True):
+    """Two peers with one data channel; returns (a, b, channel_a, channel_b)."""
+    a = Peer(factory, rw.RtcConfiguration(dc_chunking=chunk_a))
+    b = Peer(factory, rw.RtcConfiguration(dc_chunking=chunk_b))
+    dc_a = a.pc.create_data_channel("data")
+    offer = await a.pc.create_offer()
+    await a.pc.set_local_description(offer)
+    await b.pc.set_remote_description(offer)
+    answer = await b.pc.create_answer()
+    await b.pc.set_local_description(answer)
+    await a.pc.set_remote_description(answer)
+
+    def trickle() -> bool:
+        for src, dst in ((a, b), (b, a)):
+            while src.ice:
+                asyncio.ensure_future(dst.pc.add_ice_candidate(src.ice.pop(0)))
+        return (
+            dc_a.state() == rw.DataChannelState.Open
+            and bool(b.channels)
+            and b.channels[0].state() == rw.DataChannelState.Open
+        )
+
+    await wait_for(trickle)
+    return a, b, dc_a, b.channels[0]
+
+
+def inbox(dc: rw.DataChannel) -> list:
+    got: list = []
+    dc.on_message(lambda data, binary: got.append((data, binary)))
+    return got
+
+
+def pattern(seed: int, n: int) -> bytes:
+    block = bytes((seed * 31 + i * 7) & 0xFF for i in range(256))
+    return (block * (n // 256 + 1))[:n]
+
+
+def test_with_dc_chunking_rejects_settings_that_cannot_work():
+    builder = rw.PeerConnectionFactoryBuilder()
+    builder.with_dc_chunking(chunk_size=1)
+    with pytest.raises(RuntimeError, match="chunk_size"):
+        builder.build()
+
+
+async def test_the_offer_declares_chunking_unless_the_connection_opts_out(factory):
+    for opt_in, expected in ((True, True), (False, False)):
+        p = Peer(factory, rw.RtcConfiguration(dc_chunking=opt_in))
+        p.pc.create_data_channel("probe")
+        offer = await p.pc.create_offer()
+        assert ("a=x-reactor-dc-chunking:1 max-message-size=" in offer.sdp) is expected
+
+
+async def test_a_large_message_arrives_whole_on_a_chunked_channel(factory):
+    _a, _b, dc_a, dc_b = await connect(factory)
+    assert dc_a.is_chunked() and dc_b.is_chunked()
+    assert dc_a.ordered() and dc_a.reliable()
+    got = inbox(dc_b)
+    msg = pattern(1, 20 * MIB)
+    dc_a.send(msg)
+    assert dc_a.buffered_amount() > 0
+    await wait_for(lambda: got, timeout=60)
+    data, binary = got[0]
+    assert binary and data == msg
+
+
+async def test_text_split_across_frames_arrives_as_text(factory):
+    _a, _b, dc_a, dc_b = await connect(factory)
+    got = inbox(dc_b)
+    text = "€uro ünïcödé ✓ " * 40_000
+    dc_a.send(text.encode(), binary=False)
+    await wait_for(lambda: got, timeout=30)
+    data, binary = got[0]
+    assert not binary and data.decode() == text
+
+
+async def test_a_peer_that_opts_out_keeps_both_ends_plain(factory):
+    _a, _b, dc_a, dc_b = await connect(factory, chunk_a=True, chunk_b=False)
+    assert not dc_a.is_chunked() and not dc_b.is_chunked()
+    got = inbox(dc_b)
+    dc_a.send(b"plain")
+    await wait_for(lambda: got)
+    assert got[0] == (b"plain", True)
+
+
+async def test_drain_waits_for_the_queue_and_send_releases_the_gil(factory):
+    _a, _b, dc_a, dc_b = await connect(factory)
+    got = inbox(dc_b)
+    ticks = 0
+    stop = threading.Event()
+
+    def ticker():
+        nonlocal ticks
+        while not stop.is_set():
+            ticks += 1
+            time.sleep(0.001)
+
+    t = threading.Thread(target=ticker)
+    t.start()
+    dc_a.send(pattern(2, 50 * MIB))
+    assert dc_a.buffered_amount() > 16 * MIB
+    assert await dc_a.drain(timeout=60) is True
+    stop.set()
+    t.join()
+    assert dc_a.buffered_amount() == 0
+    assert ticks > 10, "a Python thread kept running while the transfer drained"
+    await wait_for(lambda: got, timeout=60)
+
+
+async def test_a_full_queue_raises_queue_full_and_low_threshold_fires(factory):
+    # A connection of this factory has a 128 MiB queue; fill it past that.
+    _a, _b, dc_a, dc_b = await connect(factory)
+    inbox(dc_b)
+    fired = threading.Event()
+    dc_a.set_buffered_amount_low_threshold(1 * MIB)
+    dc_a.on_buffered_amount_low(fired.set)
+    msg = pattern(3, 60 * MIB)
+    with pytest.raises(rw.DataChannelQueueFull):
+        for _ in range(4):
+            dc_a.send(msg)
+    assert issubclass(rw.DataChannelQueueFull, RuntimeError)
+    await wait_for(fired.is_set, timeout=120)
+    assert dc_a.state() == rw.DataChannelState.Open
+
+
+async def test_an_oversized_message_raises_message_too_large(factory):
+    _a, _b, dc_a, _dc_b = await connect(factory)
+    with pytest.raises(rw.DataChannelMessageTooLarge):
+        dc_a.send(b"\0" * (64 * MIB + 1))
+    assert dc_a.state() == rw.DataChannelState.Open
+
+
+async def test_close_sends_what_was_queued_first(factory):
+    _a, _b, dc_a, dc_b = await connect(factory)
+    got = inbox(dc_b)
+    msg = pattern(4, 30 * MIB)
+    dc_a.send(msg)
+    await asyncio.get_running_loop().run_in_executor(None, dc_a.close, 60.0)
+    await wait_for(lambda: got, timeout=60)
+    assert got[0][0] == msg
