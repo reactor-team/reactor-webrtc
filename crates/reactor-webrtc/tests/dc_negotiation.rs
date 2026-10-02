@@ -216,7 +216,7 @@ mod tests {
         let (pc1, pc2, dc1, dc2) = connect(&f1, &f2);
         assert!(dc1.is_chunked() && dc2.is_chunked());
 
-        // A second offer/answer with the attribute stripped from both.
+        // A second offer with the attribute stripped.
         let strip = |d: &SessionDescription| SessionDescription {
             kind: d.kind,
             sdp: d
@@ -229,7 +229,10 @@ mod tests {
         let offer = strip(&pc1.create_offer().expect("offer"));
         pc1.set_local_description(&offer).expect("pc1 local");
         pc2.set_remote_description(&offer).expect("pc2 remote");
-        let answer = strip(&pc2.create_answer().expect("answer"));
+        // The answer to an offer without the attribute leaves it out too, even
+        // though this connection already negotiated chunking.
+        let answer = pc2.create_answer().expect("answer");
+        assert!(!answer.declares_dc_chunking());
         pc2.set_local_description(&answer).expect("pc2 local");
         pc1.set_remote_description(&answer).expect("pc1 remote");
 

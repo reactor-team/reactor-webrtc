@@ -1,10 +1,11 @@
 //! [`DcChunking`] — the factory-wide settings for large data-channel messages.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use reactor_webrtc_dc_chunking::sdp::{self, Params};
 
-use crate::{Error, Result, SessionDescription};
+use crate::{Error, Result, SdpType, SessionDescription};
 
 /// Settings for chunked data channels, set on a factory with
 /// [`PeerConnectionFactoryBuilder::with_dc_chunking`](crate::PeerConnectionFactoryBuilder::with_dc_chunking).
@@ -84,6 +85,9 @@ impl DcChunking {
 pub(crate) struct DcNegotiation {
     settings: Option<DcChunking>,
     remote: Mutex<Option<Params>>,
+    // Whether the latest remote offer declared chunking. Unlike `remote` it
+    // is not sticky: an answer mirrors the offer it answers.
+    offer_declares: AtomicBool,
 }
 
 impl DcNegotiation {
@@ -91,6 +95,7 @@ impl DcNegotiation {
         Arc::new(Self {
             settings,
             remote: Mutex::new(None),
+            offer_declares: AtomicBool::new(false),
         })
     }
 
@@ -112,11 +117,14 @@ impl DcNegotiation {
         }
     }
 
-    /// An answer declares it only when the offer did: offer/answer cannot
-    /// introduce a capability the offerer never asked for.
+    /// An answer declares it only when the offer it answers did:
+    /// offer/answer cannot introduce a capability the offerer never asked
+    /// for, even on a renegotiation of a connection that already chunks.
     pub(crate) fn answer(&self, answer: SessionDescription) -> SessionDescription {
-        match (&self.settings, self.remote()) {
-            (Some(s), Some(_)) => answer.with_dc_chunking(&Params::local(s.max_message_size)),
+        match &self.settings {
+            Some(s) if self.offer_declares.load(Ordering::SeqCst) => {
+                answer.with_dc_chunking(&Params::local(s.max_message_size))
+            }
             _ => answer,
         }
     }
@@ -133,9 +141,14 @@ impl DcNegotiation {
         if self.settings.is_none() {
             return;
         }
+        let parsed = sdp::parse(&remote.sdp);
+        if remote.kind == SdpType::Offer {
+            self.offer_declares
+                .store(parsed.is_some(), Ordering::SeqCst);
+        }
         let mut slot = self.remote.lock().unwrap();
         if slot.is_none() {
-            *slot = sdp::parse(&remote.sdp);
+            *slot = parsed;
         }
     }
 }
