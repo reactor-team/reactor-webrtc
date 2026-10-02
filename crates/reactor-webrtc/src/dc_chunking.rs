@@ -84,10 +84,14 @@ impl DcChunking {
 /// every channel, so they all read the same negotiation.
 pub(crate) struct DcNegotiation {
     settings: Option<DcChunking>,
+    // The established negotiation: set once an offer/answer round completes
+    // with the attribute on both sides, and sticky from then on.
     remote: Mutex<Option<Params>>,
-    // Whether the latest remote offer declared chunking. Unlike `remote` it
-    // is not sticky: an answer mirrors the offer it answers.
-    offer_declares: AtomicBool,
+    // The latest remote offer's parameters, while it awaits our answer. An
+    // answer mirrors the offer it answers, so this is not sticky.
+    pending: Mutex<Option<Params>>,
+    // Whether the offer this side last applied locally declared chunking.
+    local_offer_declared: AtomicBool,
 }
 
 impl DcNegotiation {
@@ -95,7 +99,8 @@ impl DcNegotiation {
         Arc::new(Self {
             settings,
             remote: Mutex::new(None),
-            offer_declares: AtomicBool::new(false),
+            pending: Mutex::new(None),
+            local_offer_declared: AtomicBool::new(false),
         })
     }
 
@@ -104,7 +109,7 @@ impl DcNegotiation {
     }
 
     /// The peer's parameters, once negotiated. `None` while this connection
-    /// does not take part or the peer has not declared chunking.
+    /// does not take part or no round has completed with chunking.
     pub(crate) fn remote(&self) -> Option<Params> {
         *self.remote.lock().unwrap()
     }
@@ -122,33 +127,70 @@ impl DcNegotiation {
     /// for, even on a renegotiation of a connection that already chunks.
     pub(crate) fn answer(&self, answer: SessionDescription) -> SessionDescription {
         match &self.settings {
-            Some(s) if self.offer_declares.load(Ordering::SeqCst) => {
+            Some(s) if self.pending.lock().unwrap().is_some() => {
                 answer.with_dc_chunking(&Params::local(s.max_message_size))
             }
             _ => answer,
         }
     }
 
-    /// Record the peer's parameters from an applied remote description.
+    /// Track a description this side applied locally.
     ///
-    /// Sticky: the first description that declares chunking settles it for
-    /// the life of the connection, and a later renegotiation that drops the
+    /// An answer that declares chunking, to an offer that did, completes the
+    /// round on the answerer's side.
+    pub(crate) fn on_local_description(&self, local: &SessionDescription) {
+        if self.settings.is_none() {
+            return;
+        }
+        let declares = sdp::has_attribute(&local.sdp);
+        match local.kind {
+            SdpType::Offer => self.local_offer_declared.store(declares, Ordering::SeqCst),
+            SdpType::Answer => {
+                let pending = self.pending.lock().unwrap().take();
+                if declares {
+                    self.establish(pending);
+                }
+            }
+            SdpType::Rollback => self.local_offer_declared.store(false, Ordering::SeqCst),
+            SdpType::PrAnswer => {}
+        }
+    }
+
+    /// Track a description the peer's side applied here.
+    ///
+    /// An offer only becomes pending: it may still be rolled back, or
+    /// answered without the attribute. A final answer that declares chunking,
+    /// to an offer of ours that did, completes the round on the offerer's
+    /// side.
+    ///
+    /// Sticky once established: a later renegotiation that drops the
     /// attribute does not undo it. Channels already open keep their framing
-    /// either way, and both ends must keep agreeing for new ones; the
-    /// offerer applies the answer before any SCTP data can flow, so both
-    /// sides have settled before the first channel opens.
+    /// either way, and both ends must keep agreeing for new ones; each end
+    /// completes the round before any SCTP data can flow, so both have
+    /// settled before the first channel opens. The one way the ends can
+    /// still disagree is an answer that loses the attribute between the
+    /// answerer and the offerer.
     pub(crate) fn on_remote_description(&self, remote: &SessionDescription) {
         if self.settings.is_none() {
             return;
         }
         let parsed = sdp::parse(&remote.sdp);
-        if remote.kind == SdpType::Offer {
-            self.offer_declares
-                .store(parsed.is_some(), Ordering::SeqCst);
+        match remote.kind {
+            SdpType::Offer => *self.pending.lock().unwrap() = parsed,
+            SdpType::Answer => {
+                if self.local_offer_declared.load(Ordering::SeqCst) {
+                    self.establish(parsed);
+                }
+            }
+            SdpType::Rollback => *self.pending.lock().unwrap() = None,
+            SdpType::PrAnswer => {}
         }
+    }
+
+    fn establish(&self, params: Option<Params>) {
         let mut slot = self.remote.lock().unwrap();
         if slot.is_none() {
-            *slot = parsed;
+            *slot = params;
         }
     }
 }
@@ -156,6 +198,67 @@ impl DcNegotiation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn desc(kind: SdpType, declares: bool) -> SessionDescription {
+        let mut sdp =
+            "v=0\r\ns=-\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n".to_owned();
+        if declares {
+            sdp = sdp::declare(&sdp, &Params::local(1024));
+        }
+        SessionDescription { kind, sdp }
+    }
+
+    fn negotiation() -> Arc<DcNegotiation> {
+        DcNegotiation::new(Some(DcChunking::default()))
+    }
+
+    #[test]
+    fn a_completed_round_with_the_attribute_establishes_both_ends() {
+        let (offerer, answerer) = (negotiation(), negotiation());
+        offerer.on_local_description(&desc(SdpType::Offer, true));
+        answerer.on_remote_description(&desc(SdpType::Offer, true));
+        assert!(
+            answerer.remote().is_none(),
+            "an offer alone settles nothing"
+        );
+        let answer = answerer.answer(desc(SdpType::Answer, false));
+        assert!(answer.declares_dc_chunking());
+        answerer.on_local_description(&answer);
+        offerer.on_remote_description(&answer);
+        assert!(offerer.remote().is_some() && answerer.remote().is_some());
+    }
+
+    #[test]
+    fn a_rolled_back_offer_leaves_nothing_established() {
+        let answerer = negotiation();
+        answerer.on_remote_description(&desc(SdpType::Offer, true));
+        answerer.on_remote_description(&desc(SdpType::Rollback, false));
+        answerer.on_remote_description(&desc(SdpType::Offer, false));
+        let answer = answerer.answer(desc(SdpType::Answer, false));
+        assert!(!answer.declares_dc_chunking());
+        answerer.on_local_description(&answer);
+        assert!(answerer.remote().is_none());
+    }
+
+    #[test]
+    fn an_answer_without_the_attribute_establishes_neither_end() {
+        let (offerer, answerer) = (negotiation(), negotiation());
+        offerer.on_local_description(&desc(SdpType::Offer, true));
+        answerer.on_remote_description(&desc(SdpType::Offer, true));
+        // The answer is stripped before either end applies it.
+        let answer = desc(SdpType::Answer, false);
+        answerer.on_local_description(&answer);
+        offerer.on_remote_description(&answer);
+        assert!(offerer.remote().is_none() && answerer.remote().is_none());
+    }
+
+    #[test]
+    fn an_offerer_whose_offer_lost_the_attribute_ignores_a_declaring_answer() {
+        let offerer = negotiation();
+        offerer.on_local_description(&desc(SdpType::Offer, false));
+        offerer.on_remote_description(&desc(SdpType::Answer, true));
+        assert!(offerer.remote().is_none());
+    }
 
     #[test]
     fn default_is_valid() {
