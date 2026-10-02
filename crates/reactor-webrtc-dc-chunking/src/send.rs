@@ -150,8 +150,16 @@ pub struct SendQueue {
 }
 
 impl SendQueue {
-    /// A queue for one channel. `config` should have passed [`SendConfig::validate`].
+    /// A queue for one channel.
+    ///
+    /// # Panics
+    ///
+    /// When `config` fails [`SendConfig::validate`]: a frame size below 2
+    /// bytes, for one, would emit header-only frames forever.
     pub fn new(config: SendConfig) -> Self {
+        if let Err(e) = config.validate() {
+            panic!("invalid SendConfig: {e}");
+        }
         Self {
             config,
             pending: VecDeque::new(),
@@ -259,6 +267,15 @@ mod tests {
     #[test]
     fn default_config_is_valid() {
         assert_eq!(SendConfig::default().validate(), Ok(()));
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid SendConfig: chunk_size 1")]
+    fn a_queue_refuses_a_config_that_cannot_drain() {
+        SendQueue::new(SendConfig {
+            chunk_size: 1,
+            ..SendConfig::default()
+        });
     }
 
     #[test]
