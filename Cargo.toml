@@ -4,12 +4,14 @@ members = [
     "crates/reactor-webrtc-sys",
     "crates/reactor-webrtc",
     "crates/reactor-webrtc-py",
+    "crates/reactor-webrtc-dc-chunking",
 ]
 # reactor-webrtc-py is a cdylib (Maturin wheel) — excluded from the default
 # workspace build so `cargo check/test` targets the library crates only.
 default-members = [
     "crates/reactor-webrtc-sys",
     "crates/reactor-webrtc",
+    "crates/reactor-webrtc-dc-chunking",
 ]
 
 [workspace.package]
@@ -25,6 +27,7 @@ repository = "https://github.com/reactor-team/reactor-webrtc"
 [workspace.dependencies]
 reactor-webrtc-sys = { path = "crates/reactor-webrtc-sys", version = "0.18.0" }
 reactor-webrtc = { path = "crates/reactor-webrtc", version = "0.18.0" }
+reactor-webrtc-dc-chunking = { path = "crates/reactor-webrtc-dc-chunking", version = "0.18.0" }
 
 # The pinned upstream WebRTC milestone is tracked in ./WEBRTC_VERSION and baked
 # into the prebuilt artifacts produced by ./webrtc-build.
