@@ -1134,6 +1134,9 @@ struct ChannelCore {
     raw: RawDc,
     on_message: Slot<MessageCb>,
     on_state_change: Slot<StateCb>,
+    // Their own slots, so on_open, on_close and on_state_change coexist.
+    on_open: Slot<EventCb>,
+    on_close: Slot<EventCb>,
     on_buffered_amount_low: Slot<EventCb>,
     registered: AtomicBool,
     // Serializes native (re-)registration: the glue replaces its observer
@@ -1344,6 +1347,14 @@ extern "C" fn dc_on_state_change(ud: *mut c_void, state: c_int) {
     if let Some(cb) = core.on_state_change.get() {
         (*cb.lock().unwrap())(state);
     }
+    let event = match state {
+        DataChannelState::Open => Some(&core.on_open),
+        DataChannelState::Closed => Some(&core.on_close),
+        _ => None,
+    };
+    if let Some(cb) = event.and_then(Slot::get) {
+        (*cb.lock().unwrap())();
+    }
 }
 
 extern "C" fn dc_on_buffered_amount_low(ud: *mut c_void) {
@@ -1400,6 +1411,8 @@ impl DataChannel {
                 raw: RawDc(raw),
                 on_message: Slot::empty(),
                 on_state_change: Slot::empty(),
+                on_open: Slot::empty(),
+                on_close: Slot::empty(),
                 on_buffered_amount_low: Slot::empty(),
                 registered: AtomicBool::new(false),
                 register_lock: Mutex::new(()),
@@ -1592,24 +1605,19 @@ impl DataChannel {
         self.reregister();
     }
 
-    /// Convenience: fires once when the channel becomes `Open`.
+    /// Fires when the channel becomes `Open`. Independent of
+    /// [`on_state_change`](Self::on_state_change) and [`on_close`](Self::on_close):
+    /// setting one does not replace the others.
     pub fn on_open(&self, cb: impl FnMut() + Send + 'static) {
-        let mut cb = cb;
-        self.on_state_change(move |s| {
-            if s == DataChannelState::Open {
-                cb();
-            }
-        });
+        self.core.on_open.set(Box::new(cb));
+        self.reregister();
     }
 
-    /// Convenience: fires once when the channel reaches `Closed`.
+    /// Fires when the channel reaches `Closed`. Independent of
+    /// [`on_state_change`](Self::on_state_change) and [`on_open`](Self::on_open).
     pub fn on_close(&self, cb: impl FnMut() + Send + 'static) {
-        let mut cb = cb;
-        self.on_state_change(move |s| {
-            if s == DataChannelState::Closed {
-                cb();
-            }
-        });
+        self.core.on_close.set(Box::new(cb));
+        self.reregister();
     }
 
     /// Flow-control handler — fires when `buffered_amount` drops at or below

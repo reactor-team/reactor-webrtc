@@ -2060,7 +2060,8 @@ impl DataChannel {
         });
     }
 
-    /// Fire `callback()` once when the channel opens.
+    /// Fire `callback()` when the channel opens. Independent of
+    /// `on_state_change` and `on_close`: setting one keeps the others.
     fn on_open(&mut self, py: Python, callback: PyObject) {
         py.allow_threads(|| {
             self.inner.on_open(move || {
@@ -2071,7 +2072,8 @@ impl DataChannel {
         });
     }
 
-    /// Fire `callback()` once when the channel closes.
+    /// Fire `callback()` when the channel closes. Independent of
+    /// `on_state_change` and `on_open`.
     fn on_close(&mut self, py: Python, callback: PyObject) {
         py.allow_threads(|| {
             self.inner.on_close(move || {
