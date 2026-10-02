@@ -190,3 +190,17 @@ async def test_on_close_and_on_state_change_both_fire(factory):
     dc_b.on_close(closed.set)
     dc_a.close()
     await wait_for(lambda: closed.is_set() and rw.DataChannelState.Closed in states)
+
+
+async def test_drain_and_close_take_inf_and_refuse_nan(factory):
+    _a, _b, dc_a, dc_b = await connect(factory)
+    got = inbox(dc_b)
+    dc_a.send(pattern(5, 2 * MIB))
+    assert await dc_a.drain(timeout=float("inf")) is True
+    with pytest.raises(ValueError, match="timeout"):
+        await dc_a.drain(timeout=float("nan"))
+    with pytest.raises(ValueError, match="drain_timeout"):
+        dc_a.close(float("nan"))
+    assert dc_a.state() == rw.DataChannelState.Open
+    dc_a.close(float("inf"))
+    await wait_for(lambda: got)

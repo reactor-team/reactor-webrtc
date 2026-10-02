@@ -90,6 +90,17 @@ fn join_err(e: tokio::task::JoinError) -> PyErr {
     PyRuntimeError::new_err(format!("task join: {e}"))
 }
 
+/// Seconds from Python as a timeout: negative waits not at all, `inf` (or
+/// anything too large for a `Duration`) waits without limit, NaN is refused.
+fn timeout_secs(name: &str, secs: f64) -> PyResult<std::time::Duration> {
+    if secs.is_nan() {
+        return Err(PyValueError::new_err(format!(
+            "{name} must be a number, not NaN"
+        )));
+    }
+    Ok(std::time::Duration::try_from_secs_f64(secs.max(0.0)).unwrap_or(std::time::Duration::MAX))
+}
+
 fn sdp_type_to_str(kind: rw::SdpType) -> &'static str {
     match kind {
         rw::SdpType::Offer => "offer",
@@ -2015,11 +2026,12 @@ impl DataChannel {
 
     /// Awaitable: resolves to `True` once everything queued has been handed to
     /// SCTP and libwebrtc's own buffer is empty, or `False` after `timeout`
-    /// seconds or when the channel stops being open.
+    /// seconds or when the channel stops being open. `float("inf")` waits
+    /// without limit; NaN raises `ValueError`.
     #[pyo3(signature = (timeout = 30.0))]
     fn drain<'py>(&self, py: Python<'py>, timeout: f64) -> PyResult<Bound<'py, PyAny>> {
         let inner = Arc::clone(&self.inner);
-        let timeout = std::time::Duration::from_secs_f64(timeout.max(0.0));
+        let timeout = timeout_secs("timeout", timeout)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             tokio::task::spawn_blocking(move || inner.drain(timeout))
                 .await
@@ -2028,11 +2040,13 @@ impl DataChannel {
     }
 
     /// Close the channel. A chunked channel first drains what it has queued,
-    /// for up to `drain_timeout` seconds.
+    /// for up to `drain_timeout` seconds (`float("inf")`: without limit; NaN
+    /// raises `ValueError`).
     #[pyo3(signature = (drain_timeout = 5.0))]
-    fn close(&self, py: Python, drain_timeout: f64) {
-        let timeout = std::time::Duration::from_secs_f64(drain_timeout.max(0.0));
-        py.allow_threads(|| self.inner.close(timeout))
+    fn close(&self, py: Python, drain_timeout: f64) -> PyResult<()> {
+        let timeout = timeout_secs("drain_timeout", drain_timeout)?;
+        py.allow_threads(|| self.inner.close(timeout));
+        Ok(())
     }
 
     /// Register `callback(data: bytes, binary: bool)` for incoming messages.
