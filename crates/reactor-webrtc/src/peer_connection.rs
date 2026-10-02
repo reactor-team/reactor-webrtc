@@ -1580,6 +1580,7 @@ impl PeerConnection {
     /// which role it is playing.
     pub fn set_local_description(&self, sdp: &SessionDescription) -> Result<()> {
         self.set_description(sdp, true)?;
+        self.dc_negotiation.on_local_description(sdp);
         self.install_frame_metadata_transforms();
         self.lock_negotiated_send_codecs();
         Ok(())
