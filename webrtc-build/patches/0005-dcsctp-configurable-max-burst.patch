@@ -1,0 +1,31 @@
+diff --git a/media/sctp/dcsctp_transport.cc b/media/sctp/dcsctp_transport.cc
+index 2bdfe26a07..e221f2100b 100644
+--- a/media/sctp/dcsctp_transport.cc
++++ b/media/sctp/dcsctp_transport.cc
+@@ -13,6 +13,7 @@
+ #include <atomic>
+ #include <cstddef>
+ #include <cstdint>
++#include <cstdlib>
+ #include <functional>
+ #include <limits>
+ #include <memory>
+@@ -809,6 +810,18 @@ dcsctp::DcSctpOptions DcSctpTransport::CreateDcSctpOptions(
+   dcsctp_options.max_send_buffer_size = std::numeric_limits<size_t>::max();
+   dcsctp_options.enable_message_interleaving =
+       field_trials.IsEnabled("WebRTC-DataChannelMessageInterleaving");
++  // Reactor: dcsctp sends at most `max_burst` (default 4) packets per Send()
++  // and per incoming SACK, so a message larger than ~4 packets ramps up
++  // 4 -> 8 -> 16 ... packets per RTT even when the congestion window would let
++  // it all out at once: about one extra RTT per doubling of message size.
++  // "WebRTC-DcSctp-MaxBurst/<n>/" overrides the limit (unset or <= 0 keeps the
++  // upstream default); the congestion window still bounds every send. See
++  // webrtc-build/patches/README.md (0005).
++  if (int max_burst =
++          std::atoi(field_trials.Lookup("WebRTC-DcSctp-MaxBurst").c_str());
++      max_burst > 0) {
++    dcsctp_options.max_burst = max_burst;
++  }
+ 
+   return dcsctp_options;
+ }

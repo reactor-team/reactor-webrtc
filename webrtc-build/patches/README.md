@@ -204,6 +204,39 @@ previously showed nothing (see "Why" above for the exact before-state).
 
 ---
 
+### 0005 — configurable dcsctp `max_burst`
+
+`0005-dcsctp-configurable-max-burst.patch` · touches `media/sctp/dcsctp_transport.cc` (+13 lines)
+
+**What.** `DcSctpTransport::CreateDcSctpOptions` reads the field trial
+`WebRTC-DcSctp-MaxBurst/<n>/` and, when `n > 0`, uses it as
+`DcSctpOptions::max_burst`. Unset (or `<= 0`) keeps upstream's default of 4, so
+the patch changes nothing until a caller sets the trial.
+
+**Why.** dcsctp sends at most `max_burst` packets per `Send()` and per incoming
+SACK, and the receiver SACKs every second packet. A message larger than ~4
+packets (~4.6 KB of payload) therefore leaves in bursts of 4, 8, 16, … packets,
+one burst per round trip, even when the congestion window would let it all out
+at once: about one extra RTT per doubling of message size. The window itself is
+not the limit (dcsctp never shrinks it on idle), so every message pays the ramp
+again. Measured over a 31 ms path: a single 100 KB message takes 5.4 RTT with
+the default and 1.15 RTT with `max_burst` 256; 255 KB goes from 6.6 to 1.3 RTT.
+The congestion window still bounds every send, so the larger burst never puts
+more in flight than congestion control allows.
+
+**How it works.** libwebrtc builds `DcSctpOptions` from `SctpOptions` and the
+factory's `FieldTrialsView`, which our glue owns (`ReactorFieldTrials`), so the
+binding can set the value per factory without new plumbing through
+`SctpOptions`. The value is parsed with `std::atoi`; no new deps.
+
+**Verify.** Built for mac arm64 release (`strings libwebrtc.a | grep
+WebRTC-DcSctp-MaxBurst` finds the key) and measured with two reactor-webrtc
+peers over an emulated 31 ms path: with the trial unset the curve matches the
+unpatched prebuilt exactly; with 64 a message up to ~74 KB (64 packets) fits one
+flight; with 256 everything up to the 256 KiB message limit does.
+
+---
+
 ## Planned (not yet authored — need their target builds to validate)
 
 - **Symbol isolation** — keep WebRTC's C++ symbols from clashing when a consumer
