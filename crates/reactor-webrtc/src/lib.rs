@@ -64,6 +64,8 @@ pub use encoded::{
 /// What a peer declares in `a=x-reactor-dc-chunking` (see
 /// [`SessionDescription::with_dc_chunking`]).
 pub use reactor_webrtc_dc_chunking::Params as DcChunkingParams;
+/// Why a chunked data channel refused a message ([`Error::DataChannel`]).
+pub use reactor_webrtc_dc_chunking::SendError as DcSendError;
 
 /// Whether this build targets Apple (H.264 VideoToolbox backend exists).
 pub(crate) const HAVE_VIDEO_TOOLBOX: bool = cfg!(target_vendor = "apple");
@@ -113,6 +115,10 @@ pub enum Error {
     Webrtc(String),
     /// The requested track/transceiver/data-channel was not found.
     NotFound(String),
+    /// A chunked data channel refused a message: it is larger than the
+    /// effective max message size, or the send queue is full. Nothing of it
+    /// was sent, and the channel is still usable.
+    DataChannel(DcSendError),
 }
 
 impl std::fmt::Display for Error {
@@ -120,6 +126,7 @@ impl std::fmt::Display for Error {
         match self {
             Error::Webrtc(m) => write!(f, "webrtc error: {m}"),
             Error::NotFound(m) => write!(f, "not found: {m}"),
+            Error::DataChannel(e) => write!(f, "data channel: {e}"),
         }
     }
 }
