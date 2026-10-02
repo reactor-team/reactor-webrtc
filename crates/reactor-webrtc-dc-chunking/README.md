@@ -15,5 +15,8 @@ builds for native targets and for `wasm32-unknown-unknown`.
 |---|---|
 | `frame` | The one-byte header on every frame: `MORE`, `TEXT`, version bits. |
 | `sdp` | `a=x-reactor-dc-chunking:1 max-message-size=N`: declare, parse, effective limit. |
+| `send` | `SendQueue`: messages in, frames out, gated by the native buffer's high-water mark. |
+| `recv` | `Reassembler`: frames in, whole messages out; oversized messages dropped. |
 
-The send queue and the reassembler follow in a separate change.
+`tests/vectors.txt` holds the golden vectors for the wire format. Any other
+implementation must produce and accept exactly those bytes.

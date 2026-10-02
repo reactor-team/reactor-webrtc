@@ -14,12 +14,18 @@
 //!
 //! - [`frame`] — the one-byte header every frame carries.
 //! - [`sdp`] — the session-level attribute both peers declare.
+//! - [`send`] — the per-channel queue that turns messages into frames.
+//! - [`recv`] — the per-channel reassembler that turns frames into messages.
 
 pub mod frame;
+pub mod recv;
 pub mod sdp;
+pub mod send;
 
 pub use frame::{FrameError, Header};
+pub use recv::{Delivery, Reassembler};
 pub use sdp::Params;
+pub use send::{ConfigError, SendConfig, SendError, SendQueue};
 
 /// Largest message a chunking side accepts by default (64 MiB).
 pub const DEFAULT_MAX_MESSAGE_SIZE: u64 = 64 * 1024 * 1024;
