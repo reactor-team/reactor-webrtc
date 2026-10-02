@@ -1085,7 +1085,7 @@ static webrtc::scoped_refptr<webrtc::AudioProcessing> build_apm(int apm_flags) {
 extern "C" {
 
 // ABI version of this native build. The safe crate asserts compatibility.
-unsigned int reactor_webrtc_abi_version() { return 4; }
+unsigned int reactor_webrtc_abi_version() { return 5; }
 
 // Link/run self-test: build the builtin audio + video encoder factories and
 // enumerate the codecs they support. Writes a comma-separated, NUL-terminated
@@ -2131,6 +2131,9 @@ struct ReactorFactoryOptions {
   // WebRTC-IceHandshakeDtls field trial, which only the factory's Environment
   // can carry — hence a factory option rather than a per-connection one.
   int                          dtls_in_stun;
+  // > 0: dcsctp's max_burst for every data channel of the factory, answered
+  // as the WebRTC-DcSctp-MaxBurst field trial (patch 0005). 0: upstream's 4.
+  int                          sctp_max_burst;
 };
 }
 
@@ -2477,20 +2480,26 @@ class ReactorCompositeVideoDecoderFactory : public webrtc::VideoDecoderFactory {
 // so this view only ever *adds* a key.
 class ReactorFieldTrials : public webrtc::FieldTrialsView {
  public:
-  explicit ReactorFieldTrials(bool dtls_in_stun) : dtls_in_stun_(dtls_in_stun) {}
+  ReactorFieldTrials(bool dtls_in_stun, int sctp_max_burst)
+      : dtls_in_stun_(dtls_in_stun), sctp_max_burst_(sctp_max_burst) {}
 
   std::string Lookup(absl::string_view key) const override {
     // SPED: piggyback the DTLS handshake on the ICE binding requests.
     if (dtls_in_stun_ && key == "WebRTC-IceHandshakeDtls") return "Enabled";
+    // Patch 0005: dcsctp packets per Send() and per SACK.
+    if (sctp_max_burst_ > 0 && key == "WebRTC-DcSctp-MaxBurst") {
+      return std::to_string(sctp_max_burst_);
+    }
     return global_.Lookup(key);
   }
 
   std::unique_ptr<webrtc::FieldTrialsView> CreateCopy() const override {
-    return std::make_unique<ReactorFieldTrials>(dtls_in_stun_);
+    return std::make_unique<ReactorFieldTrials>(dtls_in_stun_, sctp_max_burst_);
   }
 
  private:
   const bool dtls_in_stun_;
+  const int sctp_max_burst_;
   // The process-global trials, i.e. exactly the view the factory installs when
   // the binding passes none. Stateless; it reads the global string on lookup.
   webrtc::DeprecatedGlobalFieldTrials global_;
@@ -2519,9 +2528,13 @@ void* reactor_webrtc_factory_create(const ReactorFactoryOptions* opts,
   // binding requests instead of waiting for ICE to finish. libwebrtc reads the
   // switch off the factory's Environment, so it is decided here, once, for
   // every peer connection this factory makes.
+  //
+  // The dcsctp max_burst (patch 0005) is read from the same Environment when
+  // each SCTP transport is created, so it is a factory decision too.
   std::unique_ptr<webrtc::FieldTrialsView> trials;
-  if (opts->dtls_in_stun) {
-    trials = std::make_unique<ReactorFieldTrials>(/*dtls_in_stun=*/true);
+  if (opts->dtls_in_stun || opts->sctp_max_burst > 0) {
+    trials = std::make_unique<ReactorFieldTrials>(opts->dtls_in_stun != 0,
+                                                  opts->sctp_max_burst);
   }
 
   std::unique_ptr<webrtc::VideoEncoderFactory> openh264_enc;
