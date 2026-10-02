@@ -56,8 +56,9 @@ impl DcChunking {
     pub(crate) fn validate(&self) -> Result<()> {
         if self.max_burst == 0 || self.max_burst > i32::MAX as u32 {
             return Err(Error::Webrtc(format!(
-                "dc chunking: max_burst {} must be at least 1",
-                self.max_burst
+                "dc chunking: max_burst {} must be between 1 and {}",
+                self.max_burst,
+                i32::MAX
             )));
         }
         let config = reactor_webrtc_dc_chunking::SendConfig {
@@ -89,6 +90,7 @@ mod tests {
             c.validate().is_err()
         };
         assert!(bad(|c| c.max_burst = 0));
+        assert!(bad(|c| c.max_burst = i32::MAX as u32 + 1));
         assert!(bad(|c| c.chunk_size = 1));
         assert!(bad(|c| c.chunk_size = 1 << 20));
         assert!(bad(|c| c.send_buffer_limit = c.max_message_size - 1));
