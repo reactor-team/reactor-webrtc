@@ -339,25 +339,32 @@ mod tests {
         let (f1, f2) = (factory(Some(tight)), chunking());
         let mut p = connect(&f1, &f2);
         let at_b = inbox(&mut p.b);
-        // Built up front: generating 3 MiB per send would give loopback time
-        // to drain between sends, and the queue would never fill.
-        let messages: Vec<Vec<u8>> = (0..12).map(|i| pattern(i, 3 * MIB)).collect();
+        // Built once and sent back to back until the queue refuses one: how
+        // many fit depends on how fast loopback drains, so a fixed count
+        // would fill the queue on one machine and not on another. Copying
+        // 3 MiB into the queue is far faster than SCTP moves it.
+        let msg = pattern(7, 3 * MIB);
         let mut accepted = 0;
-        let mut refused = 0;
-        for msg in &messages {
-            match p.a.send(msg, true) {
+        let mut refused = false;
+        for _ in 0..1000 {
+            match p.a.send(&msg, true) {
                 Ok(()) => accepted += 1,
-                Err(Error::DataChannel(DcSendError::QueueFull { .. })) => refused += 1,
+                Err(Error::DataChannel(DcSendError::QueueFull { .. })) => {
+                    refused = true;
+                    break;
+                }
                 Err(e) => panic!("unexpected error {e}"),
             }
             // The pump never lets libwebrtc's buffer pass high-water + one
             // frame; the rest is the queue, bounded by its 4 MiB limit.
             assert!(p.a.buffered_amount() <= (8 + 4) * MIB as u64 + 64 * 1024);
         }
-        assert!(
-            refused > 0,
-            "a 4 MiB queue must refuse part of 36 MiB sent at once"
-        );
+        assert!(refused, "a 4 MiB queue never filled in 1000 sends of 3 MiB");
+        // The channel still takes a message once the queue has room.
+        assert!(p.a.drain(Duration::from_secs(60)));
+        p.a.send(&msg, true)
+            .expect("a send after the queue drained");
+        accepted += 1;
         for _ in 0..accepted {
             at_b.recv_timeout(Duration::from_secs(30))
                 .expect("every accepted message arrives");
