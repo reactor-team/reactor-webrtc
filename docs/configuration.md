@@ -402,6 +402,28 @@ chunking.max_message_size = 16 * 1024 * 1024;
 
 </details>
 
+<details>
+<summary>🐍 Example using Python</summary>
+
+```python
+import reactor_webrtc as rw
+
+builder = rw.PeerConnectionFactoryBuilder()
+builder.with_dc_chunking()   # or with_dc_chunking(max_message_size=16 * 1024 * 1024)
+factory = builder.build()
+
+config = rw.RtcConfiguration(dc_chunking=False)   # opt one connection out
+
+# On a chunked channel:
+dc.send(payload)                 # any size up to the limit
+await dc.drain(timeout=30.0)     # wait for the queue to empty
+```
+
+</details>
+
+In Python a refused send raises `DataChannelMessageTooLarge` or
+`DataChannelQueueFull`, both subclasses of `RuntimeError`.
+
 ## Congestion-control bitrate limits
 
 `set_bitrate` is a `PeerConnection` method, not an `RtcConfiguration` field —
