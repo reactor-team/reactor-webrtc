@@ -1,0 +1,14 @@
+# Golden vectors for the reactor-webrtc-dc-chunking v1 wire format.
+# reactor-wasm runs the same file, so both sides must agree byte for byte.
+#
+# One case per line, tab-separated:
+#   chunk_size  type  message (hex)  frames (hex, comma-separated)
+# type is "binary" or "text". An empty message is written as "-".
+4	binary	-	00
+4	text	-	02
+4	binary	616263	00616263
+4	binary	61626364	01616263,0064
+4	text	68656c6c6f	0368656c,026c6f
+5	binary	6162636465666768	0161626364,0065666768
+2	text	e282ac	03e2,0382,02ac
+16	binary	000102030405060708090a0b0c0d0e0f10	01000102030405060708090a0b0c0d0e,000f10
