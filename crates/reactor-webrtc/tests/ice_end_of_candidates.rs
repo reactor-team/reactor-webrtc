@@ -63,7 +63,12 @@ fn forward_gathered(from: &Shared, to: &PeerConnection) -> usize {
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut added = 0usize;
     while Instant::now() < deadline {
-        while let Some(c) = from.ice.lock().unwrap().pop_front() {
+        // Pop in a block so the guard drops before add_ice_candidate, which
+        // waits on the signaling thread that may be waiting for this lock.
+        while let Some(c) = {
+            let mut q = from.ice.lock().unwrap();
+            q.pop_front()
+        } {
             if !c.candidate.is_empty() {
                 to.add_ice_candidate(&c).expect("a real candidate applies");
                 added += 1;
