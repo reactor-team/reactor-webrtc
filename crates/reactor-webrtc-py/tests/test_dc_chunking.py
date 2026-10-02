@@ -180,3 +180,13 @@ async def test_close_sends_what_was_queued_first(factory):
     await asyncio.get_running_loop().run_in_executor(None, dc_a.close, 60.0)
     await wait_for(lambda: got, timeout=60)
     assert got[0][0] == msg
+
+
+async def test_on_close_and_on_state_change_both_fire(factory):
+    _a, _b, dc_a, dc_b = await connect(factory)
+    closed = threading.Event()
+    states: list = []
+    dc_b.on_state_change(states.append)
+    dc_b.on_close(closed.set)
+    dc_a.close()
+    await wait_for(lambda: closed.is_set() and rw.DataChannelState.Closed in states)
