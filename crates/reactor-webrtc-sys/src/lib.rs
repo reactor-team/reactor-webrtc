@@ -173,6 +173,10 @@ pub struct ReactorFactoryOptions {
     /// `WebRTC-IceHandshakeDtls` field trial. Factory-wide because field
     /// trials live in the factory's `Environment`, not in a peer connection.
     pub dtls_in_stun: c_int,
+    /// dcsctp's `max_burst` for every data channel of the factory, through
+    /// the `WebRTC-DcSctp-MaxBurst` field trial (libwebrtc patch 0005), when
+    /// positive. 0 keeps upstream's default of 4.
+    pub sctp_max_burst: c_int,
 }
 
 impl Default for ReactorFactoryOptions {
@@ -190,6 +194,7 @@ impl Default for ReactorFactoryOptions {
             encode_video_backend_for: None,
             encode_rate_update: None,
             dtls_in_stun: 0,
+            sctp_max_burst: 0,
         }
     }
 }

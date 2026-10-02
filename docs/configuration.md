@@ -15,6 +15,7 @@ an existing `pc`.
 - [TCP candidates](#tcp-candidates)
 - [ICE timeouts](#ice-timeouts)
 - [Faster connection setup (WARP: SPED + SNAP)](#faster-connection-setup-warp-sped--snap)
+- [Large data-channel messages (max_burst and chunking)](#large-data-channel-messages-max_burst-and-chunking)
 - [Congestion-control bitrate limits](#congestion-control-bitrate-limits)
 - [Per-sender bitrate limits](#per-sender-bitrate-limits)
 
@@ -329,6 +330,52 @@ builder.with_dtls_in_stun(True)   # SPED, factory-wide
 factory = builder.build()
 
 config = rw.RtcConfiguration(sctp_snap=True)   # SNAP, per connection
+```
+
+</details>
+
+## Large data-channel messages (max_burst and chunking)
+
+dcsctp, libwebrtc's SCTP stack, sends at most `max_burst` packets per
+`send()` and per incoming SACK, and upstream's value is 4. A message larger
+than about 4.6 KB therefore leaves in bursts of 4, 8, 16 … packets, one burst
+per round trip, even when the congestion window would let it all out at once:
+roughly one extra round trip each time the message size doubles. Over a 31 ms
+path a single 100 KB message takes 5.4 round trips.
+
+`PeerConnectionFactoryBuilder::with_dc_chunking` sets `max_burst` for every
+data channel of the factory (libwebrtc patch 0005). With the default of 256, a
+message up to the 256 KiB data-channel limit leaves in one flight: the same
+100 KB message takes about 1.2 round trips. The congestion window still bounds
+every send, so the larger burst never puts more in flight than congestion
+control allows.
+
+It is a factory knob, like SPED, because libwebrtc reads it from a field trial
+in the factory's environment. A factory built without it keeps upstream's 4.
+
+The same `DcChunking` settings also carry the limits for chunked data
+channels — the largest message (`max_message_size`, 64 MiB), the bytes a
+channel may queue beyond libwebrtc's 16 MiB send buffer (`send_buffer_limit`,
+128 MiB) and the frame size (`chunk_size`, 64 KiB). `build()` fails when they
+cannot work together. Chunking itself, negotiated in the SDP so that both peers
+must opt in, comes with the next changes; `RtcConfiguration::dc_chunking`
+(default `true`) lets one connection of a chunking factory opt out of it.
+
+<details>
+<summary>🦀 Example using Rust</summary>
+
+```rust
+use reactor_webrtc::{DcChunking, PeerConnectionFactory};
+
+// Defaults: max_burst 256, 64 MiB messages, 128 MiB queue, 64 KiB frames.
+let factory = PeerConnectionFactory::builder()
+    .with_dc_chunking(DcChunking::default())
+    .build()
+    .expect("factory");
+
+// DcChunking is #[non_exhaustive]: start from the default and change fields.
+let mut chunking = DcChunking::default();
+chunking.max_message_size = 16 * 1024 * 1024;
 ```
 
 </details>

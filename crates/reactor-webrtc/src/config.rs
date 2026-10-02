@@ -176,6 +176,15 @@ pub struct RtcConfiguration {
     /// [`PeerConnectionFactoryBuilder::with_dtls_in_stun`](crate::PeerConnectionFactoryBuilder::with_dtls_in_stun),
     /// a factory knob because libwebrtc reads it from the factory Environment.
     pub sctp_snap: bool,
+    /// Whether this connection takes part in data-channel chunking, when its
+    /// factory enables it with
+    /// [`PeerConnectionFactoryBuilder::with_dc_chunking`](crate::PeerConnectionFactoryBuilder::with_dc_chunking).
+    ///
+    /// On by default, and on its own it does nothing: chunking needs the
+    /// factory setting, and both peers must declare it in the SDP. Turn it off
+    /// to keep one connection of a chunking factory on plain data channels.
+    /// The factory's `max_burst` still applies to it.
+    pub dc_chunking: bool,
 }
 
 impl Default for RtcConfiguration {
@@ -202,6 +211,8 @@ impl Default for RtcConfiguration {
             // Off: the peer has to opt in too (it mirrors the attribute only
             // when its own flag is on), and the draft is not a standard yet.
             sctp_snap: false,
+            // Only an opt-out: the factory decides whether chunking is offered.
+            dc_chunking: true,
         }
     }
 }

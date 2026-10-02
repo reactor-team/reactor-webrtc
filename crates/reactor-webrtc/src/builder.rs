@@ -1,7 +1,7 @@
 //! [`PeerConnectionFactoryBuilder`] — the composable entry point for every
 //! [`PeerConnectionFactory`].
 
-use crate::{AdmMode, ApmConfig, PeerConnectionFactory, Result};
+use crate::{AdmMode, ApmConfig, DcChunking, PeerConnectionFactory, Result};
 
 /// Builds a [`PeerConnectionFactory`] knob by knob — the single entry point
 /// that replaced the old mutually-exclusive constructors (they could not
@@ -31,6 +31,7 @@ pub struct PeerConnectionFactoryBuilder {
     apm: ApmConfig,
     metadata: bool,
     dtls_in_stun: bool,
+    dc_chunking: Option<DcChunking>,
     #[cfg(feature = "openh264")]
     openh264: Option<std::path::PathBuf>,
 }
@@ -42,6 +43,7 @@ impl PeerConnectionFactoryBuilder {
             apm: ApmConfig::default(),
             metadata: true,
             dtls_in_stun: false,
+            dc_chunking: None,
             #[cfg(feature = "openh264")]
             openh264: None,
         }
@@ -125,6 +127,21 @@ impl PeerConnectionFactoryBuilder {
         self
     }
 
+    /// Fast, large data-channel messages: dcsctp's `max_burst` for every data
+    /// channel of the factory, and chunking offered to every peer connection
+    /// it creates (see [`DcChunking`]). Off by default: a factory built
+    /// without it keeps upstream's `max_burst` of 4 and never offers chunking.
+    ///
+    /// A factory knob, like [`with_dtls_in_stun`](Self::with_dtls_in_stun):
+    /// libwebrtc reads `max_burst` from a field trial in the factory's
+    /// `Environment`. One connection can still opt out of chunking with
+    /// [`RtcConfiguration::dc_chunking`](crate::RtcConfiguration::dc_chunking).
+    /// [`build`](Self::build) fails when the settings cannot work together.
+    pub fn with_dc_chunking(mut self, settings: DcChunking) -> Self {
+        self.dc_chunking = Some(settings);
+        self
+    }
+
     /// Register the OpenH264 backend for real H.264 encode/decode (see
     /// [`crate::openh264::ensure_available`] to obtain `lib_path`). This
     /// never fails because the library itself couldn't be loaded: a
@@ -144,6 +161,9 @@ impl PeerConnectionFactoryBuilder {
     /// with a NUL byte) or on factory/thread construction — the error carries
     /// the reason the glue reported.
     pub fn build(self) -> Result<PeerConnectionFactory> {
+        if let Some(chunking) = &self.dc_chunking {
+            chunking.validate()?;
+        }
         #[cfg(feature = "openh264")]
         let openh264_c = match &self.openh264 {
             Some(p) => Some(
@@ -162,6 +182,11 @@ impl PeerConnectionFactoryBuilder {
             use_platform_adm: matches!(self.adm, AdmMode::Platform) as std::os::raw::c_int,
             apm_flags: self.apm.to_flags(),
             dtls_in_stun: self.dtls_in_stun as std::os::raw::c_int,
+            // validate() bounds it to i32, so the cast is lossless.
+            sctp_max_burst: self
+                .dc_chunking
+                .as_ref()
+                .map_or(0, |c| c.max_burst as std::os::raw::c_int),
             #[cfg(feature = "openh264")]
             openh264_lib_path: openh264_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
             ..Default::default()
@@ -183,6 +208,7 @@ impl PeerConnectionFactoryBuilder {
         PeerConnectionFactory::create_from_options(
             &opts,
             self.metadata,
+            self.dc_chunking,
             registry.clone(),
             openh264_registered,
         )
