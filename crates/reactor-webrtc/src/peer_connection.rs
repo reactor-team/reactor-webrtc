@@ -1088,8 +1088,9 @@ struct Chunked {
     queue: Mutex<reactor_webrtc_dc_chunking::SendQueue>,
     // Held while frames move from the queue to the native channel, so the
     // frames of one message stay contiguous whoever pumps. Taken with
-    // try_lock from the native callbacks: a busy pump sets `pump_again`
-    // instead of waiting, so a callback never blocks on a sender.
+    // try_lock by every caller, after setting `pump_again`: a caller that
+    // finds it busy leaves the work to the holder instead of waiting, so a
+    // callback never blocks on a sender.
     pump: Mutex<()>,
     pump_again: AtomicBool,
     reassembler: Mutex<reactor_webrtc_dc_chunking::Reassembler>,
@@ -1201,27 +1202,33 @@ impl ChannelCore {
     /// Move frames from the queue to the native channel while it has room.
     fn pump(&self, c: &Chunked) {
         loop {
+            // Ask first, then try the lock. A failed try_lock means another
+            // thread holds it and has not yet re-checked the flag after
+            // unlocking, so the request cannot be lost between its last pass
+            // and its exit.
+            c.pump_again.store(true, Ordering::SeqCst);
             let Ok(_guard) = c.pump.try_lock() else {
-                c.pump_again.store(true, Ordering::SeqCst);
                 return;
             };
-            c.pump_again.store(false, Ordering::SeqCst);
-            loop {
-                let frame = c
-                    .queue
-                    .lock()
-                    .unwrap()
-                    .next_frame(self.raw.buffered_amount());
-                let Some(frame) = frame else { break };
-                if !self.raw.send(&frame, true) {
-                    // libwebrtc closes the channel on a failed send. The peer
-                    // may hold part of a message; nothing more can follow it.
-                    c.queue.lock().unwrap().clear();
-                    return;
+            while c.pump_again.swap(false, Ordering::SeqCst) {
+                loop {
+                    let frame = c
+                        .queue
+                        .lock()
+                        .unwrap()
+                        .next_frame(self.raw.buffered_amount());
+                    let Some(frame) = frame else { break };
+                    if !self.raw.send(&frame, true) {
+                        // libwebrtc closes the channel on a failed send. The
+                        // peer may hold part of a message; nothing more can
+                        // follow it.
+                        c.queue.lock().unwrap().clear();
+                        return;
+                    }
                 }
             }
             drop(_guard);
-            // A request that arrived while we held the lock is ours to serve.
+            // A request that arrived after our last pass is ours to serve.
             if !c.pump_again.load(Ordering::SeqCst) {
                 break;
             }
@@ -1473,12 +1480,14 @@ impl DataChannel {
     /// Block until everything queued has been handed to SCTP and libwebrtc's
     /// own buffer is empty, or `timeout` passes. Returns whether it drained.
     pub fn drain(&self, timeout: std::time::Duration) -> bool {
-        let deadline = std::time::Instant::now() + timeout;
+        // A timeout too large to add to now never expires.
+        let deadline = std::time::Instant::now().checked_add(timeout);
         loop {
             if self.buffered_amount() == 0 {
                 return true;
             }
-            if self.state() != DataChannelState::Open || std::time::Instant::now() >= deadline {
+            let expired = deadline.is_some_and(|d| std::time::Instant::now() >= d);
+            if self.state() != DataChannelState::Open || expired {
                 return false;
             }
             std::thread::sleep(std::time::Duration::from_millis(2));

@@ -264,6 +264,39 @@ mod tests {
         assert_eq!(next, [25; 4]);
     }
 
+    /// Small messages from many threads keep libwebrtc's buffer far below
+    /// the low-water mark, so no native callback would come to move a
+    /// message a lost pump request left behind: every one must arrive.
+    #[test]
+    #[cfg_attr(target_os = "windows", ignore)]
+    fn small_concurrent_sends_are_never_left_queued() {
+        const THREADS: u64 = 8;
+        const EACH: u64 = 2_000;
+        let (f1, f2) = (chunking(), chunking());
+        let mut p = connect(&f1, &f2);
+        let at_b = inbox(&mut p.b);
+        let a = Arc::new(p.a);
+        let senders: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let a = a.clone();
+                thread::spawn(move || {
+                    for i in 0..EACH {
+                        a.send(&[t as u8, (i % 251) as u8], true).expect("send");
+                    }
+                })
+            })
+            .collect();
+        for s in senders {
+            s.join().unwrap();
+        }
+        for n in 0..THREADS * EACH {
+            at_b.recv_timeout(Duration::from_secs(10))
+                .unwrap_or_else(|_| {
+                    panic!("message {n} never arrived; queued {}", a.buffered_amount())
+                });
+        }
+    }
+
     #[test]
     #[cfg_attr(target_os = "windows", ignore)]
     fn buffered_amount_counts_the_queue_and_drain_waits_for_it() {
