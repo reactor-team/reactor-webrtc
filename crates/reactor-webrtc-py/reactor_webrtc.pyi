@@ -613,11 +613,13 @@ class DataChannel:
     def drain(self, timeout: float = 30.0) -> Awaitable[bool]:
         """Resolve to `True` once everything queued has been handed to SCTP and
         libwebrtc's own buffer is empty; `False` after `timeout` seconds or when
-        the channel stops being open."""
+        the channel stops being open. `float("inf")` waits without limit;
+        NaN raises `ValueError`."""
         ...
     def close(self, drain_timeout: float = 5.0) -> None:
         """Close the channel. A chunked channel first drains what it has
-        queued, for up to `drain_timeout` seconds."""
+        queued, for up to `drain_timeout` seconds (`float("inf")`: without
+        limit; NaN raises `ValueError`)."""
         ...
     def on_message(self, callback: Callable[[bytes, bool], None]) -> None:
         """`callback(data, binary)` for every incoming message. On a chunked
