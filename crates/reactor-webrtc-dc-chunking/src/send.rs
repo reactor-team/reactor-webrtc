@@ -55,8 +55,10 @@ impl SendConfig {
                 high: self.high_water,
             });
         }
-        // high_water plus one frame must stay under the native limit.
-        if self.high_water + self.chunk_size as u64 > crate::NATIVE_SEND_BUFFER_LIMIT {
+        // high_water plus one frame must stay under the native limit. Written
+        // as a subtraction (chunk_size is at most 256 KiB here) so an extreme
+        // high_water cannot overflow.
+        if self.high_water > crate::NATIVE_SEND_BUFFER_LIMIT - self.chunk_size as u64 {
             return Err(ConfigError::HighWater(self.high_water));
         }
         if self.queue_limit < self.max_message_size {
@@ -257,6 +259,15 @@ mod tests {
     #[test]
     fn default_config_is_valid() {
         assert_eq!(SendConfig::default().validate(), Ok(()));
+    }
+
+    #[test]
+    fn an_extreme_high_water_is_rejected_without_overflow() {
+        let c = SendConfig {
+            high_water: u64::MAX,
+            ..SendConfig::default()
+        };
+        assert_eq!(c.validate(), Err(ConfigError::HighWater(u64::MAX)));
     }
 
     #[test]
