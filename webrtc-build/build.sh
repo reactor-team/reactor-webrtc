@@ -11,6 +11,10 @@
 #   IOS_ENV=device|simulator   (ios only; default device)
 #   NINJA_TARGET=webrtc        (override the ninja target if needed)
 #   NINJA_JOBS=<count>          (limit parallel compiler processes)
+#   MAC_SDK_PATH=<dir>          (mac only: build against this SDK instead of
+#                                Xcode's; e.g. the Command Line Tools'
+#                                MacOSX26.5.sdk when Xcode's SDK is newer than
+#                                the bundled lld understands)
 set -euo pipefail
 
 OS="${1:?usage: build.sh <os> <arch> [profile]}"
@@ -98,6 +102,15 @@ gn_args() {
       # Hardware H.264 via VideoToolbox; no software OpenH264 needed.
       # Modern Xcode libc++ is the platform stdlib for both lib and glue.
       args+=("rtc_use_h264=false" "use_custom_libcxx=false" "symbol_level=1")
+      # gn only accepts an SDK under the build dir (Chromium links Xcode's own
+      # SDK into sdk/xcode_links for the same reason), so link the override there.
+      if [ -n "${MAC_SDK_PATH:-}" ]; then
+        local link
+        link="$OUT/sdk/local_links/$(basename "$MAC_SDK_PATH")"
+        mkdir -p "$(dirname "$link")"
+        ln -sfn "$MAC_SDK_PATH" "$link"
+        args+=("mac_sdk_path=\"$link\"")
+      fi
       ;;
     ios)
       args+=(
