@@ -100,7 +100,6 @@ async def test_a_large_message_arrives_whole_on_a_chunked_channel(factory):
     got = inbox(dc_b)
     msg = pattern(1, 20 * MIB)
     dc_a.send(msg)
-    assert dc_a.buffered_amount() > 0
     await wait_for(lambda: got, timeout=60)
     data, binary = got[0]
     assert binary and data == msg
@@ -139,8 +138,10 @@ async def test_drain_waits_for_the_queue_and_send_releases_the_gil(factory):
 
     t = threading.Thread(target=ticker)
     t.start()
+    # 50 MiB is past libwebrtc's 16 MiB buffer; how much of it is still
+    # queued when send returns depends on how fast the link drains (Windows
+    # loopback keeps up with the sender), so only the outcome is asserted.
     dc_a.send(pattern(2, 50 * MIB))
-    assert dc_a.buffered_amount() > 16 * MIB
     assert await dc_a.drain(timeout=60) is True
     stop.set()
     t.join()
@@ -151,15 +152,33 @@ async def test_drain_waits_for_the_queue_and_send_releases_the_gil(factory):
 
 async def test_a_full_queue_raises_queue_full_and_low_threshold_fires(factory):
     # A connection of this factory has a 128 MiB queue; fill it past that.
+    # From one thread a fast link (Windows loopback) can drain each send as it
+    # is pumped, so the queue never fills. Several threads send at once: while
+    # one pumps, the others' sends only queue, which fills it at any speed.
     _a, _b, dc_a, dc_b = await connect(factory)
     inbox(dc_b)
     fired = threading.Event()
     dc_a.set_buffered_amount_low_threshold(1 * MIB)
     dc_a.on_buffered_amount_low(fired.set)
     msg = pattern(3, 60 * MIB)
-    with pytest.raises(rw.DataChannelQueueFull):
-        for _ in range(4):
-            dc_a.send(msg)
+    refused = threading.Event()
+
+    def sender() -> None:
+        for _ in range(20):
+            if refused.is_set():
+                return
+            try:
+                dc_a.send(msg)
+            except rw.DataChannelQueueFull:
+                refused.set()
+                return
+
+    threads = [threading.Thread(target=sender) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        await asyncio.get_running_loop().run_in_executor(None, t.join)
+    assert refused.is_set(), "eight threads sending 60 MiB never filled a 128 MiB queue"
     assert issubclass(rw.DataChannelQueueFull, RuntimeError)
     await wait_for(fired.is_set, timeout=120)
     assert dc_a.state() == rw.DataChannelState.Open
