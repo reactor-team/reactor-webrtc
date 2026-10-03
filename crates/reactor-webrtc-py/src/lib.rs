@@ -2050,7 +2050,7 @@ impl DataChannel {
     }
 
     /// Register `callback(data: bytes, binary: bool)` for incoming messages.
-    fn on_message(&mut self, py: Python, callback: PyObject) {
+    fn on_message(&self, py: Python, callback: PyObject) {
         // Registering re-registers the native observer, which dispatches to the
         // thread that delivers messages into Python. The GIL has to be free.
         py.allow_threads(|| {
@@ -2064,7 +2064,7 @@ impl DataChannel {
     }
 
     /// Register `callback(state: DataChannelState)` for state transitions.
-    fn on_state_change(&mut self, py: Python, callback: PyObject) {
+    fn on_state_change(&self, py: Python, callback: PyObject) {
         py.allow_threads(|| {
             self.inner.on_state_change(move |s| {
                 Python::with_gil(|py| {
@@ -2076,7 +2076,7 @@ impl DataChannel {
 
     /// Fire `callback()` when the channel opens. Independent of
     /// `on_state_change` and `on_close`: setting one keeps the others.
-    fn on_open(&mut self, py: Python, callback: PyObject) {
+    fn on_open(&self, py: Python, callback: PyObject) {
         py.allow_threads(|| {
             self.inner.on_open(move || {
                 Python::with_gil(|py| {
@@ -2088,7 +2088,7 @@ impl DataChannel {
 
     /// Fire `callback()` when the channel closes. Independent of
     /// `on_state_change` and `on_open`.
-    fn on_close(&mut self, py: Python, callback: PyObject) {
+    fn on_close(&self, py: Python, callback: PyObject) {
         py.allow_threads(|| {
             self.inner.on_close(move || {
                 Python::with_gil(|py| {

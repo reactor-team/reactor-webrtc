@@ -204,3 +204,19 @@ async def test_drain_and_close_take_inf_and_refuse_nan(factory):
     assert dc_a.state() == rw.DataChannelState.Open
     dc_a.close(float("inf"))
     await wait_for(lambda: got)
+
+
+async def test_a_held_message_reaches_a_callback_that_reads_the_channel(factory):
+    """Messages held until on_message is set are flushed while it registers;
+    the callback can still use the channel it was set on."""
+    _a, _b, dc_a, dc_b = await connect(factory)
+    dc_a.send(b"held for later")
+    await asyncio.sleep(0.5)
+    seen: list = []
+
+    def on_message(data: bytes, binary: bool) -> None:
+        seen.append((data, binary, dc_b.state()))
+
+    dc_b.on_message(on_message)
+    await wait_for(lambda: seen)
+    assert seen == [(b"held for later", True, rw.DataChannelState.Open)]
