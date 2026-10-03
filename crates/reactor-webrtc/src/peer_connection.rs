@@ -1050,6 +1050,28 @@ type MessageCb = Box<dyn for<'a> FnMut(&'a [u8], bool) + Send>;
 type EventCb = Box<dyn FnMut() + Send>;
 type StateCb = Box<dyn FnMut(DataChannelState) + Send>;
 
+/// One callback, shared so it can be called with its slot unlocked.
+type Shared<F> = Arc<Mutex<F>>;
+
+/// A callback slot. A callback runs with the slot's lock released, so it may
+/// replace any handler of its own channel; its own lock, held while it runs,
+/// keeps calls to it in order.
+struct Slot<F>(Mutex<Option<Shared<F>>>);
+
+impl<F> Slot<F> {
+    fn empty() -> Self {
+        Self(Mutex::new(None))
+    }
+
+    fn set(&self, f: F) {
+        *self.0.lock().unwrap() = Some(Arc::new(Mutex::new(f)));
+    }
+
+    fn get(&self) -> Option<Shared<F>> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
 /// The native channel handle, shared with the callbacks that run on WebRTC's
 /// threads. Valid for as long as the owning [`DataChannel`] lives: the native
 /// observer is unregistered before the handle is destroyed.
@@ -1110,9 +1132,9 @@ struct Chunked {
 /// Everything the native observer reaches through `userdata`.
 struct ChannelCore {
     raw: RawDc,
-    on_message: Mutex<Option<MessageCb>>,
-    on_state_change: Mutex<Option<StateCb>>,
-    on_buffered_amount_low: Mutex<Option<EventCb>>,
+    on_message: Slot<MessageCb>,
+    on_state_change: Slot<StateCb>,
+    on_buffered_amount_low: Slot<EventCb>,
     registered: AtomicBool,
     // The owning connection's chunking negotiation, and this channel's
     // decision, made once it is open.
@@ -1233,31 +1255,37 @@ impl ChannelCore {
                 break;
             }
         }
-        self.maybe_fire_user_low(c);
     }
 
     fn maybe_fire_user_low(&self, c: &Chunked) {
         let threshold = c.user_low_threshold.load(Ordering::SeqCst);
         if self.buffered_amount() <= threshold && c.user_low_armed.swap(false, Ordering::SeqCst) {
-            if let Some(cb) = self.on_buffered_amount_low.lock().unwrap().as_mut() {
-                cb();
+            if let Some(cb) = self.on_buffered_amount_low.get() {
+                (*cb.lock().unwrap())();
             }
         }
     }
 
     /// Hand a whole message to the caller, or hold it until on_message is set.
+    ///
+    /// The slot stays locked only while deciding, so a message cannot be
+    /// held just after `on_message` flushed what was held.
     fn deliver(&self, c: &Chunked, data: Vec<u8>, binary: bool) {
-        let mut cb = self.on_message.lock().unwrap();
-        match cb.as_mut() {
-            Some(cb) => cb(&data, binary),
-            None => {
-                let size = data.len() as u64;
-                if c.pending_bytes.load(Ordering::SeqCst) + size <= c.pending_limit {
-                    c.pending_bytes.fetch_add(size, Ordering::SeqCst);
-                    c.pending.lock().unwrap().push_back((data, binary));
+        let cb = {
+            let slot = self.on_message.0.lock().unwrap();
+            match slot.clone() {
+                Some(cb) => cb,
+                None => {
+                    let size = data.len() as u64;
+                    if c.pending_bytes.load(Ordering::SeqCst) + size <= c.pending_limit {
+                        c.pending_bytes.fetch_add(size, Ordering::SeqCst);
+                        c.pending.lock().unwrap().push_back((data, binary));
+                    }
+                    return;
                 }
             }
-        }
+        };
+        (*cb.lock().unwrap())(&data, binary);
     }
 }
 
@@ -1265,8 +1293,8 @@ extern "C" fn dc_on_message(ud: *mut c_void, data: *const u8, len: usize, binary
     let core = unsafe { &*(ud as *const ChannelCore) };
     let bytes = unsafe { std::slice::from_raw_parts(data, len) };
     let Some(c) = core.chunked() else {
-        if let Some(cb) = core.on_message.lock().unwrap().as_mut() {
-            cb(bytes, binary != 0);
+        if let Some(cb) = core.on_message.get() {
+            (*cb.lock().unwrap())(bytes, binary != 0);
         }
         return;
     };
@@ -1309,18 +1337,23 @@ extern "C" fn dc_on_state_change(ud: *mut c_void, state: c_int) {
         }
         _ => {}
     }
-    if let Some(cb) = core.on_state_change.lock().unwrap().as_mut() {
-        cb(state);
+    if let Some(cb) = core.on_state_change.get() {
+        (*cb.lock().unwrap())(state);
     }
 }
 
 extern "C" fn dc_on_buffered_amount_low(ud: *mut c_void) {
     let core = unsafe { &*(ud as *const ChannelCore) };
     match core.decided.get() {
-        Some(Some(c)) => core.pump(c),
+        // The caller's own threshold is checked here, from the native event,
+        // never from inside a send: like libwebrtc, `send` does not call back.
+        Some(Some(c)) => {
+            core.pump(c);
+            core.maybe_fire_user_low(c);
+        }
         _ => {
-            if let Some(cb) = core.on_buffered_amount_low.lock().unwrap().as_mut() {
-                cb();
+            if let Some(cb) = core.on_buffered_amount_low.get() {
+                (*cb.lock().unwrap())();
             }
         }
     }
@@ -1361,9 +1394,9 @@ impl DataChannel {
             raw,
             core: Box::new(ChannelCore {
                 raw: RawDc(raw),
-                on_message: Mutex::new(None),
-                on_state_change: Mutex::new(None),
-                on_buffered_amount_low: Mutex::new(None),
+                on_message: Slot::empty(),
+                on_state_change: Slot::empty(),
+                on_buffered_amount_low: Slot::empty(),
                 registered: AtomicBool::new(false),
                 negotiation: None,
                 decided: std::sync::OnceLock::new(),
@@ -1467,6 +1500,11 @@ impl DataChannel {
                 Err(Error::Webrtc("data channel send failed".into()))
             };
         };
+        // A closed channel would take the message and drop it on the first
+        // native send; refuse it as the plain path does.
+        if self.state() != DataChannelState::Open {
+            return Err(Error::Webrtc("data channel send failed".into()));
+        }
         c.queue
             .lock()
             .unwrap()
@@ -1479,6 +1517,10 @@ impl DataChannel {
 
     /// Block until everything queued has been handed to SCTP and libwebrtc's
     /// own buffer is empty, or `timeout` passes. Returns whether it drained.
+    ///
+    /// Don't call it (or [`close`](Self::close) with a drain timeout) from
+    /// this channel's callbacks: they run on libwebrtc's network thread, which
+    /// is the thread that sends, so nothing drains until the timeout passes.
     pub fn drain(&self, timeout: std::time::Duration) -> bool {
         // A timeout too large to add to now never expires.
         let deadline = std::time::Instant::now().checked_add(timeout);
@@ -1489,6 +1531,11 @@ impl DataChannel {
             let expired = deadline.is_some_and(|d| std::time::Instant::now() >= d);
             if self.state() != DataChannelState::Open || expired {
                 return false;
+            }
+            // Refill here too, rather than only from the native low-water
+            // event, so a drain never waits on an event it already missed.
+            if let Some(c) = self.core.chunked() {
+                self.core.pump(c);
             }
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
@@ -1509,23 +1556,34 @@ impl DataChannel {
     /// chunked channel it fires once per whole message, including any that
     /// arrived before it was set.
     pub fn on_message(&mut self, cb: impl for<'a> FnMut(&'a [u8], bool) + Send + 'static) {
-        let mut slot = self.core.on_message.lock().unwrap();
-        *slot = Some(Box::new(cb));
-        if let Some(Some(c)) = self.core.decided.get() {
-            let cb = slot.as_mut().unwrap();
-            for (data, binary) in c.pending.lock().unwrap().drain(..) {
-                cb(&data, binary);
+        // The new callback is published already locked, and the held messages
+        // are taken out under the slot's lock: a message that arrives while
+        // they are flushed waits on the callback, so the order holds, and the
+        // callback can still replace any handler of this channel.
+        let shared: Shared<MessageCb> = Arc::new(Mutex::new(Box::new(cb)));
+        let mut running = shared.lock().unwrap();
+        let held = {
+            let mut slot = self.core.on_message.0.lock().unwrap();
+            *slot = Some(Arc::clone(&shared));
+            match self.core.decided.get() {
+                Some(Some(c)) => {
+                    c.pending_bytes.store(0, Ordering::SeqCst);
+                    std::mem::take(&mut *c.pending.lock().unwrap())
+                }
+                _ => std::collections::VecDeque::new(),
             }
-            c.pending_bytes.store(0, Ordering::SeqCst);
+        };
+        for (data, binary) in held {
+            (*running)(&data, binary);
         }
-        drop(slot);
+        drop(running);
         self.reregister();
     }
 
     /// State-change handler — fires for every transition including
     /// Connecting → Open → Closing → Closed.
     pub fn on_state_change(&mut self, cb: impl FnMut(DataChannelState) + Send + 'static) {
-        *self.core.on_state_change.lock().unwrap() = Some(Box::new(cb));
+        self.core.on_state_change.set(Box::new(cb));
         self.reregister();
     }
 
@@ -1551,8 +1609,12 @@ impl DataChannel {
 
     /// Flow-control handler — fires when `buffered_amount` drops at or below
     /// the threshold set by [`set_buffered_amount_low_threshold`](Self::set_buffered_amount_low_threshold).
+    ///
+    /// Like libwebrtc's, it never fires from inside [`send`](Self::send), so
+    /// it may call `send` to refill. On a chunked channel it is checked when
+    /// libwebrtc's buffer falls to the queue's low-water mark.
     pub fn on_buffered_amount_low(&mut self, cb: impl FnMut() + Send + 'static) {
-        *self.core.on_buffered_amount_low.lock().unwrap() = Some(Box::new(cb));
+        self.core.on_buffered_amount_low.set(Box::new(cb));
         self.reregister();
     }
 
