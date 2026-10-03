@@ -49,13 +49,56 @@ fn claim_factory() -> PyResult<()> {
         })
 }
 
+// pyo3's create_exception! expands to a cfg check on its own `gil-refs`
+// feature, which this crate does not declare; keep that lint local to it.
+#[allow(unexpected_cfgs)]
+mod exceptions {
+    use pyo3::exceptions::PyRuntimeError;
+
+    pyo3::create_exception!(
+        reactor_webrtc,
+        DataChannelQueueFull,
+        PyRuntimeError,
+        "A chunked data channel's send queue cannot take the message yet. Nothing \
+         was sent and the channel is still usable: wait for `on_buffered_amount_low` \
+         or `drain()`, then send again."
+    );
+    pyo3::create_exception!(
+        reactor_webrtc,
+        DataChannelMessageTooLarge,
+        PyRuntimeError,
+        "The message is larger than the chunked channel's effective limit (the \
+         smaller of this side's max_message_size and the peer's). Nothing was sent."
+    );
+}
+use exceptions::{DataChannelMessageTooLarge, DataChannelQueueFull};
+
 fn err(e: rw::Error) -> PyErr {
-    PyRuntimeError::new_err(e.to_string())
+    match &e {
+        rw::Error::DataChannel(rw::DcSendError::QueueFull { .. }) => {
+            DataChannelQueueFull::new_err(e.to_string())
+        }
+        rw::Error::DataChannel(rw::DcSendError::TooLarge { .. }) => {
+            DataChannelMessageTooLarge::new_err(e.to_string())
+        }
+        _ => PyRuntimeError::new_err(e.to_string()),
+    }
 }
 
 /// Maps a `spawn_blocking` `JoinError` (task panic) to a `PyErr`.
 fn join_err(e: tokio::task::JoinError) -> PyErr {
     PyRuntimeError::new_err(format!("task join: {e}"))
+}
+
+/// Seconds from Python as a timeout: negative waits not at all, `inf` (or
+/// anything too large for a `Duration`) waits without limit, NaN is refused.
+fn timeout_secs(name: &str, secs: f64) -> PyResult<std::time::Duration> {
+    if secs.is_nan() {
+        return Err(PyValueError::new_err(format!(
+            "{name} must be a number, not NaN"
+        )));
+    }
+    Ok(std::time::Duration::try_from_secs_f64(secs.max(0.0)).unwrap_or(std::time::Duration::MAX))
 }
 
 fn sdp_type_to_str(kind: rw::SdpType) -> &'static str {
@@ -184,6 +227,9 @@ pub struct RtcConfiguration {
     /// Whether the SCTP handshake is accelerated with SNAP
     /// (draft-hancke-tsvwg-snap). `False` by default; both ends must opt in.
     pub sctp_snap: bool,
+    /// Whether this connection takes part in data-channel chunking when its
+    /// factory enables it. `True` by default; only an opt-out.
+    pub dc_chunking: bool,
 }
 
 #[pymethods]
@@ -202,6 +248,7 @@ impl RtcConfiguration {
         tcp_candidate_policy=TcpCandidatePolicy::Disabled,
         frame_metadata=true,
         sctp_snap=false,
+        dc_chunking=true,
     ))]
     fn new(
         ice_servers: Vec<IceServer>,
@@ -215,6 +262,7 @@ impl RtcConfiguration {
         tcp_candidate_policy: TcpCandidatePolicy,
         frame_metadata: bool,
         sctp_snap: bool,
+        dc_chunking: bool,
     ) -> PyResult<Self> {
         Ok(Self {
             ice_servers,
@@ -228,6 +276,7 @@ impl RtcConfiguration {
             tcp_candidate_policy: rw::TcpCandidatePolicy::from(tcp_candidate_policy),
             frame_metadata,
             sctp_snap,
+            dc_chunking,
         })
     }
     #[getter]
@@ -326,6 +375,15 @@ impl RtcConfiguration {
     fn set_sctp_snap(&mut self, value: bool) {
         self.sctp_snap = value;
     }
+
+    #[getter]
+    fn dc_chunking(&self) -> bool {
+        self.dc_chunking
+    }
+    #[setter]
+    fn set_dc_chunking(&mut self, value: bool) {
+        self.dc_chunking = value;
+    }
 }
 
 impl From<&RtcConfiguration> for rw::RtcConfiguration {
@@ -361,7 +419,7 @@ impl From<&RtcConfiguration> for rw::RtcConfiguration {
             tcp_candidate_policy: c.tcp_candidate_policy,
             frame_metadata: c.frame_metadata,
             sctp_snap: c.sctp_snap,
-            dc_chunking: true,
+            dc_chunking: c.dc_chunking,
         }
     }
 }
@@ -1894,7 +1952,8 @@ impl Transceiver {
 /// An SCTP data channel for binary or text messaging.
 #[pyclass]
 pub struct DataChannel {
-    inner: ManuallyDrop<rw::DataChannel>,
+    // Arc so `drain()` can hand a handle to a spawn_blocking future.
+    inner: ManuallyDrop<Arc<rw::DataChannel>>,
 }
 
 impl Drop for DataChannel {
@@ -1919,14 +1978,79 @@ impl DataChannel {
     }
 
     /// Send bytes. `binary=True` for binary SCTP messages, `False` for text.
+    ///
+    /// On a chunked channel (`is_chunked()`) the message may be larger than
+    /// libwebrtc's 16 MiB send buffer: it is queued and leaves as frames. A
+    /// full queue raises `DataChannelQueueFull` and an oversized message
+    /// `DataChannelMessageTooLarge`; nothing is sent either way.
     #[pyo3(signature = (data, binary = true))]
     fn send(&self, py: Python, data: &[u8], binary: bool) -> PyResult<()> {
         py.allow_threads(|| self.inner.send(data, binary))
             .map_err(err)
     }
 
+    /// Whether this channel carries chunked messages: its connection
+    /// negotiated chunking and it is ordered and fully reliable. Decided once
+    /// the channel is open; `False` before.
+    fn is_chunked(&self, py: Python) -> bool {
+        py.allow_threads(|| self.inner.is_chunked())
+    }
+
+    /// Whether the channel delivers messages in order.
+    fn ordered(&self, py: Python) -> bool {
+        py.allow_threads(|| self.inner.ordered())
+    }
+
+    /// Whether the channel retransmits until delivery.
+    fn reliable(&self, py: Python) -> bool {
+        py.allow_threads(|| self.inner.reliable())
+    }
+
+    /// Threshold for `on_buffered_amount_low`. On a chunked channel it applies
+    /// to `buffered_amount()`, queue included.
+    fn set_buffered_amount_low_threshold(&self, py: Python, threshold: u64) {
+        py.allow_threads(|| self.inner.set_buffered_amount_low_threshold(threshold))
+    }
+
+    /// Register `callback()` for when `buffered_amount()` drops to the
+    /// threshold set with `set_buffered_amount_low_threshold`.
+    fn on_buffered_amount_low(&self, py: Python, callback: PyObject) {
+        py.allow_threads(|| {
+            self.inner.on_buffered_amount_low(move || {
+                Python::with_gil(|py| {
+                    let _ = callback.call0(py);
+                });
+            });
+        });
+    }
+
+    /// Awaitable: resolves to `True` once everything queued has been handed to
+    /// SCTP and libwebrtc's own buffer is empty, or `False` after `timeout`
+    /// seconds or when the channel stops being open. `float("inf")` waits
+    /// without limit; NaN raises `ValueError`.
+    #[pyo3(signature = (timeout = 30.0))]
+    fn drain<'py>(&self, py: Python<'py>, timeout: f64) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+        let timeout = timeout_secs("timeout", timeout)?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            tokio::task::spawn_blocking(move || inner.drain(timeout))
+                .await
+                .map_err(join_err)
+        })
+    }
+
+    /// Close the channel. A chunked channel first drains what it has queued,
+    /// for up to `drain_timeout` seconds (`float("inf")`: without limit; NaN
+    /// raises `ValueError`).
+    #[pyo3(signature = (drain_timeout = 5.0))]
+    fn close(&self, py: Python, drain_timeout: f64) -> PyResult<()> {
+        let timeout = timeout_secs("drain_timeout", drain_timeout)?;
+        py.allow_threads(|| self.inner.close(timeout));
+        Ok(())
+    }
+
     /// Register `callback(data: bytes, binary: bool)` for incoming messages.
-    fn on_message(&mut self, py: Python, callback: PyObject) {
+    fn on_message(&self, py: Python, callback: PyObject) {
         // Registering re-registers the native observer, which dispatches to the
         // thread that delivers messages into Python. The GIL has to be free.
         py.allow_threads(|| {
@@ -1940,7 +2064,7 @@ impl DataChannel {
     }
 
     /// Register `callback(state: DataChannelState)` for state transitions.
-    fn on_state_change(&mut self, py: Python, callback: PyObject) {
+    fn on_state_change(&self, py: Python, callback: PyObject) {
         py.allow_threads(|| {
             self.inner.on_state_change(move |s| {
                 Python::with_gil(|py| {
@@ -1950,8 +2074,9 @@ impl DataChannel {
         });
     }
 
-    /// Fire `callback()` once when the channel opens.
-    fn on_open(&mut self, py: Python, callback: PyObject) {
+    /// Fire `callback()` when the channel opens. Independent of
+    /// `on_state_change` and `on_close`: setting one keeps the others.
+    fn on_open(&self, py: Python, callback: PyObject) {
         py.allow_threads(|| {
             self.inner.on_open(move || {
                 Python::with_gil(|py| {
@@ -1961,8 +2086,9 @@ impl DataChannel {
         });
     }
 
-    /// Fire `callback()` once when the channel closes.
-    fn on_close(&mut self, py: Python, callback: PyObject) {
+    /// Fire `callback()` when the channel closes. Independent of
+    /// `on_state_change` and `on_open`.
+    fn on_close(&self, py: Python, callback: PyObject) {
         py.allow_threads(|| {
             self.inner.on_close(move || {
                 Python::with_gil(|py| {
@@ -2106,7 +2232,7 @@ impl PeerConnectionObserver {
                     match Py::new(
                         py,
                         DataChannel {
-                            inner: ManuallyDrop::new(dc),
+                            inner: ManuallyDrop::new(Arc::new(dc)),
                         },
                     ) {
                         Ok(py_dc) => {
@@ -2281,7 +2407,7 @@ impl PeerConnection {
     fn create_data_channel(&self, py: Python, label: &str) -> PyResult<DataChannel> {
         py.allow_threads(|| self.pc().create_data_channel(label))
             .map(|inner| DataChannel {
-                inner: ManuallyDrop::new(inner),
+                inner: ManuallyDrop::new(Arc::new(inner)),
             })
             .map_err(err)
     }
@@ -2529,6 +2655,38 @@ impl PeerConnectionFactoryBuilder {
             .take()
             .ok_or_else(|| PyRuntimeError::new_err("builder already consumed by build()"))?;
         self.pending = Some(b.with_dtls_in_stun(enabled));
+        Ok(())
+    }
+
+    /// Fast, large data-channel messages. Sets dcsctp's `max_burst` for every
+    /// data channel of the factory, and offers chunking to every peer
+    /// connection it creates; a channel is chunked only when the peer declares
+    /// chunking too. Defaults: `max_burst=256`, `max_message_size=64 MiB`,
+    /// `send_buffer_limit=128 MiB`, `chunk_size=64 KiB`. `build()` raises when
+    /// the values cannot work together.
+    #[pyo3(signature = (
+        max_burst = 256,
+        max_message_size = 64 * 1024 * 1024,
+        send_buffer_limit = 128 * 1024 * 1024,
+        chunk_size = 64 * 1024,
+    ))]
+    fn with_dc_chunking(
+        &mut self,
+        max_burst: u32,
+        max_message_size: u64,
+        send_buffer_limit: u64,
+        chunk_size: usize,
+    ) -> PyResult<()> {
+        let b = self
+            .pending
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("builder already consumed by build()"))?;
+        let mut settings = rw::DcChunking::default();
+        settings.max_burst = max_burst;
+        settings.max_message_size = max_message_size;
+        settings.send_buffer_limit = send_buffer_limit;
+        settings.chunk_size = chunk_size;
+        self.pending = Some(b.with_dc_chunking(settings));
         Ok(())
     }
 
@@ -2987,6 +3145,14 @@ fn reactor_webrtc(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<EncodedVideoTrack>()?;
     m.add_class::<Transceiver>()?;
     m.add_class::<DataChannel>()?;
+    m.add(
+        "DataChannelQueueFull",
+        m.py().get_type_bound::<DataChannelQueueFull>(),
+    )?;
+    m.add(
+        "DataChannelMessageTooLarge",
+        m.py().get_type_bound::<DataChannelMessageTooLarge>(),
+    )?;
     m.add_class::<PeerConnectionObserver>()?;
     m.add_class::<PeerConnection>()?;
     m.add_class::<PeerConnectionFactory>()?;

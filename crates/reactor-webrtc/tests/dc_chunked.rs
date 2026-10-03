@@ -499,6 +499,44 @@ mod tests {
         assert!(p.a.send(b"too late", true).is_err());
     }
 
+    /// A callback may replace a handler while another thread replaces one
+    /// too. Neither may wait on the signaling thread, which runs the
+    /// callbacks: that cycle deadlocked when every setter re-registered the
+    /// native observer under a lock.
+    #[test]
+    #[cfg_attr(target_os = "windows", ignore)]
+    fn handlers_can_be_replaced_from_a_callback_while_another_thread_does_too() {
+        let (f1, f2) = (chunking(), chunking());
+        let p = connect(&f1, &f2);
+        let b = Arc::new(p.b);
+        let (tx, rx) = mpsc::channel::<()>();
+        b.on_message({
+            let b = Arc::downgrade(&b);
+            move |_, _| {
+                if let Some(b) = b.upgrade() {
+                    b.on_state_change(|_| {});
+                }
+                let _ = tx.send(());
+            }
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let churn = thread::spawn({
+            let (b, stop) = (Arc::clone(&b), Arc::clone(&stop));
+            move || {
+                while !stop.load(Ordering::SeqCst) {
+                    b.on_close(|| {});
+                }
+            }
+        });
+        for i in 0..200u32 {
+            p.a.send(&i.to_be_bytes(), true).expect("send");
+            rx.recv_timeout(Duration::from_secs(10))
+                .unwrap_or_else(|_| panic!("callback {i} never completed: deadlocked"));
+        }
+        stop.store(true, Ordering::SeqCst);
+        churn.join().unwrap();
+    }
+
     #[test]
     #[cfg_attr(target_os = "windows", ignore)]
     fn messages_that_arrive_before_on_message_are_kept() {

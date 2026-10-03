@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Callable, Optional, Union, final
+from typing import Awaitable, Callable, Optional, Union, final
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -74,6 +74,14 @@ class RtcConfiguration:
     flag is on, and a peer that does not understand it ignores it and negotiates
     SCTP the usual way. The DTLS half of the same saving is
     `PeerConnectionFactoryBuilder.with_dtls_in_stun`."""
+    dc_chunking: bool
+    """Take part in data-channel chunking when the factory enables it with
+    `PeerConnectionFactoryBuilder.with_dc_chunking`.
+
+    `True` by default, and on its own it does nothing: the factory must enable
+    chunking and the peer must declare it too. Set `False` to keep one
+    connection of a chunking factory on plain data channels; the factory's
+    `max_burst` still applies to it."""
     def __init__(
         self,
         ice_servers: list[IceServer] = ...,
@@ -87,6 +95,7 @@ class RtcConfiguration:
         tcp_candidate_policy: TcpCandidatePolicy = ...,
         frame_metadata: bool = True,
         sctp_snap: bool = False,
+        dc_chunking: bool = True,
     ) -> None: ...
 
 # ── Signaling types ───────────────────────────────────────────────────────────
@@ -566,15 +575,66 @@ class Transceiver:
 
 # ── Data channel ──────────────────────────────────────────────────────────────
 
+class DataChannelQueueFull(RuntimeError):
+    """A chunked channel's send queue cannot take the message yet. Nothing was
+    sent and the channel is still usable: wait for `on_buffered_amount_low` or
+    `drain()`, then send again."""
+
+class DataChannelMessageTooLarge(RuntimeError):
+    """The message is larger than the chunked channel's effective limit (the
+    smaller of this side's `max_message_size` and the peer's). Nothing was
+    sent."""
+
 class DataChannel:
     def label(self) -> str: ...
     def state(self) -> DataChannelState: ...
-    def buffered_amount(self) -> int: ...
-    def send(self, data: bytes, binary: bool = True) -> None: ...
-    def on_message(self, callback: Callable[[bytes, bool], None]) -> None: ...
+    def buffered_amount(self) -> int:
+        """Bytes waiting to be sent. On a chunked channel this includes what is
+        still queued beyond libwebrtc's own buffer."""
+        ...
+    def send(self, data: bytes, binary: bool = True) -> None:
+        """Send a message. On a chunked channel it may be larger than
+        libwebrtc's 16 MiB send buffer: it is queued and leaves as frames.
+        Raises `DataChannelQueueFull` or `DataChannelMessageTooLarge` without
+        sending anything."""
+        ...
+    def is_chunked(self) -> bool:
+        """Whether this channel carries chunked messages: its connection
+        negotiated chunking and it is ordered and fully reliable. Decided once
+        the channel is open; `False` before."""
+        ...
+    def ordered(self) -> bool: ...
+    def reliable(self) -> bool: ...
+    def set_buffered_amount_low_threshold(self, threshold: int) -> None:
+        """Threshold for `on_buffered_amount_low`; on a chunked channel it
+        applies to `buffered_amount()`, queue included."""
+        ...
+    def on_buffered_amount_low(self, callback: Callable[[], None]) -> None: ...
+    def drain(self, timeout: float = 30.0) -> Awaitable[bool]:
+        """Resolve to `True` once everything queued has been handed to SCTP and
+        libwebrtc's own buffer is empty; `False` after `timeout` seconds or when
+        the channel stops being open. `float("inf")` waits without limit;
+        NaN raises `ValueError`."""
+        ...
+    def close(self, drain_timeout: float = 5.0) -> None:
+        """Close the channel. A chunked channel first drains what it has
+        queued, for up to `drain_timeout` seconds (`float("inf")`: without
+        limit; NaN raises `ValueError`)."""
+        ...
+    def on_message(self, callback: Callable[[bytes, bool], None]) -> None:
+        """`callback(data, binary)` for every incoming message. On a chunked
+        channel it fires once per whole message, including messages that
+        arrived before it was set."""
+        ...
     def on_state_change(self, callback: Callable[[DataChannelState], None]) -> None: ...
-    def on_open(self, callback: Callable[[], None]) -> None: ...
-    def on_close(self, callback: Callable[[], None]) -> None: ...
+    def on_open(self, callback: Callable[[], None]) -> None:
+        """`callback()` when the channel opens. `on_state_change`, `on_open`
+        and `on_close` are independent: setting one keeps the others."""
+        ...
+    def on_close(self, callback: Callable[[], None]) -> None:
+        """`callback()` when the channel closes. Independent of
+        `on_state_change` and `on_open`."""
+        ...
 
 # ── Observer ──────────────────────────────────────────────────────────────────
 
@@ -722,6 +782,23 @@ class PeerConnectionFactoryBuilder:
         when it does not. Factory-wide: libwebrtc reads it from the factory's
         environment. The SCTP half of the same saving is
         `RtcConfiguration.sctp_snap`."""
+        ...
+    def with_dc_chunking(
+        self,
+        max_burst: int = 256,
+        max_message_size: int = 64 * 1024 * 1024,
+        send_buffer_limit: int = 128 * 1024 * 1024,
+        chunk_size: int = 64 * 1024,
+    ) -> None:
+        """Fast, large data-channel messages.
+
+        Sets dcsctp's `max_burst` (packets per send and per SACK; upstream's 4
+        makes a message above ~4.6 KB ramp up over one round trip per doubling)
+        for every data channel of the factory, and offers chunking to every
+        peer connection it creates through `a=x-reactor-dc-chunking`. A channel
+        is chunked only when the peer declares chunking too; against any other
+        peer nothing changes. `build()` raises when the values cannot work
+        together."""
         ...
     def with_openh264(self, lib_path: str) -> None:
         """Register the OpenH264 backend from a downloaded library path

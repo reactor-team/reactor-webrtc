@@ -239,4 +239,36 @@ mod tests {
         assert!(dc1.is_chunked() && dc2.is_chunked());
         assert!(pc1.dc_chunking_negotiated() && pc2.dc_chunking_negotiated());
     }
+
+    #[test]
+    #[cfg_attr(target_os = "windows", ignore)]
+    fn on_close_and_on_state_change_both_fire() {
+        let (f1, f2) = (chunking_factory(), chunking_factory());
+        let (_pc1, _pc2, dc1, dc2) = connect(&f1, &f2);
+        let closed = Arc::new(AtomicBool::new(false));
+        let saw_closed_state = Arc::new(AtomicBool::new(false));
+        dc2.on_state_change({
+            let s = saw_closed_state.clone();
+            move |st| {
+                if st == DataChannelState::Closed {
+                    s.store(true, Ordering::SeqCst);
+                }
+            }
+        });
+        dc2.on_close({
+            let c = closed.clone();
+            move || c.store(true, Ordering::SeqCst)
+        });
+        dc1.close(Duration::from_secs(5));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !(closed.load(Ordering::SeqCst) && saw_closed_state.load(Ordering::SeqCst)) {
+            assert!(
+                Instant::now() < deadline,
+                "on_close {} on_state_change {}",
+                closed.load(Ordering::SeqCst),
+                saw_closed_state.load(Ordering::SeqCst)
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
 }
