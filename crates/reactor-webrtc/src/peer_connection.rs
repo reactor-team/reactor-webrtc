@@ -1139,9 +1139,6 @@ struct ChannelCore {
     on_close: Slot<EventCb>,
     on_buffered_amount_low: Slot<EventCb>,
     registered: AtomicBool,
-    // Serializes native (re-)registration: the glue replaces its observer
-    // object on every call, and setters take &self, so two threads may race.
-    register_lock: Mutex<()>,
     // The owning connection's chunking negotiation, and this channel's
     // decision, made once it is open.
     negotiation: Option<Arc<crate::dc_chunking::DcNegotiation>>,
@@ -1206,7 +1203,6 @@ impl ChannelCore {
     }
 
     fn register(&self) {
-        let _guard = self.register_lock.lock().unwrap();
         let ud = self as *const ChannelCore as *mut c_void;
         unsafe {
             reactor_webrtc_sys::reactor_webrtc_data_channel_register_observer(
@@ -1415,7 +1411,6 @@ impl DataChannel {
                 on_close: Slot::empty(),
                 on_buffered_amount_low: Slot::empty(),
                 registered: AtomicBool::new(false),
-                register_lock: Mutex::new(()),
                 negotiation: None,
                 decided: std::sync::OnceLock::new(),
                 early_low_threshold: AtomicU64::new(0),
@@ -1631,11 +1626,14 @@ impl DataChannel {
         self.reregister();
     }
 
-    // Setting a callback (re-)registers the native observer, as it always
-    // has; a chunked channel registers on its own when it decides.
+    // The native observer is registered once, by whichever comes first: a
+    // setter, or a chunked channel deciding. It addresses the channel's core
+    // and every callback reads its slot when it fires, so a later setter only
+    // swaps the slot. Re-registering would wait on the signaling thread, which
+    // runs the callbacks: a setter called from a callback while another
+    // thread re-registered deadlocked.
     fn reregister(&self) {
-        self.core.registered.store(true, Ordering::SeqCst);
-        self.core.register();
+        self.core.ensure_registered();
     }
 }
 
