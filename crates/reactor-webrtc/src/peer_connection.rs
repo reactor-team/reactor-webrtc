@@ -1507,9 +1507,10 @@ impl PeerConnection {
         self.dc_negotiation.settings()
     }
 
-    /// Whether the peer declared data-channel chunking in a description this
-    /// connection applied, and this connection takes part. Sticky once true.
-    /// Each channel still decides for itself: see [`DataChannel::is_chunked`].
+    /// Whether chunking was negotiated: this connection takes part, and the
+    /// first offer/answer round to complete declared it on both sides. Fixed
+    /// from then on; a later renegotiation neither adds nor drops it. Each
+    /// channel still decides for itself: see [`DataChannel::is_chunked`].
     pub fn dc_chunking_negotiated(&self) -> bool {
         self.dc_negotiation.remote().is_some()
     }

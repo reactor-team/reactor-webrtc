@@ -84,9 +84,10 @@ impl DcChunking {
 /// every channel, so they all read the same negotiation.
 pub(crate) struct DcNegotiation {
     settings: Option<DcChunking>,
-    // The established negotiation: set once an offer/answer round completes
-    // with the attribute on both sides, and sticky from then on.
+    // The negotiation, settled by the first offer/answer round to complete:
+    // the peer's parameters when both sides declared chunking in it.
     remote: Mutex<Option<Params>>,
+    settled: AtomicBool,
     // The latest remote offer's parameters, while it awaits our answer. An
     // answer mirrors the offer it answers, so this is not sticky.
     pending: Mutex<Option<Params>>,
@@ -99,6 +100,7 @@ impl DcNegotiation {
         Arc::new(Self {
             settings,
             remote: Mutex::new(None),
+            settled: AtomicBool::new(false),
             pending: Mutex::new(None),
             local_offer_declared: AtomicBool::new(false),
         })
@@ -147,9 +149,7 @@ impl DcNegotiation {
             SdpType::Offer => self.local_offer_declared.store(declares, Ordering::SeqCst),
             SdpType::Answer => {
                 let pending = self.pending.lock().unwrap().take();
-                if declares {
-                    self.establish(pending);
-                }
+                self.settle(pending.filter(|_| declares));
             }
             SdpType::Rollback => self.local_offer_declared.store(false, Ordering::SeqCst),
             SdpType::PrAnswer => {}
@@ -163,13 +163,12 @@ impl DcNegotiation {
     /// to an offer of ours that did, completes the round on the offerer's
     /// side.
     ///
-    /// Sticky once established: a later renegotiation that drops the
-    /// attribute does not undo it. Channels already open keep their framing
-    /// either way, and both ends must keep agreeing for new ones; each end
-    /// completes the round before any SCTP data can flow, so both have
-    /// settled before the first channel opens. The one way the ends can
-    /// still disagree is an answer that loses the attribute between the
-    /// answerer and the offerer.
+    /// Settled by the first round to complete, either way, and fixed for the
+    /// connection's life: a later renegotiation neither adds nor drops it.
+    /// Each end completes that round before any SCTP data can flow, so a
+    /// channel reaches the same decision as its twin whenever it is asked.
+    /// The one way the ends can still disagree is an answer that loses the
+    /// attribute between the answerer and the offerer.
     pub(crate) fn on_remote_description(&self, remote: &SessionDescription) {
         if self.settings.is_none() {
             return;
@@ -178,19 +177,17 @@ impl DcNegotiation {
         match remote.kind {
             SdpType::Offer => *self.pending.lock().unwrap() = parsed,
             SdpType::Answer => {
-                if self.local_offer_declared.load(Ordering::SeqCst) {
-                    self.establish(parsed);
-                }
+                let offered = self.local_offer_declared.load(Ordering::SeqCst);
+                self.settle(parsed.filter(|_| offered));
             }
             SdpType::Rollback => *self.pending.lock().unwrap() = None,
             SdpType::PrAnswer => {}
         }
     }
 
-    fn establish(&self, params: Option<Params>) {
-        let mut slot = self.remote.lock().unwrap();
-        if slot.is_none() {
-            *slot = params;
+    fn settle(&self, params: Option<Params>) {
+        if !self.settled.swap(true, Ordering::SeqCst) {
+            *self.remote.lock().unwrap() = params;
         }
     }
 }
@@ -258,6 +255,25 @@ mod tests {
         offerer.on_local_description(&desc(SdpType::Offer, false));
         offerer.on_remote_description(&desc(SdpType::Answer, true));
         assert!(offerer.remote().is_none());
+    }
+
+    #[test]
+    fn a_later_round_cannot_add_chunking_to_a_connection_settled_without_it() {
+        let (offerer, answerer) = (negotiation(), negotiation());
+        // First round: the answer comes back without the attribute.
+        offerer.on_local_description(&desc(SdpType::Offer, true));
+        answerer.on_remote_description(&desc(SdpType::Offer, false));
+        let first = answerer.answer(desc(SdpType::Answer, false));
+        answerer.on_local_description(&first);
+        offerer.on_remote_description(&first);
+        // Second round: both declare it.
+        offerer.on_local_description(&desc(SdpType::Offer, true));
+        answerer.on_remote_description(&desc(SdpType::Offer, true));
+        let second = answerer.answer(desc(SdpType::Answer, false));
+        assert!(second.declares_dc_chunking(), "the answer still mirrors");
+        answerer.on_local_description(&second);
+        offerer.on_remote_description(&second);
+        assert!(offerer.remote().is_none() && answerer.remote().is_none());
     }
 
     #[test]
