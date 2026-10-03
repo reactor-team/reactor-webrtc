@@ -134,6 +134,24 @@ mod tests {
 
     /// Bytes that differ between messages and positions, so a reordered,
     /// duplicated or lost frame shows up as a mismatch.
+    /// Wait for the next message. On a timeout, say whether the sender still
+    /// holds bytes (its queue or libwebrtc's buffer never drained) or handed
+    /// everything over and the message was lost after it.
+    fn arrival(
+        rx: &mpsc::Receiver<(Vec<u8>, bool)>,
+        sender: &DataChannel,
+        what: &str,
+        timeout: Duration,
+    ) -> (Vec<u8>, bool) {
+        rx.recv_timeout(timeout).unwrap_or_else(|_| {
+            panic!(
+                "{what} did not arrive in {timeout:?}: sender buffered_amount {} bytes, state {:?}",
+                sender.buffered_amount(),
+                sender.state()
+            )
+        })
+    }
+
     fn pattern(seed: u64, len: usize) -> Vec<u8> {
         let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
         (0..len)
@@ -168,16 +186,22 @@ mod tests {
         for (i, &n) in sizes.iter().enumerate() {
             let msg = pattern(i as u64, n);
             p.a.send(&msg, true).expect("send a→b");
-            let (got, binary) = at_b
-                .recv_timeout(Duration::from_secs(60))
-                .expect("a→b arrives");
+            let (got, binary) = arrival(
+                &at_b,
+                &p.a,
+                &format!("a→b {n} bytes"),
+                Duration::from_secs(60),
+            );
             assert!(binary);
             assert!(got == msg, "a→b {n} bytes: content differs");
 
             p.b.send(&msg, true).expect("send b→a");
-            let (got, _) = at_a
-                .recv_timeout(Duration::from_secs(60))
-                .expect("b→a arrives");
+            let (got, _) = arrival(
+                &at_a,
+                &p.b,
+                &format!("b→a {n} bytes"),
+                Duration::from_secs(60),
+            );
             assert!(got == msg, "b→a {n} bytes: content differs");
         }
         assert_eq!(p.a.state(), DataChannelState::Open);
