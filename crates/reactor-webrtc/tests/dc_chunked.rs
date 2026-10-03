@@ -327,11 +327,45 @@ mod tests {
         let (f1, f2) = (chunking(), chunking());
         let mut p = connect(&f1, &f2);
         let at_b = inbox(&mut p.b);
-        p.a.send(&pattern(1, 50 * MIB), true).expect("send");
-        assert!(p.a.buffered_amount() > 16 * MIB as u64);
-        assert!(p.a.drain(Duration::from_secs(60)), "drained");
-        assert_eq!(p.a.buffered_amount(), 0);
-        at_b.recv_timeout(Duration::from_secs(60)).expect("arrives");
+        // How much of one send is still queued when it returns depends on how
+        // fast loopback drains, which a fast runner does as it is pumped. Four
+        // threads send at once instead: while one pumps, the others' sends
+        // only queue, so the queue outgrows libwebrtc's 16 MiB buffer at any
+        // link speed. A sampler records the peak.
+        let a = Arc::new(p.a);
+        let msg = Arc::new(pattern(1, 25 * MIB)); // 4 x 25 MiB stays under the 128 MiB queue
+        let sending = Arc::new(AtomicBool::new(true));
+        let sampler = thread::spawn({
+            let (a, sending) = (Arc::clone(&a), Arc::clone(&sending));
+            move || {
+                let mut peak = 0;
+                while sending.load(Ordering::SeqCst) {
+                    peak = peak.max(a.buffered_amount());
+                    thread::sleep(Duration::from_micros(200));
+                }
+                peak.max(a.buffered_amount())
+            }
+        });
+        let senders: Vec<_> = (0..4)
+            .map(|_| {
+                let (a, msg) = (Arc::clone(&a), Arc::clone(&msg));
+                thread::spawn(move || a.send(&msg, true).expect("send"))
+            })
+            .collect();
+        for s in senders {
+            s.join().unwrap();
+        }
+        sending.store(false, Ordering::SeqCst);
+        let peak = sampler.join().unwrap();
+        assert!(
+            peak > 16 * MIB as u64,
+            "buffered_amount peaked at {peak}, never past libwebrtc's buffer"
+        );
+        assert!(a.drain(Duration::from_secs(120)), "drained");
+        assert_eq!(a.buffered_amount(), 0);
+        for _ in 0..4 {
+            at_b.recv_timeout(Duration::from_secs(60)).expect("arrives");
+        }
     }
 
     #[test]
