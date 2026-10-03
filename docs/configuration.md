@@ -368,8 +368,20 @@ negotiated it, each data channel decides for itself when it opens: it is
 chunked when it is ordered and fully reliable (no `maxRetransmits`, no
 `maxPacketLifeTime`), and `DataChannel::is_chunked()` reports the decision,
 which never changes afterwards. `RtcConfiguration::dc_chunking` (default
-`true`) lets one connection of a chunking factory opt out. Sending and
-receiving chunked messages comes with the next change.
+`true`) lets one connection of a chunking factory opt out.
+
+On a chunked channel `send()` accepts a message of any size up to the
+effective limit (the smaller of this side's `max_message_size` and the peer's
+advertised one). It queues the message and feeds libwebrtc frames of
+`chunk_size` bytes as its buffer drains, never letting that buffer pass about
+8 MiB, so the 16 MiB limit at which libwebrtc closes a channel is never
+reached. A message larger than the limit, or one that would pass
+`send_buffer_limit`, is refused with `Error::DataChannel` and nothing of it is
+sent. `buffered_amount()` and `on_buffered_amount_low` count the queue too;
+`drain()` waits for it to empty, and `close()` drains before closing. The
+receiver's `on_message` fires once per whole message, with its original
+binary or text type; a message larger than the receiver's own limit is dropped
+without closing the channel.
 
 <details>
 <summary>🦀 Example using Rust</summary>

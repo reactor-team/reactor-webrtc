@@ -57,6 +57,16 @@ impl Default for DcChunking {
 }
 
 impl DcChunking {
+    /// The send-queue configuration for a channel whose peer declared `remote`.
+    pub(crate) fn send_config(&self, remote: &Params) -> reactor_webrtc_dc_chunking::SendConfig {
+        reactor_webrtc_dc_chunking::SendConfig {
+            chunk_size: self.chunk_size,
+            queue_limit: self.send_buffer_limit,
+            max_message_size: sdp::effective_max_message_size(self.max_message_size, remote),
+            ..reactor_webrtc_dc_chunking::SendConfig::default()
+        }
+    }
+
     /// Reject settings that cannot work, before any factory exists.
     pub(crate) fn validate(&self) -> Result<()> {
         if self.max_burst == 0 || self.max_burst > i32::MAX as u32 {
@@ -293,5 +303,23 @@ mod tests {
         assert!(bad(|c| c.chunk_size = 1));
         assert!(bad(|c| c.chunk_size = 1 << 20));
         assert!(bad(|c| c.send_buffer_limit = c.max_message_size - 1));
+    }
+
+    #[test]
+    fn send_config_takes_the_smaller_message_limit() {
+        let c = DcChunking {
+            max_message_size: 1000,
+            ..Default::default()
+        };
+        assert_eq!(c.send_config(&Params::local(500)).max_message_size, 500);
+        assert_eq!(c.send_config(&Params::local(5000)).max_message_size, 1000);
+        assert_eq!(
+            c.send_config(&Params {
+                version: 1,
+                max_message_size: None
+            })
+            .max_message_size,
+            1000.min(reactor_webrtc_dc_chunking::LEGACY_MAX_MESSAGE_SIZE)
+        );
     }
 }

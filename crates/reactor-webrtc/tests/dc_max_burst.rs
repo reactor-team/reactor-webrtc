@@ -244,7 +244,7 @@ mod tests {
             let t0 = Instant::now();
             dc1.send(&payload[..n], true).expect("send");
             got_rx
-                .recv_timeout(Duration::from_secs(10))
+                .recv_timeout(Duration::from_secs(120))
                 .expect("message arrives");
             dc2.send(b"k", true).expect("ack");
             let t1 = ack_rx
@@ -256,7 +256,8 @@ mod tests {
         for _ in 0..10 {
             round(255 * 1024);
         }
-        let mut rtts: Vec<f64> = (0..9).map(|_| round(size)).collect();
+        let reps = if size > 1024 * 1024 { 3 } else { 9 };
+        let mut rtts: Vec<f64> = (0..reps).map(|_| round(size)).collect();
         rtts.sort_by(f64::total_cmp);
         rtts[rtts.len() / 2]
     }
@@ -283,5 +284,26 @@ mod tests {
             after < 1.6,
             "max_burst 256 should take ~1 RTT, took {after:.2}"
         );
+    }
+
+    #[test]
+    #[ignore = "timed, and needs a libwebrtc with patch 0005 (prebuilt p10 or a local build)"]
+    fn a_10_mb_chunked_message_crosses_the_relay_without_stalling() {
+        let chunking = PeerConnectionFactory::builder()
+            .with_dc_chunking(DcChunking::default())
+            .build()
+            .expect("factory");
+        let rtts = single_message_rtts(&chunking, 10 * 1024 * 1024);
+        let secs = rtts * 2.0 * ONE_WAY.as_secs_f64();
+        println!(
+            "10 MB chunked message: {rtts:.1} RTT ({secs:.2} s, {:.0} Mbps)",
+            10.0 * 8.0 * 1.048_576 / secs
+        );
+        // No bandwidth limit on the relay: the transfer is bounded by the
+        // congestion window. The first large round can overflow the relay's
+        // UDP buffers and stall in dcsctp's loss recovery for tens of seconds
+        // (REA-6852), hence the long per-round timeout; the median of the
+        // measured rounds is what has to stay low.
+        assert!(secs < 10.0, "10 MB took {secs:.1} s");
     }
 }
