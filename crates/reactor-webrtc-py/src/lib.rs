@@ -361,6 +361,7 @@ impl From<&RtcConfiguration> for rw::RtcConfiguration {
             tcp_candidate_policy: c.tcp_candidate_policy,
             frame_metadata: c.frame_metadata,
             sctp_snap: c.sctp_snap,
+            dc_chunking: true,
         }
     }
 }

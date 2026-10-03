@@ -21,4 +21,5 @@ openh264 = ["reactor-webrtc-sys/openh264"]
 
 [dependencies]
 reactor-webrtc-sys = { workspace = true }
+reactor-webrtc-dc-chunking = { workspace = true }
 prost = "0.13"
