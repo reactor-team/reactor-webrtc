@@ -387,6 +387,60 @@ mod tests {
         assert!(got == msg);
     }
 
+    /// A low-buffer callback that refills the channel must not deadlock or
+    /// recurse: it fires from the native event, never from inside `send`.
+    #[test]
+    #[cfg_attr(target_os = "windows", ignore)]
+    fn a_low_buffer_callback_can_refill_the_channel() {
+        const REFILLS: usize = 20;
+        let (f1, f2) = (chunking(), chunking());
+        let mut p = connect(&f1, &f2);
+        let at_b = inbox(&mut p.b);
+        let channel: Arc<std::sync::OnceLock<std::sync::Weak<DataChannel>>> = Arc::default();
+        let refills = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        p.a.set_buffered_amount_low_threshold(MIB as u64);
+        p.a.on_buffered_amount_low({
+            let channel = Arc::clone(&channel);
+            let refills = Arc::clone(&refills);
+            move || {
+                let Some(a) = channel.get().and_then(std::sync::Weak::upgrade) else {
+                    return;
+                };
+                if refills.fetch_add(1, Ordering::SeqCst) < REFILLS {
+                    // Large enough to cross the native low-water mark again,
+                    // so the next event comes.
+                    a.send(&pattern(11, 6 * MIB), true).expect("refill");
+                }
+            }
+        });
+        let a = Arc::new(p.a);
+        channel.set(Arc::downgrade(&a)).unwrap();
+        a.send(&pattern(10, 6 * MIB), true).expect("first send");
+
+        let mut got = 0;
+        while got < REFILLS + 1 {
+            at_b.recv_timeout(Duration::from_secs(60))
+                .unwrap_or_else(|_| panic!("message {got} never arrived: a refill stalled"));
+            got += 1;
+        }
+        assert_eq!(a.state(), DataChannelState::Open);
+    }
+
+    #[test]
+    #[cfg_attr(target_os = "windows", ignore)]
+    fn a_send_after_close_is_refused() {
+        let (f1, f2) = (chunking(), chunking());
+        let p = connect(&f1, &f2);
+        assert!(p.a.is_chunked());
+        p.a.close(Duration::ZERO);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while p.a.state() == DataChannelState::Open {
+            assert!(Instant::now() < deadline, "the channel never left Open");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(p.a.send(b"too late", true).is_err());
+    }
+
     #[test]
     #[cfg_attr(target_os = "windows", ignore)]
     fn messages_that_arrive_before_on_message_are_kept() {
