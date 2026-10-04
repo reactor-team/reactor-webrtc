@@ -61,7 +61,11 @@ impl PeerConnectionObserver {
         self
     }
 
-    pub(crate) fn into_state(self, factory: Arc<FactoryHandle>) -> Box<ObserverState> {
+    pub(crate) fn into_state(
+        self,
+        factory: Arc<FactoryHandle>,
+        dc_negotiation: Arc<crate::dc_chunking::DcNegotiation>,
+    ) -> Box<ObserverState> {
         Box::new(ObserverState {
             conn: self.on_connection_state_change.map(Mutex::new),
             gathering: self.on_ice_gathering_change.map(Mutex::new),
@@ -69,6 +73,7 @@ impl PeerConnectionObserver {
             track: self.on_track.map(Mutex::new),
             data_channel: self.on_data_channel.map(Mutex::new),
             factory,
+            dc_negotiation,
         })
     }
 }
@@ -85,6 +90,9 @@ pub(crate) struct ObserverState {
     // a caller that detaches a remote track and drops the peer connection
     // still keeps the factory's threads alive for as long as that track does.
     factory: Arc<FactoryHandle>,
+    // The connection's chunking negotiation, handed to every channel the peer
+    // opens so it classifies itself exactly as a locally created one does.
+    dc_negotiation: Arc<crate::dc_chunking::DcNegotiation>,
 }
 
 impl ObserverState {
@@ -168,7 +176,8 @@ extern "C" fn tramp_track(ud: *mut c_void, track: *mut reactor_webrtc_sys::Media
 
 extern "C" fn tramp_data_channel(ud: *mut c_void, dc: *mut reactor_webrtc_sys::DataChannel) {
     let st = unsafe { &*(ud as *const ObserverState) };
-    let channel = DataChannel::from_raw(dc, Arc::clone(&st.factory));
+    let channel = DataChannel::from_raw(dc, Arc::clone(&st.factory))
+        .with_dc_negotiation(Arc::clone(&st.dc_negotiation));
     if let Some(m) = &st.data_channel {
         if let Ok(mut cb) = m.lock() {
             cb(channel);

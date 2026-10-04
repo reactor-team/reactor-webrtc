@@ -357,9 +357,19 @@ The same `DcChunking` settings also carry the limits for chunked data
 channels — the largest message (`max_message_size`, 64 MiB), the bytes a
 channel may queue beyond libwebrtc's 16 MiB send buffer (`send_buffer_limit`,
 128 MiB) and the frame size (`chunk_size`, 64 KiB). `build()` fails when they
-cannot work together. Chunking itself, negotiated in the SDP so that both peers
-must opt in, comes with the next changes; `RtcConfiguration::dc_chunking`
-(default `true`) lets one connection of a chunking factory opt out of it.
+cannot work together.
+
+Chunking is negotiated in the SDP, so both peers must opt in. Every connection
+of a chunking factory declares a session-level
+`a=x-reactor-dc-chunking:1 max-message-size=<bytes>` in its offer, and an
+answerer mirrors it only when the offer carried it and its own factory chunks.
+Against a peer that never declares it, nothing changes. Once a connection has
+negotiated it, each data channel decides for itself when it opens: it is
+chunked when it is ordered and fully reliable (no `maxRetransmits`, no
+`maxPacketLifeTime`), and `DataChannel::is_chunked()` reports the decision,
+which never changes afterwards. `RtcConfiguration::dc_chunking` (default
+`true`) lets one connection of a chunking factory opt out. Sending and
+receiving chunked messages comes with the next change.
 
 <details>
 <summary>🦀 Example using Rust</summary>

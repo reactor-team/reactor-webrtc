@@ -1401,6 +1401,23 @@ int reactor_webrtc_data_channel_state(void* data_channel) {
   }
 }
 
+// 1 when the channel delivers in order, 0 when unordered (or on error).
+int reactor_webrtc_data_channel_ordered(void* data_channel) {
+  auto* h = reinterpret_cast<ReactorDataChannel*>(data_channel);
+  if (!h || !h->channel) return 0;
+  return h->channel->ordered() ? 1 : 0;
+}
+
+// 1 when the channel retransmits until delivery: neither maxRetransmits nor
+// maxPacketLifeTime is set. 0 when partially reliable (or on error).
+int reactor_webrtc_data_channel_reliable(void* data_channel) {
+  auto* h = reinterpret_cast<ReactorDataChannel*>(data_channel);
+  if (!h || !h->channel) return 0;
+  return (!h->channel->maxRetransmitsOpt() && !h->channel->maxPacketLifeTime())
+             ? 1
+             : 0;
+}
+
 // Sets the buffered-amount-low threshold. on_buffered_amount_low fires when
 // the buffered amount drops to this value or below after a send.
 // M7907 removed SetBufferedAmountLowThreshold from the public API; the

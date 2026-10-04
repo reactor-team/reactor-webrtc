@@ -245,6 +245,25 @@ impl SessionDescription {
     /// session section: RFC 8866 §5 puts session-level attributes after `t=`/`z=`/`k=`
     /// and before the first media description, and everything preceding the first
     /// `m=` is by definition session level.
+    /// Whether this description declares data-channel chunking at a version
+    /// this build speaks (`a=x-reactor-dc-chunking:1 …`). Read off the SDP
+    /// string, like [`declares_frame_metadata`](Self::declares_frame_metadata).
+    pub fn declares_dc_chunking(&self) -> bool {
+        reactor_webrtc_dc_chunking::sdp::parse(&self.sdp).is_some()
+    }
+
+    /// Return a copy declaring data-channel chunking with `params`, at session
+    /// level. Idempotent. [`PeerConnection::create_offer`] and
+    /// [`create_answer`](PeerConnection::create_answer) already apply it when
+    /// the connection takes part, so callers using this crate's signalling
+    /// never need it.
+    pub fn with_dc_chunking(&self, params: &crate::DcChunkingParams) -> Self {
+        Self {
+            kind: self.kind,
+            sdp: reactor_webrtc_dc_chunking::sdp::declare(&self.sdp, params),
+        }
+    }
+
     pub fn with_frame_metadata(&self) -> Self {
         if self.declares_frame_metadata() || self.sdp.lines().next().is_none() {
             return self.clone();
@@ -1074,6 +1093,10 @@ pub struct DataChannel {
     // channel exists — a caller can detach it and outlive both the connection
     // that created it and the factory that ultimately owns those threads.
     _factory: Arc<FactoryHandle>,
+    // The owning connection's chunking negotiation, and this channel's own
+    // decision, made once it is open (see is_chunked).
+    dc_negotiation: Option<Arc<crate::dc_chunking::DcNegotiation>>,
+    dc_decided: std::sync::OnceLock<Option<reactor_webrtc_dc_chunking::Params>>,
 }
 
 // SAFETY: the native data channel is internally thread-safe; callbacks are
@@ -1091,7 +1114,53 @@ impl DataChannel {
             raw,
             observer: None,
             _factory: factory,
+            dc_negotiation: None,
+            dc_decided: std::sync::OnceLock::new(),
         }
+    }
+
+    pub(crate) fn with_dc_negotiation(
+        mut self,
+        negotiation: Arc<crate::dc_chunking::DcNegotiation>,
+    ) -> Self {
+        self.dc_negotiation = Some(negotiation);
+        self
+    }
+
+    /// Whether this channel carries chunked messages.
+    ///
+    /// Decided once, the first time it is asked while the channel is open,
+    /// and fixed from then on: a channel is chunked when its connection
+    /// negotiated chunking with the peer and the channel is ordered and fully
+    /// reliable (no `maxRetransmits`, no `maxPacketLifeTime`). Both ends see
+    /// the same SDP and the same channel parameters, so they reach the same
+    /// answer without signalling anything else. `false` before the channel
+    /// opens.
+    pub fn is_chunked(&self) -> bool {
+        if let Some(decided) = self.dc_decided.get() {
+            return decided.is_some();
+        }
+        let Some(negotiation) = &self.dc_negotiation else {
+            return false;
+        };
+        if self.state() != DataChannelState::Open {
+            return false;
+        }
+        let params = negotiation
+            .remote()
+            .filter(|_| self.ordered() && self.reliable());
+        self.dc_decided.get_or_init(|| params).is_some()
+    }
+
+    /// Whether the channel delivers messages in order.
+    pub fn ordered(&self) -> bool {
+        unsafe { reactor_webrtc_sys::reactor_webrtc_data_channel_ordered(self.raw) != 0 }
+    }
+
+    /// Whether the channel retransmits until delivery: neither
+    /// `maxRetransmits` nor `maxPacketLifeTime` is set.
+    pub fn reliable(&self) -> bool {
+        unsafe { reactor_webrtc_sys::reactor_webrtc_data_channel_reliable(self.raw) != 0 }
     }
 
     /// The label this channel was created with.
@@ -1401,9 +1470,10 @@ pub struct PeerConnection {
     // built before the capability existed: nothing is advertised, nothing is
     // mirrored, the gate never opens and no transform is installed.
     frame_metadata_enabled: bool,
-    // The factory's DcChunking, unless RtcConfiguration::dc_chunking opted
-    // this connection out. None: chunking is never offered or mirrored.
-    dc_chunking: Option<crate::DcChunking>,
+    // The factory's DcChunking (unless RtcConfiguration::dc_chunking opted
+    // this connection out) and, once negotiated, the peer's parameters.
+    // Shared with the observer and every data channel.
+    dc_negotiation: Arc<crate::dc_chunking::DcNegotiation>,
 }
 
 // SAFETY: the native peer connection is internally thread-safe; observer
@@ -1417,7 +1487,7 @@ impl PeerConnection {
         observer: Box<ObserverState>,
         factory: Arc<FactoryHandle>,
         frame_metadata_enabled: bool,
-        dc_chunking: Option<crate::DcChunking>,
+        dc_negotiation: Arc<crate::dc_chunking::DcNegotiation>,
     ) -> Self {
         Self {
             raw,
@@ -1425,7 +1495,7 @@ impl PeerConnection {
             _factory: factory,
             frame_metadata_gate: crate::metadata::FrameMetadataGate::new(),
             frame_metadata_enabled,
-            dc_chunking,
+            dc_negotiation,
         }
     }
 
@@ -1434,7 +1504,15 @@ impl PeerConnection {
     /// enable chunking or this connection opted out. A channel is only
     /// chunked when the peer declares chunking too.
     pub fn dc_chunking(&self) -> Option<&crate::DcChunking> {
-        self.dc_chunking.as_ref()
+        self.dc_negotiation.settings()
+    }
+
+    /// Whether chunking was negotiated: this connection takes part, and the
+    /// first offer/answer round to complete declared it on both sides. Fixed
+    /// from then on; a later renegotiation neither adds nor drops it. Each
+    /// channel still decides for itself: see [`DataChannel::is_chunked`].
+    pub fn dc_chunking_negotiated(&self) -> bool {
+        self.dc_negotiation.remote().is_some()
     }
 
     // ── Signaling (blocking on the native callback) ──────────────────────────
@@ -1455,10 +1533,13 @@ impl PeerConnection {
                 self.raw, ud, sdp_ok, sdp_err,
             )
         })?;
-        if !self.frame_metadata_enabled {
-            return Ok(offer);
-        }
-        Ok(offer.with_frame_metadata())
+        let offer = if self.frame_metadata_enabled {
+            offer.with_frame_metadata()
+        } else {
+            offer
+        };
+        // Declared whenever this connection takes part in chunking.
+        Ok(self.dc_negotiation.offer(offer))
     }
 
     /// Create an answer.
@@ -1478,10 +1559,14 @@ impl PeerConnection {
         })?;
         // The gate is only ever armed when the flag is on, so this covers both "the
         // offer did not ask" and "this connection does not take part".
-        if self.frame_metadata_gate.is_open() {
-            return Ok(answer.with_frame_metadata());
-        }
-        Ok(answer)
+        let answer = if self.frame_metadata_gate.is_open() {
+            answer.with_frame_metadata()
+        } else {
+            answer
+        };
+        // Mirrors the offer: declared only when the offer declared chunking
+        // and this connection takes part.
+        Ok(self.dc_negotiation.answer(answer))
     }
 
     /// Apply the local description.
@@ -1496,6 +1581,7 @@ impl PeerConnection {
     /// which role it is playing.
     pub fn set_local_description(&self, sdp: &SessionDescription) -> Result<()> {
         self.set_description(sdp, true)?;
+        self.dc_negotiation.on_local_description(sdp);
         self.install_frame_metadata_transforms();
         self.lock_negotiated_send_codecs();
         Ok(())
@@ -1519,6 +1605,7 @@ impl PeerConnection {
         // capability and never installs a transform.
         self.frame_metadata_gate
             .set(self.frame_metadata_enabled && sdp.declares_frame_metadata());
+        self.dc_negotiation.on_remote_description(sdp);
         self.install_frame_metadata_transforms();
         self.lock_negotiated_send_codecs();
         Ok(())
@@ -1776,7 +1863,8 @@ impl PeerConnection {
         if raw.is_null() {
             Err(Error::Webrtc("create_data_channel returned null".into()))
         } else {
-            Ok(DataChannel::from_raw(raw, Arc::clone(&self._factory)))
+            Ok(DataChannel::from_raw(raw, Arc::clone(&self._factory))
+                .with_dc_negotiation(Arc::clone(&self.dc_negotiation)))
         }
     }
 
