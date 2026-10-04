@@ -1418,6 +1418,12 @@ int reactor_webrtc_data_channel_reliable(void* data_channel) {
              : 0;
 }
 
+// Start closing the channel. libwebrtc still sends what it has buffered.
+void reactor_webrtc_data_channel_close(void* data_channel) {
+  auto* h = reinterpret_cast<ReactorDataChannel*>(data_channel);
+  if (h && h->channel) h->channel->Close();
+}
+
 // Sets the buffered-amount-low threshold. on_buffered_amount_low fires when
 // the buffered amount drops to this value or below after a send.
 // M7907 removed SetBufferedAmountLowThreshold from the public API; the
