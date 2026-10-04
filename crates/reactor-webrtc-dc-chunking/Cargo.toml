@@ -1,0 +1,17 @@
+[package]
+name = "reactor-webrtc-dc-chunking"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+description = "Sans-I/O chunking, reassembly and send pacing for WebRTC data channels, shared by reactor-webrtc and reactor-wasm."
+keywords = ["webrtc", "data-channel", "sctp", "chunking"]
+categories = ["network-programming", "encoding"]
+
+[lib]
+doctest = false
+
+# No dependencies: this crate builds for native targets and for
+# wasm32-unknown-unknown without features or a libwebrtc.
+[dependencies]
