@@ -1401,6 +1401,9 @@ pub struct PeerConnection {
     // built before the capability existed: nothing is advertised, nothing is
     // mirrored, the gate never opens and no transform is installed.
     frame_metadata_enabled: bool,
+    // The factory's DcChunking, unless RtcConfiguration::dc_chunking opted
+    // this connection out. None: chunking is never offered or mirrored.
+    dc_chunking: Option<crate::DcChunking>,
 }
 
 // SAFETY: the native peer connection is internally thread-safe; observer
@@ -1414,6 +1417,7 @@ impl PeerConnection {
         observer: Box<ObserverState>,
         factory: Arc<FactoryHandle>,
         frame_metadata_enabled: bool,
+        dc_chunking: Option<crate::DcChunking>,
     ) -> Self {
         Self {
             raw,
@@ -1421,7 +1425,16 @@ impl PeerConnection {
             _factory: factory,
             frame_metadata_gate: crate::metadata::FrameMetadataGate::new(),
             frame_metadata_enabled,
+            dc_chunking,
         }
+    }
+
+    /// The chunking settings this connection takes part with: its factory's
+    /// [`DcChunking`](crate::DcChunking), or `None` when the factory does not
+    /// enable chunking or this connection opted out. A channel is only
+    /// chunked when the peer declares chunking too.
+    pub fn dc_chunking(&self) -> Option<&crate::DcChunking> {
+        self.dc_chunking.as_ref()
     }
 
     // ── Signaling (blocking on the native callback) ──────────────────────────

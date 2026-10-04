@@ -37,6 +37,7 @@
 
 mod builder;
 mod config;
+mod dc_chunking;
 mod encoded;
 mod media;
 pub mod metadata;
@@ -54,6 +55,7 @@ pub use config::{
     BundlePolicy, ContinualGatheringPolicy, IceServer, IceTransportsType, RtcConfiguration,
     TcpCandidatePolicy,
 };
+pub use dc_chunking::DcChunking;
 pub use encoded::{
     EncodedFrame, EncodedVideoFrame, EncodedVideoTrack, EncoderFeedback, FrameAction,
     FrameDirection, FrameTransform, H264Backend, InlineEncoderCallback, LocalVideoTrack,
@@ -212,6 +214,10 @@ pub struct PeerConnectionFactory {
     /// [`PeerConnection`] from this factory behaves like one created with
     /// `RtcConfiguration::frame_metadata` off, whatever each config says.
     metadata_enabled: bool,
+    /// [`PeerConnectionFactoryBuilder::with_dc_chunking`]: the settings every
+    /// connection from this factory takes part with, unless its
+    /// `RtcConfiguration::dc_chunking` opts out. `None` = never offered.
+    dc_chunking: Option<DcChunking>,
     /// Per-track encoder slots (pre-encoded / inline), wired into the native
     /// factory at creation. Every factory has one; tracks register slots via
     /// [`PeerConnectionFactory::create_video_track_with_options`].
@@ -253,6 +259,7 @@ impl PeerConnectionFactory {
     pub(crate) fn create_from_options(
         opts: &reactor_webrtc_sys::ReactorFactoryOptions,
         metadata_enabled: bool,
+        dc_chunking: Option<DcChunking>,
         registry: Arc<crate::encoded::EncoderRegistry>,
         openh264_registered: bool,
     ) -> Result<Self> {
@@ -277,6 +284,7 @@ impl PeerConnectionFactory {
         Ok(Self {
             handle: Arc::new(FactoryHandle(raw)),
             metadata_enabled,
+            dc_chunking,
             registry,
             openh264_registered,
         })
@@ -318,6 +326,7 @@ impl PeerConnectionFactory {
             state,
             self.handle(),
             config.frame_metadata && self.metadata_enabled,
+            self.dc_chunking.clone().filter(|_| config.dc_chunking),
         ))
     }
 
