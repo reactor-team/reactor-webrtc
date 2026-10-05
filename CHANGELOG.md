@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.20.0 — which transceiver, which codec
+
+`get_stats` said whether a stream was audio or video, but not which track it
+belonged to or what it was encoded with. A reader with one track of each kind
+could get by on `kind`; one with two video tracks could not tell them apart,
+and nothing in the report named the codec at all. Both are what a client needs
+to report per-track quality the way the browser does, where every RTP stream
+carries its `mid` and a `codecId` pointing at its codec.
+
+Additive. Nothing removed, nothing renamed.
+
+### Added
+
+**`mid` and `codec_mime_type` on both stream types**, each an `Option<String>`.
+`mid` is the transceiver the stream belongs to (`RTCInboundRtpStreamStats::mid`,
+`RTCOutboundRtpStreamStats::mid`); match it against `Transceiver::mid`.
+`codec_mime_type` is the codec's mime type (`"video/VP9"`, `"audio/opus"`),
+followed through the stream's `codec_id` to its `RTCCodecStats` the same way the
+send path's RTT is followed through `remote_id`. Both are `None` until the
+stream has been negotiated and has a codec. Python gets the same two attributes,
+as `Optional[str]`.
+
+### Notes
+
+The C ABI struct grew by two fixed 32-byte string buffers. A `mid` too long to
+fit is reported as absent rather than truncated, because a truncated mid could
+match a transceiver it does not belong to. As in 0.15.0 the glue is compiled
+from source, so no ABI version changed; both copies of the struct pin the
+offsets of the two strings as well as the new size, since they share a width
+and swapping them on one side would leave the size unchanged.
+
 ## 0.19.1 — Default native archive p10 in every build
 
 `reactor-webrtc-sys`'s fallback prebuilt tag, used when `WEBRTC_VERSION` is
