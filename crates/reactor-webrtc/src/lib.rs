@@ -44,6 +44,7 @@ pub mod metadata;
 mod observer;
 mod peer_connection;
 pub mod platform;
+mod playout;
 mod sender_meta;
 
 use std::ffi::CString;
@@ -83,6 +84,7 @@ pub use peer_connection::{
     PeerConnectionState, RelayProtocol, SdpType, SessionDescription, StatsReport, StreamKind,
     Transceiver, TransceiverDirection,
 };
+pub use playout::PlayoutDelay;
 /// Runtime download/verification/caching of Cisco's OpenH264 shared library,
 /// and the required attribution string — registered with
 /// [`PeerConnectionFactoryBuilder::with_openh264`].

@@ -10,6 +10,7 @@ builds on it.
 | [configuration.md](configuration.md) | Every `RtcConfiguration` field and `set_bitrate` — ICE servers/policy, port range, bundle policy, TCP candidates, ICE timeouts, congestion-control bitrate limits |
 | [frame-metadata.md](frame-metadata.md) | Per-frame metadata trailers and custom encoded-frame transforms (inspect, drop, or rewrite a frame in flight) |
 | [av-sync.md](av-sync.md) | Capture timestamps for synthetic media — `time_micros`, the `capture_time_us` arguments, and why the audio sample counter has to keep pace with the wall clock |
+| [video-latency.md](video-latency.md) | How long a received frame waits before decode, and the settings that change it — immediate playout (send or receive side), a per-transceiver jitter buffer floor, and the stats that measure it |
 
 For the native build pipeline that produces `libwebrtc` itself, see
 [`webrtc-build/README.md`](../webrtc-build/README.md) and the

@@ -236,6 +236,22 @@ class InboundRtpStats:
     frames_dropped: int
     frame_width: int
     frame_height: int
+    #: Cumulative seconds the emitted frames spent in the jitter buffer — for
+    #: video, from first packet to leaving for the decoder.
+    jitter_buffer_delay_s: float
+    #: Cumulative target delay, seconds, over the same frames, with every floor
+    #: in force (jitter buffer minimum, playout delay, A/V sync).
+    jitter_buffer_target_delay_s: float
+    #: Cumulative minimum delay, seconds, over the same frames. For video,
+    #: libwebrtc's own computed minimum, not a floor the app set.
+    jitter_buffer_minimum_delay_s: float
+    #: Frames that have left the jitter buffer; the three delays' denominator.
+    jitter_buffer_emitted_count: int
+    @property
+    def average_jitter_buffer_delay_s(self) -> Optional[float]:
+        """Average seconds a frame spent in the jitter buffer; None before the
+        first one left it."""
+        ...
 
 class OutboundRtpStats:
     ssrc: int
@@ -528,6 +544,15 @@ class Transceiver:
         lets the remote sync a published audio track against a published video
         track. It reaches the wire in the next offer or answer."""
     async def set_direction(self, direction: TransceiverDirection) -> None: ...
+    async def set_jitter_buffer_minimum_delay(self, delay_s: Optional[float]) -> None:
+        """Hold this transceiver's received media in the jitter buffer for at
+        least `delay_s` seconds (`RTCRtpReceiver.jitterBufferTarget`); None
+        restores the default. A floor, so it can only add latency; to cut
+        playout latency use
+        `PeerConnectionFactoryBuilder.with_receive_playout_delay`. Remembered
+        when set before the stream exists. Raises ValueError for a negative,
+        NaN, or above-10 s delay."""
+        ...
     async def set_codec_preferences(self, codecs: list[VideoCodec]) -> None:
         """Reorder this video transceiver's codec preferences: `codecs`, most
         preferred first, sort ahead of every other codec the endpoint
@@ -807,6 +832,21 @@ class PeerConnectionFactoryBuilder:
         is chunked only when the peer declares chunking too; against any other
         peer nothing changes. `build()` raises when the values cannot work
         together."""
+        ...
+    def with_send_playout_delay(self, min_s: float = 0.0, max_s: float = 0.0) -> None:
+        """Stamp the playout-delay RTP header extension on every video frame
+        the factory sends, asking each receiver to keep its playout delay
+        between `min_s` and `max_s` seconds. The defaults ask for immediate
+        playout. Factory-wide: libwebrtc reads it from the factory's
+        environment. Raises ValueError for a negative or NaN value,
+        `min_s > max_s`, or `max_s` beyond 40.95 s."""
+        ...
+    def with_receive_playout_delay(self, min_s: float = 0.0, max_s: float = 0.0) -> None:
+        """Play every video stream the factory receives with its playout delay
+        held between `min_s` and `max_s` seconds, whatever the sender asks for.
+        The defaults hand each frame to the decoder as soon as it is complete,
+        dropping the ~10 ms of render smoothing a default receiver adds. Same
+        validation as `with_send_playout_delay`."""
         ...
     def with_openh264(self, lib_path: str) -> None:
         """Register the OpenH264 backend from a downloaded library path

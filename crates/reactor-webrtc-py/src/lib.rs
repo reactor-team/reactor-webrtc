@@ -900,12 +900,36 @@ pub struct InboundRtpStats {
     /// Decoded frame size; `0` for audio, and before the first frame.
     pub frame_width: u32,
     pub frame_height: u32,
+    /// Cumulative seconds the `jitter_buffer_emitted_count` frames spent in the
+    /// jitter buffer — for video, from first packet to leaving for the decoder.
+    pub jitter_buffer_delay_s: f64,
+    /// Cumulative seconds of target delay over the same frames, with every
+    /// floor in force — `Transceiver.set_jitter_buffer_minimum_delay`, a
+    /// playout delay, A/V sync — less the ~10 ms render delay.
+    pub jitter_buffer_target_delay_s: f64,
+    /// Cumulative seconds of minimum delay over the same frames. For video,
+    /// libwebrtc's own computed minimum, not a floor the app set.
+    pub jitter_buffer_minimum_delay_s: f64,
+    /// Frames that have left the jitter buffer: the denominator for the three
+    /// cumulative delays.
+    pub jitter_buffer_emitted_count: u64,
 }
 
 #[pymethods]
 impl InboundRtpStats {
     fn __repr__(&self) -> String {
         format!("InboundRtpStats(ssrc={})", self.ssrc)
+    }
+
+    /// Average seconds a frame spent in the jitter buffer, or `None` before the
+    /// first one left it.
+    #[getter]
+    fn average_jitter_buffer_delay_s(&self) -> Option<f64> {
+        // Clamped like the Rust helper, which has to: a negative value cannot
+        // become a Duration.
+        (self.jitter_buffer_emitted_count > 0).then(|| {
+            (self.jitter_buffer_delay_s / self.jitter_buffer_emitted_count as f64).max(0.0)
+        })
     }
 }
 
@@ -929,6 +953,10 @@ impl From<rw::InboundRtpStats> for InboundRtpStats {
             frames_dropped: s.frames_dropped,
             frame_width: s.frame_width,
             frame_height: s.frame_height,
+            jitter_buffer_delay_s: s.jitter_buffer_delay_s,
+            jitter_buffer_target_delay_s: s.jitter_buffer_target_delay_s,
+            jitter_buffer_minimum_delay_s: s.jitter_buffer_minimum_delay_s,
+            jitter_buffer_emitted_count: s.jitter_buffer_emitted_count,
         }
     }
 }
@@ -1884,6 +1912,37 @@ impl Transceiver {
         })
     }
 
+    /// Hold this transceiver's received media in the jitter buffer for at least
+    /// `delay_s` seconds (`RTCRtpReceiver.jitterBufferTarget`); `None` restores
+    /// the default. A floor — it can only add latency; to cut playout latency
+    /// use `PeerConnectionFactoryBuilder.with_receive_playout_delay`. Remembered
+    /// when set before the stream exists, so it applies from the first frame.
+    /// Raises `ValueError` for a negative, NaN, or above-10 s delay. Natively
+    /// awaitable.
+    #[pyo3(signature = (delay_s))]
+    fn set_jitter_buffer_minimum_delay<'py>(
+        &self,
+        py: Python<'py>,
+        delay_s: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let delay = delay_s
+            .map(|s| {
+                std::time::Duration::try_from_secs_f64(s).map_err(|_| {
+                    PyValueError::new_err(format!(
+                        "delay_s must be a finite, non-negative number of seconds, got {s}"
+                    ))
+                })
+            })
+            .transpose()?;
+        let inner = Arc::clone(self.tc()?);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            tokio::task::spawn_blocking(move || inner.set_jitter_buffer_minimum_delay(delay))
+                .await
+                .map_err(join_err)?
+                .map_err(|e| PyValueError::new_err(e.to_string()))
+        })
+    }
+
     /// Reorder this video transceiver's codec preferences: `codecs`, most
     /// preferred first, sort ahead of every other codec the endpoint
     /// supports; nothing is dropped. Must be called before
@@ -2578,6 +2637,31 @@ pub struct PeerConnectionFactoryBuilder {
     pending: Option<rw::PeerConnectionFactoryBuilder>,
 }
 
+/// Playout-delay limits from Python seconds, refused here rather than at
+/// `build()` so the `ValueError` points at the call that set them.
+fn playout_delay(min_s: f64, max_s: f64) -> PyResult<rw::PlayoutDelay> {
+    let secs = |name: &str, v: f64| {
+        std::time::Duration::try_from_secs_f64(v).map_err(|_| {
+            PyValueError::new_err(format!(
+                "{name} must be a finite, non-negative number of seconds, got {v}"
+            ))
+        })
+    };
+    let (min, max) = (secs("min_s", min_s)?, secs("max_s", max_s)?);
+    if min > max {
+        return Err(PyValueError::new_err(format!(
+            "min_s ({min_s}) must not be larger than max_s ({max_s})"
+        )));
+    }
+    if max > rw::PlayoutDelay::MAX {
+        return Err(PyValueError::new_err(format!(
+            "max_s ({max_s}) is beyond the extension's {} s",
+            rw::PlayoutDelay::MAX.as_secs_f64()
+        )));
+    }
+    Ok(rw::PlayoutDelay::new(min, max))
+}
+
 #[pymethods]
 impl PeerConnectionFactoryBuilder {
     #[new]
@@ -2703,6 +2787,37 @@ impl PeerConnectionFactoryBuilder {
         settings.send_buffer_limit = send_buffer_limit;
         settings.chunk_size = chunk_size;
         self.pending = Some(b.with_dc_chunking(settings));
+        Ok(())
+    }
+
+    /// Stamp the playout-delay RTP header extension on every video frame the
+    /// factory sends, asking each receiver to keep its playout delay between
+    /// `min_s` and `max_s` seconds. The defaults (both 0) ask for immediate
+    /// playout. Raises `ValueError` for a negative or NaN value, `min_s >
+    /// max_s`, or `max_s` beyond 40.95 s.
+    #[pyo3(signature = (min_s = 0.0, max_s = 0.0))]
+    fn with_send_playout_delay(&mut self, min_s: f64, max_s: f64) -> PyResult<()> {
+        let delay = playout_delay(min_s, max_s)?;
+        let b = self
+            .pending
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("builder already consumed by build()"))?;
+        self.pending = Some(b.with_send_playout_delay(delay));
+        Ok(())
+    }
+
+    /// Play every video stream the factory receives with its playout delay
+    /// held between `min_s` and `max_s` seconds, whatever the sender asks for.
+    /// The defaults (both 0) decode each frame as soon as it is complete. Same
+    /// validation as `with_send_playout_delay`.
+    #[pyo3(signature = (min_s = 0.0, max_s = 0.0))]
+    fn with_receive_playout_delay(&mut self, min_s: f64, max_s: f64) -> PyResult<()> {
+        let delay = playout_delay(min_s, max_s)?;
+        let b = self
+            .pending
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("builder already consumed by build()"))?;
+        self.pending = Some(b.with_receive_playout_delay(delay));
         Ok(())
     }
 

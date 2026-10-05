@@ -494,6 +494,45 @@ impl Transceiver {
         }
     }
 
+    /// Hold this transceiver's received media in the jitter buffer for at least
+    /// `delay` (`RTCRtpReceiver.jitterBufferTarget`); `None` restores the
+    /// default. The buffer still adds whatever the network's jitter calls for
+    /// on top — this is a floor, so it can only add latency, never remove it.
+    /// To cut playout latency instead, see
+    /// [`with_receive_playout_delay`](crate::PeerConnectionFactoryBuilder::with_receive_playout_delay).
+    ///
+    /// Takes effect immediately on a running stream, and is remembered when set
+    /// before one exists — on a transceiver of your own before you offer, or in
+    /// `on_track` — so it
+    /// applies from the first frame. Read the result back as
+    /// [`InboundRtpStats::jitter_buffer_target_delay_s`]. Fails when `delay`
+    /// is above libwebrtc's 10 s limit.
+    pub fn set_jitter_buffer_minimum_delay(
+        &self,
+        delay: Option<std::time::Duration>,
+    ) -> Result<()> {
+        const LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
+        if delay.is_some_and(|d| d > LIMIT) {
+            return Err(Error::Webrtc(format!(
+                "jitter buffer minimum delay {delay:?} is above libwebrtc's {LIMIT:?}"
+            )));
+        }
+        let ok = unsafe {
+            reactor_webrtc_sys::reactor_webrtc_rtp_transceiver_set_jitter_buffer_minimum_delay(
+                self.raw,
+                delay.is_some() as c_int,
+                delay.map_or(0.0, |d| d.as_secs_f64()),
+            )
+        };
+        if ok == 1 {
+            Ok(())
+        } else {
+            Err(Error::Webrtc(
+                "transceiver set_jitter_buffer_minimum_delay failed".into(),
+            ))
+        }
+    }
+
     /// Reorder this video transceiver's codec preferences: `codecs`, most
     /// preferred first, sort ahead of every other codec the endpoint
     /// supports. Mirrors [`RTCRtpTransceiver.setCodecPreferences`](
@@ -956,6 +995,39 @@ pub struct InboundRtpStats {
     /// Decoded frame size; `0` for audio, and before the first frame.
     pub frame_width: u32,
     pub frame_height: u32,
+    /// Cumulative time, in seconds, that the frames counted by
+    /// [`jitter_buffer_emitted_count`](Self::jitter_buffer_emitted_count) spent
+    /// in the jitter buffer (`RTCInboundRtpStreamStats::jitterBufferDelay`). For
+    /// video, from a frame's first packet arriving to the frame leaving for the
+    /// decoder; divide by the count for the per-frame average.
+    pub jitter_buffer_delay_s: f64,
+    /// Cumulative target delay in seconds, over the same frames: what the
+    /// jitter buffer was aiming for, with every floor in force — a
+    /// [`Transceiver::set_jitter_buffer_minimum_delay`], a playout delay, or
+    /// what A/V sync needed. A floor shows up here, less the receiver's ~10 ms
+    /// render delay.
+    pub jitter_buffer_target_delay_s: f64,
+    /// Cumulative minimum delay in seconds, over the same frames. For video
+    /// this is libwebrtc's own computed minimum — jitter estimate plus decode
+    /// and render time — not a floor the app set; read
+    /// [`jitter_buffer_target_delay_s`](Self::jitter_buffer_target_delay_s)
+    /// for that.
+    pub jitter_buffer_minimum_delay_s: f64,
+    /// Frames that have left the jitter buffer — the denominator for the three
+    /// cumulative delays above.
+    pub jitter_buffer_emitted_count: u64,
+}
+
+impl InboundRtpStats {
+    /// Average time a frame spent in the jitter buffer, or `None` before the
+    /// first one left it.
+    pub fn average_jitter_buffer_delay(&self) -> Option<std::time::Duration> {
+        (self.jitter_buffer_emitted_count > 0).then(|| {
+            std::time::Duration::from_secs_f64(
+                (self.jitter_buffer_delay_s / self.jitter_buffer_emitted_count as f64).max(0.0),
+            )
+        })
+    }
 }
 
 /// `RTCOutboundRtpStreamStats` subset.
@@ -1743,6 +1815,10 @@ extern "C" fn stats_cb(ud: *mut c_void, entries: *const ReactorStatEntry, count:
                 frames_dropped: e.frames_dropped,
                 frame_width: e.frame_width,
                 frame_height: e.frame_height,
+                jitter_buffer_delay_s: e.jitter_buffer_delay,
+                jitter_buffer_target_delay_s: e.jitter_buffer_target_delay,
+                jitter_buffer_minimum_delay_s: e.jitter_buffer_minimum_delay,
+                jitter_buffer_emitted_count: e.jitter_buffer_emitted_count,
             }),
             1 => report.outbound_rtp.push(OutboundRtpStats {
                 ssrc: e.ssrc,
