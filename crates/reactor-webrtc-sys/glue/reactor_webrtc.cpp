@@ -185,6 +185,17 @@ struct ReactorStatEntry {
   double   available_outgoing_bitrate; // bps, kind 2, 0 if not estimated
   double   available_incoming_bitrate; // bps, kind 2, 0 if not estimated
   double   frames_per_second;          // kinds 0 and 1, 0 if not measured
+  // Strings, kinds 0 and 1, NUL-terminated; empty when absent. Fixed-size so
+  // the entry stays a flat, copyable record with nothing to free.
+  //
+  // RTCInboundRtpStreamStats::mid / RTCOutboundRtpStreamStats::mid: the
+  // transceiver the stream belongs to, which is how a reader that negotiated
+  // several tracks of one kind tells them apart. A mid that does not fit is
+  // left empty rather than cut, so it can never match the wrong transceiver.
+  char     mid[32];
+  // RTCCodecStats::mime_type, reached through the stream's codec_id, e.g.
+  // "video/VP9" or "audio/opus". Empty until the stream has a codec.
+  char     codec_mime_type[32];
 };
 
 // The layout guard, and the reason it is a size and not a comment: this struct
@@ -196,7 +207,7 @@ struct ReactorStatEntry {
 //
 // The Rust side carries the same assertion against the same number. If you are
 // here because one of them failed: you changed the struct on one side only.
-static_assert(sizeof(struct ReactorStatEntry) == 200,
+static_assert(sizeof(struct ReactorStatEntry) == 264,
               "ReactorStatEntry changed size — update the repr(C) mirror in "
               "reactor-webrtc-sys/src/lib.rs and both assertions");
 static_assert(offsetof(struct ReactorStatEntry, bytes_received) == 72,
@@ -211,6 +222,12 @@ static_assert(offsetof(struct ReactorStatEntry, pli_count) == 20,
               "the feedback counters moved — see above");
 static_assert(offsetof(struct ReactorStatEntry, fir_count) == 24,
               "the feedback counters moved — see above");
+// The two strings share a width too, and swapping them would match a mime type
+// against a transceiver's mid.
+static_assert(offsetof(struct ReactorStatEntry, mid) == 200,
+              "the stream strings moved — see above");
+static_assert(offsetof(struct ReactorStatEntry, codec_mime_type) == 232,
+              "the stream strings moved — see above");
 
 // PeerConnectionObserver events, forwarded to the safe crate. Any pointer may
 // be null (the field is `Option<extern "C" fn>` on the Rust side).
@@ -861,6 +878,30 @@ static auto stat_val(const M& m) -> std::decay_t<decltype(*m)> {
   return m ? static_cast<T>(*m) : T{};
 }
 
+// Copy an optional stats string into one of ReactorStatEntry's fixed buffers.
+// Absent, or too long to fit with its NUL, leaves the buffer empty: a reader
+// matches these values against others (a mid against a transceiver's), and a
+// truncated one could match something it isn't.
+template <size_t N>
+static void stat_str(const std::optional<std::string>& m, char (&out)[N]) {
+  if (!m || m->size() >= N) return;
+  std::memcpy(out, m->data(), m->size());
+  out[m->size()] = '\0';
+}
+
+// Copy the mime type of the codec *codec_id* names. Checked rather than
+// assumed, like the other lookups by id: cast_to asserts on the type.
+template <size_t N>
+static void stat_codec(const webrtc::RTCStatsReport& report,
+                       const std::optional<std::string>& codec_id,
+                       char (&out)[N]) {
+  if (!codec_id) return;
+  const webrtc::RTCStats* codec = report.Get(*codec_id);
+  if (codec != nullptr && codec->type() == webrtc::RTCCodecStats::kType) {
+    stat_str(codec->cast_to<webrtc::RTCCodecStats>().mime_type, out);
+  }
+}
+
 // Parse the string ICE-pair state to the integer encoding used in
 // ReactorStatEntry::pair_state.
 template <typename S>
@@ -946,6 +987,8 @@ class StatsCallback : public webrtc::RTCStatsCollectorCallback {
           e.kind              = 0;
           e.ssrc              = stat_val(s.ssrc);
           e.stream_kind       = parse_stream_kind(s.kind);
+          stat_str(s.mid, e.mid);
+          stat_codec(*report, s.codec_id, e.codec_mime_type);
           e.packets_received  = stat_val(s.packets_received);
           e.bytes_received    = stat_val(s.bytes_received);
           e.jitter            = stat_val(s.jitter);
@@ -966,6 +1009,8 @@ class StatsCallback : public webrtc::RTCStatsCollectorCallback {
           e.kind                       = 1;
           e.ssrc                       = stat_val(s.ssrc);
           e.stream_kind                = parse_stream_kind(s.kind);
+          stat_str(s.mid, e.mid);
+          stat_codec(*report, s.codec_id, e.codec_mime_type);
           e.packets_sent               = stat_val(s.packets_sent);
           e.bytes_sent                 = stat_val(s.bytes_sent);
           e.target_bitrate             = stat_val(s.target_bitrate);
