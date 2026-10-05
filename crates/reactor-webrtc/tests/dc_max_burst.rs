@@ -202,7 +202,7 @@ mod tests {
     fn single_message_rtts(factory: &PeerConnectionFactory, size: usize) -> f64 {
         let (pc1, s1) = make_peer(factory);
         let (pc2, s2) = make_peer(factory);
-        let mut dc1 = pc1.create_data_channel("data").expect("dc");
+        let dc1 = pc1.create_data_channel("data").expect("dc");
         let offer = pc1.create_offer().expect("offer");
         pc1.set_local_description(&offer).expect("pc1 local");
         pc2.set_remote_description(&offer).expect("pc2 remote");
@@ -227,7 +227,7 @@ mod tests {
                 && !s2.data_channels.lock().unwrap().is_empty()
         });
 
-        let mut dc2 = s2.data_channels.lock().unwrap().pop().unwrap();
+        let dc2 = s2.data_channels.lock().unwrap().pop().unwrap();
         let (got_tx, got_rx) = mpsc::channel::<()>();
         dc2.on_message(move |_, _| {
             let _ = got_tx.send(());

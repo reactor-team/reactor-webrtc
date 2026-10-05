@@ -1134,6 +1134,9 @@ struct ChannelCore {
     raw: RawDc,
     on_message: Slot<MessageCb>,
     on_state_change: Slot<StateCb>,
+    // Their own slots, so on_open, on_close and on_state_change coexist.
+    on_open: Slot<EventCb>,
+    on_close: Slot<EventCb>,
     on_buffered_amount_low: Slot<EventCb>,
     registered: AtomicBool,
     // The owning connection's chunking negotiation, and this channel's
@@ -1340,6 +1343,14 @@ extern "C" fn dc_on_state_change(ud: *mut c_void, state: c_int) {
     if let Some(cb) = core.on_state_change.get() {
         (*cb.lock().unwrap())(state);
     }
+    let event = match state {
+        DataChannelState::Open => Some(&core.on_open),
+        DataChannelState::Closed => Some(&core.on_close),
+        _ => None,
+    };
+    if let Some(cb) = event.and_then(Slot::get) {
+        (*cb.lock().unwrap())();
+    }
 }
 
 extern "C" fn dc_on_buffered_amount_low(ud: *mut c_void) {
@@ -1396,6 +1407,8 @@ impl DataChannel {
                 raw: RawDc(raw),
                 on_message: Slot::empty(),
                 on_state_change: Slot::empty(),
+                on_open: Slot::empty(),
+                on_close: Slot::empty(),
                 on_buffered_amount_low: Slot::empty(),
                 registered: AtomicBool::new(false),
                 negotiation: None,
@@ -1555,7 +1568,7 @@ impl DataChannel {
     /// a WebRTC network thread; return quickly or offload heavy work. On a
     /// chunked channel it fires once per whole message, including any that
     /// arrived before it was set.
-    pub fn on_message(&mut self, cb: impl for<'a> FnMut(&'a [u8], bool) + Send + 'static) {
+    pub fn on_message(&self, cb: impl for<'a> FnMut(&'a [u8], bool) + Send + 'static) {
         // The new callback is published already locked, and the held messages
         // are taken out under the slot's lock: a message that arrives while
         // they are flushed waits on the callback, so the order holds, and the
@@ -1582,29 +1595,24 @@ impl DataChannel {
 
     /// State-change handler — fires for every transition including
     /// Connecting → Open → Closing → Closed.
-    pub fn on_state_change(&mut self, cb: impl FnMut(DataChannelState) + Send + 'static) {
+    pub fn on_state_change(&self, cb: impl FnMut(DataChannelState) + Send + 'static) {
         self.core.on_state_change.set(Box::new(cb));
         self.reregister();
     }
 
-    /// Convenience: fires once when the channel becomes `Open`.
-    pub fn on_open(&mut self, cb: impl FnMut() + Send + 'static) {
-        let mut cb = cb;
-        self.on_state_change(move |s| {
-            if s == DataChannelState::Open {
-                cb();
-            }
-        });
+    /// Fires when the channel becomes `Open`. Independent of
+    /// [`on_state_change`](Self::on_state_change) and [`on_close`](Self::on_close):
+    /// setting one does not replace the others.
+    pub fn on_open(&self, cb: impl FnMut() + Send + 'static) {
+        self.core.on_open.set(Box::new(cb));
+        self.reregister();
     }
 
-    /// Convenience: fires once when the channel reaches `Closed`.
-    pub fn on_close(&mut self, cb: impl FnMut() + Send + 'static) {
-        let mut cb = cb;
-        self.on_state_change(move |s| {
-            if s == DataChannelState::Closed {
-                cb();
-            }
-        });
+    /// Fires when the channel reaches `Closed`. Independent of
+    /// [`on_state_change`](Self::on_state_change) and [`on_open`](Self::on_open).
+    pub fn on_close(&self, cb: impl FnMut() + Send + 'static) {
+        self.core.on_close.set(Box::new(cb));
+        self.reregister();
     }
 
     /// Flow-control handler — fires when `buffered_amount` drops at or below
@@ -1613,16 +1621,19 @@ impl DataChannel {
     /// Like libwebrtc's, it never fires from inside [`send`](Self::send), so
     /// it may call `send` to refill. On a chunked channel it is checked when
     /// libwebrtc's buffer falls to the queue's low-water mark.
-    pub fn on_buffered_amount_low(&mut self, cb: impl FnMut() + Send + 'static) {
+    pub fn on_buffered_amount_low(&self, cb: impl FnMut() + Send + 'static) {
         self.core.on_buffered_amount_low.set(Box::new(cb));
         self.reregister();
     }
 
-    // Setting a callback (re-)registers the native observer, as it always
-    // has; a chunked channel registers on its own when it decides.
-    fn reregister(&mut self) {
-        self.core.registered.store(true, Ordering::SeqCst);
-        self.core.register();
+    // The native observer is registered once, by whichever comes first: a
+    // setter, or a chunked channel deciding. It addresses the channel's core
+    // and every callback reads its slot when it fires, so a later setter only
+    // swaps the slot. Re-registering would wait on the signaling thread, which
+    // runs the callbacks: a setter called from a callback while another
+    // thread re-registered deadlocked.
+    fn reregister(&self) {
+        self.core.ensure_registered();
     }
 }
 

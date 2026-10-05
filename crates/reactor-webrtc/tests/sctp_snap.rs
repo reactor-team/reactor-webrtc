@@ -190,7 +190,7 @@ mod tests {
         );
 
         let received = Arc::new(AtomicU32::new(0));
-        let mut dc2 = s2.data_channels.lock().unwrap().pop().unwrap();
+        let dc2 = s2.data_channels.lock().unwrap().pop().unwrap();
         let received2 = received.clone();
         dc2.on_message(move |_data, _binary| {
             received2.fetch_add(1, Ordering::SeqCst);

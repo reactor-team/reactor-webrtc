@@ -247,6 +247,10 @@ jobs:
     name: pytest (${{ inputs.platform }}, built wheel)
     needs: build
     runs-on: ${{ inputs.os }}
+    # The suite takes about a minute. A Python process that never exits after
+    # its tests (seen once on Windows, after failures) otherwise holds the job
+    # for GitHub's 6 h default.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
 
