@@ -165,8 +165,8 @@ impl crate::sender_meta::SenderMetaSource for CaptureTimeMeta {
     }
 }
 
-// receiver: FIFO queue written by the strip transform and drained by
-// video_sink_tramp; preserves ordering when there is no packet loss.
+// receiver: queue written by the strip transform and drained by video_sink_tramp,
+// which pairs by RTP timestamp so a frame dropped before render can't shift it.
 use crate::sender_meta::ReceiverMetaQueue;
 
 // Heap-pinned sink state behind the C userdata pointer.
@@ -181,11 +181,17 @@ struct AudioSinkState {
     cb: Mutex<AudioSinkCb>,
 }
 
-extern "C" fn video_sink_tramp(ud: *mut c_void, bgra: *const u8, width: c_int, height: c_int) {
+extern "C" fn video_sink_tramp(
+    ud: *mut c_void,
+    bgra: *const u8,
+    width: c_int,
+    height: c_int,
+    rtp_timestamp: u32,
+) {
     let st = unsafe { &*(ud as *const VideoSinkState) };
     let len = (width as usize) * (height as usize) * 4;
     let slice = unsafe { std::slice::from_raw_parts(bgra, len) };
-    let metadata = st.receiver_meta.lock().ok().and_then(|mut q| q.pop_front());
+    let metadata = crate::sender_meta::take_receiver_meta(&st.receiver_meta, rtp_timestamp);
     if let Ok(mut cb) = st.cb.lock() {
         cb(VideoFrame {
             bgra: slice,

@@ -703,8 +703,9 @@ extern "C" {
         track: *mut MediaStreamTrack,
     ) -> c_int;
     /// Attach a frame sink to a (received) video track. `on_frame(userdata,
-    /// bgra, width, height)` fires per decoded frame (BGRA, `width*height*4`
-    /// bytes, valid only during the call) until the track is destroyed.
+    /// bgra, width, height, rtp_timestamp)` fires per decoded frame (BGRA,
+    /// `width*height*4` bytes, valid only during the call) until the track is
+    /// destroyed. `rtp_timestamp` is the one the receive transform saw for it.
     pub fn reactor_webrtc_video_track_add_sink(
         track: *mut MediaStreamTrack,
         userdata: *mut c_void,
@@ -713,6 +714,7 @@ extern "C" {
             bgra: *const u8,
             width: c_int,
             height: c_int,
+            rtp_timestamp: u32,
         ),
     );
     /// Kind of a track handle: 0 = audio, 1 = video, -1 = unknown.
@@ -837,6 +839,10 @@ extern "C" {
     /// Replace the encoded payload of the frame currently in the callback
     /// (copies). `frame` is [`ReactorEncodedFrame::frame`].
     pub fn reactor_webrtc_encoded_frame_set_data(frame: *mut c_void, data: *const u8, len: usize);
+    /// The current payload of the frame in the callback, reflecting any earlier
+    /// [`reactor_webrtc_encoded_frame_set_data`]. Valid until the next `set_data`
+    /// or the end of the callback.
+    pub fn reactor_webrtc_encoded_frame_data(frame: *mut c_void, len: *mut usize) -> *const u8;
     /// Attach the transformer to the transceiver's **sender** (encoder →
     /// packetizer). Returns 1 on success, 0 on failure.
     pub fn reactor_webrtc_rtp_transceiver_set_sender_transform(

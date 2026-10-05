@@ -61,8 +61,31 @@ fn registry() -> &'static Registry {
 /// `set_remote_description` has only a transceiver to go on.
 type RecvRegistry = Mutex<HashMap<usize, Weak<ReceiverMetaQueue>>>;
 
-/// FIFO of metadata stripped from inbound frames, in arrival order.
-pub(crate) type ReceiverMetaQueue = Mutex<std::collections::VecDeque<FrameMetadata>>;
+/// Metadata stripped from inbound frames, in arrival order, each tagged with its
+/// frame's RTP timestamp.
+///
+/// Not every frame the transform sees reaches the sink — a decode error, the
+/// keyframe wait after one, or a frame libwebrtc skips as late all leave their
+/// entry behind — so the sink takes the entry whose timestamp matches the frame
+/// it decoded, never simply the oldest one. See [`take_receiver_meta`].
+pub(crate) type ReceiverMetaQueue = Mutex<std::collections::VecDeque<(u32, FrameMetadata)>>;
+
+/// Take the metadata for the decoded frame with `rtp_timestamp`.
+///
+/// Decoded frames come out in the order their encoded frames went in, so every
+/// entry ahead of the match belongs to a frame that was dropped on the way to the
+/// decoder or out of it; those go too. With no match the queue is left alone: the
+/// frame carried no trailer, and the entries waiting belong to frames still in
+/// flight.
+pub(crate) fn take_receiver_meta(
+    queue: &ReceiverMetaQueue,
+    rtp_timestamp: u32,
+) -> Option<FrameMetadata> {
+    let mut q = queue.lock().ok()?;
+    let pos = q.iter().position(|(ts, _)| *ts == rtp_timestamp)?;
+    q.drain(..pos);
+    q.pop_front().map(|(_, m)| m)
+}
 
 fn recv_registry() -> &'static RecvRegistry {
     static REGISTRY: OnceLock<RecvRegistry> = OnceLock::new();
@@ -214,13 +237,14 @@ enum MetaStep {
         source: Arc<dyn SenderMetaSource>,
         gate: crate::metadata::FrameMetadataGate,
     },
-    /// Receive: strip the trailer and queue the metadata for the video sink.
+    /// Receive: strip the trailer and queue the metadata, keyed by RTP
+    /// timestamp, for the video sink.
     Strip {
         queue: Arc<ReceiverMetaQueue>,
         /// Dedup window over (ssrc, rtp timestamp) — WebRTC can reassemble the
         /// same frame more than once when NACK retransmissions arrive after the
         /// original packets left the jitter buffer. Duplicates still get stripped
-        /// but skip the queue push, so it stays 1:1 with decoded frames.
+        /// but skip the queue push, so a frame has one entry waiting for it.
         seen: Mutex<std::collections::VecDeque<(u32, u32)>>,
     },
 }
@@ -274,7 +298,7 @@ impl ComposedSlot {
                     if gate.is_open() {
                         if let Some(ref m) = m {
                             let trailer = crate::metadata::encode_trailer(m);
-                            let mut out = frame.data.to_vec();
+                            let mut out = frame.current_data().to_vec();
                             out.extend_from_slice(&trailer);
                             frame.replace_data(&out);
                         }
@@ -282,7 +306,7 @@ impl ComposedSlot {
                 }
                 Some(MetaStep::Strip { queue, seen }) => {
                     if let Some((m, stripped)) =
-                        crate::metadata::decode_and_strip_trailer(frame.data)
+                        crate::metadata::decode_and_strip_trailer(frame.current_data())
                     {
                         frame.replace_data(&stripped);
                         let key = (frame.ssrc, frame.timestamp);
@@ -302,7 +326,7 @@ impl ComposedSlot {
                                 if q.len() >= RECEIVER_META_CAP {
                                     q.pop_front();
                                 }
-                                q.push_back(m);
+                                q.push_back((frame.timestamp, m));
                             }
                         }
                     }
@@ -472,4 +496,60 @@ pub(crate) fn attach_strip(
         seen: Mutex::default(),
     });
     slot.claim_install().then(|| native_for(slot))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn queue(entries: &[(u32, u64)]) -> ReceiverMetaQueue {
+        Mutex::new(
+            entries
+                .iter()
+                .map(|&(ts, frame_id)| {
+                    (
+                        ts,
+                        FrameMetadata {
+                            frame_id,
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    fn ids(q: &ReceiverMetaQueue) -> Vec<u64> {
+        q.lock().unwrap().iter().map(|(_, m)| m.frame_id).collect()
+    }
+
+    #[test]
+    fn takes_the_entry_with_the_frames_timestamp() {
+        let q = queue(&[(100, 1), (200, 2)]);
+        assert_eq!(take_receiver_meta(&q, 100).map(|m| m.frame_id), Some(1));
+        assert_eq!(ids(&q), [2]);
+    }
+
+    #[test]
+    fn discards_entries_of_frames_dropped_before_render() {
+        // 200 and 300 were assembled but never decoded.
+        let q = queue(&[(100, 1), (200, 2), (300, 3), (400, 4)]);
+        assert_eq!(take_receiver_meta(&q, 100).map(|m| m.frame_id), Some(1));
+        assert_eq!(take_receiver_meta(&q, 400).map(|m| m.frame_id), Some(4));
+        assert!(ids(&q).is_empty());
+    }
+
+    #[test]
+    fn a_frame_without_a_trailer_leaves_the_queue_alone() {
+        let q = queue(&[(200, 2), (300, 3)]);
+        assert!(take_receiver_meta(&q, 100).is_none());
+        assert_eq!(ids(&q), [2, 3]);
+    }
+
+    #[test]
+    fn matches_across_rtp_timestamp_wraparound() {
+        let q = queue(&[(u32::MAX - 1, 1), (u32::MAX, 2), (5, 3)]);
+        assert_eq!(take_receiver_meta(&q, 5).map(|m| m.frame_id), Some(3));
+        assert!(ids(&q).is_empty());
+    }
 }

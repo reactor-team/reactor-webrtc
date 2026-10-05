@@ -78,6 +78,11 @@ strip the trailer (see below), or the sender didn't include one for that
 particular frame — always check for `None` rather than assuming it's
 present.
 
+Metadata is matched to the decoded frame by RTP timestamp, so a frame that
+libwebrtc assembles but never renders — a decode error, the keyframe wait
+after one, a frame skipped as late — takes its metadata with it rather than
+shifting every later frame onto its predecessor's.
+
 Python's `on_video_frame` also accepts the legacy 3-argument signature
 (`callback(bgra, width, height)`) for code that predates this feature; if a
 4-argument callback raises, it is retried once as a 3-argument call. The
