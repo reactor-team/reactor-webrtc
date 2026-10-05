@@ -20,6 +20,15 @@ use crate::{Error, Result};
 /// receiving side with
 /// [`with_receive_playout_delay`](crate::PeerConnectionFactoryBuilder::with_receive_playout_delay),
 /// which needs nothing from the sender.
+///
+/// # Precision
+///
+/// Limits are taken in whole milliseconds; anything finer is dropped. On the
+/// **send** side they then travel in the extension's 12-bit, 10 ms units, and
+/// libwebrtc truncates each limit to a multiple of 10 ms when it writes the
+/// header: a `max` of 40.949 s goes out as 40.94 s. That loss is intentional —
+/// it is the wire format — and nothing reports it. The **receive** side applies
+/// its limits locally, to the millisecond.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlayoutDelay {
     pub min: Duration,
@@ -40,9 +49,9 @@ impl PlayoutDelay {
         Self { min, max }
     }
 
-    /// `(min_ms, max_ms)`, or why the limits cannot be sent. The wire format
-    /// counts in 10 ms units, so values are rounded down to a multiple of 10 ms
-    /// on the way out.
+    /// `(min_ms, max_ms)`, or why the limits are invalid. Only checks ordering
+    /// and range; see the type's precision notes for what happens to the
+    /// values after this.
     pub(crate) fn validate(&self) -> Result<(i32, i32)> {
         if self.min > self.max {
             return Err(Error::Webrtc(format!(

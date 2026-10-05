@@ -925,8 +925,11 @@ impl InboundRtpStats {
     /// first one left it.
     #[getter]
     fn average_jitter_buffer_delay_s(&self) -> Option<f64> {
-        (self.jitter_buffer_emitted_count > 0)
-            .then(|| self.jitter_buffer_delay_s / self.jitter_buffer_emitted_count as f64)
+        // Clamped like the Rust helper, which has to: a negative value cannot
+        // become a Duration.
+        (self.jitter_buffer_emitted_count > 0).then(|| {
+            (self.jitter_buffer_delay_s / self.jitter_buffer_emitted_count as f64).max(0.0)
+        })
     }
 }
 
