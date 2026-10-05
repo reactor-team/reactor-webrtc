@@ -216,6 +216,10 @@ class RelayProtocol:
 class InboundRtpStats:
     ssrc: int
     kind: StreamKind
+    #: The transceiver this stream belongs to; None before negotiation.
+    mid: Optional[str]
+    #: The codec's mime type, e.g. "video/VP9"; None until there is one.
+    codec_mime_type: Optional[str]
     packets_received: int
     bytes_received: int
     jitter_s: float
@@ -236,6 +240,10 @@ class InboundRtpStats:
 class OutboundRtpStats:
     ssrc: int
     kind: StreamKind
+    #: The transceiver this stream belongs to; None before negotiation.
+    mid: Optional[str]
+    #: The codec's mime type, e.g. "video/VP9"; None until there is one.
+    codec_mime_type: Optional[str]
     packets_sent: int
     bytes_sent: int
     target_bitrate_bps: float

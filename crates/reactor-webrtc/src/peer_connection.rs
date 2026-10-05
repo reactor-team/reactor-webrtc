@@ -917,6 +917,15 @@ pub struct InboundRtpStats {
     pub ssrc: u32,
     /// Audio or video. See [`StreamKind`].
     pub kind: StreamKind,
+    /// The transceiver this stream belongs to (`RTCInboundRtpStreamStats::mid`).
+    /// Several tracks of one kind are told apart by this, not by
+    /// [`StreamKind`]: match it against [`Transceiver::mid`]. `None` before the
+    /// stream is negotiated.
+    pub mid: Option<String>,
+    /// The codec this stream carries, as its mime type (`"video/VP9"`,
+    /// `"audio/opus"`), from the `RTCCodecStats` its `codec_id` names. `None`
+    /// until the stream has a codec.
+    pub codec_mime_type: Option<String>,
     pub packets_received: u32,
     pub bytes_received: u64,
     /// Jitter in seconds.
@@ -955,6 +964,15 @@ pub struct OutboundRtpStats {
     pub ssrc: u32,
     /// Audio or video. See [`StreamKind`].
     pub kind: StreamKind,
+    /// The transceiver this stream belongs to (`RTCOutboundRtpStreamStats::mid`).
+    /// Several tracks of one kind are told apart by this, not by
+    /// [`StreamKind`]: match it against [`Transceiver::mid`]. `None` before the
+    /// stream is negotiated.
+    pub mid: Option<String>,
+    /// The codec this stream carries, as its mime type (`"video/VP9"`,
+    /// `"audio/opus"`), from the `RTCCodecStats` its `codec_id` names. `None`
+    /// until the stream has a codec.
+    pub codec_mime_type: Option<String>,
     /// 64-bit because `RTCSentRtpStreamStats` reports it that way. It was `u32`
     /// until 0.15.0, which wrapped silently after ~4.3 billion packets — about
     /// seven weeks at a thousand packets a second — and then reported a
@@ -1686,6 +1704,17 @@ extern "C" fn complete_cb(ud: *mut c_void, error: *const c_char) {
 
 type StatsTx = SyncSender<StatsReport>;
 
+/// One of [`ReactorStatEntry`]'s fixed string buffers; `None` when empty, which
+/// is how the glue says absent.
+fn stat_str(buf: &[c_char]) -> Option<String> {
+    let bytes: Vec<u8> = buf
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect();
+    (!bytes.is_empty()).then(|| String::from_utf8_lossy(&bytes).into_owned())
+}
+
 extern "C" fn stats_cb(ud: *mut c_void, entries: *const ReactorStatEntry, count: c_int) {
     let tx = unsafe { Arc::from_raw(ud as *const StatsTx) };
     let slice = if entries.is_null() || count <= 0 {
@@ -1699,6 +1728,8 @@ extern "C" fn stats_cb(ud: *mut c_void, entries: *const ReactorStatEntry, count:
             0 => report.inbound_rtp.push(InboundRtpStats {
                 ssrc: e.ssrc,
                 kind: StreamKind::from_raw(e.stream_kind),
+                mid: stat_str(&e.mid),
+                codec_mime_type: stat_str(&e.codec_mime_type),
                 packets_received: e.packets_received,
                 bytes_received: e.bytes_received,
                 jitter_s: e.jitter,
@@ -1716,6 +1747,8 @@ extern "C" fn stats_cb(ud: *mut c_void, entries: *const ReactorStatEntry, count:
             1 => report.outbound_rtp.push(OutboundRtpStats {
                 ssrc: e.ssrc,
                 kind: StreamKind::from_raw(e.stream_kind),
+                mid: stat_str(&e.mid),
+                codec_mime_type: stat_str(&e.codec_mime_type),
                 packets_sent: e.packets_sent,
                 bytes_sent: e.bytes_sent,
                 target_bitrate_bps: e.target_bitrate,

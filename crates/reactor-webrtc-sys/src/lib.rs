@@ -312,6 +312,12 @@ pub struct ReactorStatEntry {
     pub available_incoming_bitrate: f64,
     /// frames per second (kinds 0 and 1), 0 if not measured
     pub frames_per_second: f64,
+    /// The stream's transceiver mid (kinds 0 and 1), NUL-terminated; empty
+    /// when absent or too long to fit, never truncated.
+    pub mid: [c_char; 32],
+    /// The stream's codec mime type (kinds 0 and 1), e.g. `"video/VP9"`,
+    /// NUL-terminated; empty until the stream has a codec.
+    pub codec_mime_type: [c_char; 32],
 }
 
 // The other half of the layout guard in
@@ -325,7 +331,7 @@ pub struct ReactorStatEntry {
 // with their neighbours are pinned too, on both sides.
 const _: () = {
     assert!(
-        core::mem::size_of::<ReactorStatEntry>() == 200,
+        core::mem::size_of::<ReactorStatEntry>() == 264,
         "ReactorStatEntry changed size — update the C struct in \
          glue/reactor_webrtc.cpp and both assertions"
     );
@@ -345,6 +351,14 @@ const _: () = {
     assert!(
         core::mem::offset_of!(ReactorStatEntry, fir_count) == 24,
         "the feedback counters moved — see above"
+    );
+    assert!(
+        core::mem::offset_of!(ReactorStatEntry, mid) == 200,
+        "the stream strings moved — see above"
+    );
+    assert!(
+        core::mem::offset_of!(ReactorStatEntry, codec_mime_type) == 232,
+        "the stream strings moved — see above"
     );
 };
 

@@ -621,7 +621,7 @@ for s in report.inbound_rtp:
 
 </details>
 
-Five things worth knowing before you read a number off this.
+Six things worth knowing before you read a number off this.
 
 - **Zero means "not measured yet" far more often than it means zero.** RTT, the
   available-bitrate estimates and `frames_per_second` all start at `0.0` and
@@ -630,6 +630,12 @@ Five things worth knowing before you read a number off this.
   against, a stream that has not decoded a second's worth of frames. A caller
   that treats those as measurements reports a zero-latency link on a connection
   that has not finished connecting.
+
+- **`mid` says which track, `kind` only says which kind.** With two video
+  tracks, two `inbound_rtp` entries report `StreamKind::Video`; match each
+  entry's `mid` against `Transceiver::mid` to tell them apart.
+  `codec_mime_type` (`"video/VP9"`, `"audio/opus"`) is the codec the stream is
+  using. Both are `None` until the stream has been negotiated.
 
 - **Read `nominated`, not `state` and `priority`.** A connection gathers many
   pairs — a plain loopback produces eighteen — and exactly one is nominated.

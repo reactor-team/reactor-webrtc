@@ -871,6 +871,12 @@ pub struct InboundRtpStats {
     pub ssrc: u32,
     /// Audio or video.
     pub kind: StreamKind,
+    /// The transceiver this stream belongs to — how several tracks of one kind
+    /// are told apart. `None` before the stream is negotiated.
+    pub mid: Option<String>,
+    /// The codec's mime type, e.g. `"video/VP9"`. `None` until the stream has
+    /// a codec.
+    pub codec_mime_type: Option<String>,
     pub packets_received: u32,
     pub bytes_received: u64,
     /// Jitter in seconds.
@@ -908,6 +914,8 @@ impl From<rw::InboundRtpStats> for InboundRtpStats {
         Self {
             ssrc: s.ssrc,
             kind: StreamKind::from(s.kind),
+            mid: s.mid,
+            codec_mime_type: s.codec_mime_type,
             packets_received: s.packets_received,
             bytes_received: s.bytes_received,
             jitter_s: s.jitter_s,
@@ -932,6 +940,12 @@ pub struct OutboundRtpStats {
     pub ssrc: u32,
     /// Audio or video.
     pub kind: StreamKind,
+    /// The transceiver this stream belongs to — how several tracks of one kind
+    /// are told apart. `None` before the stream is negotiated.
+    pub mid: Option<String>,
+    /// The codec's mime type, e.g. `"video/VP9"`. `None` until the stream has
+    /// a codec.
+    pub codec_mime_type: Option<String>,
     /// 64-bit because libwebrtc reports it that way; a 32-bit counter wrapped
     /// silently on a long-lived connection.
     pub packets_sent: u64,
@@ -981,6 +995,8 @@ impl From<rw::OutboundRtpStats> for OutboundRtpStats {
         Self {
             ssrc: s.ssrc,
             kind: StreamKind::from(s.kind),
+            mid: s.mid,
+            codec_mime_type: s.codec_mime_type,
             packets_sent: s.packets_sent,
             bytes_sent: s.bytes_sent,
             target_bitrate_bps: s.target_bitrate_bps,
