@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.19.1 — Default native archive p10 in every build
+
+`reactor-webrtc-sys`'s fallback prebuilt tag, used when `WEBRTC_VERSION` is
+not readable (a build from the crate rather than this repository), now names
+`webrtc-7907-a5ddff60-p10`; 0.19.0 left it on p9 in the source, which lacks
+libwebrtc patch 0005, so such a build would ignore `with_dc_chunking`'s
+`max_burst`. The crates published as 0.19.0 already carried p10, since the
+release workflow rewrites the fallback before publishing. All crates advance to
+0.19.1; no API change.
+
 ## 0.19.0 — Large data-channel messages (max_burst and chunking)
 
 A data-channel message used to take several round trips once it passed a few
