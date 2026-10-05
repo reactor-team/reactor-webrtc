@@ -198,7 +198,15 @@ mod tests {
         // Nomination and the first byte counters land a tick or two after the
         // connection event, so this polls for the nominated pair rather than
         // reading one snapshot and hoping.
+        //
+        // It also polls for the pair's state. libwebrtc keeps checking the
+        // selected pair after nominating it, and while one of those checks is
+        // out the pair reports `InProgress` — so a single snapshot can catch the
+        // live pair mid-check. What has to hold is that the nominated pair
+        // carrying traffic reaches `Succeeded`, which is what a reader picking
+        // the live pair (nominated *and* succeeded) relies on.
         let deadline = Instant::now() + Duration::from_secs(5);
+        let mut last_seen = None;
         let pair = loop {
             let report = pc1.get_stats().expect("get_stats");
             if let Some(p) = report
@@ -206,22 +214,19 @@ mod tests {
                 .into_iter()
                 .find(|p| p.nominated && p.bytes_sent > 0)
             {
-                break Some(p);
+                if p.state == IceCandidatePairState::Succeeded {
+                    break p;
+                }
+                last_seen = Some(p.state);
             }
-            if Instant::now() >= deadline {
-                break None;
-            }
+            assert!(
+                Instant::now() < deadline,
+                "no nominated, succeeded candidate pair with traffic appeared \
+                 (last nominated pair with traffic was {last_seen:?})"
+            );
             thread::sleep(Duration::from_millis(50));
         };
-        let pair = pair.expect("no nominated candidate pair with traffic appeared");
 
-        // The whole point of the field: before it, "selected" had to be inferred
-        // from state plus priority.
-        assert_eq!(
-            pair.state,
-            IceCandidatePairState::Succeeded,
-            "the nominated pair must be a succeeded one"
-        );
         assert!(pair.writable, "a nominated pair carrying bytes is writable");
 
         // Loopback goes host-to-host, and nothing is relayed — which is exactly
