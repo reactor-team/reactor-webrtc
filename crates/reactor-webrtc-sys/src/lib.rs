@@ -703,9 +703,10 @@ extern "C" {
         track: *mut MediaStreamTrack,
     ) -> c_int;
     /// Attach a frame sink to a (received) video track. `on_frame(userdata,
-    /// bgra, width, height, rtp_timestamp)` fires per decoded frame (BGRA,
+    /// bgra, width, height, ssrc, rtp_timestamp)` fires per decoded frame (BGRA,
     /// `width*height*4` bytes, valid only during the call) until the track is
-    /// destroyed. `rtp_timestamp` is the one the receive transform saw for it.
+    /// destroyed. `ssrc` and `rtp_timestamp` are the ones the receive transform
+    /// saw for it; `ssrc` is 0 when the frame carries no packet information.
     pub fn reactor_webrtc_video_track_add_sink(
         track: *mut MediaStreamTrack,
         userdata: *mut c_void,
@@ -714,6 +715,7 @@ extern "C" {
             bgra: *const u8,
             width: c_int,
             height: c_int,
+            ssrc: u32,
             rtp_timestamp: u32,
         ),
     );

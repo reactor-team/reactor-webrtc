@@ -499,12 +499,13 @@ class AudioFrameSink : public webrtc::AudioTrackSinkInterface {
 };
 
 // Bridges decoded frames from a (remote) video track to a C callback,
-// converting to BGRA (width*height*4) on the way out. The frame's RTP timestamp
-// rides along so the binding can pair it with what the receive transform saw.
+// converting to BGRA (width*height*4) on the way out. The frame's SSRC and RTP
+// timestamp ride along so the binding can pair it with what the receive
+// transform saw.
 class FrameSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
  public:
   FrameSink(void* userdata,
-            void (*on_frame)(void*, const uint8_t*, int, int, uint32_t))
+            void (*on_frame)(void*, const uint8_t*, int, int, uint32_t, uint32_t))
       : userdata_(userdata), on_frame_(on_frame) {}
   void OnFrame(const webrtc::VideoFrame& frame) override {
     if (!on_frame_) return;
@@ -517,12 +518,16 @@ class FrameSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
     libyuv::I420ToARGB(i420->DataY(), i420->StrideY(), i420->DataU(),
                        i420->StrideU(), i420->DataV(), i420->StrideV(),
                        bgra_.data(), w * 4, w, h);
-    on_frame_(userdata_, bgra_.data(), w, h, frame.rtp_timestamp());
+    // A received frame lists the RTP packets it was built from; they share one
+    // SSRC. 0 when the list is empty (a frame that did not come off the wire).
+    const webrtc::RtpPacketInfos& packets = frame.packet_infos();
+    const uint32_t ssrc = packets.empty() ? 0 : packets.begin()->ssrc();
+    on_frame_(userdata_, bgra_.data(), w, h, ssrc, frame.rtp_timestamp());
   }
 
  private:
   void* userdata_;
-  void (*on_frame_)(void*, const uint8_t*, int, int, uint32_t);
+  void (*on_frame_)(void*, const uint8_t*, int, int, uint32_t, uint32_t);
   std::vector<uint8_t> bgra_;
 };
 
@@ -1705,7 +1710,7 @@ void reactor_webrtc_audio_track_add_sink(
 // `FrameSink` the broadcaster still holds and calls into.
 void reactor_webrtc_video_track_add_sink(
     void* track, void* userdata,
-    void (*on_frame)(void*, const uint8_t*, int, int, uint32_t)) {
+    void (*on_frame)(void*, const uint8_t*, int, int, uint32_t, uint32_t)) {
   auto* h = reinterpret_cast<ReactorMediaStreamTrack*>(track);
   if (!h || !h->track || h->track->kind() != "video") return;
   auto* vt = static_cast<webrtc::VideoTrackInterface*>(h->track.get());

@@ -61,28 +61,47 @@ fn registry() -> &'static Registry {
 /// `set_remote_description` has only a transceiver to go on.
 type RecvRegistry = Mutex<HashMap<usize, Weak<ReceiverMetaQueue>>>;
 
-/// Metadata stripped from inbound frames, in arrival order, each tagged with its
-/// frame's RTP timestamp.
+/// Which inbound frame a queued entry belongs to: its SSRC and RTP timestamp.
+///
+/// The timestamp alone is not enough. One receiver can see several SSRCs — a
+/// stream restart, or the sender switching streams — and a timestamp from the
+/// new one can equal a stale entry's from the old.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FrameKey {
+    pub ssrc: u32,
+    pub rtp_timestamp: u32,
+}
+
+/// Metadata stripped from inbound frames, in arrival order, each tagged with the
+/// frame it came from.
 ///
 /// Not every frame the transform sees reaches the sink — a decode error, the
 /// keyframe wait after one, or a frame libwebrtc skips as late all leave their
-/// entry behind — so the sink takes the entry whose timestamp matches the frame
-/// it decoded, never simply the oldest one. See [`take_receiver_meta`].
-pub(crate) type ReceiverMetaQueue = Mutex<std::collections::VecDeque<(u32, FrameMetadata)>>;
+/// entry behind — so the sink takes the entry that matches the frame it
+/// decoded, never simply the oldest one. See [`take_receiver_meta`].
+pub(crate) type ReceiverMetaQueue = Mutex<std::collections::VecDeque<(FrameKey, FrameMetadata)>>;
 
-/// Take the metadata for the decoded frame with `rtp_timestamp`.
+/// Take the metadata for the decoded frame `ssrc`/`rtp_timestamp`.
 ///
-/// Decoded frames come out in the order their encoded frames went in, so every
-/// entry ahead of the match belongs to a frame that was dropped on the way to the
-/// decoder or out of it; those go too. With no match the queue is left alone: the
-/// frame carried no trailer, and the entries waiting belong to frames still in
-/// flight.
+/// Assumes the decoder does not reorder: frames come out in the order their
+/// encoded frames went in. That holds for every codec WebRTC negotiates today
+/// (none uses B-frames). Under it, every entry ahead of the match belongs to a
+/// frame that was dropped on the way to the decoder or out of it, or to an SSRC
+/// the stream has left, so those go too. A reordering decoder would break this:
+/// entries for earlier frames still in flight would be discarded here.
+///
+/// With no match the queue is left alone: the frame carried no trailer, and the
+/// entries waiting belong to frames still in flight. An `ssrc` of 0 — a frame
+/// with no packet information — matches on the timestamp alone.
 pub(crate) fn take_receiver_meta(
     queue: &ReceiverMetaQueue,
+    ssrc: u32,
     rtp_timestamp: u32,
 ) -> Option<FrameMetadata> {
     let mut q = queue.lock().ok()?;
-    let pos = q.iter().position(|(ts, _)| *ts == rtp_timestamp)?;
+    let pos = q
+        .iter()
+        .position(|(k, _)| k.rtp_timestamp == rtp_timestamp && (ssrc == 0 || k.ssrc == ssrc))?;
     q.drain(..pos);
     q.pop_front().map(|(_, m)| m)
 }
@@ -326,7 +345,11 @@ impl ComposedSlot {
                                 if q.len() >= RECEIVER_META_CAP {
                                     q.pop_front();
                                 }
-                                q.push_back((frame.timestamp, m));
+                                let key = FrameKey {
+                                    ssrc: frame.ssrc,
+                                    rtp_timestamp: frame.timestamp,
+                                };
+                                q.push_back((key, m));
                             }
                         }
                     }
@@ -502,13 +525,18 @@ pub(crate) fn attach_strip(
 mod tests {
     use super::*;
 
-    fn queue(entries: &[(u32, u64)]) -> ReceiverMetaQueue {
+    const SSRC: u32 = 1111;
+
+    fn queue(entries: &[(u32, u32, u64)]) -> ReceiverMetaQueue {
         Mutex::new(
             entries
                 .iter()
-                .map(|&(ts, frame_id)| {
+                .map(|&(ssrc, rtp_timestamp, frame_id)| {
                     (
-                        ts,
+                        FrameKey {
+                            ssrc,
+                            rtp_timestamp,
+                        },
                         FrameMetadata {
                             frame_id,
                             ..Default::default()
@@ -523,33 +551,58 @@ mod tests {
         q.lock().unwrap().iter().map(|(_, m)| m.frame_id).collect()
     }
 
+    fn take(q: &ReceiverMetaQueue, ssrc: u32, ts: u32) -> Option<u64> {
+        take_receiver_meta(q, ssrc, ts).map(|m| m.frame_id)
+    }
+
     #[test]
     fn takes_the_entry_with_the_frames_timestamp() {
-        let q = queue(&[(100, 1), (200, 2)]);
-        assert_eq!(take_receiver_meta(&q, 100).map(|m| m.frame_id), Some(1));
+        let q = queue(&[(SSRC, 100, 1), (SSRC, 200, 2)]);
+        assert_eq!(take(&q, SSRC, 100), Some(1));
         assert_eq!(ids(&q), [2]);
     }
 
     #[test]
     fn discards_entries_of_frames_dropped_before_render() {
         // 200 and 300 were assembled but never decoded.
-        let q = queue(&[(100, 1), (200, 2), (300, 3), (400, 4)]);
-        assert_eq!(take_receiver_meta(&q, 100).map(|m| m.frame_id), Some(1));
-        assert_eq!(take_receiver_meta(&q, 400).map(|m| m.frame_id), Some(4));
+        let q = queue(&[
+            (SSRC, 100, 1),
+            (SSRC, 200, 2),
+            (SSRC, 300, 3),
+            (SSRC, 400, 4),
+        ]);
+        assert_eq!(take(&q, SSRC, 100), Some(1));
+        assert_eq!(take(&q, SSRC, 400), Some(4));
         assert!(ids(&q).is_empty());
     }
 
     #[test]
     fn a_frame_without_a_trailer_leaves_the_queue_alone() {
-        let q = queue(&[(200, 2), (300, 3)]);
-        assert!(take_receiver_meta(&q, 100).is_none());
+        let q = queue(&[(SSRC, 200, 2), (SSRC, 300, 3)]);
+        assert!(take(&q, SSRC, 100).is_none());
         assert_eq!(ids(&q), [2, 3]);
     }
 
     #[test]
     fn matches_across_rtp_timestamp_wraparound() {
-        let q = queue(&[(u32::MAX - 1, 1), (u32::MAX, 2), (5, 3)]);
-        assert_eq!(take_receiver_meta(&q, 5).map(|m| m.frame_id), Some(3));
+        let q = queue(&[(SSRC, u32::MAX - 1, 1), (SSRC, u32::MAX, 2), (SSRC, 5, 3)]);
+        assert_eq!(take(&q, SSRC, 5), Some(3));
         assert!(ids(&q).is_empty());
+    }
+
+    #[test]
+    fn a_stale_entry_from_another_ssrc_is_not_taken() {
+        // The stream restarted on a new SSRC; the old one's entry happens to
+        // carry the same timestamp as the new stream's first frame.
+        const NEW: u32 = 2222;
+        let q = queue(&[(SSRC, 100, 1), (NEW, 100, 2)]);
+        assert_eq!(take(&q, NEW, 100), Some(2));
+        assert!(ids(&q).is_empty());
+    }
+
+    #[test]
+    fn an_unknown_ssrc_matches_on_the_timestamp() {
+        let q = queue(&[(SSRC, 100, 1)]);
+        assert_eq!(take(&q, 0, 100), Some(1));
     }
 }

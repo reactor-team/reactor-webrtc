@@ -133,6 +133,7 @@ extern "C" fn ctx_on_video(
     _bgra: *const u8,
     _width: c_int,
     _height: c_int,
+    _ssrc: u32,
     _rtp_timestamp: u32,
 ) {
     let ctx = unsafe { &*(ud as *const PcCtx) };
