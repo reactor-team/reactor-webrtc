@@ -1,5 +1,68 @@
 # Changelog
 
+## 0.21.0 — the frame you decoded, sooner
+
+Two things a robot-control client found out the hard way. Per-frame metadata
+could end up on the wrong frame, because the receive side matched it to
+decoded frames by queue order. And every received video frame waited ~10 ms of
+render smoothing before decode, with no way to turn that off.
+
+### Fixed
+
+**Frame metadata stays on its own frame when libwebrtc drops one.** The receive
+transform strips every assembled frame's trailer, but not every assembled frame
+is rendered: a decode error, the keyframe wait after one, or a frame skipped as
+late each left an entry behind, and from then on every decoded frame was handed
+its predecessor's metadata. Metadata is now matched to the decoded frame by SSRC
+and RTP timestamp, and the entries of frames that never rendered are discarded.
+
+**A caller's `replace_data` survives the metadata step.** With metadata
+negotiated, the metadata step worked on the frame's original bytes rather than
+the rewritten ones, so a `FrameTransform` that rewrote the payload was silently
+undone — on send the trailer was appended to the original payload, on receive
+the strip put it back. It now builds on the current payload, as the docs said.
+
+### Added
+
+**Playout delay**, in Rust and Python, through a new `PlayoutDelay { min, max }`:
+
+- `PeerConnectionFactoryBuilder::with_receive_playout_delay` plays every
+  received video stream within the limits, whatever the sender asks for.
+  `PlayoutDelay::IMMEDIATE` (both zero) decodes each frame as soon as it is
+  complete; on a loopback the wait before decode goes from ~11 ms to ~30 µs.
+- `PeerConnectionFactoryBuilder::with_send_playout_delay` stamps the
+  playout-delay RTP header extension on every video frame sent, for receivers
+  you do not control.
+
+Both are factory-wide: libwebrtc reads them from field trials in the factory's
+`Environment`, like `with_dtls_in_stun`.
+
+**`Transceiver::set_jitter_buffer_minimum_delay`**, a per-receiver floor
+(`RTCRtpReceiver.jitterBufferTarget`), honoured from the first frame when set
+before the stream exists.
+
+**Jitter buffer stats** on `InboundRtpStats`: `jitter_buffer_delay_s`,
+`jitter_buffer_target_delay_s`, `jitter_buffer_minimum_delay_s`,
+`jitter_buffer_emitted_count`, and `average_jitter_buffer_delay()`
+(`average_jitter_buffer_delay_s` in Python) — the per-frame wait before decode.
+
+[docs/video-latency.md](docs/video-latency.md) covers all of it.
+
+### Breaking
+
+`reactor-webrtc-sys` only: the `on_frame` callback of
+`reactor_webrtc_video_track_add_sink` takes two more arguments, the decoded
+frame's `ssrc` and `rtp_timestamp`. Code using `reactor-webrtc` or the Python
+package is unaffected. `InboundRtpStats` gains public fields, which is why this
+is a minor rather than a patch release.
+
+### Notes
+
+`ReactorStatEntry` grew from 264 to 296 bytes, and `ReactorFactoryOptions` by
+six `int`s. As in 0.15.0 the glue is compiled from source, so no ABI version
+changed; the stats struct pins the offsets of its three new delays, which share
+a width and a unit.
+
 ## 0.20.0 — which transceiver, which codec
 
 `get_stats` said whether a stream was audio or video, but not which track it
