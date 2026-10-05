@@ -1,7 +1,7 @@
 //! [`PeerConnectionFactoryBuilder`] — the composable entry point for every
 //! [`PeerConnectionFactory`].
 
-use crate::{AdmMode, ApmConfig, DcChunking, PeerConnectionFactory, Result};
+use crate::{AdmMode, ApmConfig, DcChunking, PeerConnectionFactory, PlayoutDelay, Result};
 
 /// Builds a [`PeerConnectionFactory`] knob by knob — the single entry point
 /// that replaced the old mutually-exclusive constructors (they could not
@@ -23,7 +23,8 @@ use crate::{AdmMode, ApmConfig, DcChunking, PeerConnectionFactory, Result};
 /// process-physical singletons — the audio device (ADM), the audio-processing
 /// chain (APM), codec backends loaded once per process (OpenH264) — and the
 /// field trials baked into the factory's `Environment`
-/// ([`with_dtls_in_stun`](Self::with_dtls_in_stun)). Everything else — track
+/// ([`with_dtls_in_stun`](Self::with_dtls_in_stun),
+/// [`with_send_playout_delay`](Self::with_send_playout_delay)). Everything else — track
 /// kinds, per-track encoder choices, per-track metadata — belongs to track
 /// creation, not the builder.
 pub struct PeerConnectionFactoryBuilder {
@@ -32,6 +33,8 @@ pub struct PeerConnectionFactoryBuilder {
     metadata: bool,
     dtls_in_stun: bool,
     dc_chunking: Option<DcChunking>,
+    send_playout_delay: Option<PlayoutDelay>,
+    receive_playout_delay: Option<PlayoutDelay>,
     #[cfg(feature = "openh264")]
     openh264: Option<std::path::PathBuf>,
 }
@@ -44,6 +47,8 @@ impl PeerConnectionFactoryBuilder {
             metadata: true,
             dtls_in_stun: false,
             dc_chunking: None,
+            send_playout_delay: None,
+            receive_playout_delay: None,
             #[cfg(feature = "openh264")]
             openh264: None,
         }
@@ -142,6 +147,47 @@ impl PeerConnectionFactoryBuilder {
         self
     }
 
+    /// Ask every receiver of this factory's video to hold its playout delay
+    /// within `delay`, by stamping the playout-delay RTP header extension on
+    /// every frame sent. Off by default: libwebrtc's own encoders never ask for
+    /// a playout delay, so without this the extension is negotiated but never
+    /// sent, and each receiver smooths playout as it sees fit.
+    ///
+    /// [`PlayoutDelay::IMMEDIATE`] is the low-latency setting — the receiver
+    /// renders each frame as soon as it is decoded. It is honoured by any
+    /// receiver that negotiated the extension, which libwebrtc (and so every
+    /// browser) offers by default; one that did not simply ignores it.
+    ///
+    /// A factory knob, like [`with_dtls_in_stun`](Self::with_dtls_in_stun):
+    /// libwebrtc reads it from a field trial in the factory's `Environment`, so
+    /// it covers every video track the factory sends.
+    /// [`build`](Self::build) fails when `min > max` or `max` exceeds
+    /// [`PlayoutDelay::MAX`].
+    pub fn with_send_playout_delay(mut self, delay: PlayoutDelay) -> Self {
+        self.send_playout_delay = Some(delay);
+        self
+    }
+
+    /// Play every video stream this factory receives with its playout delay
+    /// held within `delay`, whatever the sender's extension asks for — the
+    /// receiving-side counterpart of
+    /// [`with_send_playout_delay`](Self::with_send_playout_delay), for when you
+    /// don't control the sender. Off by default.
+    ///
+    /// [`PlayoutDelay::IMMEDIATE`] hands each frame to the decoder as soon as it
+    /// is complete instead of scheduling it against a render time, which takes
+    /// out the ~10 ms of render-delay smoothing a default receiver adds. It
+    /// applies from a stream's first frame. To keep the default behaviour but
+    /// raise its floor on one transceiver, use
+    /// [`Transceiver::set_jitter_buffer_minimum_delay`](crate::Transceiver::set_jitter_buffer_minimum_delay).
+    ///
+    /// A factory knob for the same reason as the send side, and
+    /// [`build`](Self::build) validates it the same way.
+    pub fn with_receive_playout_delay(mut self, delay: PlayoutDelay) -> Self {
+        self.receive_playout_delay = Some(delay);
+        self
+    }
+
     /// Register the OpenH264 backend for real H.264 encode/decode (see
     /// [`crate::openh264::ensure_available`] to obtain `lib_path`). This
     /// never fails because the library itself couldn't be loaded: a
@@ -164,6 +210,11 @@ impl PeerConnectionFactoryBuilder {
         if let Some(chunking) = &self.dc_chunking {
             chunking.validate()?;
         }
+        let send_playout = self.send_playout_delay.map(|d| d.validate()).transpose()?;
+        let recv_playout = self
+            .receive_playout_delay
+            .map(|d| d.validate())
+            .transpose()?;
         #[cfg(feature = "openh264")]
         let openh264_c = match &self.openh264 {
             Some(p) => Some(
@@ -187,6 +238,12 @@ impl PeerConnectionFactoryBuilder {
                 .dc_chunking
                 .as_ref()
                 .map_or(0, |c| c.max_burst as std::os::raw::c_int),
+            send_playout_delay_set: send_playout.is_some() as std::os::raw::c_int,
+            send_playout_delay_min_ms: send_playout.map_or(0, |(min, _)| min),
+            send_playout_delay_max_ms: send_playout.map_or(0, |(_, max)| max),
+            recv_playout_delay_set: recv_playout.is_some() as std::os::raw::c_int,
+            recv_playout_delay_min_ms: recv_playout.map_or(0, |(min, _)| min),
+            recv_playout_delay_max_ms: recv_playout.map_or(0, |(_, max)| max),
             #[cfg(feature = "openh264")]
             openh264_lib_path: openh264_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
             ..Default::default()

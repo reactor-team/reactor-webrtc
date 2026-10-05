@@ -83,6 +83,7 @@ builder = rw.PeerConnectionFactoryBuilder()
 builder.with_platform_adm()          # real mic + AEC3/NS/AGC/high_pass
 builder.with_metadata(False)         # factory-wide frame-metadata kill switch
 builder.with_dtls_in_stun(True)      # SPED: DTLS handshake inside the ICE checks
+builder.with_receive_playout_delay() # decode each frame as soon as it's complete
 factory = builder.build()
 
 # Raw video with an H.264 backend chosen per track:
