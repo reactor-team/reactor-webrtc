@@ -530,7 +530,10 @@ fn legacy_peer_gets_no_trailer() {
 /// expressible because the crate owns that slot and composes: the caller's callback
 /// runs first, on the bytes the encoder produced, and the trailer is appended after.
 /// Both observations are checked — the callback ran, *and* the receiver decoded
-/// metadata.
+/// metadata. The callback also rewrites the payload, and the metadata step has to
+/// build on the rewrite rather than on the bytes the callback was handed: the
+/// sender's marker must reach the receiver ahead of the trailer, and the
+/// receiver's own rewrite (taking the marker back out) must survive the strip.
 #[test]
 fn caller_transform_and_metadata_compose_on_one_sender() {
     let factory = PeerConnectionFactory::builder().build().expect("factory");
@@ -547,6 +550,8 @@ fn caller_transform_and_metadata_compose_on_one_sender() {
         .expect("video track");
     tx1.set_track(&video).expect("set track");
 
+    const MARKER: &[u8] = b"CALR";
+
     // What the caller sees must be the encoder's output, with no trailer yet.
     let ran = Arc::new(AtomicBool::new(false));
     let saw_trailer = Arc::new(AtomicBool::new(false));
@@ -559,6 +564,9 @@ fn caller_transform_and_metadata_compose_on_one_sender() {
                 if frame.data.ends_with(b"RXMT") {
                     saw_trailer.store(true, Ordering::SeqCst);
                 }
+                let mut out = frame.data.to_vec();
+                out.extend_from_slice(MARKER);
+                frame.replace_data(&out);
             }
             FrameAction::Forward
         }
@@ -567,6 +575,33 @@ fn caller_transform_and_metadata_compose_on_one_sender() {
 
     negotiate(&pc1, &pc2);
     assert!(pc1.frame_metadata_gate().is_open());
+
+    // Count received frames whose payload ends in the sender's marker, then
+    // remove it before the strip step runs.
+    let rx2 = pc2
+        .transceivers()
+        .into_iter()
+        .find(|t| t.kind() == MediaKind::Video)
+        .expect("pc2 video transceiver");
+    let marked = Arc::new(AtomicU32::new(0));
+    let unmark = FrameTransform::new({
+        let marked = marked.clone();
+        move |frame| {
+            if let Some((_, payload)) =
+                reactor_webrtc::metadata::decode_and_strip_trailer(frame.data)
+            {
+                if let Some(original) = payload.strip_suffix(MARKER) {
+                    marked.fetch_add(1, Ordering::SeqCst);
+                    let mut out = original.to_vec();
+                    out.extend_from_slice(&frame.data[payload.len()..]);
+                    frame.replace_data(&out);
+                }
+            }
+            FrameAction::Forward
+        }
+    });
+    rx2.set_receiver_transform(&unmark)
+        .expect("unmark transform");
 
     let received: Arc<Mutex<Vec<FrameMetadata>>> = Arc::new(Mutex::new(Vec::new()));
     let stop = AtomicBool::new(false);
@@ -626,6 +661,10 @@ fn caller_transform_and_metadata_compose_on_one_sender() {
         "no metadata arrived — composing dropped the metadata step"
     );
     assert_eq!(metas[0].user_data, b"composed");
+    assert!(
+        marked.load(Ordering::SeqCst) > 0,
+        "the sender's rewrite never reached the wire — the trailer was appended to the original payload"
+    );
 
     println!(
         "caller_transform_and_metadata_compose_on_one_sender ✅  — {} metadata frames",
@@ -1153,4 +1192,144 @@ fn kill_switch_beats_per_track_opt_in() {
     }
     assert!(!pc1.frame_metadata_gate().is_open());
     println!("kill switch over per-track opt-in ✅");
+}
+
+/// Metadata stays paired with its own frame when libwebrtc drops decoded frames.
+///
+/// The receive transform strips every assembled frame's trailer, but not every
+/// assembled frame reaches the sink: a decode error, and the keyframe wait that
+/// follows it, discard frames whose metadata was already taken. Each frame's
+/// gray level and its `user_data` carry the same sequence number, so a decoded
+/// frame handed its predecessor's metadata shows up as a mismatch.
+#[test]
+fn metadata_stays_paired_when_decoded_frames_are_dropped() {
+    const BUCKETS: u8 = 8;
+    fn gray(seq: u8) -> u8 {
+        (seq % BUCKETS) * 32 + 16
+    }
+
+    let factory = PeerConnectionFactory::builder().build().expect("factory");
+    let config = RtcConfiguration::default();
+
+    let (pc1, s1) = make_peer(&factory, &config);
+    let (pc2, s2) = make_peer(&factory, &config);
+
+    let tx1 = pc1
+        .add_transceiver(MediaKind::Video, TransceiverDirection::SendOnly)
+        .expect("send transceiver");
+    let video = factory
+        .create_video_track("dropped-video")
+        .expect("video track");
+    tx1.set_track(&video).expect("set track");
+
+    negotiate(&pc1, &pc2);
+
+    // Corrupt a few delta frames' payloads but keep their trailers, so the
+    // metadata step still takes their metadata while the decoder rejects them.
+    let rx2 = pc2
+        .transceivers()
+        .into_iter()
+        .find(|t| t.kind() == MediaKind::Video)
+        .expect("pc2 video transceiver");
+    let assembled = Arc::new(AtomicU32::new(0));
+    let corrupted = Arc::new(AtomicU32::new(0));
+    let corrupt = FrameTransform::new({
+        let assembled = assembled.clone();
+        let corrupted = corrupted.clone();
+        move |frame| {
+            let n = assembled.fetch_add(1, Ordering::SeqCst);
+            if !frame.is_key_frame && (n == 20 || n == 40 || n == 60) {
+                if let Some((_, payload)) =
+                    reactor_webrtc::metadata::decode_and_strip_trailer(frame.data)
+                {
+                    let trailer = &frame.data[payload.len()..];
+                    let mut out = vec![0xFFu8];
+                    out.extend_from_slice(trailer);
+                    frame.replace_data(&out);
+                    corrupted.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            FrameAction::Forward
+        }
+    });
+    rx2.set_receiver_transform(&corrupt)
+        .expect("corrupting transform");
+
+    // (gray level decoded, sequence number from user_data)
+    let pairs: Arc<Mutex<Vec<(u8, u8)>>> = Arc::new(Mutex::new(Vec::new()));
+    let stop = AtomicBool::new(false);
+
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            let mut seq = 0u8;
+            while !stop.load(Ordering::SeqCst) {
+                let bgra = vec![gray(seq); (W * H * 4) as usize];
+                video
+                    .push_frame_with_metadata(reactor_webrtc::VideoFrame::new(&bgra, W, H), &[seq])
+                    .expect("push frame");
+                seq = seq.wrapping_add(1);
+                thread::sleep(Duration::from_millis(33));
+            }
+        });
+
+        let start = Instant::now();
+        let mut recv_setup = false;
+        loop {
+            forward_ice(&s1, &pc2);
+            forward_ice(&s2, &pc1);
+
+            if !recv_setup {
+                let tracks = s2.recv.lock().unwrap();
+                if let Some(video) = tracks.iter().find_map(|t| t.as_video()) {
+                    let out = pairs.clone();
+                    video.on_frame(move |frame| {
+                        let Some(meta) = frame.metadata else { return };
+                        let center =
+                            ((frame.height / 2 * frame.width + frame.width / 2) * 4) as usize;
+                        let level = frame.bgra[center + 1];
+                        out.lock().unwrap().push((level, meta.user_data[0]));
+                    });
+                    recv_setup = true;
+                }
+            }
+
+            if assembled.load(Ordering::SeqCst) >= 120 || start.elapsed() > Duration::from_secs(30)
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        stop.store(true, Ordering::SeqCst);
+    });
+
+    let pairs = pairs.lock().unwrap().clone();
+    let corrupted = corrupted.load(Ordering::SeqCst);
+    assert!(
+        corrupted > 0,
+        "no frame was corrupted; the test exercised nothing"
+    );
+    assert!(
+        pairs.len() >= 30,
+        "only {} frames decoded with metadata",
+        pairs.len()
+    );
+
+    let mismatched: Vec<_> = pairs
+        .iter()
+        .enumerate()
+        .filter(|(_, &(level, seq))| (level as i16 - gray(seq) as i16).abs() > 12)
+        .collect();
+    assert!(
+        mismatched.is_empty(),
+        "{} of {} decoded frames carried another frame's metadata after {corrupted} \
+         corrupted frames (index, (gray, seq)): {:?}",
+        mismatched.len(),
+        pairs.len(),
+        &mismatched[..mismatched.len().min(10)],
+    );
+
+    println!(
+        "metadata_stays_paired_when_decoded_frames_are_dropped ✅  — {} frames, {corrupted} corrupted",
+        pairs.len()
+    );
 }
