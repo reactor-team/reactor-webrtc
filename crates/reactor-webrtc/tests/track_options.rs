@@ -68,7 +68,12 @@ fn make_peer(
 }
 
 fn trickle(from: &Peer, to: &PeerConnection) {
-    while let Some(c) = from.ice.lock().unwrap().pop_front() {
+    // Pop in a block so the guard drops before add_ice_candidate, which
+    // waits on the signaling thread that may be waiting for this lock.
+    while let Some(c) = {
+        let mut q = from.ice.lock().unwrap();
+        q.pop_front()
+    } {
         let _ = to.add_ice_candidate(&c);
     }
 }

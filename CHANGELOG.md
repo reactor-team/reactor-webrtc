@@ -1,26 +1,147 @@
 # Changelog
 
-## 0.19.0 — Per-stage latency in stats
+## 0.21.0 — the frame you decoded, sooner
 
-Expose the per-stage timings libwebrtc already computes but the stats copy
-never carried, so a caller can see where a frame's time goes on each side.
+Two things a robot-control client found out the hard way. Per-frame metadata
+could end up on the wrong frame, because the receive side matched it to
+decoded frames by queue order. And every received video frame waited ~10 ms of
+render smoothing before decode, with no way to turn that off.
 
-- `OutboundRtpStats` gains `frames_encoded`, `total_encode_time_s` and
-  `total_packet_send_delay_s` (time in the pacer, summed over packets).
-- `InboundRtpStats` gains `jitter_buffer_delay_s`,
-  `jitter_buffer_target_delay_s`, `jitter_buffer_emitted_count` and
-  `total_processing_delay_s`.
-- `InboundRtpStats::timing_frame` carries a `TimingFrameInfo`: one video frame
-  stamped at encode, packetization, pacer exit, receive and decode, from
-  libwebrtc's `video-timing` header extension — of those in the last second,
-  the one that took longest. It is the only per-frame view of the
-  packetizer and the pacer. Its timestamps are grouped by the side that took
-  them: `sender` (`TimingFrameSenderTimestamps`) and `receiver`
-  (`TimingFrameReceiverTimestamps`).
+### Fixed
 
-The new fields are public struct fields, so code that builds these structs by
-hand needs them. The glue ABI version advances 4 -> 5. All three crates advance
-to 0.19.0; the default native archive remains `webrtc-7907-a5ddff60-p9`.
+**Frame metadata stays on its own frame when libwebrtc drops one.** The receive
+transform strips every assembled frame's trailer, but not every assembled frame
+is rendered: a decode error, the keyframe wait after one, or a frame skipped as
+late each left an entry behind, and from then on every decoded frame was handed
+its predecessor's metadata. Metadata is now matched to the decoded frame by SSRC
+and RTP timestamp, and the entries of frames that never rendered are discarded.
+
+**A caller's `replace_data` survives the metadata step.** With metadata
+negotiated, the metadata step worked on the frame's original bytes rather than
+the rewritten ones, so a `FrameTransform` that rewrote the payload was silently
+undone — on send the trailer was appended to the original payload, on receive
+the strip put it back. It now builds on the current payload, as the docs said.
+
+### Added
+
+**Playout delay**, in Rust and Python, through a new `PlayoutDelay { min, max }`:
+
+- `PeerConnectionFactoryBuilder::with_receive_playout_delay` plays every
+  received video stream within the limits, whatever the sender asks for.
+  `PlayoutDelay::IMMEDIATE` (both zero) decodes each frame as soon as it is
+  complete; on a loopback the wait before decode goes from ~11 ms to ~30 µs.
+- `PeerConnectionFactoryBuilder::with_send_playout_delay` stamps the
+  playout-delay RTP header extension on every video frame sent, for receivers
+  you do not control.
+
+Both are factory-wide: libwebrtc reads them from field trials in the factory's
+`Environment`, like `with_dtls_in_stun`.
+
+**`Transceiver::set_jitter_buffer_minimum_delay`**, a per-receiver floor
+(`RTCRtpReceiver.jitterBufferTarget`), honoured from the first frame when set
+before the stream exists.
+
+**Jitter buffer stats** on `InboundRtpStats`: `jitter_buffer_delay_s`,
+`jitter_buffer_target_delay_s`, `jitter_buffer_minimum_delay_s`,
+`jitter_buffer_emitted_count`, and `average_jitter_buffer_delay()`
+(`average_jitter_buffer_delay_s` in Python) — the per-frame wait before decode.
+
+[docs/video-latency.md](docs/video-latency.md) covers all of it.
+
+### Breaking
+
+`reactor-webrtc-sys` only: the `on_frame` callback of
+`reactor_webrtc_video_track_add_sink` takes two more arguments, the decoded
+frame's `ssrc` and `rtp_timestamp`. Code using `reactor-webrtc` or the Python
+package is unaffected. `InboundRtpStats` gains public fields, which is why this
+is a minor rather than a patch release.
+
+### Notes
+
+`ReactorStatEntry` grew from 264 to 296 bytes, and `ReactorFactoryOptions` by
+six `int`s. As in 0.15.0 the glue is compiled from source, so no ABI version
+changed; the stats struct pins the offsets of its three new delays, which share
+a width and a unit.
+
+## 0.20.0 — which transceiver, which codec
+
+`get_stats` said whether a stream was audio or video, but not which track it
+belonged to or what it was encoded with. A reader with one track of each kind
+could get by on `kind`; one with two video tracks could not tell them apart,
+and nothing in the report named the codec at all. Both are what a client needs
+to report per-track quality the way the browser does, where every RTP stream
+carries its `mid` and a `codecId` pointing at its codec.
+
+Additive. Nothing removed, nothing renamed.
+
+### Added
+
+**`mid` and `codec_mime_type` on both stream types**, each an `Option<String>`.
+`mid` is the transceiver the stream belongs to (`RTCInboundRtpStreamStats::mid`,
+`RTCOutboundRtpStreamStats::mid`); match it against `Transceiver::mid`.
+`codec_mime_type` is the codec's mime type (`"video/VP9"`, `"audio/opus"`),
+followed through the stream's `codec_id` to its `RTCCodecStats` the same way the
+send path's RTT is followed through `remote_id`. Both are `None` until the
+stream has been negotiated and has a codec. Python gets the same two attributes,
+as `Optional[str]`.
+
+### Notes
+
+The C ABI struct grew by two fixed 32-byte string buffers. A `mid` too long to
+fit is reported as absent rather than truncated, because a truncated mid could
+match a transceiver it does not belong to. As in 0.15.0 the glue is compiled
+from source, so no ABI version changed; both copies of the struct pin the
+offsets of the two strings as well as the new size, since they share a width
+and swapping them on one side would leave the size unchanged.
+
+## 0.19.1 — Default native archive p10 in every build
+
+`reactor-webrtc-sys`'s fallback prebuilt tag, used when `WEBRTC_VERSION` is
+not readable (a build from the crate rather than this repository), now names
+`webrtc-7907-a5ddff60-p10`; 0.19.0 left it on p9 in the source, which lacks
+libwebrtc patch 0005, so such a build would ignore `with_dc_chunking`'s
+`max_burst`. The crates published as 0.19.0 already carried p10, since the
+release workflow rewrites the fallback before publishing. All crates advance to
+0.19.1; no API change.
+
+## 0.19.0 — Large data-channel messages (max_burst and chunking)
+
+A data-channel message used to take several round trips once it passed a few
+KB, and could not exceed 256 KiB on the wire or 16 MiB queued without
+libwebrtc closing the channel. Both limits go, for peers that opt in.
+
+- `PeerConnectionFactoryBuilder::with_dc_chunking(DcChunking)` sets dcsctp's
+  `max_burst` for every data channel of the factory (libwebrtc patch 0005,
+  default 256 instead of upstream's 4): a 100 KB message takes about one round
+  trip instead of five. It also offers chunking to every connection, through
+  a session-level `a=x-reactor-dc-chunking:1 max-message-size=<bytes>`
+  attribute that an answerer mirrors only when its own factory chunks.
+  `RtcConfiguration::dc_chunking` (default `true`) opts one connection out.
+- On a chunked channel (negotiated, ordered and fully reliable; see
+  `DataChannel::is_chunked`) `send` accepts messages up to 64 MiB, queues up
+  to 128 MiB beyond libwebrtc's buffer and feeds it 64 KiB frames, never
+  letting that buffer near the 16 MiB at which libwebrtc closes a channel.
+  `on_message` fires once per whole message. A refused send returns
+  `Error::DataChannel(DcSendError::{TooLarge, QueueFull})` and leaves the
+  channel open. New: `DataChannel::drain`, `close(drain_timeout)`, `ordered`,
+  `reliable`, `PeerConnection::dc_chunking` and `dc_chunking_negotiated`.
+- The framing, the SDP helpers and the send queue live in a new sans-I/O
+  crate, `reactor-webrtc-dc-chunking`, which builds for wasm32 so the browser
+  SDK can implement the same wire format.
+- Python: `PeerConnectionFactoryBuilder.with_dc_chunking(...)`,
+  `RtcConfiguration(dc_chunking=...)`, the new `DataChannel` methods
+  (`drain` is awaitable), and `DataChannelMessageTooLarge` /
+  `DataChannelQueueFull`, both `RuntimeError` subclasses.
+
+Breaking (0.x): `DataChannel`'s callback setters take `&self`, and
+`on_open`, `on_close` and `on_state_change` are independent instead of
+replacing one another. The glue ABI version advances 4 -> 5. All crates
+advance to 0.19.0, and the default native archive is
+`webrtc-7907-a5ddff60-p10`.
+
+Known limitation: dcsctp can stall for tens of seconds recovering from the
+first loss episode of a large transfer that overruns a queue on the path, at
+any `max_burst`.
 
 ## 0.18.0 — Faster connection setup (WARP: SPED + SNAP)
 

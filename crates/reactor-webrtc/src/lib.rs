@@ -37,12 +37,14 @@
 
 mod builder;
 mod config;
+mod dc_chunking;
 mod encoded;
 mod media;
 pub mod metadata;
 mod observer;
 mod peer_connection;
 pub mod platform;
+mod playout;
 mod sender_meta;
 
 use std::ffi::CString;
@@ -54,11 +56,17 @@ pub use config::{
     BundlePolicy, ContinualGatheringPolicy, IceServer, IceTransportsType, RtcConfiguration,
     TcpCandidatePolicy,
 };
+pub use dc_chunking::DcChunking;
 pub use encoded::{
     EncodedFrame, EncodedVideoFrame, EncodedVideoTrack, EncoderFeedback, FrameAction,
     FrameDirection, FrameTransform, H264Backend, InlineEncoderCallback, LocalVideoTrack,
     PreEncodedOptions, RawVideoFrame, TrackVideoEncoder, VideoCodec, VideoTrackOptions,
 };
+/// What a peer declares in `a=x-reactor-dc-chunking` (see
+/// [`SessionDescription::with_dc_chunking`]).
+pub use reactor_webrtc_dc_chunking::Params as DcChunkingParams;
+/// Why a chunked data channel refused a message ([`Error::DataChannel`]).
+pub use reactor_webrtc_dc_chunking::SendError as DcSendError;
 
 /// Whether this build targets Apple (H.264 VideoToolbox backend exists).
 pub(crate) const HAVE_VIDEO_TOOLBOX: bool = cfg!(target_vendor = "apple");
@@ -77,6 +85,7 @@ pub use peer_connection::{
     TimingFrameInfo, TimingFrameReceiverTimestamps, TimingFrameSenderTimestamps, Transceiver,
     TransceiverDirection,
 };
+pub use playout::PlayoutDelay;
 /// Runtime download/verification/caching of Cisco's OpenH264 shared library,
 /// and the required attribution string — registered with
 /// [`PeerConnectionFactoryBuilder::with_openh264`].
@@ -109,6 +118,10 @@ pub enum Error {
     Webrtc(String),
     /// The requested track/transceiver/data-channel was not found.
     NotFound(String),
+    /// A chunked data channel refused a message: it is larger than the
+    /// effective max message size, or the send queue is full. Nothing of it
+    /// was sent, and the channel is still usable.
+    DataChannel(DcSendError),
 }
 
 impl std::fmt::Display for Error {
@@ -116,6 +129,7 @@ impl std::fmt::Display for Error {
         match self {
             Error::Webrtc(m) => write!(f, "webrtc error: {m}"),
             Error::NotFound(m) => write!(f, "not found: {m}"),
+            Error::DataChannel(e) => write!(f, "data channel: {e}"),
         }
     }
 }
@@ -213,6 +227,10 @@ pub struct PeerConnectionFactory {
     /// [`PeerConnection`] from this factory behaves like one created with
     /// `RtcConfiguration::frame_metadata` off, whatever each config says.
     metadata_enabled: bool,
+    /// [`PeerConnectionFactoryBuilder::with_dc_chunking`]: the settings every
+    /// connection from this factory takes part with, unless its
+    /// `RtcConfiguration::dc_chunking` opts out. `None` = never offered.
+    dc_chunking: Option<DcChunking>,
     /// Per-track encoder slots (pre-encoded / inline), wired into the native
     /// factory at creation. Every factory has one; tracks register slots via
     /// [`PeerConnectionFactory::create_video_track_with_options`].
@@ -254,6 +272,7 @@ impl PeerConnectionFactory {
     pub(crate) fn create_from_options(
         opts: &reactor_webrtc_sys::ReactorFactoryOptions,
         metadata_enabled: bool,
+        dc_chunking: Option<DcChunking>,
         registry: Arc<crate::encoded::EncoderRegistry>,
         openh264_registered: bool,
     ) -> Result<Self> {
@@ -278,6 +297,7 @@ impl PeerConnectionFactory {
         Ok(Self {
             handle: Arc::new(FactoryHandle(raw)),
             metadata_enabled,
+            dc_chunking,
             registry,
             openh264_registered,
         })
@@ -289,7 +309,10 @@ impl PeerConnectionFactory {
         config: &RtcConfiguration,
         observer: PeerConnectionObserver,
     ) -> Result<PeerConnection> {
-        let state = observer.into_state(self.handle());
+        let dc_negotiation = dc_chunking::DcNegotiation::new(
+            self.dc_chunking.clone().filter(|_| config.dc_chunking),
+        );
+        let state = observer.into_state(self.handle(), Arc::clone(&dc_negotiation));
         let callbacks = state.callbacks();
         let native = config.to_native()?;
         // libwebrtc reports why it rejected the configuration (an empty TURN
@@ -319,6 +342,7 @@ impl PeerConnectionFactory {
             state,
             self.handle(),
             config.frame_metadata && self.metadata_enabled,
+            dc_negotiation,
         ))
     }
 

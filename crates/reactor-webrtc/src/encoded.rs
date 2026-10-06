@@ -87,6 +87,21 @@ impl EncodedFrame<'_> {
             );
         }
     }
+
+    /// The payload as it stands now: `data` until a
+    /// [`replace_data`](Self::replace_data), then the replacement. A step that
+    /// runs after a caller's callback reads this, not `data`, or it would undo
+    /// whatever the callback rewrote.
+    pub(crate) fn current_data(&self) -> &[u8] {
+        let mut len = 0usize;
+        let ptr =
+            unsafe { reactor_webrtc_sys::reactor_webrtc_encoded_frame_data(self.frame, &mut len) };
+        if ptr.is_null() || len == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(ptr, len) }
+        }
+    }
 }
 
 pub(crate) type EncodedCb = Box<dyn for<'a> FnMut(&EncodedFrame<'a>) -> FrameAction + Send>;

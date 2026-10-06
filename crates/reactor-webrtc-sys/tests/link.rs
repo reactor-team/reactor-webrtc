@@ -128,7 +128,14 @@ extern "C" fn ctx_on_conn(ud: *mut c_void, state: i32) {
         ctx.connected.store(true, Ordering::SeqCst);
     }
 }
-extern "C" fn ctx_on_video(ud: *mut c_void, _bgra: *const u8, _width: c_int, _height: c_int) {
+extern "C" fn ctx_on_video(
+    ud: *mut c_void,
+    _bgra: *const u8,
+    _width: c_int,
+    _height: c_int,
+    _ssrc: u32,
+    _rtp_timestamp: u32,
+) {
     let ctx = unsafe { &*(ud as *const PcCtx) };
     ctx.video_frames.fetch_add(1, Ordering::SeqCst);
 }

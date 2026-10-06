@@ -185,20 +185,37 @@ struct ReactorStatEntry {
   double   available_outgoing_bitrate; // bps, kind 2, 0 if not estimated
   double   available_incoming_bitrate; // bps, kind 2, 0 if not estimated
   double   frames_per_second;          // kinds 0 and 1, 0 if not measured
-  // Where the time goes per stage, as cumulative totals: a reader divides the
-  // change in a total by the change in its count to get the average over an
-  // interval. Encode and the pacer are on the send side (kind 1); the jitter
-  // buffer and processing delay on the receive side (kind 0).
+  // Strings, kinds 0 and 1, NUL-terminated; empty when absent. Fixed-size so
+  // the entry stays a flat, copyable record with nothing to free.
+  //
+  // RTCInboundRtpStreamStats::mid / RTCOutboundRtpStreamStats::mid: the
+  // transceiver the stream belongs to, which is how a reader that negotiated
+  // several tracks of one kind tells them apart. A mid that does not fit is
+  // left empty rather than cut, so it can never match the wrong transceiver.
+  char     mid[32];
+  // RTCCodecStats::mime_type, reached through the stream's codec_id, e.g.
+  // "video/VP9" or "audio/opus". Empty until the stream has a codec.
+  char     codec_mime_type[32];
+  // Inbound (kind 0) jitter buffer, cumulative over emitted frames:
+  // RTCInboundRtpStreamStats::jitter_buffer_delay / _target_delay /
+  // _minimum_delay in seconds, and jitter_buffer_emitted_count. A delay divided
+  // by the count is the per-frame average — for video, how long a frame waited
+  // between its first packet arriving and it leaving for the decoder.
+  double   jitter_buffer_delay;
+  double   jitter_buffer_target_delay;
+  double   jitter_buffer_minimum_delay;
+  uint64_t jitter_buffer_emitted_count;
+  // Where the rest of the time goes per stage, as cumulative totals: a reader
+  // divides the change in a total by the change in its count to get the
+  // average over an interval. Encode and the pacer are on the send side
+  // (kind 1); processing delay on the receive side (kind 0).
   double   total_encode_time;          // seconds, kind 1, over frames_encoded
   // Time packets waited in the pacer before going out, summed over packets,
   // not frames: divide by packets_sent.
   double   total_packet_send_delay;    // seconds, kind 1
-  double   jitter_buffer_delay;        // seconds, kind 0, over jitter_buffer_emitted_count
-  double   jitter_buffer_target_delay; // seconds, kind 0, over jitter_buffer_emitted_count
   // Receive to decode finished, summed over decoded frames.
   double   total_processing_delay;     // seconds, kind 0, over frames_decoded
   uint64_t frames_encoded;             // kind 1
-  uint64_t jitter_buffer_emitted_count; // kind 0
   // A timing frame (kind 0, video): one frame libwebrtc stamped at each
   // stage, carried in the video-timing RTP header extension and reported as
   // goog_timing_frame_info — the one that took longest in the last second.
@@ -225,7 +242,7 @@ struct ReactorStatEntry {
 //
 // The Rust side carries the same assertion against the same number. If you are
 // here because one of them failed: you changed the struct on one side only.
-static_assert(sizeof(struct ReactorStatEntry) == 336,
+static_assert(sizeof(struct ReactorStatEntry) == 408,
               "ReactorStatEntry changed size — update the repr(C) mirror in "
               "reactor-webrtc-sys/src/lib.rs and both assertions");
 static_assert(offsetof(struct ReactorStatEntry, bytes_received) == 72,
@@ -240,13 +257,26 @@ static_assert(offsetof(struct ReactorStatEntry, pli_count) == 20,
               "the feedback counters moved — see above");
 static_assert(offsetof(struct ReactorStatEntry, fir_count) == 24,
               "the feedback counters moved — see above");
+// The two strings share a width too, and swapping them would match a mime type
+// against a transceiver's mid.
+static_assert(offsetof(struct ReactorStatEntry, mid) == 200,
+              "the stream strings moved — see above");
+static_assert(offsetof(struct ReactorStatEntry, codec_mime_type) == 232,
+              "the stream strings moved — see above");
+// The three jitter buffer delays share a width and a unit.
+static_assert(offsetof(struct ReactorStatEntry, jitter_buffer_delay) == 264,
+              "the jitter buffer delays moved — see above");
+static_assert(offsetof(struct ReactorStatEntry, jitter_buffer_target_delay) == 272,
+              "the jitter buffer delays moved — see above");
+static_assert(offsetof(struct ReactorStatEntry, jitter_buffer_minimum_delay) == 280,
+              "the jitter buffer delays moved — see above");
 // The per-stage totals and the timing frame stamps are runs of same-width
 // fields too, so the start of each run is pinned the same way.
-static_assert(offsetof(struct ReactorStatEntry, total_encode_time) == 200,
+static_assert(offsetof(struct ReactorStatEntry, total_encode_time) == 296,
               "the per-stage totals moved — see above");
-static_assert(offsetof(struct ReactorStatEntry, timing_frame_present) == 256,
+static_assert(offsetof(struct ReactorStatEntry, timing_frame_present) == 328,
               "the timing frame fields moved — see above");
-static_assert(offsetof(struct ReactorStatEntry, timing_encode_start_ms) == 272,
+static_assert(offsetof(struct ReactorStatEntry, timing_encode_start_ms) == 344,
               "the timing frame stamps moved — see above");
 
 // PeerConnectionObserver events, forwarded to the safe crate. Any pointer may
@@ -503,10 +533,13 @@ class AudioFrameSink : public webrtc::AudioTrackSinkInterface {
 };
 
 // Bridges decoded frames from a (remote) video track to a C callback,
-// converting to BGRA (width*height*4) on the way out.
+// converting to BGRA (width*height*4) on the way out. The frame's SSRC and RTP
+// timestamp ride along so the binding can pair it with what the receive
+// transform saw.
 class FrameSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
  public:
-  FrameSink(void* userdata, void (*on_frame)(void*, const uint8_t*, int, int))
+  FrameSink(void* userdata,
+            void (*on_frame)(void*, const uint8_t*, int, int, uint32_t, uint32_t))
       : userdata_(userdata), on_frame_(on_frame) {}
   void OnFrame(const webrtc::VideoFrame& frame) override {
     if (!on_frame_) return;
@@ -519,12 +552,16 @@ class FrameSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
     libyuv::I420ToARGB(i420->DataY(), i420->StrideY(), i420->DataU(),
                        i420->StrideU(), i420->DataV(), i420->StrideV(),
                        bgra_.data(), w * 4, w, h);
-    on_frame_(userdata_, bgra_.data(), w, h);
+    // A received frame lists the RTP packets it was built from; they share one
+    // SSRC. 0 when the list is empty (a frame that did not come off the wire).
+    const webrtc::RtpPacketInfos& packets = frame.packet_infos();
+    const uint32_t ssrc = packets.empty() ? 0 : packets.begin()->ssrc();
+    on_frame_(userdata_, bgra_.data(), w, h, ssrc, frame.rtp_timestamp());
   }
 
  private:
   void* userdata_;
-  void (*on_frame_)(void*, const uint8_t*, int, int);
+  void (*on_frame_)(void*, const uint8_t*, int, int, uint32_t, uint32_t);
   std::vector<uint8_t> bgra_;
 };
 
@@ -898,6 +935,30 @@ static auto stat_val(const M& m) -> std::decay_t<decltype(*m)> {
   return m ? static_cast<T>(*m) : T{};
 }
 
+// Copy an optional stats string into one of ReactorStatEntry's fixed buffers.
+// Absent, or too long to fit with its NUL, leaves the buffer empty: a reader
+// matches these values against others (a mid against a transceiver's), and a
+// truncated one could match something it isn't.
+template <size_t N>
+static void stat_str(const std::optional<std::string>& m, char (&out)[N]) {
+  if (!m || m->size() >= N) return;
+  std::memcpy(out, m->data(), m->size());
+  out[m->size()] = '\0';
+}
+
+// Copy the mime type of the codec *codec_id* names. Checked rather than
+// assumed, like the other lookups by id: cast_to asserts on the type.
+template <size_t N>
+static void stat_codec(const webrtc::RTCStatsReport& report,
+                       const std::optional<std::string>& codec_id,
+                       char (&out)[N]) {
+  if (!codec_id) return;
+  const webrtc::RTCStats* codec = report.Get(*codec_id);
+  if (codec != nullptr && codec->type() == webrtc::RTCCodecStats::kType) {
+    stat_str(codec->cast_to<webrtc::RTCCodecStats>().mime_type, out);
+  }
+}
+
 // Parse the string ICE-pair state to the integer encoding used in
 // ReactorStatEntry::pair_state.
 template <typename S>
@@ -1019,6 +1080,8 @@ class StatsCallback : public webrtc::RTCStatsCollectorCallback {
           e.kind              = 0;
           e.ssrc              = stat_val(s.ssrc);
           e.stream_kind       = parse_stream_kind(s.kind);
+          stat_str(s.mid, e.mid);
+          stat_codec(*report, s.codec_id, e.codec_mime_type);
           e.packets_received  = stat_val(s.packets_received);
           e.bytes_received    = stat_val(s.bytes_received);
           e.jitter            = stat_val(s.jitter);
@@ -1035,6 +1098,7 @@ class StatsCallback : public webrtc::RTCStatsCollectorCallback {
           e.frame_height      = stat_val(s.frame_height);
           e.jitter_buffer_delay         = stat_val(s.jitter_buffer_delay);
           e.jitter_buffer_target_delay  = stat_val(s.jitter_buffer_target_delay);
+          e.jitter_buffer_minimum_delay = stat_val(s.jitter_buffer_minimum_delay);
           e.jitter_buffer_emitted_count = stat_val(s.jitter_buffer_emitted_count);
           e.total_processing_delay      = stat_val(s.total_processing_delay);
           if (s.goog_timing_frame_info) {
@@ -1046,6 +1110,8 @@ class StatsCallback : public webrtc::RTCStatsCollectorCallback {
           e.kind                       = 1;
           e.ssrc                       = stat_val(s.ssrc);
           e.stream_kind                = parse_stream_kind(s.kind);
+          stat_str(s.mid, e.mid);
+          stat_codec(*report, s.codec_id, e.codec_mime_type);
           e.packets_sent               = stat_val(s.packets_sent);
           e.bytes_sent                 = stat_val(s.bytes_sent);
           e.target_bitrate             = stat_val(s.target_bitrate);
@@ -1484,6 +1550,29 @@ int reactor_webrtc_data_channel_state(void* data_channel) {
   }
 }
 
+// 1 when the channel delivers in order, 0 when unordered (or on error).
+int reactor_webrtc_data_channel_ordered(void* data_channel) {
+  auto* h = reinterpret_cast<ReactorDataChannel*>(data_channel);
+  if (!h || !h->channel) return 0;
+  return h->channel->ordered() ? 1 : 0;
+}
+
+// 1 when the channel retransmits until delivery: neither maxRetransmits nor
+// maxPacketLifeTime is set. 0 when partially reliable (or on error).
+int reactor_webrtc_data_channel_reliable(void* data_channel) {
+  auto* h = reinterpret_cast<ReactorDataChannel*>(data_channel);
+  if (!h || !h->channel) return 0;
+  return (!h->channel->maxRetransmitsOpt() && !h->channel->maxPacketLifeTime())
+             ? 1
+             : 0;
+}
+
+// Start closing the channel. libwebrtc still sends what it has buffered.
+void reactor_webrtc_data_channel_close(void* data_channel) {
+  auto* h = reinterpret_cast<ReactorDataChannel*>(data_channel);
+  if (h && h->channel) h->channel->Close();
+}
+
 // Sets the buffered-amount-low threshold. on_buffered_amount_low fires when
 // the buffered amount drops to this value or below after a send.
 // M7907 removed SetBufferedAmountLowThreshold from the public API; the
@@ -1698,7 +1787,7 @@ void reactor_webrtc_audio_track_add_sink(
 // `FrameSink` the broadcaster still holds and calls into.
 void reactor_webrtc_video_track_add_sink(
     void* track, void* userdata,
-    void (*on_frame)(void*, const uint8_t*, int, int)) {
+    void (*on_frame)(void*, const uint8_t*, int, int, uint32_t, uint32_t)) {
   auto* h = reinterpret_cast<ReactorMediaStreamTrack*>(track);
   if (!h || !h->track || h->track->kind() != "video") return;
   auto* vt = static_cast<webrtc::VideoTrackInterface*>(h->track.get());
@@ -2214,6 +2303,21 @@ struct ReactorFactoryOptions {
   // WebRTC-IceHandshakeDtls field trial, which only the factory's Environment
   // can carry — hence a factory option rather than a per-connection one.
   int                          dtls_in_stun;
+  // > 0: dcsctp's max_burst for every data channel of the factory, answered
+  // as the WebRTC-DcSctp-MaxBurst field trial (patch 0005). 0: upstream's 4.
+  int                          sctp_max_burst;
+  // Nonzero `_set`: every video stream this factory sends carries the
+  // playout-delay RTP header extension with these limits, answered as the
+  // WebRTC-ForceSendPlayoutDelay field trial. 0 <= min <= max <= 40950 ms.
+  int                          send_playout_delay_set;
+  int                          send_playout_delay_min_ms;
+  int                          send_playout_delay_max_ms;
+  // Nonzero `_set`: every video stream this factory receives is played out
+  // with these limits, whatever the sender's extension says, answered as the
+  // WebRTC-ForcePlayoutDelay field trial. Same bounds.
+  int                          recv_playout_delay_set;
+  int                          recv_playout_delay_min_ms;
+  int                          recv_playout_delay_max_ms;
 };
 }
 
@@ -2560,20 +2664,54 @@ class ReactorCompositeVideoDecoderFactory : public webrtc::VideoDecoderFactory {
 // so this view only ever *adds* a key.
 class ReactorFieldTrials : public webrtc::FieldTrialsView {
  public:
-  explicit ReactorFieldTrials(bool dtls_in_stun) : dtls_in_stun_(dtls_in_stun) {}
+  // The trials a factory's options turn on. An empty playout-delay string
+  // leaves that trial to the process-global view.
+  struct Settings {
+    bool dtls_in_stun = false;
+    int sctp_max_burst = 0;
+    std::string send_playout_delay;
+    std::string recv_playout_delay;
+
+    bool any() const {
+      return dtls_in_stun || sctp_max_burst > 0 || !send_playout_delay.empty() ||
+             !recv_playout_delay.empty();
+    }
+  };
+
+  explicit ReactorFieldTrials(Settings settings) : s_(std::move(settings)) {}
 
   std::string Lookup(absl::string_view key) const override {
     // SPED: piggyback the DTLS handshake on the ICE binding requests.
-    if (dtls_in_stun_ && key == "WebRTC-IceHandshakeDtls") return "Enabled";
+    if (s_.dtls_in_stun && key == "WebRTC-IceHandshakeDtls") return "Enabled";
+    // Patch 0005: dcsctp packets per Send() and per SACK.
+    if (s_.sctp_max_burst > 0 && key == "WebRTC-DcSctp-MaxBurst") {
+      return std::to_string(s_.sctp_max_burst);
+    }
+    // RTPSenderVideo stamps these limits on every frame it sends, in place of
+    // whatever the encoder asked for (which, for libwebrtc's own encoders, is
+    // nothing — so without this the extension is never sent).
+    if (!s_.send_playout_delay.empty() && key == "WebRTC-ForceSendPlayoutDelay") {
+      return s_.send_playout_delay;
+    }
+    // RtpVideoStreamReceiver2 applies these to every frame it receives, in
+    // place of the sender's extension.
+    if (!s_.recv_playout_delay.empty() && key == "WebRTC-ForcePlayoutDelay") {
+      return s_.recv_playout_delay;
+    }
     return global_.Lookup(key);
   }
 
   std::unique_ptr<webrtc::FieldTrialsView> CreateCopy() const override {
-    return std::make_unique<ReactorFieldTrials>(dtls_in_stun_);
+    return std::make_unique<ReactorFieldTrials>(s_);
+  }
+
+  // The value both playout-delay trials parse: "min_ms:<n>,max_ms:<n>".
+  static std::string PlayoutDelay(int min_ms, int max_ms) {
+    return "min_ms:" + std::to_string(min_ms) + ",max_ms:" + std::to_string(max_ms);
   }
 
  private:
-  const bool dtls_in_stun_;
+  const Settings s_;
   // The process-global trials, i.e. exactly the view the factory installs when
   // the binding passes none. Stateless; it reads the global string on lookup.
   webrtc::DeprecatedGlobalFieldTrials global_;
@@ -2602,9 +2740,26 @@ void* reactor_webrtc_factory_create(const ReactorFactoryOptions* opts,
   // binding requests instead of waiting for ICE to finish. libwebrtc reads the
   // switch off the factory's Environment, so it is decided here, once, for
   // every peer connection this factory makes.
+  //
+  // The dcsctp max_burst (patch 0005) is read from the same Environment when
+  // each SCTP transport is created, so it is a factory decision too.
+  //
+  // So are the playout-delay overrides: RTPSenderVideo and
+  // RtpVideoStreamReceiver2 each read theirs once, when a stream is created.
+  ReactorFieldTrials::Settings trial_settings;
+  trial_settings.dtls_in_stun = opts->dtls_in_stun != 0;
+  trial_settings.sctp_max_burst = opts->sctp_max_burst;
+  if (opts->send_playout_delay_set) {
+    trial_settings.send_playout_delay = ReactorFieldTrials::PlayoutDelay(
+        opts->send_playout_delay_min_ms, opts->send_playout_delay_max_ms);
+  }
+  if (opts->recv_playout_delay_set) {
+    trial_settings.recv_playout_delay = ReactorFieldTrials::PlayoutDelay(
+        opts->recv_playout_delay_min_ms, opts->recv_playout_delay_max_ms);
+  }
   std::unique_ptr<webrtc::FieldTrialsView> trials;
-  if (opts->dtls_in_stun) {
-    trials = std::make_unique<ReactorFieldTrials>(/*dtls_in_stun=*/true);
+  if (trial_settings.any()) {
+    trials = std::make_unique<ReactorFieldTrials>(std::move(trial_settings));
   }
 
   std::unique_ptr<webrtc::VideoEncoderFactory> openh264_enc;
@@ -2682,6 +2837,17 @@ void* reactor_webrtc_factory_create(const ReactorFactoryOptions* opts,
     return nullptr;
   }
   return f.release();
+}
+
+// The current encoded payload of the frame in the callback — what an earlier
+// set_data left, not the bytes the callback was first handed. Valid until the
+// next set_data or the end of the callback.
+const uint8_t* reactor_webrtc_encoded_frame_data(void* frame, size_t* len) {
+  *len = 0;
+  if (!frame) return nullptr;
+  auto data = reinterpret_cast<webrtc::TransformableFrameInterface*>(frame)->GetData();
+  *len = data.size();
+  return data.data();
 }
 
 // Replace the encoded payload of the frame currently in the callback. Copies.
@@ -2816,6 +2982,19 @@ int reactor_webrtc_rtp_transceiver_set_sender_transform(void* transceiver,
   auto* th = reinterpret_cast<ReactorTransformerHandle*>(transformer);
   if (!h || !h->tc || !th || !h->tc->sender()) return 0;
   h->tc->sender()->SetFrameTransformer(th->t);
+  return 1;
+}
+
+// Floor for the receiver's jitter buffer, in seconds (libwebrtc clamps it to
+// 0..10 s); `has_delay` 0 returns it to the default. Cached by the receiver
+// when it has no stream yet, so it can be set before the first frame.
+// Returns 1 on success, 0 on failure.
+int reactor_webrtc_rtp_transceiver_set_jitter_buffer_minimum_delay(
+    void* transceiver, int has_delay, double delay_seconds) {
+  auto* h = reinterpret_cast<ReactorTransceiver*>(transceiver);
+  if (!h || !h->tc || !h->tc->receiver()) return 0;
+  h->tc->receiver()->SetJitterBufferMinimumDelay(
+      has_delay ? std::optional<double>(delay_seconds) : std::nullopt);
   return 1;
 }
 

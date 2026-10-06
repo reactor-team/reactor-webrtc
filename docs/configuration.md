@@ -15,6 +15,7 @@ an existing `pc`.
 - [TCP candidates](#tcp-candidates)
 - [ICE timeouts](#ice-timeouts)
 - [Faster connection setup (WARP: SPED + SNAP)](#faster-connection-setup-warp-sped--snap)
+- [Large data-channel messages (max_burst and chunking)](#large-data-channel-messages-max_burst-and-chunking)
 - [Congestion-control bitrate limits](#congestion-control-bitrate-limits)
 - [Per-sender bitrate limits](#per-sender-bitrate-limits)
 
@@ -333,6 +334,96 @@ config = rw.RtcConfiguration(sctp_snap=True)   # SNAP, per connection
 
 </details>
 
+## Large data-channel messages (max_burst and chunking)
+
+dcsctp, libwebrtc's SCTP stack, sends at most `max_burst` packets per
+`send()` and per incoming SACK, and upstream's value is 4. A message larger
+than about 4.6 KB therefore leaves in bursts of 4, 8, 16 … packets, one burst
+per round trip, even when the congestion window would let it all out at once:
+roughly one extra round trip each time the message size doubles. Over a 31 ms
+path a single 100 KB message takes 5.4 round trips.
+
+`PeerConnectionFactoryBuilder::with_dc_chunking` sets `max_burst` for every
+data channel of the factory (libwebrtc patch 0005). With the default of 256, a
+message up to the 256 KiB data-channel limit leaves in one flight: the same
+100 KB message takes about 1.2 round trips. The congestion window still bounds
+every send, so the larger burst never puts more in flight than congestion
+control allows.
+
+It is a factory knob, like SPED, because libwebrtc reads it from a field trial
+in the factory's environment. A factory built without it keeps upstream's 4.
+
+The same `DcChunking` settings also carry the limits for chunked data
+channels — the largest message (`max_message_size`, 64 MiB), the bytes a
+channel may queue beyond libwebrtc's 16 MiB send buffer (`send_buffer_limit`,
+128 MiB) and the frame size (`chunk_size`, 64 KiB). `build()` fails when they
+cannot work together.
+
+Chunking is negotiated in the SDP, so both peers must opt in. Every connection
+of a chunking factory declares a session-level
+`a=x-reactor-dc-chunking:1 max-message-size=<bytes>` in its offer, and an
+answerer mirrors it only when the offer carried it and its own factory chunks.
+Against a peer that never declares it, nothing changes. Once a connection has
+negotiated it, each data channel decides for itself when it opens: it is
+chunked when it is ordered and fully reliable (no `maxRetransmits`, no
+`maxPacketLifeTime`), and `DataChannel::is_chunked()` reports the decision,
+which never changes afterwards. `RtcConfiguration::dc_chunking` (default
+`true`) lets one connection of a chunking factory opt out.
+
+On a chunked channel `send()` accepts a message of any size up to the
+effective limit (the smaller of this side's `max_message_size` and the peer's
+advertised one). It queues the message and feeds libwebrtc frames of
+`chunk_size` bytes as its buffer drains, never letting that buffer pass about
+8 MiB, so the 16 MiB limit at which libwebrtc closes a channel is never
+reached. A message larger than the limit, or one that would pass
+`send_buffer_limit`, is refused with `Error::DataChannel` and nothing of it is
+sent. `buffered_amount()` and `on_buffered_amount_low` count the queue too;
+`drain()` waits for it to empty, and `close()` drains before closing. The
+receiver's `on_message` fires once per whole message, with its original
+binary or text type; a message larger than the receiver's own limit is dropped
+without closing the channel.
+
+<details>
+<summary>🦀 Example using Rust</summary>
+
+```rust
+use reactor_webrtc::{DcChunking, PeerConnectionFactory};
+
+// Defaults: max_burst 256, 64 MiB messages, 128 MiB queue, 64 KiB frames.
+let factory = PeerConnectionFactory::builder()
+    .with_dc_chunking(DcChunking::default())
+    .build()
+    .expect("factory");
+
+// DcChunking is #[non_exhaustive]: start from the default and change fields.
+let mut chunking = DcChunking::default();
+chunking.max_message_size = 16 * 1024 * 1024;
+```
+
+</details>
+
+<details>
+<summary>🐍 Example using Python</summary>
+
+```python
+import reactor_webrtc as rw
+
+builder = rw.PeerConnectionFactoryBuilder()
+builder.with_dc_chunking()   # or with_dc_chunking(max_message_size=16 * 1024 * 1024)
+factory = builder.build()
+
+config = rw.RtcConfiguration(dc_chunking=False)   # opt one connection out
+
+# On a chunked channel:
+dc.send(payload)                 # any size up to the limit
+await dc.drain(timeout=30.0)     # wait for the queue to empty
+```
+
+</details>
+
+In Python a refused send raises `DataChannelMessageTooLarge` or
+`DataChannelQueueFull`, both subclasses of `RuntimeError`.
+
 ## Congestion-control bitrate limits
 
 `set_bitrate` is a `PeerConnection` method, not an `RtcConfiguration` field —
@@ -539,6 +630,12 @@ Six things worth knowing before you read a number off this.
   against, a stream that has not decoded a second's worth of frames. A caller
   that treats those as measurements reports a zero-latency link on a connection
   that has not finished connecting.
+
+- **`mid` says which track, `kind` only says which kind.** With two video
+  tracks, two `inbound_rtp` entries report `StreamKind::Video`; match each
+  entry's `mid` against `Transceiver::mid` to tell them apart.
+  `codec_mime_type` (`"video/VP9"`, `"audio/opus"`) is the codec the stream is
+  using. Both are `None` until the stream has been negotiated.
 
 - **Read `nominated`, not `state` and `priority`.** A connection gathers many
   pairs — a plain loopback produces eighteen — and exactly one is nominated.

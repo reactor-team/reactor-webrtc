@@ -173,6 +173,22 @@ pub struct ReactorFactoryOptions {
     /// `WebRTC-IceHandshakeDtls` field trial. Factory-wide because field
     /// trials live in the factory's `Environment`, not in a peer connection.
     pub dtls_in_stun: c_int,
+    /// dcsctp's `max_burst` for every data channel of the factory, through
+    /// the `WebRTC-DcSctp-MaxBurst` field trial (libwebrtc patch 0005), when
+    /// positive. 0 keeps upstream's default of 4.
+    pub sctp_max_burst: c_int,
+    /// Nonzero → every video stream the factory sends carries the
+    /// playout-delay RTP header extension with these limits, through the
+    /// `WebRTC-ForceSendPlayoutDelay` field trial. `0 <= min <= max <= 40950`.
+    pub send_playout_delay_set: c_int,
+    pub send_playout_delay_min_ms: c_int,
+    pub send_playout_delay_max_ms: c_int,
+    /// Nonzero → every video stream the factory receives plays out with these
+    /// limits, whatever the sender's extension says, through the
+    /// `WebRTC-ForcePlayoutDelay` field trial. Same bounds.
+    pub recv_playout_delay_set: c_int,
+    pub recv_playout_delay_min_ms: c_int,
+    pub recv_playout_delay_max_ms: c_int,
 }
 
 impl Default for ReactorFactoryOptions {
@@ -190,6 +206,13 @@ impl Default for ReactorFactoryOptions {
             encode_video_backend_for: None,
             encode_rate_update: None,
             dtls_in_stun: 0,
+            sctp_max_burst: 0,
+            send_playout_delay_set: 0,
+            send_playout_delay_min_ms: 0,
+            send_playout_delay_max_ms: 0,
+            recv_playout_delay_set: 0,
+            recv_playout_delay_min_ms: 0,
+            recv_playout_delay_max_ms: 0,
         }
     }
 }
@@ -307,23 +330,31 @@ pub struct ReactorStatEntry {
     pub available_incoming_bitrate: f64,
     /// frames per second (kinds 0 and 1), 0 if not measured
     pub frames_per_second: f64,
+    /// The stream's transceiver mid (kinds 0 and 1), NUL-terminated; empty
+    /// when absent or too long to fit, never truncated.
+    pub mid: [c_char; 32],
+    /// The stream's codec mime type (kinds 0 and 1), e.g. `"video/VP9"`,
+    /// NUL-terminated; empty until the stream has a codec.
+    pub codec_mime_type: [c_char; 32],
+    /// Inbound (kind 0): cumulative jitter buffer delay in seconds over
+    /// `jitter_buffer_emitted_count` frames.
+    pub jitter_buffer_delay: f64,
+    /// Inbound (kind 0): cumulative jitter buffer target delay in seconds.
+    pub jitter_buffer_target_delay: f64,
+    /// Inbound (kind 0): cumulative jitter buffer minimum delay in seconds.
+    pub jitter_buffer_minimum_delay: f64,
+    /// Inbound (kind 0): frames that have left the jitter buffer.
+    pub jitter_buffer_emitted_count: u64,
     /// cumulative encode time in seconds (kind 1), over `frames_encoded`
     pub total_encode_time: f64,
     /// cumulative time packets waited in the pacer, in seconds (kind 1),
     /// summed over packets rather than frames
     pub total_packet_send_delay: f64,
-    /// cumulative jitter buffer delay in seconds (kind 0), over
-    /// `jitter_buffer_emitted_count`
-    pub jitter_buffer_delay: f64,
-    /// cumulative jitter buffer target delay in seconds (kind 0)
-    pub jitter_buffer_target_delay: f64,
     /// cumulative receive-to-decoded delay in seconds (kind 0), over
     /// `frames_decoded`
     pub total_processing_delay: f64,
     /// frames encoded (kind 1)
     pub frames_encoded: u64,
-    /// frames that left the jitter buffer (kind 0)
-    pub jitter_buffer_emitted_count: u64,
     /// 1 if the `timing_*` fields hold a timing frame (kind 0, video): the one
     /// that took longest in the last second
     pub timing_frame_present: u64,
@@ -352,7 +383,7 @@ pub struct ReactorStatEntry {
 // with their neighbours are pinned too, on both sides.
 const _: () = {
     assert!(
-        core::mem::size_of::<ReactorStatEntry>() == 336,
+        core::mem::size_of::<ReactorStatEntry>() == 408,
         "ReactorStatEntry changed size — update the C struct in \
          glue/reactor_webrtc.cpp and both assertions"
     );
@@ -374,15 +405,35 @@ const _: () = {
         "the feedback counters moved — see above"
     );
     assert!(
-        core::mem::offset_of!(ReactorStatEntry, total_encode_time) == 200,
+        core::mem::offset_of!(ReactorStatEntry, mid) == 200,
+        "the stream strings moved — see above"
+    );
+    assert!(
+        core::mem::offset_of!(ReactorStatEntry, codec_mime_type) == 232,
+        "the stream strings moved — see above"
+    );
+    assert!(
+        core::mem::offset_of!(ReactorStatEntry, jitter_buffer_delay) == 264,
+        "the jitter buffer delays moved — see above"
+    );
+    assert!(
+        core::mem::offset_of!(ReactorStatEntry, jitter_buffer_target_delay) == 272,
+        "the jitter buffer delays moved — see above"
+    );
+    assert!(
+        core::mem::offset_of!(ReactorStatEntry, jitter_buffer_minimum_delay) == 280,
+        "the jitter buffer delays moved — see above"
+    );
+    assert!(
+        core::mem::offset_of!(ReactorStatEntry, total_encode_time) == 296,
         "the per-stage totals moved — see above"
     );
     assert!(
-        core::mem::offset_of!(ReactorStatEntry, timing_frame_present) == 256,
+        core::mem::offset_of!(ReactorStatEntry, timing_frame_present) == 328,
         "the timing frame fields moved — see above"
     );
     assert!(
-        core::mem::offset_of!(ReactorStatEntry, timing_encode_start_ms) == 272,
+        core::mem::offset_of!(ReactorStatEntry, timing_encode_start_ms) == 344,
         "the timing frame stamps moved — see above"
     );
 };
@@ -636,6 +687,14 @@ extern "C" {
     ) -> c_int;
     /// Current channel state: 0=Connecting 1=Open 2=Closing 3=Closed.
     pub fn reactor_webrtc_data_channel_state(data_channel: *mut DataChannel) -> c_int;
+    /// 1 when the channel delivers in order, 0 otherwise (or on error).
+    pub fn reactor_webrtc_data_channel_ordered(data_channel: *mut DataChannel) -> c_int;
+    /// 1 when the channel retransmits until delivery (no maxRetransmits and
+    /// no maxPacketLifeTime), 0 otherwise (or on error).
+    pub fn reactor_webrtc_data_channel_reliable(data_channel: *mut DataChannel) -> c_int;
+    /// Start closing the channel (DataChannelInterface::Close). Data already
+    /// handed to libwebrtc is still sent first.
+    pub fn reactor_webrtc_data_channel_close(data_channel: *mut DataChannel);
     /// Set the buffered-amount-low threshold (bytes). The
     /// `on_buffered_amount_low` callback fires when `buffered_amount` drops to
     /// this value or below after a send.
@@ -681,8 +740,10 @@ extern "C" {
         track: *mut MediaStreamTrack,
     ) -> c_int;
     /// Attach a frame sink to a (received) video track. `on_frame(userdata,
-    /// bgra, width, height)` fires per decoded frame (BGRA, `width*height*4`
-    /// bytes, valid only during the call) until the track is destroyed.
+    /// bgra, width, height, ssrc, rtp_timestamp)` fires per decoded frame (BGRA,
+    /// `width*height*4` bytes, valid only during the call) until the track is
+    /// destroyed. `ssrc` and `rtp_timestamp` are the ones the receive transform
+    /// saw for it; `ssrc` is 0 when the frame carries no packet information.
     pub fn reactor_webrtc_video_track_add_sink(
         track: *mut MediaStreamTrack,
         userdata: *mut c_void,
@@ -691,6 +752,8 @@ extern "C" {
             bgra: *const u8,
             width: c_int,
             height: c_int,
+            ssrc: u32,
+            rtp_timestamp: u32,
         ),
     );
     /// Kind of a track handle: 0 = audio, 1 = video, -1 = unknown.
@@ -815,11 +878,23 @@ extern "C" {
     /// Replace the encoded payload of the frame currently in the callback
     /// (copies). `frame` is [`ReactorEncodedFrame::frame`].
     pub fn reactor_webrtc_encoded_frame_set_data(frame: *mut c_void, data: *const u8, len: usize);
+    /// The current payload of the frame in the callback, reflecting any earlier
+    /// [`reactor_webrtc_encoded_frame_set_data`]. Valid until the next `set_data`
+    /// or the end of the callback.
+    pub fn reactor_webrtc_encoded_frame_data(frame: *mut c_void, len: *mut usize) -> *const u8;
     /// Attach the transformer to the transceiver's **sender** (encoder →
     /// packetizer). Returns 1 on success, 0 on failure.
     pub fn reactor_webrtc_rtp_transceiver_set_sender_transform(
         transceiver: *mut RtpTransceiver,
         transformer: *mut FrameTransformer,
+    ) -> c_int;
+    /// Floor for the transceiver's receive jitter buffer, in seconds (clamped
+    /// by libwebrtc to 0..10 s); `has_delay` 0 restores the default. May be
+    /// called before the stream exists. Returns 1 on success, 0 on failure.
+    pub fn reactor_webrtc_rtp_transceiver_set_jitter_buffer_minimum_delay(
+        transceiver: *mut RtpTransceiver,
+        has_delay: c_int,
+        delay_seconds: f64,
     ) -> c_int;
     /// Attach the transformer to the transceiver's **receiver** (depacketizer →
     /// decoder). Returns 1 on success, 0 on failure.

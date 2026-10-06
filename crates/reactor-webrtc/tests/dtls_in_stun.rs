@@ -64,7 +64,12 @@ mod tests {
     }
 
     fn trickle(from: &Peer, to: &PeerConnection) {
-        while let Some(c) = from.ice.lock().unwrap().pop_front() {
+        // Pop in a block so the guard drops before add_ice_candidate, which
+        // waits on the signaling thread that may be waiting for this lock.
+        while let Some(c) = {
+            let mut q = from.ice.lock().unwrap();
+            q.pop_front()
+        } {
             let _ = to.add_ice_candidate(&c);
         }
     }
@@ -124,7 +129,7 @@ mod tests {
         );
 
         let received = Arc::new(AtomicU32::new(0));
-        let mut dc2 = s2.data_channels.lock().unwrap().pop().unwrap();
+        let dc2 = s2.data_channels.lock().unwrap().pop().unwrap();
         let received2 = received.clone();
         dc2.on_message(move |_data, _binary| {
             received2.fetch_add(1, Ordering::SeqCst);

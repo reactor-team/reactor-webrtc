@@ -17,7 +17,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use reactor_webrtc::{
-    IceCandidate, PeerConnection, PeerConnectionFactory, PeerConnectionObserver,
+    IceCandidate, MediaKind, PeerConnection, PeerConnectionFactory, PeerConnectionObserver,
     PeerConnectionState, RemoteTrack, RtcConfiguration, StreamKind,
 };
 
@@ -247,6 +247,58 @@ fn safe_loopback_exchanges_media() {
     assert_eq!(audio_in.frames_decoded, 0);
     assert_eq!(audio_in.frame_width, 0);
 
+    // Which transceiver, and which codec. A reader with several tracks of one
+    // kind can only tell them apart by `mid`, so each stream's has to name a
+    // transceiver of its own kind on its own peer — and its codec has to be one
+    // of that kind, which is what says the `codec_id` lookup found the codec
+    // stat rather than nothing.
+    for (pc, streams, side) in [
+        (
+            &pc2,
+            inbound
+                .iter()
+                .map(|s| (s.kind, &s.mid, &s.codec_mime_type))
+                .collect::<Vec<_>>(),
+            "inbound",
+        ),
+        (
+            &pc1,
+            outbound
+                .iter()
+                .map(|s| (s.kind, &s.mid, &s.codec_mime_type))
+                .collect::<Vec<_>>(),
+            "outbound",
+        ),
+    ] {
+        let transceivers: Vec<(Option<String>, MediaKind)> = pc
+            .transceivers()
+            .iter()
+            .map(|t| (t.mid(), t.kind()))
+            .collect();
+        for (kind, mid, mime) in streams {
+            let (media, prefix) = match kind {
+                StreamKind::Video => (MediaKind::Video, "video/"),
+                StreamKind::Audio => (MediaKind::Audio, "audio/"),
+                StreamKind::Unknown => continue,
+            };
+            let mid = mid
+                .as_ref()
+                .unwrap_or_else(|| panic!("{side} {kind:?} stream has no mid"));
+            assert!(
+                transceivers.contains(&(Some(mid.clone()), media)),
+                "{side} {kind:?} stream's mid {mid:?} names no {media:?} transceiver \
+                 (have {transceivers:?})"
+            );
+            let mime = mime
+                .as_ref()
+                .unwrap_or_else(|| panic!("{side} {kind:?} stream has no codec"));
+            assert!(
+                mime.starts_with(prefix),
+                "{side} {kind:?} stream reported codec {mime:?}"
+            );
+        }
+    }
+
     // The send path's RTT, and the reason it gets an assertion of its own: it is
     // not on the stat it appears on. libwebrtc moved it out of
     // RTCOutboundRtpStreamStats in M7907, so the glue follows `remote_id` to the
@@ -268,6 +320,7 @@ fn safe_loopback_exchanges_media() {
         "per-stream stats ✅\n  \
          inbound  video: {}x{} @{:.1}fps  frames={} dropped={} jitter={:.1}ms\n  \
          inbound  audio: jitter={:.1}ms packets={}\n  \
+         inbound  codecs: video={:?} (mid {:?}) audio={:?} (mid {:?})\n  \
          outbound rtt={:.3}ms fraction_lost={:.4}",
         video_in.frame_width,
         video_in.frame_height,
@@ -277,6 +330,10 @@ fn safe_loopback_exchanges_media() {
         video_in.jitter_s * 1000.0,
         audio_in.jitter_s * 1000.0,
         audio_in.packets_received,
+        video_in.codec_mime_type,
+        video_in.mid,
+        audio_in.codec_mime_type,
+        audio_in.mid,
         outbound
             .iter()
             .map(|s| s.round_trip_time_s * 1000.0)

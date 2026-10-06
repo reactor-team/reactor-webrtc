@@ -66,7 +66,12 @@ mod tests {
     }
 
     fn trickle(from: &Peer, to: &PeerConnection) {
-        while let Some(c) = from.ice.lock().unwrap().pop_front() {
+        // Pop in a block so the guard drops before add_ice_candidate, which
+        // waits on the signaling thread that may be waiting for this lock.
+        while let Some(c) = {
+            let mut q = from.ice.lock().unwrap();
+            q.pop_front()
+        } {
             let _ = to.add_ice_candidate(&c);
         }
     }
@@ -116,7 +121,7 @@ mod tests {
         let (pc2, s2) = make_peer(&factory, &cfg);
 
         // pc1 creates the channel before negotiation.
-        let mut dc1 = pc1.create_data_channel("test").expect("create dc");
+        let dc1 = pc1.create_data_channel("test").expect("create dc");
 
         let recv_count = Arc::new(AtomicU32::new(0));
         let last_msg: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
@@ -142,7 +147,7 @@ mod tests {
         assert!(ok, "timed out waiting for connection + dc1 open");
 
         // Wire up the receiver on pc2's side.
-        let mut dc2 = s2.data_channels.lock().unwrap().pop().unwrap();
+        let dc2 = s2.data_channels.lock().unwrap().pop().unwrap();
         let recv_count2 = recv_count.clone();
         let last_msg2 = last_msg.clone();
         dc2.on_message(move |data, _binary| {
@@ -176,7 +181,7 @@ mod tests {
         let (pc1, s1) = make_peer(&factory, &cfg);
         let (pc2, s2) = make_peer(&factory, &cfg);
 
-        let mut dc1 = pc1.create_data_channel("state-test").expect("dc");
+        let dc1 = pc1.create_data_channel("state-test").expect("dc");
 
         let states: Arc<Mutex<Vec<DataChannelState>>> = Arc::new(Mutex::new(Vec::new()));
         let states2 = states.clone();

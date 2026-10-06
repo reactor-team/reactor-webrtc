@@ -2,6 +2,7 @@
 
 use std::ffi::{c_void, CStr, CString};
 use std::os::raw::{c_char, c_int};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -245,6 +246,25 @@ impl SessionDescription {
     /// session section: RFC 8866 §5 puts session-level attributes after `t=`/`z=`/`k=`
     /// and before the first media description, and everything preceding the first
     /// `m=` is by definition session level.
+    /// Whether this description declares data-channel chunking at a version
+    /// this build speaks (`a=x-reactor-dc-chunking:1 …`). Read off the SDP
+    /// string, like [`declares_frame_metadata`](Self::declares_frame_metadata).
+    pub fn declares_dc_chunking(&self) -> bool {
+        reactor_webrtc_dc_chunking::sdp::parse(&self.sdp).is_some()
+    }
+
+    /// Return a copy declaring data-channel chunking with `params`, at session
+    /// level. Idempotent. [`PeerConnection::create_offer`] and
+    /// [`create_answer`](PeerConnection::create_answer) already apply it when
+    /// the connection takes part, so callers using this crate's signalling
+    /// never need it.
+    pub fn with_dc_chunking(&self, params: &crate::DcChunkingParams) -> Self {
+        Self {
+            kind: self.kind,
+            sdp: reactor_webrtc_dc_chunking::sdp::declare(&self.sdp, params),
+        }
+    }
+
     pub fn with_frame_metadata(&self) -> Self {
         if self.declares_frame_metadata() || self.sdp.lines().next().is_none() {
             return self.clone();
@@ -471,6 +491,45 @@ impl Transceiver {
             Ok(())
         } else {
             Err(Error::Webrtc("transceiver set_direction failed".into()))
+        }
+    }
+
+    /// Hold this transceiver's received media in the jitter buffer for at least
+    /// `delay` (`RTCRtpReceiver.jitterBufferTarget`); `None` restores the
+    /// default. The buffer still adds whatever the network's jitter calls for
+    /// on top — this is a floor, so it can only add latency, never remove it.
+    /// To cut playout latency instead, see
+    /// [`with_receive_playout_delay`](crate::PeerConnectionFactoryBuilder::with_receive_playout_delay).
+    ///
+    /// Takes effect immediately on a running stream, and is remembered when set
+    /// before one exists — on a transceiver of your own before you offer, or in
+    /// `on_track` — so it
+    /// applies from the first frame. Read the result back as
+    /// [`InboundRtpStats::jitter_buffer_target_delay_s`]. Fails when `delay`
+    /// is above libwebrtc's 10 s limit.
+    pub fn set_jitter_buffer_minimum_delay(
+        &self,
+        delay: Option<std::time::Duration>,
+    ) -> Result<()> {
+        const LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
+        if delay.is_some_and(|d| d > LIMIT) {
+            return Err(Error::Webrtc(format!(
+                "jitter buffer minimum delay {delay:?} is above libwebrtc's {LIMIT:?}"
+            )));
+        }
+        let ok = unsafe {
+            reactor_webrtc_sys::reactor_webrtc_rtp_transceiver_set_jitter_buffer_minimum_delay(
+                self.raw,
+                delay.is_some() as c_int,
+                delay.map_or(0.0, |d| d.as_secs_f64()),
+            )
+        };
+        if ok == 1 {
+            Ok(())
+        } else {
+            Err(Error::Webrtc(
+                "transceiver set_jitter_buffer_minimum_delay failed".into(),
+            ))
         }
     }
 
@@ -897,6 +956,15 @@ pub struct InboundRtpStats {
     pub ssrc: u32,
     /// Audio or video. See [`StreamKind`].
     pub kind: StreamKind,
+    /// The transceiver this stream belongs to (`RTCInboundRtpStreamStats::mid`).
+    /// Several tracks of one kind are told apart by this, not by
+    /// [`StreamKind`]: match it against [`Transceiver::mid`]. `None` before the
+    /// stream is negotiated.
+    pub mid: Option<String>,
+    /// The codec this stream carries, as its mime type (`"video/VP9"`,
+    /// `"audio/opus"`), from the `RTCCodecStats` its `codec_id` names. `None`
+    /// until the stream has a codec.
+    pub codec_mime_type: Option<String>,
     pub packets_received: u32,
     pub bytes_received: u64,
     /// Jitter in seconds.
@@ -927,15 +995,26 @@ pub struct InboundRtpStats {
     /// Decoded frame size; `0` for audio, and before the first frame.
     pub frame_width: u32,
     pub frame_height: u32,
-    /// Cumulative time frames spent in the jitter buffer, in seconds. Divide
-    /// the change over an interval by the change in
-    /// [`InboundRtpStats::jitter_buffer_emitted_count`] for the average per
-    /// frame over that interval.
+    /// Cumulative time, in seconds, that the frames counted by
+    /// [`jitter_buffer_emitted_count`](Self::jitter_buffer_emitted_count) spent
+    /// in the jitter buffer (`RTCInboundRtpStreamStats::jitterBufferDelay`). For
+    /// video, from a frame's first packet arriving to the frame leaving for the
+    /// decoder; divide by the count for the per-frame average.
     pub jitter_buffer_delay_s: f64,
-    /// Cumulative delay the jitter buffer was aiming for, in seconds, over the
-    /// same count.
+    /// Cumulative target delay in seconds, over the same frames: what the
+    /// jitter buffer was aiming for, with every floor in force — a
+    /// [`Transceiver::set_jitter_buffer_minimum_delay`], a playout delay, or
+    /// what A/V sync needed. A floor shows up here, less the receiver's ~10 ms
+    /// render delay.
     pub jitter_buffer_target_delay_s: f64,
-    /// Frames that have left the jitter buffer.
+    /// Cumulative minimum delay in seconds, over the same frames. For video
+    /// this is libwebrtc's own computed minimum — jitter estimate plus decode
+    /// and render time — not a floor the app set; read
+    /// [`jitter_buffer_target_delay_s`](Self::jitter_buffer_target_delay_s)
+    /// for that.
+    pub jitter_buffer_minimum_delay_s: f64,
+    /// Frames that have left the jitter buffer — the denominator for the three
+    /// cumulative delays above.
     pub jitter_buffer_emitted_count: u64,
     /// Cumulative time from a frame's first packet arriving to it being
     /// decoded, in seconds, over [`InboundRtpStats::frames_decoded`].
@@ -943,6 +1022,18 @@ pub struct InboundRtpStats {
     /// The slowest timing frame of the last second, or `None` if none arrived
     /// in it. Video only.
     pub timing_frame: Option<TimingFrameInfo>,
+}
+
+impl InboundRtpStats {
+    /// Average time a frame spent in the jitter buffer, or `None` before the
+    /// first one left it.
+    pub fn average_jitter_buffer_delay(&self) -> Option<std::time::Duration> {
+        (self.jitter_buffer_emitted_count > 0).then(|| {
+            std::time::Duration::from_secs_f64(
+                (self.jitter_buffer_delay_s / self.jitter_buffer_emitted_count as f64).max(0.0),
+            )
+        })
+    }
 }
 
 /// One frame libwebrtc stamped at each stage of its trip, as reported by the
@@ -999,6 +1090,15 @@ pub struct OutboundRtpStats {
     pub ssrc: u32,
     /// Audio or video. See [`StreamKind`].
     pub kind: StreamKind,
+    /// The transceiver this stream belongs to (`RTCOutboundRtpStreamStats::mid`).
+    /// Several tracks of one kind are told apart by this, not by
+    /// [`StreamKind`]: match it against [`Transceiver::mid`]. `None` before the
+    /// stream is negotiated.
+    pub mid: Option<String>,
+    /// The codec this stream carries, as its mime type (`"video/VP9"`,
+    /// `"audio/opus"`), from the `RTCCodecStats` its `codec_id` names. `None`
+    /// until the stream has a codec.
+    pub codec_mime_type: Option<String>,
     /// 64-bit because `RTCSentRtpStreamStats` reports it that way. It was `u32`
     /// until 0.15.0, which wrapped silently after ~4.3 billion packets — about
     /// seven weeks at a thousand packets a second — and then reported a
@@ -1102,46 +1202,340 @@ type MessageCb = Box<dyn for<'a> FnMut(&'a [u8], bool) + Send>;
 type EventCb = Box<dyn FnMut() + Send>;
 type StateCb = Box<dyn FnMut(DataChannelState) + Send>;
 
-// Heap-pinned data-channel callback state addressed by the sys `userdata`.
-#[derive(Default)]
-struct DcObserverState {
-    on_message: Option<Mutex<MessageCb>>,
-    on_state_change: Option<Mutex<StateCb>>,
-    on_buffered_amount_low: Option<Mutex<EventCb>>,
+/// One callback, shared so it can be called with its slot unlocked.
+type Shared<F> = Arc<Mutex<F>>;
+
+/// A callback slot. A callback runs with the slot's lock released, so it may
+/// replace any handler of its own channel; its own lock, held while it runs,
+/// keeps calls to it in order.
+struct Slot<F>(Mutex<Option<Shared<F>>>);
+
+impl<F> Slot<F> {
+    fn empty() -> Self {
+        Self(Mutex::new(None))
+    }
+
+    fn set(&self, f: F) {
+        *self.0.lock().unwrap() = Some(Arc::new(Mutex::new(f)));
+    }
+
+    fn get(&self) -> Option<Shared<F>> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+/// The native channel handle, shared with the callbacks that run on WebRTC's
+/// threads. Valid for as long as the owning [`DataChannel`] lives: the native
+/// observer is unregistered before the handle is destroyed.
+#[derive(Clone, Copy)]
+struct RawDc(*mut reactor_webrtc_sys::DataChannel);
+// SAFETY: the native data channel is internally thread-safe.
+unsafe impl Send for RawDc {}
+unsafe impl Sync for RawDc {}
+
+impl RawDc {
+    fn state(self) -> DataChannelState {
+        DataChannelState::from_raw(unsafe {
+            reactor_webrtc_sys::reactor_webrtc_data_channel_state(self.0)
+        })
+    }
+    fn buffered_amount(self) -> u64 {
+        unsafe { reactor_webrtc_sys::reactor_webrtc_data_channel_buffered_amount(self.0) }
+    }
+    fn send(self, data: &[u8], binary: bool) -> bool {
+        unsafe {
+            reactor_webrtc_sys::reactor_webrtc_data_channel_send(
+                self.0,
+                data.as_ptr(),
+                data.len(),
+                binary as c_int,
+            ) == 1
+        }
+    }
+    fn close(self) {
+        unsafe { reactor_webrtc_sys::reactor_webrtc_data_channel_close(self.0) }
+    }
+}
+
+/// Per-channel state of a chunked channel.
+struct Chunked {
+    queue: Mutex<reactor_webrtc_dc_chunking::SendQueue>,
+    // Held while frames move from the queue to the native channel, so the
+    // frames of one message stay contiguous whoever pumps. Taken with
+    // try_lock by every caller, after setting `pump_again`: a caller that
+    // finds it busy leaves the work to the holder instead of waiting, so a
+    // callback never blocks on a sender.
+    pump: Mutex<()>,
+    pump_again: AtomicBool,
+    reassembler: Mutex<reactor_webrtc_dc_chunking::Reassembler>,
+    // Whole messages that arrived before on_message was set: libwebrtc holds
+    // messages for a channel with no observer, and this keeps that promise
+    // for the frames the pump's observer had to accept. Bounded by
+    // `send_buffer_limit` bytes.
+    pending: Mutex<std::collections::VecDeque<(Vec<u8>, bool)>>,
+    pending_bytes: AtomicU64,
+    pending_limit: u64,
+    // The caller's on_buffered_amount_low threshold. The native threshold
+    // belongs to the pump (the queue's low-water mark).
+    user_low_threshold: AtomicU64,
+    user_low_armed: AtomicBool,
+}
+
+/// Everything the native observer reaches through `userdata`.
+struct ChannelCore {
+    raw: RawDc,
+    on_message: Slot<MessageCb>,
+    on_state_change: Slot<StateCb>,
+    // Their own slots, so on_open, on_close and on_state_change coexist.
+    on_open: Slot<EventCb>,
+    on_close: Slot<EventCb>,
+    on_buffered_amount_low: Slot<EventCb>,
+    registered: AtomicBool,
+    // The owning connection's chunking negotiation, and this channel's
+    // decision, made once it is open.
+    negotiation: Option<Arc<crate::dc_chunking::DcNegotiation>>,
+    decided: std::sync::OnceLock<Option<Chunked>>,
+    // The threshold the caller set before the channel decided, so a chunked
+    // channel can take it over.
+    early_low_threshold: AtomicU64,
+}
+
+impl ChannelCore {
+    /// This channel's chunking state, deciding it on first call once open.
+    fn chunked(&self) -> Option<&Chunked> {
+        if let Some(decided) = self.decided.get() {
+            return decided.as_ref();
+        }
+        let negotiation = self.negotiation.as_ref()?;
+        if self.raw.state() != DataChannelState::Open {
+            return None;
+        }
+        let ordered =
+            unsafe { reactor_webrtc_sys::reactor_webrtc_data_channel_ordered(self.raw.0) != 0 };
+        let reliable =
+            unsafe { reactor_webrtc_sys::reactor_webrtc_data_channel_reliable(self.raw.0) != 0 };
+        let chunked = match (negotiation.settings(), negotiation.remote()) {
+            (Some(settings), Some(remote)) if ordered && reliable => {
+                let config = settings.send_config(&remote);
+                Some(Chunked {
+                    queue: Mutex::new(reactor_webrtc_dc_chunking::SendQueue::new(config)),
+                    pump: Mutex::new(()),
+                    pump_again: AtomicBool::new(false),
+                    reassembler: Mutex::new(reactor_webrtc_dc_chunking::Reassembler::new(
+                        settings.max_message_size,
+                    )),
+                    pending: Mutex::new(std::collections::VecDeque::new()),
+                    pending_bytes: AtomicU64::new(0),
+                    pending_limit: settings.send_buffer_limit,
+                    user_low_threshold: AtomicU64::new(
+                        self.early_low_threshold.load(Ordering::SeqCst),
+                    ),
+                    user_low_armed: AtomicBool::new(false),
+                })
+            }
+            _ => None,
+        };
+        let decided = self.decided.get_or_init(|| chunked).as_ref();
+        if let Some(c) = decided {
+            // The pump needs the native callbacks whether or not the caller
+            // set any, and resumes at the queue's low-water mark.
+            let low = c.queue.lock().unwrap().config().low_water;
+            unsafe {
+                reactor_webrtc_sys::reactor_webrtc_data_channel_set_low_threshold(self.raw.0, low)
+            };
+            self.ensure_registered();
+        }
+        decided
+    }
+
+    fn ensure_registered(&self) {
+        if !self.registered.swap(true, Ordering::SeqCst) {
+            self.register();
+        }
+    }
+
+    fn register(&self) {
+        let ud = self as *const ChannelCore as *mut c_void;
+        unsafe {
+            reactor_webrtc_sys::reactor_webrtc_data_channel_register_observer(
+                self.raw.0,
+                ud,
+                dc_on_message,
+                dc_on_state_change,
+                dc_on_buffered_amount_low,
+            );
+        }
+    }
+
+    /// Native buffered bytes plus, on a chunked channel, the queued ones.
+    fn buffered_amount(&self) -> u64 {
+        let native = self.raw.buffered_amount();
+        match self.chunked() {
+            Some(c) => native + c.queue.lock().unwrap().queued(),
+            None => native,
+        }
+    }
+
+    /// Move frames from the queue to the native channel while it has room.
+    fn pump(&self, c: &Chunked) {
+        loop {
+            // Ask first, then try the lock. A failed try_lock means another
+            // thread holds it and has not yet re-checked the flag after
+            // unlocking, so the request cannot be lost between its last pass
+            // and its exit.
+            c.pump_again.store(true, Ordering::SeqCst);
+            let Ok(_guard) = c.pump.try_lock() else {
+                return;
+            };
+            while c.pump_again.swap(false, Ordering::SeqCst) {
+                loop {
+                    let frame = c
+                        .queue
+                        .lock()
+                        .unwrap()
+                        .next_frame(self.raw.buffered_amount());
+                    let Some(frame) = frame else { break };
+                    if !self.raw.send(&frame, true) {
+                        // libwebrtc closes the channel on a failed send. The
+                        // peer may hold part of a message; nothing more can
+                        // follow it.
+                        c.queue.lock().unwrap().clear();
+                        return;
+                    }
+                }
+            }
+            drop(_guard);
+            // A request that arrived after our last pass is ours to serve.
+            if !c.pump_again.load(Ordering::SeqCst) {
+                break;
+            }
+        }
+    }
+
+    fn maybe_fire_user_low(&self, c: &Chunked) {
+        let threshold = c.user_low_threshold.load(Ordering::SeqCst);
+        if self.buffered_amount() <= threshold && c.user_low_armed.swap(false, Ordering::SeqCst) {
+            if let Some(cb) = self.on_buffered_amount_low.get() {
+                (*cb.lock().unwrap())();
+            }
+        }
+    }
+
+    /// Hand a whole message to the caller, or hold it until on_message is set.
+    ///
+    /// The slot stays locked only while deciding, so a message cannot be
+    /// held just after `on_message` flushed what was held.
+    fn deliver(&self, c: &Chunked, data: Vec<u8>, binary: bool) {
+        let cb = {
+            let slot = self.on_message.0.lock().unwrap();
+            match slot.clone() {
+                Some(cb) => cb,
+                None => {
+                    let size = data.len() as u64;
+                    if c.pending_bytes.load(Ordering::SeqCst) + size <= c.pending_limit {
+                        c.pending_bytes.fetch_add(size, Ordering::SeqCst);
+                        c.pending.lock().unwrap().push_back((data, binary));
+                    }
+                    return;
+                }
+            }
+        };
+        (*cb.lock().unwrap())(&data, binary);
+    }
 }
 
 extern "C" fn dc_on_message(ud: *mut c_void, data: *const u8, len: usize, binary: c_int) {
-    let st = unsafe { &*(ud as *const DcObserverState) };
-    if let Some(m) = &st.on_message {
-        let bytes = unsafe { std::slice::from_raw_parts(data, len) };
-        if let Ok(mut cb) = m.lock() {
-            cb(bytes, binary != 0);
+    let core = unsafe { &*(ud as *const ChannelCore) };
+    let bytes = unsafe { std::slice::from_raw_parts(data, len) };
+    let Some(c) = core.chunked() else {
+        if let Some(cb) = core.on_message.get() {
+            (*cb.lock().unwrap())(bytes, binary != 0);
+        }
+        return;
+    };
+    // Every frame of a chunked channel is sent as binary.
+    let delivery = if binary != 0 {
+        c.reassembler.lock().unwrap().push(bytes)
+    } else {
+        Err(reactor_webrtc_dc_chunking::FrameError::TypeChanged)
+    };
+    match delivery {
+        Ok(reactor_webrtc_dc_chunking::Delivery::Message { data, binary }) => {
+            core.deliver(c, data, binary)
+        }
+        Ok(reactor_webrtc_dc_chunking::Delivery::Pending) => {}
+        // Larger than this side's limit: dropped without buffering, and the
+        // channel keeps working.
+        Ok(reactor_webrtc_dc_chunking::Delivery::Dropped { .. }) => {}
+        // The peer broke the wire format; the stream cannot be trusted.
+        Err(_) => {
+            c.reassembler.lock().unwrap().reset();
+            core.raw.close();
         }
     }
 }
+
 extern "C" fn dc_on_state_change(ud: *mut c_void, state: c_int) {
-    let st = unsafe { &*(ud as *const DcObserverState) };
-    if let Some(m) = &st.on_state_change {
-        if let Ok(mut cb) = m.lock() {
-            cb(DataChannelState::from_raw(state));
+    let core = unsafe { &*(ud as *const ChannelCore) };
+    let state = DataChannelState::from_raw(state);
+    match state {
+        // Decide at the Open transition, so the framing is fixed before the
+        // first message either way.
+        DataChannelState::Open => {
+            core.chunked();
         }
+        DataChannelState::Closed => {
+            if let Some(Some(c)) = core.decided.get() {
+                c.queue.lock().unwrap().clear();
+                c.reassembler.lock().unwrap().reset();
+            }
+        }
+        _ => {}
+    }
+    if let Some(cb) = core.on_state_change.get() {
+        (*cb.lock().unwrap())(state);
+    }
+    let event = match state {
+        DataChannelState::Open => Some(&core.on_open),
+        DataChannelState::Closed => Some(&core.on_close),
+        _ => None,
+    };
+    if let Some(cb) = event.and_then(Slot::get) {
+        (*cb.lock().unwrap())();
     }
 }
+
 extern "C" fn dc_on_buffered_amount_low(ud: *mut c_void) {
-    let st = unsafe { &*(ud as *const DcObserverState) };
-    if let Some(m) = &st.on_buffered_amount_low {
-        if let Ok(mut cb) = m.lock() {
-            cb();
+    let core = unsafe { &*(ud as *const ChannelCore) };
+    match core.decided.get() {
+        // The caller's own threshold is checked here, from the native event,
+        // never from inside a send: like libwebrtc, `send` does not call back.
+        Some(Some(c)) => {
+            core.pump(c);
+            core.maybe_fire_user_low(c);
+        }
+        _ => {
+            if let Some(cb) = core.on_buffered_amount_low.get() {
+                (*cb.lock().unwrap())();
+            }
         }
     }
 }
 
 /// A data channel — either locally created or handed to `on_data_channel` by
 /// the remote peer. Dropping releases the native handle.
+///
+/// On a channel whose connection negotiated chunking (see
+/// [`is_chunked`](Self::is_chunked)), messages travel as frames: `send`
+/// accepts payloads larger than libwebrtc's 16 MiB send buffer, queueing
+/// them and feeding the native channel as it drains, and `on_message`
+/// receives each message whole. Every other channel behaves exactly as a
+/// plain libwebrtc data channel.
 pub struct DataChannel {
     raw: *mut reactor_webrtc_sys::DataChannel,
-    // Keeps the callback closures alive while the native observer is registered.
-    observer: Option<Box<DcObserverState>>,
+    // Addressed by the native observer as `userdata`; boxed so its address
+    // is stable for as long as the observer is registered.
+    core: Box<ChannelCore>,
     // Keeps the factory's signaling/network threads alive for as long as this
     // channel exists — a caller can detach it and outlive both the connection
     // that created it and the factory that ultimately owns those threads.
@@ -1161,9 +1555,52 @@ impl DataChannel {
     ) -> Self {
         Self {
             raw,
-            observer: None,
+            core: Box::new(ChannelCore {
+                raw: RawDc(raw),
+                on_message: Slot::empty(),
+                on_state_change: Slot::empty(),
+                on_open: Slot::empty(),
+                on_close: Slot::empty(),
+                on_buffered_amount_low: Slot::empty(),
+                registered: AtomicBool::new(false),
+                negotiation: None,
+                decided: std::sync::OnceLock::new(),
+                early_low_threshold: AtomicU64::new(0),
+            }),
             _factory: factory,
         }
+    }
+
+    pub(crate) fn with_dc_negotiation(
+        mut self,
+        negotiation: Arc<crate::dc_chunking::DcNegotiation>,
+    ) -> Self {
+        self.core.negotiation = Some(negotiation);
+        self
+    }
+
+    /// Whether this channel carries chunked messages.
+    ///
+    /// Decided once — at the `Open` transition, or the first time it is
+    /// asked while open — and fixed from then on: a channel is chunked when
+    /// its connection negotiated chunking with the peer and the channel is
+    /// ordered and fully reliable (no `maxRetransmits`, no
+    /// `maxPacketLifeTime`). Both ends see the same SDP and the same channel
+    /// parameters, so they reach the same answer without signalling anything
+    /// else. `false` before the channel opens.
+    pub fn is_chunked(&self) -> bool {
+        self.core.chunked().is_some()
+    }
+
+    /// Whether the channel delivers messages in order.
+    pub fn ordered(&self) -> bool {
+        unsafe { reactor_webrtc_sys::reactor_webrtc_data_channel_ordered(self.raw) != 0 }
+    }
+
+    /// Whether the channel retransmits until delivery: neither
+    /// `maxRetransmits` nor `maxPacketLifeTime` is set.
+    pub fn reliable(&self) -> bool {
+        unsafe { reactor_webrtc_sys::reactor_webrtc_data_channel_reliable(self.raw) != 0 }
     }
 
     /// The label this channel was created with.
@@ -1187,106 +1624,174 @@ impl DataChannel {
 
     /// Current readiness state.
     pub fn state(&self) -> DataChannelState {
-        DataChannelState::from_raw(unsafe {
-            reactor_webrtc_sys::reactor_webrtc_data_channel_state(self.raw)
-        })
+        self.core.raw.state()
     }
 
-    /// Bytes currently queued for sending (backpressure signal).
+    /// Bytes waiting to be sent (backpressure signal). On a chunked channel
+    /// this includes what is still queued beyond libwebrtc's own buffer.
     pub fn buffered_amount(&self) -> u64 {
-        unsafe { reactor_webrtc_sys::reactor_webrtc_data_channel_buffered_amount(self.raw) }
+        self.core.buffered_amount()
     }
 
-    /// Set the threshold below which `on_buffered_amount_low` fires.
+    /// Set the threshold below which `on_buffered_amount_low` fires. On a
+    /// chunked channel it applies to [`buffered_amount`](Self::buffered_amount),
+    /// queue included.
     pub fn set_buffered_amount_low_threshold(&self, threshold: u64) {
-        unsafe {
-            reactor_webrtc_sys::reactor_webrtc_data_channel_set_low_threshold(self.raw, threshold)
+        self.core
+            .early_low_threshold
+            .store(threshold, Ordering::SeqCst);
+        match self.core.chunked() {
+            Some(c) => c.user_low_threshold.store(threshold, Ordering::SeqCst),
+            None => unsafe {
+                reactor_webrtc_sys::reactor_webrtc_data_channel_set_low_threshold(
+                    self.raw, threshold,
+                )
+            },
         }
     }
 
-    /// Send bytes over the channel. `binary` selects the SCTP message type.
+    /// Send a message. `binary` selects the message type the receiver sees.
+    ///
+    /// On a chunked channel the message is queued and leaves as frames, so
+    /// it may be larger than libwebrtc's 16 MiB send buffer, up to the
+    /// effective max message size; a full queue or an oversized message is
+    /// an [`Error::DataChannel`] and nothing is sent. Elsewhere this is a
+    /// plain libwebrtc send.
     pub fn send(&self, data: &[u8], binary: bool) -> Result<()> {
-        let ok = unsafe {
-            reactor_webrtc_sys::reactor_webrtc_data_channel_send(
-                self.raw,
-                data.as_ptr(),
-                data.len(),
-                binary as c_int,
-            )
+        let Some(c) = self.core.chunked() else {
+            return if self.core.raw.send(data, binary) {
+                Ok(())
+            } else {
+                Err(Error::Webrtc("data channel send failed".into()))
+            };
         };
-        if ok == 1 {
-            Ok(())
-        } else {
-            Err(Error::Webrtc("data channel send failed".into()))
+        // A closed channel would take the message and drop it on the first
+        // native send; refuse it as the plain path does.
+        if self.state() != DataChannelState::Open {
+            return Err(Error::Webrtc("data channel send failed".into()));
         }
+        c.queue
+            .lock()
+            .unwrap()
+            .push(data.to_vec(), binary)
+            .map_err(Error::DataChannel)?;
+        c.user_low_armed.store(true, Ordering::SeqCst);
+        self.core.pump(c);
+        Ok(())
+    }
+
+    /// Block until everything queued has been handed to SCTP and libwebrtc's
+    /// own buffer is empty, or `timeout` passes. Returns whether it drained.
+    ///
+    /// Don't call it (or [`close`](Self::close) with a drain timeout) from
+    /// this channel's callbacks: they run on libwebrtc's network thread, which
+    /// is the thread that sends, so nothing drains until the timeout passes.
+    pub fn drain(&self, timeout: std::time::Duration) -> bool {
+        // A timeout too large to add to now never expires.
+        let deadline = std::time::Instant::now().checked_add(timeout);
+        loop {
+            if self.buffered_amount() == 0 {
+                return true;
+            }
+            let expired = deadline.is_some_and(|d| std::time::Instant::now() >= d);
+            if self.state() != DataChannelState::Open || expired {
+                return false;
+            }
+            // Refill here too, rather than only from the native low-water
+            // event, so a drain never waits on an event it already missed.
+            if let Some(c) = self.core.chunked() {
+                self.core.pump(c);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// Close the channel. A chunked channel first drains what it has queued,
+    /// for up to `drain_timeout`, so a message already accepted by `send`
+    /// is not cut short.
+    pub fn close(&self, drain_timeout: std::time::Duration) {
+        if self.core.chunked().is_some() {
+            self.drain(drain_timeout);
+        }
+        self.core.raw.close();
     }
 
     /// Receive handler — fires on every incoming message. The closure runs on
-    /// a WebRTC network thread; return quickly or offload heavy work.
-    pub fn on_message(&mut self, cb: impl for<'a> FnMut(&'a [u8], bool) + Send + 'static) {
-        self.observer
-            .get_or_insert_with(Default::default)
-            .on_message = Some(Mutex::new(Box::new(cb)));
+    /// a WebRTC network thread; return quickly or offload heavy work. On a
+    /// chunked channel it fires once per whole message, including any that
+    /// arrived before it was set.
+    pub fn on_message(&self, cb: impl for<'a> FnMut(&'a [u8], bool) + Send + 'static) {
+        // The new callback is published already locked, and the held messages
+        // are taken out under the slot's lock: a message that arrives while
+        // they are flushed waits on the callback, so the order holds, and the
+        // callback can still replace any handler of this channel.
+        let shared: Shared<MessageCb> = Arc::new(Mutex::new(Box::new(cb)));
+        let mut running = shared.lock().unwrap();
+        let held = {
+            let mut slot = self.core.on_message.0.lock().unwrap();
+            *slot = Some(Arc::clone(&shared));
+            match self.core.decided.get() {
+                Some(Some(c)) => {
+                    c.pending_bytes.store(0, Ordering::SeqCst);
+                    std::mem::take(&mut *c.pending.lock().unwrap())
+                }
+                _ => std::collections::VecDeque::new(),
+            }
+        };
+        for (data, binary) in held {
+            (*running)(&data, binary);
+        }
+        drop(running);
         self.reregister();
     }
 
     /// State-change handler — fires for every transition including
     /// Connecting → Open → Closing → Closed.
-    pub fn on_state_change(&mut self, cb: impl FnMut(DataChannelState) + Send + 'static) {
-        self.observer
-            .get_or_insert_with(Default::default)
-            .on_state_change = Some(Mutex::new(Box::new(cb)));
+    pub fn on_state_change(&self, cb: impl FnMut(DataChannelState) + Send + 'static) {
+        self.core.on_state_change.set(Box::new(cb));
         self.reregister();
     }
 
-    /// Convenience: fires once when the channel becomes `Open`.
-    pub fn on_open(&mut self, cb: impl FnMut() + Send + 'static) {
-        let mut cb = cb;
-        self.on_state_change(move |s| {
-            if s == DataChannelState::Open {
-                cb();
-            }
-        });
+    /// Fires when the channel becomes `Open`. Independent of
+    /// [`on_state_change`](Self::on_state_change) and [`on_close`](Self::on_close):
+    /// setting one does not replace the others.
+    pub fn on_open(&self, cb: impl FnMut() + Send + 'static) {
+        self.core.on_open.set(Box::new(cb));
+        self.reregister();
     }
 
-    /// Convenience: fires once when the channel reaches `Closed`.
-    pub fn on_close(&mut self, cb: impl FnMut() + Send + 'static) {
-        let mut cb = cb;
-        self.on_state_change(move |s| {
-            if s == DataChannelState::Closed {
-                cb();
-            }
-        });
+    /// Fires when the channel reaches `Closed`. Independent of
+    /// [`on_state_change`](Self::on_state_change) and [`on_open`](Self::on_open).
+    pub fn on_close(&self, cb: impl FnMut() + Send + 'static) {
+        self.core.on_close.set(Box::new(cb));
+        self.reregister();
     }
 
     /// Flow-control handler — fires when `buffered_amount` drops at or below
     /// the threshold set by [`set_buffered_amount_low_threshold`](Self::set_buffered_amount_low_threshold).
-    pub fn on_buffered_amount_low(&mut self, cb: impl FnMut() + Send + 'static) {
-        self.observer
-            .get_or_insert_with(Default::default)
-            .on_buffered_amount_low = Some(Mutex::new(Box::new(cb)));
+    ///
+    /// Like libwebrtc's, it never fires from inside [`send`](Self::send), so
+    /// it may call `send` to refill. On a chunked channel it is checked when
+    /// libwebrtc's buffer falls to the queue's low-water mark.
+    pub fn on_buffered_amount_low(&self, cb: impl FnMut() + Send + 'static) {
+        self.core.on_buffered_amount_low.set(Box::new(cb));
         self.reregister();
     }
 
-    fn reregister(&mut self) {
-        if let Some(state) = &self.observer {
-            let ud = &**state as *const DcObserverState as *mut c_void;
-            unsafe {
-                reactor_webrtc_sys::reactor_webrtc_data_channel_register_observer(
-                    self.raw,
-                    ud,
-                    dc_on_message,
-                    dc_on_state_change,
-                    dc_on_buffered_amount_low,
-                );
-            }
-        }
+    // The native observer is registered once, by whichever comes first: a
+    // setter, or a chunked channel deciding. It addresses the channel's core
+    // and every callback reads its slot when it fires, so a later setter only
+    // swaps the slot. Re-registering would wait on the signaling thread, which
+    // runs the callbacks: a setter called from a callback while another
+    // thread re-registered deadlocked.
+    fn reregister(&self) {
+        self.core.ensure_registered();
     }
 }
 
 impl Drop for DataChannel {
     fn drop(&mut self) {
-        // Unregisters the native observer before the closure box is freed.
+        // Unregisters the native observer before the core box is freed.
         unsafe { reactor_webrtc_sys::reactor_webrtc_data_channel_destroy(self.raw) }
     }
 }
@@ -1333,6 +1838,17 @@ extern "C" fn complete_cb(ud: *mut c_void, error: *const c_char) {
 
 type StatsTx = SyncSender<StatsReport>;
 
+/// One of [`ReactorStatEntry`]'s fixed string buffers; `None` when empty, which
+/// is how the glue says absent.
+fn stat_str(buf: &[c_char]) -> Option<String> {
+    let bytes: Vec<u8> = buf
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect();
+    (!bytes.is_empty()).then(|| String::from_utf8_lossy(&bytes).into_owned())
+}
+
 extern "C" fn stats_cb(ud: *mut c_void, entries: *const ReactorStatEntry, count: c_int) {
     let tx = unsafe { Arc::from_raw(ud as *const StatsTx) };
     let slice = if entries.is_null() || count <= 0 {
@@ -1346,6 +1862,8 @@ extern "C" fn stats_cb(ud: *mut c_void, entries: *const ReactorStatEntry, count:
             0 => report.inbound_rtp.push(InboundRtpStats {
                 ssrc: e.ssrc,
                 kind: StreamKind::from_raw(e.stream_kind),
+                mid: stat_str(&e.mid),
+                codec_mime_type: stat_str(&e.codec_mime_type),
                 packets_received: e.packets_received,
                 bytes_received: e.bytes_received,
                 jitter_s: e.jitter,
@@ -1361,6 +1879,7 @@ extern "C" fn stats_cb(ud: *mut c_void, entries: *const ReactorStatEntry, count:
                 frame_height: e.frame_height,
                 jitter_buffer_delay_s: e.jitter_buffer_delay,
                 jitter_buffer_target_delay_s: e.jitter_buffer_target_delay,
+                jitter_buffer_minimum_delay_s: e.jitter_buffer_minimum_delay,
                 jitter_buffer_emitted_count: e.jitter_buffer_emitted_count,
                 total_processing_delay_s: e.total_processing_delay,
                 timing_frame: (e.timing_frame_present != 0).then_some(TimingFrameInfo {
@@ -1382,6 +1901,8 @@ extern "C" fn stats_cb(ud: *mut c_void, entries: *const ReactorStatEntry, count:
             1 => report.outbound_rtp.push(OutboundRtpStats {
                 ssrc: e.ssrc,
                 kind: StreamKind::from_raw(e.stream_kind),
+                mid: stat_str(&e.mid),
+                codec_mime_type: stat_str(&e.codec_mime_type),
                 packets_sent: e.packets_sent,
                 bytes_sent: e.bytes_sent,
                 target_bitrate_bps: e.target_bitrate,
@@ -1495,6 +2016,10 @@ pub struct PeerConnection {
     // built before the capability existed: nothing is advertised, nothing is
     // mirrored, the gate never opens and no transform is installed.
     frame_metadata_enabled: bool,
+    // The factory's DcChunking (unless RtcConfiguration::dc_chunking opted
+    // this connection out) and, once negotiated, the peer's parameters.
+    // Shared with the observer and every data channel.
+    dc_negotiation: Arc<crate::dc_chunking::DcNegotiation>,
 }
 
 // SAFETY: the native peer connection is internally thread-safe; observer
@@ -1508,6 +2033,7 @@ impl PeerConnection {
         observer: Box<ObserverState>,
         factory: Arc<FactoryHandle>,
         frame_metadata_enabled: bool,
+        dc_negotiation: Arc<crate::dc_chunking::DcNegotiation>,
     ) -> Self {
         Self {
             raw,
@@ -1515,7 +2041,24 @@ impl PeerConnection {
             _factory: factory,
             frame_metadata_gate: crate::metadata::FrameMetadataGate::new(),
             frame_metadata_enabled,
+            dc_negotiation,
         }
+    }
+
+    /// The chunking settings this connection takes part with: its factory's
+    /// [`DcChunking`](crate::DcChunking), or `None` when the factory does not
+    /// enable chunking or this connection opted out. A channel is only
+    /// chunked when the peer declares chunking too.
+    pub fn dc_chunking(&self) -> Option<&crate::DcChunking> {
+        self.dc_negotiation.settings()
+    }
+
+    /// Whether chunking was negotiated: this connection takes part, and the
+    /// first offer/answer round to complete declared it on both sides. Fixed
+    /// from then on; a later renegotiation neither adds nor drops it. Each
+    /// channel still decides for itself: see [`DataChannel::is_chunked`].
+    pub fn dc_chunking_negotiated(&self) -> bool {
+        self.dc_negotiation.remote().is_some()
     }
 
     // ── Signaling (blocking on the native callback) ──────────────────────────
@@ -1536,10 +2079,13 @@ impl PeerConnection {
                 self.raw, ud, sdp_ok, sdp_err,
             )
         })?;
-        if !self.frame_metadata_enabled {
-            return Ok(offer);
-        }
-        Ok(offer.with_frame_metadata())
+        let offer = if self.frame_metadata_enabled {
+            offer.with_frame_metadata()
+        } else {
+            offer
+        };
+        // Declared whenever this connection takes part in chunking.
+        Ok(self.dc_negotiation.offer(offer))
     }
 
     /// Create an answer.
@@ -1559,10 +2105,14 @@ impl PeerConnection {
         })?;
         // The gate is only ever armed when the flag is on, so this covers both "the
         // offer did not ask" and "this connection does not take part".
-        if self.frame_metadata_gate.is_open() {
-            return Ok(answer.with_frame_metadata());
-        }
-        Ok(answer)
+        let answer = if self.frame_metadata_gate.is_open() {
+            answer.with_frame_metadata()
+        } else {
+            answer
+        };
+        // Mirrors the offer: declared only when the offer declared chunking
+        // and this connection takes part.
+        Ok(self.dc_negotiation.answer(answer))
     }
 
     /// Apply the local description.
@@ -1577,6 +2127,7 @@ impl PeerConnection {
     /// which role it is playing.
     pub fn set_local_description(&self, sdp: &SessionDescription) -> Result<()> {
         self.set_description(sdp, true)?;
+        self.dc_negotiation.on_local_description(sdp);
         self.install_frame_metadata_transforms();
         self.lock_negotiated_send_codecs();
         Ok(())
@@ -1600,6 +2151,7 @@ impl PeerConnection {
         // capability and never installs a transform.
         self.frame_metadata_gate
             .set(self.frame_metadata_enabled && sdp.declares_frame_metadata());
+        self.dc_negotiation.on_remote_description(sdp);
         self.install_frame_metadata_transforms();
         self.lock_negotiated_send_codecs();
         Ok(())
@@ -1857,7 +2409,8 @@ impl PeerConnection {
         if raw.is_null() {
             Err(Error::Webrtc("create_data_channel returned null".into()))
         } else {
-            Ok(DataChannel::from_raw(raw, Arc::clone(&self._factory)))
+            Ok(DataChannel::from_raw(raw, Arc::clone(&self._factory))
+                .with_dc_negotiation(Arc::clone(&self.dc_negotiation)))
         }
     }
 

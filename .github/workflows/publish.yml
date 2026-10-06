@@ -1,12 +1,13 @@
 name: Publish
 
 # Triggered automatically on every push to main. reactor-webrtc-sys,
-# reactor-webrtc, and reactor-webrtc-py are released in lockstep — always the
+# reactor-webrtc-dc-chunking, reactor-webrtc, and reactor-webrtc-py are
+# released in lockstep — always the
 # same version, set once in [workspace.package].version (root Cargo.toml) —
 # so `detect-versions` only needs to diff that one field against the
 # previous commit to know whether this push is a release.
 #
-# The single release tag (vX.Y.Z, covering all three) is created only at the
+# The single release tag (vX.Y.Z, covering all of them) is created only at the
 # very end of the chain, in publish-python, and only once crates.io + PyPI
 # have both actually succeeded — so a tag existing always means the full
 # release is really out, never a partial one.
@@ -106,6 +107,7 @@ jobs:
 
       # Exchange the GitHub OIDC JWT for a short-lived crates.io publish token.
       # Set up at: https://crates.io/crates/reactor-webrtc-sys/settings/trusted-publishing
+      #            https://crates.io/crates/reactor-webrtc-dc-chunking/settings/trusted-publishing
       #            https://crates.io/crates/reactor-webrtc/settings/trusted-publishing
       # Publisher: reactor-team/reactor-webrtc, workflow: publish.yml, environment: crates-io
       - name: Authenticate to crates.io
@@ -113,7 +115,8 @@ jobs:
         id: auth
         uses: rust-lang/crates-io-auth-action@v1
 
-      # Publish sys first (webrtc depends on it), then webrtc. Each step
+      # Publish sys and dc-chunking first (webrtc depends on both), then
+      # webrtc. Each step
       # queries crates.io first and skips if the version is already
       # published — safe to re-run and handles partial-release recovery
       # (crates.io has no cross-package transaction, so a prior run can fail
@@ -130,6 +133,8 @@ jobs:
 
           SYS_VER=$(cargo metadata --no-deps --format-version 1 \
             | jq -r '.packages[] | select(.name=="reactor-webrtc-sys") | .version')
+          DCC_VER=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name=="reactor-webrtc-dc-chunking") | .version')
           WRT_VER=$(cargo metadata --no-deps --format-version 1 \
             | jq -r '.packages[] | select(.name=="reactor-webrtc") | .version')
 
@@ -137,6 +142,14 @@ jobs:
             echo "::notice::reactor-webrtc-sys@${SYS_VER} already on crates.io — skipping"
           else
             cargo publish -p reactor-webrtc-sys --no-verify --allow-dirty
+            echo "Waiting 45 s for crates.io index…"
+            sleep 45
+          fi
+
+          if already_published reactor-webrtc-dc-chunking "$DCC_VER"; then
+            echo "::notice::reactor-webrtc-dc-chunking@${DCC_VER} already on crates.io — skipping"
+          else
+            cargo publish -p reactor-webrtc-dc-chunking --no-verify --allow-dirty
             echo "Waiting 45 s for crates.io index…"
             sleep 45
           fi
@@ -153,8 +166,9 @@ jobs:
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
         run: |
           echo "DRY RUN — would publish:"
-          cargo package -p reactor-webrtc-sys --no-verify --list
-          cargo package -p reactor-webrtc      --no-verify --list
+          cargo package -p reactor-webrtc-sys         --no-verify --list
+          cargo package -p reactor-webrtc-dc-chunking --no-verify --list
+          cargo package -p reactor-webrtc             --no-verify --list
 
   # ── 2. Python wheels → PyPI ─────────────────────────────────────────────
   # Dependency chain for the wheel build: reactor-webrtc-py → reactor-webrtc
@@ -345,7 +359,7 @@ jobs:
       # last stage in the chain — after crates.io (needs.publish-crates ==
       # success, checked above) and PyPI (this job reaching this step at
       # all) have both actually shipped. A tag existing always means the
-      # full release — all three packages — is really out, never a partial
+      # full release — every package — is really out, never a partial
       # one. Manual workflow_dispatch runs (dry run or real recovery
       # publish) never create tags.
       - name: Tag release
