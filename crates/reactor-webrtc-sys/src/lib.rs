@@ -345,6 +345,36 @@ pub struct ReactorStatEntry {
     pub jitter_buffer_minimum_delay: f64,
     /// Inbound (kind 0): frames that have left the jitter buffer.
     pub jitter_buffer_emitted_count: u64,
+    /// cumulative encode time in seconds (kind 1), over `frames_encoded`
+    pub total_encode_time: f64,
+    /// cumulative time packets waited in the pacer, in seconds (kind 1),
+    /// summed over packets rather than frames
+    pub total_packet_send_delay: f64,
+    /// cumulative receive-to-decoded delay in seconds (kind 0), over
+    /// `frames_decoded`
+    pub total_processing_delay: f64,
+    /// frames encoded (kind 1)
+    pub frames_encoded: u32,
+    /// RTP timestamp of the timing frame, to tell one sample from the next
+    pub timing_frame_rtp_timestamp: u32,
+    /// 1 if the `timing_*` fields hold a timing frame (kind 0, video): the one
+    /// that took longest in the last second
+    pub timing_frame_present: u8,
+    /// 1 if the timing frame was marked for its size
+    pub timing_is_outlier: u8,
+    /// 1 if the timing frame was marked by the periodic timer
+    pub timing_is_timer_triggered: u8,
+    /// Timing frame stamps in milliseconds, on our clock. Only differences
+    /// within one side's stamps are exact. Five bytes of padding precede them.
+    pub timing_capture_ms: i64,
+    pub timing_encode_start_ms: i64,
+    pub timing_encode_finish_ms: i64,
+    pub timing_packetization_finish_ms: i64,
+    pub timing_pacer_exit_ms: i64,
+    pub timing_receive_start_ms: i64,
+    pub timing_receive_finish_ms: i64,
+    pub timing_decode_start_ms: i64,
+    pub timing_decode_finish_ms: i64,
 }
 
 // The other half of the layout guard in
@@ -358,7 +388,7 @@ pub struct ReactorStatEntry {
 // with their neighbours are pinned too, on both sides.
 const _: () = {
     assert!(
-        core::mem::size_of::<ReactorStatEntry>() == 296,
+        core::mem::size_of::<ReactorStatEntry>() == 408,
         "ReactorStatEntry changed size — update the C struct in \
          glue/reactor_webrtc.cpp and both assertions"
     );
@@ -398,6 +428,22 @@ const _: () = {
     assert!(
         core::mem::offset_of!(ReactorStatEntry, jitter_buffer_minimum_delay) == 280,
         "the jitter buffer delays moved — see above"
+    );
+    assert!(
+        core::mem::offset_of!(ReactorStatEntry, total_encode_time) == 296,
+        "the per-stage totals moved — see above"
+    );
+    assert!(
+        core::mem::offset_of!(ReactorStatEntry, frames_encoded) == 320,
+        "the per-stage totals moved — see above"
+    );
+    assert!(
+        core::mem::offset_of!(ReactorStatEntry, timing_frame_present) == 328,
+        "the timing frame fields moved — see above"
+    );
+    assert!(
+        core::mem::offset_of!(ReactorStatEntry, timing_capture_ms) == 336,
+        "the timing frame stamps moved — see above"
     );
 };
 

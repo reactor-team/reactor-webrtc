@@ -205,6 +205,37 @@ struct ReactorStatEntry {
   double   jitter_buffer_target_delay;
   double   jitter_buffer_minimum_delay;
   uint64_t jitter_buffer_emitted_count;
+  // Where the rest of the time goes per stage, as cumulative totals: a reader
+  // divides the change in a total by the change in its count to get the
+  // average over an interval. Encode and the pacer are on the send side
+  // (kind 1); processing delay on the receive side (kind 0).
+  double   total_encode_time;          // seconds, kind 1, over frames_encoded
+  // Time packets waited in the pacer before going out, summed over packets,
+  // not frames: divide by packets_sent.
+  double   total_packet_send_delay;    // seconds, kind 1
+  // Receive to decode finished, summed over decoded frames.
+  double   total_processing_delay;     // seconds, kind 0, over frames_decoded
+  uint32_t frames_encoded;             // kind 1
+  // A timing frame (kind 0, video): one frame libwebrtc stamped at each
+  // stage, carried in the video-timing RTP header extension and reported as
+  // goog_timing_frame_info — the one that took longest in the last second.
+  // The stamps are on our clock, the sender's moved onto it by an estimated
+  // clock offset, so only differences within one side's stamps are exact. All
+  // zero when timing_frame_present is 0.
+  uint32_t timing_frame_rtp_timestamp; // tells one sample from the next
+  uint8_t  timing_frame_present;       // 0/1
+  uint8_t  timing_is_outlier;          // 0/1: marked for its size
+  uint8_t  timing_is_timer_triggered;  // 0/1: marked by the periodic timer
+  // Five bytes of padding here, so the stamps below start 8-byte aligned.
+  int64_t  timing_capture_ms;
+  int64_t  timing_encode_start_ms;
+  int64_t  timing_encode_finish_ms;
+  int64_t  timing_packetization_finish_ms;
+  int64_t  timing_pacer_exit_ms;
+  int64_t  timing_receive_start_ms;
+  int64_t  timing_receive_finish_ms;
+  int64_t  timing_decode_start_ms;
+  int64_t  timing_decode_finish_ms;
 };
 
 // The layout guard, and the reason it is a size and not a comment: this struct
@@ -216,7 +247,7 @@ struct ReactorStatEntry {
 //
 // The Rust side carries the same assertion against the same number. If you are
 // here because one of them failed: you changed the struct on one side only.
-static_assert(sizeof(struct ReactorStatEntry) == 296,
+static_assert(sizeof(struct ReactorStatEntry) == 408,
               "ReactorStatEntry changed size — update the repr(C) mirror in "
               "reactor-webrtc-sys/src/lib.rs and both assertions");
 static_assert(offsetof(struct ReactorStatEntry, bytes_received) == 72,
@@ -244,6 +275,16 @@ static_assert(offsetof(struct ReactorStatEntry, jitter_buffer_target_delay) == 2
               "the jitter buffer delays moved — see above");
 static_assert(offsetof(struct ReactorStatEntry, jitter_buffer_minimum_delay) == 280,
               "the jitter buffer delays moved — see above");
+// The per-stage totals and the timing frame stamps are runs of same-width
+// fields too, so the start of each run is pinned the same way.
+static_assert(offsetof(struct ReactorStatEntry, total_encode_time) == 296,
+              "the per-stage totals moved — see above");
+static_assert(offsetof(struct ReactorStatEntry, frames_encoded) == 320,
+              "the per-stage totals moved — see above");
+static_assert(offsetof(struct ReactorStatEntry, timing_frame_present) == 328,
+              "the timing frame fields moved — see above");
+static_assert(offsetof(struct ReactorStatEntry, timing_capture_ms) == 336,
+              "the timing frame stamps moved — see above");
 
 // PeerConnectionObserver events, forwarded to the safe crate. Any pointer may
 // be null (the field is `Option<extern "C" fn>` on the Rust side).
@@ -949,6 +990,45 @@ static int parse_stream_kind(const S& m) {
   return -1;
 }
 
+// Parse RTCInboundRtpStreamStats::goog_timing_frame_info into the timing_*
+// fields. libwebrtc only reports it as the string TimingFrameInfo::ToString()
+// writes: fifteen comma-separated integers, in this order —
+//   rtp_timestamp, capture_time, encode_start, encode_finish,
+//   packetization_finish, pacer_exit, network_timestamp, network2_timestamp,
+//   receive_start, receive_finish, decode_start, decode_finish, render_time,
+//   is_outlier, is_timer_triggered
+// Anything that doesn't parse leaves the entry's timing fields at zero with
+// timing_frame_present 0, so a format change shows up as "no timing frame"
+// rather than as numbers read from the wrong column.
+static void parse_timing_frame_info(const std::string& s, ReactorStatEntry& e) {
+  constexpr size_t kFields = 15;
+  int64_t v[kFields];
+  size_t n = 0;
+  const char* p = s.c_str();
+  while (n < kFields) {
+    char* end = nullptr;
+    const long long x = std::strtoll(p, &end, 10);
+    if (end == p) return;
+    v[n++] = static_cast<int64_t>(x);
+    if (*end != ',') break;
+    p = end + 1;
+  }
+  if (n != kFields) return;
+  e.timing_frame_present           = 1;
+  e.timing_frame_rtp_timestamp     = static_cast<uint32_t>(v[0]);
+  e.timing_is_outlier              = v[13] != 0;
+  e.timing_is_timer_triggered      = v[14] != 0;
+  e.timing_capture_ms              = v[1];
+  e.timing_encode_start_ms         = v[2];
+  e.timing_encode_finish_ms        = v[3];
+  e.timing_packetization_finish_ms = v[4];
+  e.timing_pacer_exit_ms           = v[5];
+  e.timing_receive_start_ms        = v[8];
+  e.timing_receive_finish_ms       = v[9];
+  e.timing_decode_start_ms         = v[10];
+  e.timing_decode_finish_ms        = v[11];
+}
+
 // Parse RTCIceCandidateStats::candidate_type to
 // ReactorStatEntry::local_candidate_type.
 template <typename S>
@@ -1030,6 +1110,10 @@ class StatsCallback : public webrtc::RTCStatsCollectorCallback {
           e.jitter_buffer_target_delay  = stat_val(s.jitter_buffer_target_delay);
           e.jitter_buffer_minimum_delay = stat_val(s.jitter_buffer_minimum_delay);
           e.jitter_buffer_emitted_count = stat_val(s.jitter_buffer_emitted_count);
+          e.total_processing_delay      = stat_val(s.total_processing_delay);
+          if (s.goog_timing_frame_info) {
+            parse_timing_frame_info(*s.goog_timing_frame_info, e);
+          }
           entries.push_back(e);
         } else if (stats.type() == webrtc::RTCOutboundRtpStreamStats::kType) {
           const auto& s = stats.cast_to<webrtc::RTCOutboundRtpStreamStats>();
@@ -1052,6 +1136,9 @@ class StatsCallback : public webrtc::RTCStatsCollectorCallback {
           e.frames_sent                = stat_val(s.frames_sent);
           e.frame_width                = stat_val(s.frame_width);
           e.frame_height               = stat_val(s.frame_height);
+          e.frames_encoded             = stat_val(s.frames_encoded);
+          e.total_encode_time          = stat_val(s.total_encode_time);
+          e.total_packet_send_delay    = stat_val(s.total_packet_send_delay);
           // round_trip_time was removed from RTCOutboundRtpStreamStats in M7907
           // and the send path's RTT moved to RTCRemoteInboundRtpStreamStats —
           // the receiver's report about us. remote_id points straight at it, so

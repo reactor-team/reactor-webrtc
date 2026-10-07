@@ -1016,6 +1016,12 @@ pub struct InboundRtpStats {
     /// Frames that have left the jitter buffer — the denominator for the three
     /// cumulative delays above.
     pub jitter_buffer_emitted_count: u64,
+    /// Cumulative time from a frame's first packet arriving to it being
+    /// decoded, in seconds, over [`InboundRtpStats::frames_decoded`].
+    pub total_processing_delay_s: f64,
+    /// The slowest timing frame of the last second, or `None` if none arrived
+    /// in it. Video only.
+    pub timing_frame: Option<TimingFrameInfo>,
 }
 
 impl InboundRtpStats {
@@ -1028,6 +1034,64 @@ impl InboundRtpStats {
             )
         })
     }
+}
+
+/// One frame libwebrtc stamped at each stage of its trip, as reported by the
+/// receiver (`goog_timing_frame_info`).
+///
+/// By default the sender marks a frame every 200 ms, plus any frame at least
+/// five times the average size, and carries its stamps in the `video-timing`
+/// RTP header extension, on the last packet of the frame; the receiver adds
+/// its own. It is the only per-frame view of the packetizer and the pacer. Of
+/// the timing frames that arrived in the last second, libwebrtc reports the
+/// one that took longest, so this is the worst recent frame, not a typical
+/// one.
+///
+/// The timestamps come in two groups, by the side that took them. All of them
+/// are on our clock: libwebrtc moves the sender's onto it once it has estimated
+/// the offset between the two clocks, and until then reports them as negative
+/// values that are still right relative to each other. So differences within
+/// one group are times: `sender.encode_finish_ms - sender.encode_start_ms` is
+/// encode time, `receiver.decode_start_ms - receiver.receive_finish_ms` is how
+/// long the frame waited in the jitter buffer. A difference across the two
+/// groups, such as `receiver.receive_start_ms - sender.pacer_exit_ms`, is only
+/// an estimate, off by the error in the clock offset, and meaningless while
+/// the sender stamps are negative.
+///
+/// The same frame can be reported by several consecutive reads; compare
+/// [`TimingFrameInfo::rtp_timestamp`] to tell a new sample from a repeat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimingFrameInfo {
+    pub rtp_timestamp: u32,
+    /// The sender marked this frame for its size.
+    pub is_outlier: bool,
+    /// The sender marked this frame because the periodic timer was due.
+    pub is_timer_triggered: bool,
+    pub sender: TimingFrameSenderTimestamps,
+    pub receiver: TimingFrameReceiverTimestamps,
+}
+
+/// The timestamps the sender took for a [`TimingFrameInfo`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimingFrameSenderTimestamps {
+    /// When the frame was captured (pushed into the track):
+    /// `encode_start_ms - capture_ms` is how long it waited for the encoder.
+    pub capture_ms: i64,
+    pub encode_start_ms: i64,
+    pub encode_finish_ms: i64,
+    /// When the encoded frame had been cut into packets and handed to the pacer.
+    pub packetization_finish_ms: i64,
+    /// When the pacer sent the frame's last packet.
+    pub pacer_exit_ms: i64,
+}
+
+/// The timestamps the receiver (this side) took for a [`TimingFrameInfo`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimingFrameReceiverTimestamps {
+    pub receive_start_ms: i64,
+    pub receive_finish_ms: i64,
+    pub decode_start_ms: i64,
+    pub decode_finish_ms: i64,
 }
 
 /// `RTCOutboundRtpStreamStats` subset.
@@ -1095,6 +1159,14 @@ pub struct OutboundRtpStats {
     /// Encoded frame size; `0` for audio, and before the first frame.
     pub frame_width: u32,
     pub frame_height: u32,
+    pub frames_encoded: u32,
+    /// Cumulative encode time in seconds, over
+    /// [`OutboundRtpStats::frames_encoded`].
+    pub total_encode_time_s: f64,
+    /// Cumulative time packets waited in the pacer before being sent, in
+    /// seconds. Summed over packets, not frames: divide by
+    /// [`OutboundRtpStats::packets_sent`].
+    pub total_packet_send_delay_s: f64,
 }
 
 /// `RTCIceCandidatePairStats` subset.
@@ -1819,6 +1891,25 @@ extern "C" fn stats_cb(ud: *mut c_void, entries: *const ReactorStatEntry, count:
                 jitter_buffer_target_delay_s: e.jitter_buffer_target_delay,
                 jitter_buffer_minimum_delay_s: e.jitter_buffer_minimum_delay,
                 jitter_buffer_emitted_count: e.jitter_buffer_emitted_count,
+                total_processing_delay_s: e.total_processing_delay,
+                timing_frame: (e.timing_frame_present != 0).then_some(TimingFrameInfo {
+                    rtp_timestamp: e.timing_frame_rtp_timestamp,
+                    is_outlier: e.timing_is_outlier != 0,
+                    is_timer_triggered: e.timing_is_timer_triggered != 0,
+                    sender: TimingFrameSenderTimestamps {
+                        capture_ms: e.timing_capture_ms,
+                        encode_start_ms: e.timing_encode_start_ms,
+                        encode_finish_ms: e.timing_encode_finish_ms,
+                        packetization_finish_ms: e.timing_packetization_finish_ms,
+                        pacer_exit_ms: e.timing_pacer_exit_ms,
+                    },
+                    receiver: TimingFrameReceiverTimestamps {
+                        receive_start_ms: e.timing_receive_start_ms,
+                        receive_finish_ms: e.timing_receive_finish_ms,
+                        decode_start_ms: e.timing_decode_start_ms,
+                        decode_finish_ms: e.timing_decode_finish_ms,
+                    },
+                }),
             }),
             1 => report.outbound_rtp.push(OutboundRtpStats {
                 ssrc: e.ssrc,
@@ -1840,6 +1931,9 @@ extern "C" fn stats_cb(ud: *mut c_void, entries: *const ReactorStatEntry, count:
                 frames_sent: e.frames_sent,
                 frame_width: e.frame_width,
                 frame_height: e.frame_height,
+                frames_encoded: e.frames_encoded,
+                total_encode_time_s: e.total_encode_time,
+                total_packet_send_delay_s: e.total_packet_send_delay,
             }),
             2 => report.candidate_pairs.push(IceCandidatePairStats {
                 current_round_trip_time_s: e.current_round_trip_time,

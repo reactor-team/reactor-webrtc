@@ -6,6 +6,7 @@ All tests require the module to be built (`maturin develop`).  Run with:
 """
 
 import asyncio
+import math
 import threading
 import time
 from dataclasses import dataclass, field
@@ -529,6 +530,61 @@ class TestStats:
         assert s.packets_received >= 0
         assert s.bytes_received >= 0
         assert s.jitter_s >= 0.0
+
+    async def test_video_stats_report_per_stage_latency(self, factory):
+        """Video stats carry the per-stage totals and a timing frame."""
+        recv_track_ref: list = []  # keeps the Track alive — Drop removes the sink
+
+        def on_track(kind, track):
+            if kind == rw.MediaKind.Video:
+                recv_track_ref.append(track)
+                track.on_video_frame(lambda *_: None)
+
+        p1 = make_peer(factory)
+        p2 = make_peer(factory, on_track=on_track)
+        video = factory.create_video_track("latency-video")
+        tx = p1.pc.add_transceiver(rw.MediaKind.Video, rw.TransceiverDirection.SendOnly)
+        await tx.set_track(video)
+        ok = await connect(p1, p2)
+        assert ok, "peers did not connect within timeout"
+
+        # Keep sending until the receiver reports a timing frame and 30 frames
+        # have gone through both ends (or give up after ~15 s). The first frame
+        # is often a timing frame already, and a single small frame on
+        # loopback can total a zero wait and a zero processing time.
+        inbound = outbound = None
+        for i in range(450):
+            bgra = bytes([(i * 7) % 256]) * (320 * 240 * 4)
+            video.push_video_frame(bgra, 320, 240)
+            await asyncio.sleep(0.033)
+            if i % 15 == 0:
+                recv = await p2.pc.get_stats()
+                sent = await p1.pc.get_stats()
+                inbound = next((s for s in recv.inbound_rtp if s.kind == rw.StreamKind.Video), None)
+                outbound = next((s for s in sent.outbound_rtp if s.kind == rw.StreamKind.Video), None)
+                if (
+                    inbound is not None
+                    and outbound is not None
+                    and inbound.timing_frame is not None
+                    and inbound.frames_decoded >= 30
+                    and outbound.frames_encoded >= 30
+                ):
+                    break
+
+        assert inbound is not None and outbound is not None, "no video stream stats"
+        assert outbound.frames_encoded > 0
+        assert outbound.total_encode_time_s > 0.0
+        assert math.isfinite(outbound.total_packet_send_delay_s)
+        assert inbound.jitter_buffer_emitted_count > 0
+        assert inbound.jitter_buffer_delay_s > 0.0
+        assert inbound.total_processing_delay_s > 0.0
+
+        t = inbound.timing_frame
+        assert t is not None, "no timing frame reported within ~15 s"
+        s, r = t.sender, t.receiver
+        assert s.encode_finish_ms >= s.encode_start_ms >= s.capture_ms
+        assert s.pacer_exit_ms >= s.packetization_finish_ms >= s.encode_finish_ms
+        assert r.decode_finish_ms >= r.decode_start_ms >= r.receive_finish_ms >= r.receive_start_ms
 
 
 # ── Frame metadata ────────────────────────────────────────────────────────────

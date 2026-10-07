@@ -913,6 +913,118 @@ pub struct InboundRtpStats {
     /// Frames that have left the jitter buffer: the denominator for the three
     /// cumulative delays.
     pub jitter_buffer_emitted_count: u64,
+    /// Cumulative first-packet-to-decoded time in seconds, over
+    /// `frames_decoded`.
+    pub total_processing_delay_s: f64,
+    /// The slowest timing frame of the last second, or `None` if none arrived
+    /// in it. Video only.
+    pub timing_frame: Option<TimingFrameInfo>,
+}
+
+/// One frame libwebrtc stamped at each stage of its trip, as the receiver
+/// reports it: of the timing frames in the last second, the one that took
+/// longest. `sender` and `receiver` group the timestamps by the side that
+/// took them; only differences within one group are exact times. Consecutive
+/// reads can report the same frame again; compare `rtp_timestamp`.
+#[pyclass(get_all)]
+#[derive(Clone)]
+pub struct TimingFrameInfo {
+    pub rtp_timestamp: u32,
+    /// The sender marked this frame for its size.
+    pub is_outlier: bool,
+    /// The sender marked this frame because the periodic timer was due.
+    pub is_timer_triggered: bool,
+    pub sender: TimingFrameSenderTimestamps,
+    pub receiver: TimingFrameReceiverTimestamps,
+}
+
+/// The timestamps the sender took for a `TimingFrameInfo`.
+#[pyclass(get_all)]
+#[derive(Clone)]
+pub struct TimingFrameSenderTimestamps {
+    pub capture_ms: i64,
+    pub encode_start_ms: i64,
+    pub encode_finish_ms: i64,
+    pub packetization_finish_ms: i64,
+    pub pacer_exit_ms: i64,
+}
+
+/// The timestamps the receiver (this side) took for a `TimingFrameInfo`.
+#[pyclass(get_all)]
+#[derive(Clone)]
+pub struct TimingFrameReceiverTimestamps {
+    pub receive_start_ms: i64,
+    pub receive_finish_ms: i64,
+    pub decode_start_ms: i64,
+    pub decode_finish_ms: i64,
+}
+
+#[pymethods]
+impl TimingFrameInfo {
+    fn __repr__(&self) -> String {
+        format!(
+            "TimingFrameInfo(rtp_timestamp={}, is_outlier={}, is_timer_triggered={})",
+            self.rtp_timestamp,
+            if self.is_outlier { "True" } else { "False" },
+            if self.is_timer_triggered {
+                "True"
+            } else {
+                "False"
+            },
+        )
+    }
+}
+
+#[pymethods]
+impl TimingFrameSenderTimestamps {
+    fn __repr__(&self) -> String {
+        format!(
+            "TimingFrameSenderTimestamps(capture_ms={}, encode_start_ms={}, \
+             encode_finish_ms={}, packetization_finish_ms={}, pacer_exit_ms={})",
+            self.capture_ms,
+            self.encode_start_ms,
+            self.encode_finish_ms,
+            self.packetization_finish_ms,
+            self.pacer_exit_ms,
+        )
+    }
+}
+
+#[pymethods]
+impl TimingFrameReceiverTimestamps {
+    fn __repr__(&self) -> String {
+        format!(
+            "TimingFrameReceiverTimestamps(receive_start_ms={}, receive_finish_ms={}, \
+             decode_start_ms={}, decode_finish_ms={})",
+            self.receive_start_ms,
+            self.receive_finish_ms,
+            self.decode_start_ms,
+            self.decode_finish_ms,
+        )
+    }
+}
+
+impl From<rw::TimingFrameInfo> for TimingFrameInfo {
+    fn from(t: rw::TimingFrameInfo) -> Self {
+        Self {
+            rtp_timestamp: t.rtp_timestamp,
+            is_outlier: t.is_outlier,
+            is_timer_triggered: t.is_timer_triggered,
+            sender: TimingFrameSenderTimestamps {
+                capture_ms: t.sender.capture_ms,
+                encode_start_ms: t.sender.encode_start_ms,
+                encode_finish_ms: t.sender.encode_finish_ms,
+                packetization_finish_ms: t.sender.packetization_finish_ms,
+                pacer_exit_ms: t.sender.pacer_exit_ms,
+            },
+            receiver: TimingFrameReceiverTimestamps {
+                receive_start_ms: t.receiver.receive_start_ms,
+                receive_finish_ms: t.receiver.receive_finish_ms,
+                decode_start_ms: t.receiver.decode_start_ms,
+                decode_finish_ms: t.receiver.decode_finish_ms,
+            },
+        }
+    }
 }
 
 #[pymethods]
@@ -957,6 +1069,8 @@ impl From<rw::InboundRtpStats> for InboundRtpStats {
             jitter_buffer_target_delay_s: s.jitter_buffer_target_delay_s,
             jitter_buffer_minimum_delay_s: s.jitter_buffer_minimum_delay_s,
             jitter_buffer_emitted_count: s.jitter_buffer_emitted_count,
+            total_processing_delay_s: s.total_processing_delay_s,
+            timing_frame: s.timing_frame.map(TimingFrameInfo::from),
         }
     }
 }
@@ -1009,6 +1123,12 @@ pub struct OutboundRtpStats {
     /// Encoded frame size; `0` for audio, and before the first frame.
     pub frame_width: u32,
     pub frame_height: u32,
+    pub frames_encoded: u32,
+    /// Cumulative encode time in seconds, over `frames_encoded`.
+    pub total_encode_time_s: f64,
+    /// Cumulative time packets waited in the pacer, in seconds. Summed over
+    /// packets, not frames: divide by `packets_sent`.
+    pub total_packet_send_delay_s: f64,
 }
 
 #[pymethods]
@@ -1040,6 +1160,9 @@ impl From<rw::OutboundRtpStats> for OutboundRtpStats {
             frames_sent: s.frames_sent,
             frame_width: s.frame_width,
             frame_height: s.frame_height,
+            frames_encoded: s.frames_encoded,
+            total_encode_time_s: s.total_encode_time_s,
+            total_packet_send_delay_s: s.total_packet_send_delay_s,
         }
     }
 }
@@ -3264,6 +3387,9 @@ fn reactor_webrtc(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<IceCandidateType>()?;
     m.add_class::<RelayProtocol>()?;
     m.add_class::<InboundRtpStats>()?;
+    m.add_class::<TimingFrameInfo>()?;
+    m.add_class::<TimingFrameSenderTimestamps>()?;
+    m.add_class::<TimingFrameReceiverTimestamps>()?;
     m.add_class::<OutboundRtpStats>()?;
     m.add_class::<IceCandidatePairStats>()?;
     m.add_class::<StatsReport>()?;

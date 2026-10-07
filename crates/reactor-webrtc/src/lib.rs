@@ -82,7 +82,8 @@ pub use peer_connection::{
     DataChannel, DataChannelState, IceCandidate, IceCandidatePairState, IceCandidatePairStats,
     IceCandidateType, IceGatheringState, InboundRtpStats, OutboundRtpStats, PeerConnection,
     PeerConnectionState, RelayProtocol, SdpType, SessionDescription, StatsReport, StreamKind,
-    Transceiver, TransceiverDirection,
+    TimingFrameInfo, TimingFrameReceiverTimestamps, TimingFrameSenderTimestamps, Transceiver,
+    TransceiverDirection,
 };
 pub use playout::PlayoutDelay;
 /// Runtime download/verification/caching of Cisco's OpenH264 shared library,

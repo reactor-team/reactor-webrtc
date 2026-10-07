@@ -247,11 +247,52 @@ class InboundRtpStats:
     jitter_buffer_minimum_delay_s: float
     #: Frames that have left the jitter buffer; the three delays' denominator.
     jitter_buffer_emitted_count: int
+    #: Cumulative first-packet-to-decoded seconds, over frames_decoded.
+    total_processing_delay_s: float
+    #: The slowest timing frame of the last second, or None if none arrived in
+    #: it. Video only.
+    timing_frame: Optional[TimingFrameInfo]
     @property
     def average_jitter_buffer_delay_s(self) -> Optional[float]:
         """Average seconds a frame spent in the jitter buffer; None before the
         first one left it."""
         ...
+
+class TimingFrameInfo:
+    """One frame stamped at each stage of its trip, as the receiver reports it.
+
+    Of the timing frames in the last second, it is the one that took longest.
+    ``sender`` and ``receiver`` group the timestamps by the side that took
+    them; only differences within one group are exact times. Consecutive reads
+    can report the same frame again; compare ``rtp_timestamp``.
+    """
+
+    rtp_timestamp: int
+    #: The sender marked this frame for its size.
+    is_outlier: bool
+    #: The sender marked this frame because the periodic timer was due.
+    is_timer_triggered: bool
+    sender: TimingFrameSenderTimestamps
+    receiver: TimingFrameReceiverTimestamps
+
+class TimingFrameSenderTimestamps:
+    """The timestamps the sender took for a TimingFrameInfo."""
+
+    #: When the frame was pushed into the track; encode_start_ms minus this is
+    #: how long it waited for the encoder.
+    capture_ms: int
+    encode_start_ms: int
+    encode_finish_ms: int
+    packetization_finish_ms: int
+    pacer_exit_ms: int
+
+class TimingFrameReceiverTimestamps:
+    """The timestamps the receiver (this side) took for a TimingFrameInfo."""
+
+    receive_start_ms: int
+    receive_finish_ms: int
+    decode_start_ms: int
+    decode_finish_ms: int
 
 class OutboundRtpStats:
     ssrc: int
@@ -279,6 +320,11 @@ class OutboundRtpStats:
     frames_sent: int
     frame_width: int
     frame_height: int
+    frames_encoded: int
+    #: Cumulative encode seconds, over frames_encoded.
+    total_encode_time_s: float
+    #: Cumulative seconds packets waited in the pacer; per packet, not per frame.
+    total_packet_send_delay_s: float
 
 class IceCandidatePairStats:
     current_round_trip_time_s: float
