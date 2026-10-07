@@ -1,15 +1,14 @@
 diff --git a/rtc_base/async_udp_socket.cc b/rtc_base/async_udp_socket.cc
-index b8f00addc0..83b27b31fa 100644
+index b8f00addc0..7d456b3fb6 100644
 --- a/rtc_base/async_udp_socket.cc
 +++ b/rtc_base/async_udp_socket.cc
-@@ -147,10 +147,28 @@ void AsyncUDPSocket::OnConnectEvent(Socket* socket) {
+@@ -147,10 +147,27 @@ void AsyncUDPSocket::OnConnectEvent(Socket* socket) {
  void AsyncUDPSocket::OnReadEvent(Socket* socket) {
    RTC_DCHECK(socket_.get() == socket);
    RTC_DCHECK_RUN_ON(&sequence_checker_);
 +  // Reactor: read up to kMaxReadsPerEvent datagrams per event instead of one,
 +  // so a burst (a data channel message is ~90 packets) costs one wakeup per
-+  // batch rather than per packet, and the replies its handlers send (SACKs)
-+  // share a ScopedUdpSendBatch. A handler may destroy this socket, so stop
++  // batch rather than per packet. A handler may destroy this socket, so stop
 +  // as soon as it is gone.
 +  std::weak_ptr<int> alive = alive_;
 +  for (int i = 0; i < kMaxReadsPerEvent; ++i) {
@@ -31,7 +30,7 @@ index b8f00addc0..83b27b31fa 100644
      // An error here typically means we got an ICMP error in response to our
      // send datagram, indicating the remote address was unreachable.
      // When doing ICE, this kind of thing will often happen.
-@@ -158,11 +176,11 @@ void AsyncUDPSocket::OnReadEvent(Socket* socket) {
+@@ -158,11 +175,11 @@ void AsyncUDPSocket::OnReadEvent(Socket* socket) {
      SocketAddress local_addr = socket_->GetLocalAddress();
      RTC_LOG(LS_INFO) << "AsyncUDPSocket[" << local_addr.ToSensitiveString()
                       << "] receive failed with error " << socket_->GetError();
@@ -45,7 +44,7 @@ index b8f00addc0..83b27b31fa 100644
    }
  
    if (!receive_buffer.arrival_time) {
-@@ -184,6 +202,7 @@ void AsyncUDPSocket::OnReadEvent(Socket* socket) {
+@@ -184,6 +201,7 @@ void AsyncUDPSocket::OnReadEvent(Socket* socket) {
    NotifyPacketReceived(
        ReceivedIpPacket(receive_buffer.payload, receive_buffer.source_address,
                         receive_buffer.arrival_time, receive_buffer.ecn));
@@ -79,7 +78,7 @@ index 605b8cdaba..33b1f0986f 100644
    std::optional<TimeDelta> socket_time_offset_
        RTC_GUARDED_BY(sequence_checker_);
 diff --git a/rtc_base/physical_socket_server.cc b/rtc_base/physical_socket_server.cc
-index 9d9927e85b..a3880a5c2b 100644
+index 9d9927e85b..e5b05ce51e 100644
 --- a/rtc_base/physical_socket_server.cc
 +++ b/rtc_base/physical_socket_server.cc
 @@ -201,8 +201,111 @@ class DeadlineTracker {
@@ -253,18 +252,8 @@ index 9d9927e85b..a3880a5c2b 100644
    int err = ::closesocket(s_);
    UpdateLastError();
    s_ = INVALID_SOCKET;
-@@ -1756,6 +1883,9 @@ bool PhysicalSocketServer::WaitEpoll(TimeDelta timeout) {
-     } else {
-       // We have signaled descriptors
-       CritScope cr(&crit_);
-+      // Reactor: sends the handlers make (SACKs, data a SACK released) go out
-+      // together when the round ends.
-+      ScopedUdpSendBatch send_batch;
-       for (int i = 0; i < n; ++i) {
-         const epoll_event& event = epoll_events_[i];
-         uint64_t key = event.data.u64;
 diff --git a/rtc_base/physical_socket_server.h b/rtc_base/physical_socket_server.h
-index d35e8f5706..8dc639e67b 100644
+index d35e8f5706..f95ba44c26 100644
 --- a/rtc_base/physical_socket_server.h
 +++ b/rtc_base/physical_socket_server.h
 @@ -27,6 +27,11 @@
@@ -279,7 +268,7 @@ index d35e8f5706..8dc639e67b 100644
  #elif defined(WEBRTC_FUCHSIA) || defined(WEBRTC_MAC)
  // Fuchsia implements select and poll but not epoll, and testing shows that poll
  // is faster than select.
-@@ -58,6 +63,29 @@ typedef int SOCKET;
+@@ -58,6 +63,32 @@ typedef int SOCKET;
  namespace webrtc {
  
  class Signaler;
@@ -290,9 +279,12 @@ index d35e8f5706..8dc639e67b 100644
 +// sendto(), and the queue goes out with one sendmmsg() per socket when the
 +// outermost scope closes, or as soon as kMaxUdpSendBatch datagrams are queued
 +// so the first of a long burst does not wait for the last. Thread::Dispatch
-+// and each round of socket events open one, so a data channel message, which
-+// leaves as ~1.2 KB SCTP packets, costs one syscall per batch instead of one
-+// per packet. A queued datagram counts as sent: if the flush fails, it is lost
++// opens one around each task, so a data channel message, which leaves as
++// ~1.2 KB SCTP packets, costs one syscall per batch instead of one per packet.
++// Socket events deliberately get none: what an incoming SACK releases leaves
++// at once, as before, so sends stay clocked by the SACKs. Batching those too
++// turned each round's SACKs into one back-to-back burst that overran a
++// receiver with no slower link in between. A queued datagram counts as sent: if the flush fails, it is lost
 +// like any UDP datagram, and a blocking error re-arms the write event as a
 +// failed sendto() would.
 +//
@@ -309,7 +301,7 @@ index d35e8f5706..8dc639e67b 100644
  
  // Event constants for the Dispatcher class.
  enum DispatcherEvent {
-@@ -253,6 +281,27 @@ class PhysicalSocket : public Socket {
+@@ -253,6 +284,27 @@ class PhysicalSocket : public Socket {
  #endif
  
   private:

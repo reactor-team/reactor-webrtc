@@ -282,7 +282,7 @@ again on the next send, as before.
 
 `0008-batch-udp-sends-and-reads.patch` · touches
 `rtc_base/physical_socket_server.{h,cc}`, `rtc_base/thread.cc`,
-`rtc_base/async_udp_socket.{h,cc}` (+219 lines)
+`rtc_base/async_udp_socket.{h,cc}` (+218 lines)
 
 **What.** Two changes, so a data channel message, which leaves as ~1.2 KB SCTP
 packets, stops costing a syscall and a wakeup per packet:
@@ -292,13 +292,18 @@ packets, stops costing a syscall and a wakeup per packet:
   scope is open; they go out with one `sendmmsg()` per socket when the
   outermost scope closes, or as soon as 16 are queued, so the first packet of a
   long burst does not wait for the last. `Thread::Dispatch` opens a scope around
-  every task (a data channel `Send` runs as one) and `WaitEpoll` around every
-  round of socket events (incoming SACKs that release more data, outgoing
-  SACKs). Elsewhere the scope does nothing.
+  every task: a data channel `Send` runs as one, so the packets of a message go
+  out in batches. Elsewhere the scope does nothing.
+- **Not socket events.** What an incoming SACK releases still leaves at once,
+  so sends stay clocked by the SACKs, as upstream. A first version also batched
+  each round of epoll events; that turned the data released by a round's SACKs
+  into one back-to-back burst, which overran a receiver with no slower link in
+  between (loopback): drops in its socket buffer, retransmission timeouts, and
+  1 MB+ messages 2–3× slower. Behind any link of 1 Gbps or less it made no
+  difference.
 - **Reads (all platforms).** `AsyncUDPSocket::OnReadEvent` reads up to 16
   datagrams per read event instead of one, stopping when the socket would
-  block. A burst costs one wakeup per 16 packets, and the SACKs its packets
-  trigger share one send batch.
+  block. A burst costs one wakeup per 16 packets.
 
 **Why.** After 0006 and 0007, one `sendto()` per packet was the largest
 remaining cost of the sender's network thread (21% on Linux, more on macOS),
@@ -320,10 +325,12 @@ nothing above the socket can batch them.
 - The read loop keeps a weak liveness flag, since a packet handler may destroy
   the socket.
 
-**Verify.** The send batch is compiled only on Linux; on macOS 0006–0008 cut the
+**Verify.** The send batch is compiled only on Linux. On macOS 0006–0008 cut the
 SDK's CPU per 100 KB command from ~1.85 to ~1.1 ms and the receiver's time per
-packet from ~35 to ~22 µs, and reactor-webrtc's Rust and Python suites pass. The
-Linux send path is validated on the Linux prebuilts.
+packet from ~35 to ~22 µs. On Linux they halve the time per packet on both
+sides. reactor-webrtc's Rust and Python suites pass on both, and a data channel
+stress run (thousands of messages of 0 B–16 MB on several channels, both
+directions, with integrity and order checks) finds no loss or corruption.
 
 ---
 
