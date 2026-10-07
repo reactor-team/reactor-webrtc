@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.22.0 — where a frame's time goes
+
+libwebrtc already measures how long each video frame spends in each stage on
+both sides of a call, but the stats copy carried only the decode total and
+jitter. A caller who wanted to know whether a slow frame was spent encoding,
+in the pacer, waiting in the jitter buffer or decoding had nothing to read.
+
+Additive. Nothing removed, nothing renamed.
+
+### Added
+
+**Per-stage totals**, in Rust and Python:
+
+- `OutboundRtpStats`: `frames_encoded`, `total_encode_time_s` and
+  `total_packet_send_delay_s` (time in the pacer, summed over packets).
+- `InboundRtpStats`: `total_processing_delay_s` (from the frame's arrival to
+  the end of its decode).
+
+These are cumulative, like `total_decode_time_s`. The average over an interval
+is the change in a total divided by the change in its count; the pacer delay
+divides by `packets_sent`.
+
+**`InboundRtpStats::timing_frame`**, an `Option<TimingFrameInfo>`: one video
+frame stamped at capture, encode start and finish, packetization, pacer exit,
+receive start and finish, and decode start and finish. It is the only
+per-frame view of the capture-to-encode wait, the packetizer and the pacer.
+libwebrtc reports the frame that took longest among those marked in the last
+second (a frame every 200 ms, plus size outliers, told apart by `is_outlier`
+and `is_timer_triggered`), and none when none arrived. The stamps come in two
+groups, `sender` (`TimingFrameSenderTimestamps`) and `receiver`
+(`TimingFrameReceiverTimestamps`); differences within a group are exact, across
+groups only an estimate. It needs the `video-timing` RTP header extension,
+which libwebrtc and Chrome negotiate by default.
+
+[docs/configuration.md](docs/configuration.md) covers how to read all of it.
+
+### Notes
+
+`InboundRtpStats` and `OutboundRtpStats` gain public fields and have no
+`Default`, which is why this is a minor rather than a patch release.
+
+`ReactorStatEntry` grew from 296 to 408 bytes, with the new fields appended and
+their offsets pinned on both the C++ and Rust sides. The glue is compiled from
+source, so no ABI version changed.
+
 ## 0.21.0 — the frame you decoded, sooner
 
 Two things a robot-control client found out the hard way. Per-frame metadata
