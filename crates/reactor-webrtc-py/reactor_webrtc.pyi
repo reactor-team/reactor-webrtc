@@ -261,18 +261,26 @@ class InboundRtpStats:
 class TimingFrameInfo:
     """One frame stamped at each stage of its trip, as the receiver reports it.
 
-    Of the timing frames in the last second, it is the one that took longest. ``sender`` and ``receiver`` group the timestamps by the side that
-    took them; only differences within one group are times. Consecutive reads
+    Of the timing frames in the last second, it is the one that took longest.
+    ``sender`` and ``receiver`` group the timestamps by the side that took
+    them; only differences within one group are exact times. Consecutive reads
     can report the same frame again; compare ``rtp_timestamp``.
     """
 
     rtp_timestamp: int
+    #: The sender marked this frame for its size.
+    is_outlier: bool
+    #: The sender marked this frame because the periodic timer was due.
+    is_timer_triggered: bool
     sender: TimingFrameSenderTimestamps
     receiver: TimingFrameReceiverTimestamps
 
 class TimingFrameSenderTimestamps:
     """The timestamps the sender took for a TimingFrameInfo."""
 
+    #: When the frame was pushed into the track; encode_start_ms minus this is
+    #: how long it waited for the encoder.
+    capture_ms: int
     encode_start_ms: int
     encode_finish_ms: int
     packetization_finish_ms: int

@@ -621,7 +621,7 @@ for s in report.inbound_rtp:
 
 </details>
 
-Six things worth knowing before you read a number off this.
+Seven things worth knowing before you read a number off this.
 
 - **Zero means "not measured yet" far more often than it means zero.** RTT, the
   available-bitrate estimates and `frames_per_second` all start at `0.0` and
@@ -681,11 +681,20 @@ Six things worth knowing before you read a number off this.
   over packets rather than frames, so divide it by `packets_sent`.
 
   `timing_frame` on a video `inbound_rtp` is a single frame libwebrtc stamped at
-  each stage, including the packetizer and the pacer, which no total covers. The
-  sender marks about one a second, and of those that arrived in the last
-  second libwebrtc reports the one that took longest — the worst recent frame,
-  not a typical one; with none in that second, it is absent. Consecutive reads can return the same one again,
-  so compare `rtp_timestamp` before counting it twice. Its stamps come in two
-  groups, `sender` and `receiver`, by the side that took them. Only
-  differences within one group are times, and a difference across the two is
-  not the network.
+  each stage, including the capture-to-encode wait, the packetizer and the
+  pacer, which no total covers. By default the sender marks a frame every
+  200 ms, plus any frame at least five times the average size
+  (`is_outlier`, against `is_timer_triggered`). Of those that arrived in the
+  last second libwebrtc reports the one that took longest — the worst recent
+  frame, not a typical one; with none in that second, it is absent.
+  Consecutive reads can return the same one again, so compare `rtp_timestamp`
+  before counting it twice. Its stamps come in two groups, `sender` and
+  `receiver`, by the side that took them. Only differences within one group
+  are exact times. A difference across the two is only an estimate, off by the
+  error in libwebrtc's clock-offset estimate, and meaningless while the sender
+  stamps are still negative, before that estimate exists.
+
+  `timing_frame` is only filled when both sides negotiate the
+  `http://www.webrtc.org/experiments/rtp-hdrext/video-timing` header
+  extension. libwebrtc and Chrome do by default; against a peer that doesn't,
+  it is always absent.

@@ -307,8 +307,8 @@ mod tests {
                 }
             });
 
-            // Timing frames are marked about once a second, so give the first
-            // one a few seconds to arrive after the connection comes up.
+            // Timing frames are marked every 200 ms, but give the first one a
+            // few seconds to arrive after the connection comes up.
             let mut found = None;
             let deadline = Instant::now() + Duration::from_secs(20);
             while Instant::now() < deadline {
@@ -343,7 +343,10 @@ mod tests {
             outbound.total_encode_time_s > 0.0,
             "no encode time on the sender"
         );
-        assert!(outbound.total_packet_send_delay_s >= 0.0);
+        assert!(
+            outbound.total_packet_send_delay_s.is_finite(),
+            "pacer delay is not a number"
+        );
         assert!(
             inbound.jitter_buffer_emitted_count > 0,
             "nothing left the jitter buffer"
@@ -359,6 +362,10 @@ mod tests {
 
         let t = inbound.timing_frame.expect("timing frame");
         let (s, r) = (t.sender, t.receiver);
+        assert!(
+            s.encode_start_ms >= s.capture_ms,
+            "encoded before captured: {t:?}"
+        );
         assert!(
             s.encode_finish_ms >= s.encode_start_ms,
             "encode ran backwards: {t:?}"

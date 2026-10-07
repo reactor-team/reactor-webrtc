@@ -215,14 +215,19 @@ struct ReactorStatEntry {
   double   total_packet_send_delay;    // seconds, kind 1
   // Receive to decode finished, summed over decoded frames.
   double   total_processing_delay;     // seconds, kind 0, over frames_decoded
-  uint64_t frames_encoded;             // kind 1
+  uint32_t frames_encoded;             // kind 1
   // A timing frame (kind 0, video): one frame libwebrtc stamped at each
   // stage, carried in the video-timing RTP header extension and reported as
   // goog_timing_frame_info — the one that took longest in the last second.
-  // Only differences within one side's stamps mean anything. All zero when
-  // timing_frame_present is 0.
-  uint64_t timing_frame_present;       // 0/1
-  uint64_t timing_frame_rtp_timestamp; // tells one sample from the next
+  // The stamps are on our clock, the sender's moved onto it by an estimated
+  // clock offset, so only differences within one side's stamps are exact. All
+  // zero when timing_frame_present is 0.
+  uint32_t timing_frame_rtp_timestamp; // tells one sample from the next
+  uint8_t  timing_frame_present;       // 0/1
+  uint8_t  timing_is_outlier;          // 0/1: marked for its size
+  uint8_t  timing_is_timer_triggered;  // 0/1: marked by the periodic timer
+  // Five bytes of padding here, so the stamps below start 8-byte aligned.
+  int64_t  timing_capture_ms;
   int64_t  timing_encode_start_ms;
   int64_t  timing_encode_finish_ms;
   int64_t  timing_packetization_finish_ms;
@@ -274,9 +279,11 @@ static_assert(offsetof(struct ReactorStatEntry, jitter_buffer_minimum_delay) == 
 // fields too, so the start of each run is pinned the same way.
 static_assert(offsetof(struct ReactorStatEntry, total_encode_time) == 296,
               "the per-stage totals moved — see above");
+static_assert(offsetof(struct ReactorStatEntry, frames_encoded) == 320,
+              "the per-stage totals moved — see above");
 static_assert(offsetof(struct ReactorStatEntry, timing_frame_present) == 328,
               "the timing frame fields moved — see above");
-static_assert(offsetof(struct ReactorStatEntry, timing_encode_start_ms) == 344,
+static_assert(offsetof(struct ReactorStatEntry, timing_capture_ms) == 336,
               "the timing frame stamps moved — see above");
 
 // PeerConnectionObserver events, forwarded to the safe crate. Any pointer may
@@ -1008,7 +1015,10 @@ static void parse_timing_frame_info(const std::string& s, ReactorStatEntry& e) {
   }
   if (n != kFields) return;
   e.timing_frame_present           = 1;
-  e.timing_frame_rtp_timestamp     = static_cast<uint64_t>(v[0]);
+  e.timing_frame_rtp_timestamp     = static_cast<uint32_t>(v[0]);
+  e.timing_is_outlier              = v[13] != 0;
+  e.timing_is_timer_triggered      = v[14] != 0;
+  e.timing_capture_ms              = v[1];
   e.timing_encode_start_ms         = v[2];
   e.timing_encode_finish_ms        = v[3];
   e.timing_packetization_finish_ms = v[4];

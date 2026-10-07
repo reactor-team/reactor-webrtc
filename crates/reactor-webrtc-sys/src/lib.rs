@@ -354,14 +354,19 @@ pub struct ReactorStatEntry {
     /// `frames_decoded`
     pub total_processing_delay: f64,
     /// frames encoded (kind 1)
-    pub frames_encoded: u64,
+    pub frames_encoded: u32,
+    /// RTP timestamp of the timing frame, to tell one sample from the next
+    pub timing_frame_rtp_timestamp: u32,
     /// 1 if the `timing_*` fields hold a timing frame (kind 0, video): the one
     /// that took longest in the last second
-    pub timing_frame_present: u64,
-    /// RTP timestamp of that timing frame, to tell one sample from the next
-    pub timing_frame_rtp_timestamp: u64,
-    /// Timing frame stamps in milliseconds. Only differences within one side's
-    /// stamps mean anything.
+    pub timing_frame_present: u8,
+    /// 1 if the timing frame was marked for its size
+    pub timing_is_outlier: u8,
+    /// 1 if the timing frame was marked by the periodic timer
+    pub timing_is_timer_triggered: u8,
+    /// Timing frame stamps in milliseconds, on our clock. Only differences
+    /// within one side's stamps are exact. Five bytes of padding precede them.
+    pub timing_capture_ms: i64,
     pub timing_encode_start_ms: i64,
     pub timing_encode_finish_ms: i64,
     pub timing_packetization_finish_ms: i64,
@@ -429,11 +434,15 @@ const _: () = {
         "the per-stage totals moved — see above"
     );
     assert!(
+        core::mem::offset_of!(ReactorStatEntry, frames_encoded) == 320,
+        "the per-stage totals moved — see above"
+    );
+    assert!(
         core::mem::offset_of!(ReactorStatEntry, timing_frame_present) == 328,
         "the timing frame fields moved — see above"
     );
     assert!(
-        core::mem::offset_of!(ReactorStatEntry, timing_encode_start_ms) == 344,
+        core::mem::offset_of!(ReactorStatEntry, timing_capture_ms) == 336,
         "the timing frame stamps moved — see above"
     );
 };

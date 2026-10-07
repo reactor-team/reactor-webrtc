@@ -1039,12 +1039,13 @@ impl InboundRtpStats {
 /// One frame libwebrtc stamped at each stage of its trip, as reported by the
 /// receiver (`goog_timing_frame_info`).
 ///
-/// The sender marks about one frame a second (and any unusually large one) and
-/// carries its stamps in the `video-timing` RTP header extension, on the last
-/// packet of the frame; the receiver adds its own. It is the only per-frame
-/// view of the packetizer and the pacer. Of the timing frames that arrived in
-/// the last second, libwebrtc reports the one that took longest, so this is
-/// the worst recent frame, not a typical one.
+/// By default the sender marks a frame every 200 ms, plus any frame at least
+/// five times the average size, and carries its stamps in the `video-timing`
+/// RTP header extension, on the last packet of the frame; the receiver adds
+/// its own. It is the only per-frame view of the packetizer and the pacer. Of
+/// the timing frames that arrived in the last second, libwebrtc reports the
+/// one that took longest, so this is the worst recent frame, not a typical
+/// one.
 ///
 /// The timestamps come in two groups, by the side that took them. All of them
 /// are on our clock: libwebrtc moves the sender's onto it once it has estimated
@@ -1053,13 +1054,19 @@ impl InboundRtpStats {
 /// one group are times: `sender.encode_finish_ms - sender.encode_start_ms` is
 /// encode time, `receiver.decode_start_ms - receiver.receive_finish_ms` is how
 /// long the frame waited in the jitter buffer. A difference across the two
-/// groups is not a network time.
+/// groups, such as `receiver.receive_start_ms - sender.pacer_exit_ms`, is only
+/// an estimate, off by the error in the clock offset, and meaningless while
+/// the sender stamps are negative.
 ///
 /// The same frame can be reported by several consecutive reads; compare
 /// [`TimingFrameInfo::rtp_timestamp`] to tell a new sample from a repeat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimingFrameInfo {
     pub rtp_timestamp: u32,
+    /// The sender marked this frame for its size.
+    pub is_outlier: bool,
+    /// The sender marked this frame because the periodic timer was due.
+    pub is_timer_triggered: bool,
     pub sender: TimingFrameSenderTimestamps,
     pub receiver: TimingFrameReceiverTimestamps,
 }
@@ -1067,6 +1074,9 @@ pub struct TimingFrameInfo {
 /// The timestamps the sender took for a [`TimingFrameInfo`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimingFrameSenderTimestamps {
+    /// When the frame was captured (pushed into the track):
+    /// `encode_start_ms - capture_ms` is how long it waited for the encoder.
+    pub capture_ms: i64,
     pub encode_start_ms: i64,
     pub encode_finish_ms: i64,
     /// When the encoded frame had been cut into packets and handed to the pacer.
@@ -1883,8 +1893,11 @@ extern "C" fn stats_cb(ud: *mut c_void, entries: *const ReactorStatEntry, count:
                 jitter_buffer_emitted_count: e.jitter_buffer_emitted_count,
                 total_processing_delay_s: e.total_processing_delay,
                 timing_frame: (e.timing_frame_present != 0).then_some(TimingFrameInfo {
-                    rtp_timestamp: e.timing_frame_rtp_timestamp as u32,
+                    rtp_timestamp: e.timing_frame_rtp_timestamp,
+                    is_outlier: e.timing_is_outlier != 0,
+                    is_timer_triggered: e.timing_is_timer_triggered != 0,
                     sender: TimingFrameSenderTimestamps {
+                        capture_ms: e.timing_capture_ms,
                         encode_start_ms: e.timing_encode_start_ms,
                         encode_finish_ms: e.timing_encode_finish_ms,
                         packetization_finish_ms: e.timing_packetization_finish_ms,
@@ -1918,7 +1931,7 @@ extern "C" fn stats_cb(ud: *mut c_void, entries: *const ReactorStatEntry, count:
                 frames_sent: e.frames_sent,
                 frame_width: e.frame_width,
                 frame_height: e.frame_height,
-                frames_encoded: e.frames_encoded as u32,
+                frames_encoded: e.frames_encoded,
                 total_encode_time_s: e.total_encode_time,
                 total_packet_send_delay_s: e.total_packet_send_delay,
             }),

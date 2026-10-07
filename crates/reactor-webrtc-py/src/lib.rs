@@ -924,12 +924,16 @@ pub struct InboundRtpStats {
 /// One frame libwebrtc stamped at each stage of its trip, as the receiver
 /// reports it: of the timing frames in the last second, the one that took
 /// longest. `sender` and `receiver` group the timestamps by the side that
-/// took them; only differences within one group are times. Consecutive reads
-/// can report the same frame again; compare `rtp_timestamp`.
+/// took them; only differences within one group are exact times. Consecutive
+/// reads can report the same frame again; compare `rtp_timestamp`.
 #[pyclass(get_all)]
 #[derive(Clone)]
 pub struct TimingFrameInfo {
     pub rtp_timestamp: u32,
+    /// The sender marked this frame for its size.
+    pub is_outlier: bool,
+    /// The sender marked this frame because the periodic timer was due.
+    pub is_timer_triggered: bool,
     pub sender: TimingFrameSenderTimestamps,
     pub receiver: TimingFrameReceiverTimestamps,
 }
@@ -938,6 +942,7 @@ pub struct TimingFrameInfo {
 #[pyclass(get_all)]
 #[derive(Clone)]
 pub struct TimingFrameSenderTimestamps {
+    pub capture_ms: i64,
     pub encode_start_ms: i64,
     pub encode_finish_ms: i64,
     pub packetization_finish_ms: i64,
@@ -957,7 +962,45 @@ pub struct TimingFrameReceiverTimestamps {
 #[pymethods]
 impl TimingFrameInfo {
     fn __repr__(&self) -> String {
-        format!("TimingFrameInfo(rtp_timestamp={})", self.rtp_timestamp)
+        format!(
+            "TimingFrameInfo(rtp_timestamp={}, is_outlier={}, is_timer_triggered={})",
+            self.rtp_timestamp,
+            if self.is_outlier { "True" } else { "False" },
+            if self.is_timer_triggered {
+                "True"
+            } else {
+                "False"
+            },
+        )
+    }
+}
+
+#[pymethods]
+impl TimingFrameSenderTimestamps {
+    fn __repr__(&self) -> String {
+        format!(
+            "TimingFrameSenderTimestamps(capture_ms={}, encode_start_ms={}, \
+             encode_finish_ms={}, packetization_finish_ms={}, pacer_exit_ms={})",
+            self.capture_ms,
+            self.encode_start_ms,
+            self.encode_finish_ms,
+            self.packetization_finish_ms,
+            self.pacer_exit_ms,
+        )
+    }
+}
+
+#[pymethods]
+impl TimingFrameReceiverTimestamps {
+    fn __repr__(&self) -> String {
+        format!(
+            "TimingFrameReceiverTimestamps(receive_start_ms={}, receive_finish_ms={}, \
+             decode_start_ms={}, decode_finish_ms={})",
+            self.receive_start_ms,
+            self.receive_finish_ms,
+            self.decode_start_ms,
+            self.decode_finish_ms,
+        )
     }
 }
 
@@ -965,7 +1008,10 @@ impl From<rw::TimingFrameInfo> for TimingFrameInfo {
     fn from(t: rw::TimingFrameInfo) -> Self {
         Self {
             rtp_timestamp: t.rtp_timestamp,
+            is_outlier: t.is_outlier,
+            is_timer_triggered: t.is_timer_triggered,
             sender: TimingFrameSenderTimestamps {
+                capture_ms: t.sender.capture_ms,
                 encode_start_ms: t.sender.encode_start_ms,
                 encode_finish_ms: t.sender.encode_finish_ms,
                 packetization_finish_ms: t.sender.packetization_finish_ms,

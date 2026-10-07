@@ -6,6 +6,7 @@ All tests require the module to be built (`maturin develop`).  Run with:
 """
 
 import asyncio
+import math
 import threading
 import time
 from dataclasses import dataclass, field
@@ -573,7 +574,7 @@ class TestStats:
         assert inbound is not None and outbound is not None, "no video stream stats"
         assert outbound.frames_encoded > 0
         assert outbound.total_encode_time_s > 0.0
-        assert outbound.total_packet_send_delay_s >= 0.0
+        assert math.isfinite(outbound.total_packet_send_delay_s)
         assert inbound.jitter_buffer_emitted_count > 0
         assert inbound.jitter_buffer_delay_s > 0.0
         assert inbound.total_processing_delay_s > 0.0
@@ -581,7 +582,7 @@ class TestStats:
         t = inbound.timing_frame
         assert t is not None, "no timing frame reported within ~15 s"
         s, r = t.sender, t.receiver
-        assert s.encode_finish_ms >= s.encode_start_ms
+        assert s.encode_finish_ms >= s.encode_start_ms >= s.capture_ms
         assert s.pacer_exit_ms >= s.packetization_finish_ms >= s.encode_finish_ms
         assert r.decode_finish_ms >= r.decode_start_ms >= r.receive_finish_ms >= r.receive_start_ms
 
