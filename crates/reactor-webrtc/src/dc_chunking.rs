@@ -1,6 +1,5 @@
 //! [`DcChunking`] — the factory-wide settings for large data-channel messages.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use reactor_webrtc_dc_chunking::sdp::{self, Params};
@@ -94,25 +93,49 @@ impl DcChunking {
 /// every channel, so they all read the same negotiation.
 pub(crate) struct DcNegotiation {
     settings: Option<DcChunking>,
+    state: Mutex<NegotiationState>,
+    // Held across a description's record, native apply and undo; see
+    // `apply`. Channels read `state` alone, never this.
+    applying: Mutex<()>,
+}
+
+/// The bookkeeping a description moves, as one value so that a description
+/// libwebrtc rejects can be undone in one step.
+#[derive(Clone, Copy, Default)]
+struct NegotiationState {
     // The negotiation, settled by the first offer/answer round to complete:
     // the peer's parameters when both sides declared chunking in it.
-    remote: Mutex<Option<Params>>,
-    settled: AtomicBool,
+    remote: Option<Params>,
+    settled: bool,
     // The latest remote offer's parameters, while it awaits our answer. An
     // answer mirrors the offer it answers, so this is not sticky.
-    pending: Mutex<Option<Params>>,
+    pending: Option<Params>,
     // Whether the offer this side last applied locally declared chunking.
-    local_offer_declared: AtomicBool,
+    local_offer_declared: bool,
+}
+
+/// How a description's native apply failed.
+pub(crate) enum ApplyError {
+    /// libwebrtc refused the description: it was never applied.
+    Rejected(Error),
+    /// libwebrtc did not answer in time. It may still apply the description.
+    Unconfirmed(Error),
+}
+
+impl ApplyError {
+    fn into_error(self) -> Error {
+        match self {
+            ApplyError::Rejected(e) | ApplyError::Unconfirmed(e) => e,
+        }
+    }
 }
 
 impl DcNegotiation {
     pub(crate) fn new(settings: Option<DcChunking>) -> Arc<Self> {
         Arc::new(Self {
             settings,
-            remote: Mutex::new(None),
-            settled: AtomicBool::new(false),
-            pending: Mutex::new(None),
-            local_offer_declared: AtomicBool::new(false),
+            state: Mutex::new(NegotiationState::default()),
+            applying: Mutex::new(()),
         })
     }
 
@@ -123,7 +146,7 @@ impl DcNegotiation {
     /// The peer's parameters, once negotiated. `None` while this connection
     /// does not take part or no round has completed with chunking.
     pub(crate) fn remote(&self) -> Option<Params> {
-        *self.remote.lock().unwrap()
+        self.state.lock().unwrap().remote
     }
 
     /// An offer declares chunking whenever this connection takes part.
@@ -139,35 +162,123 @@ impl DcNegotiation {
     /// for, even on a renegotiation of a connection that already chunks.
     pub(crate) fn answer(&self, answer: SessionDescription) -> SessionDescription {
         match &self.settings {
-            Some(s) if self.pending.lock().unwrap().is_some() => {
+            Some(s) if self.state.lock().unwrap().pending.is_some() => {
                 answer.with_dc_chunking(&Params::local(s.max_message_size))
             }
             _ => answer,
         }
     }
 
-    /// Track a description this side applied locally.
+    /// Apply a local description through `native`, tracking it here first.
+    /// See [`apply`](Self::apply).
+    pub(crate) fn apply_local(
+        &self,
+        local: &SessionDescription,
+        native: impl FnOnce() -> std::result::Result<(), ApplyError>,
+    ) -> Result<()> {
+        self.apply(|state| state.on_local_description(local), native)
+    }
+
+    /// Apply a remote description through `native`, tracking it here first.
+    /// See [`apply`](Self::apply).
+    pub(crate) fn apply_remote(
+        &self,
+        remote: &SessionDescription,
+        native: impl FnOnce() -> std::result::Result<(), ApplyError>,
+    ) -> Result<()> {
+        self.apply(|state| state.on_remote_description(remote), native)
+    }
+
+    /// Record a description, then hand it to libwebrtc, undoing the record
+    /// if libwebrtc rejects it.
     ///
+    /// The record comes *before* the native apply, not after: once libwebrtc
+    /// has the description, the SCTP association can come up and a channel
+    /// open and decide at any moment. A channel that decided before the round
+    /// was recorded would stay plain for its whole life while its twin framed,
+    /// and every message between them would be lost.
+    ///
+    /// A rejected description was never applied, so it must not move the
+    /// negotiation. No channel can have decided from it in the meantime: a
+    /// rejected description brings no association up, and a connection that
+    /// already has an open channel settled in an earlier round, which a later
+    /// description cannot change. An apply that timed out is not a rejection:
+    /// libwebrtc may still apply the description, and the record stays.
+    ///
+    /// The mirror case is accepted, not missed: if libwebrtc later rejects a
+    /// description whose apply timed out, the record stays settled from a
+    /// description that never ran, and a retried round cannot change it. That
+    /// description brought no association up, so no channel decided from it;
+    /// channels decide once a retried round brings one up, and between the same
+    /// two peers that round declares chunking exactly as the one that timed out
+    /// did, so both ends still agree. The alternative, undoing on a timeout,
+    /// reopens the race this ordering closes whenever libwebrtc does apply it.
+    ///
+    /// The whole record–apply–undo runs under one lock, so two descriptions
+    /// applied from different threads cannot interleave: an undo never
+    /// discards a description that libwebrtc accepted in between, nor does
+    /// one description build on another's unconfirmed record.
+    fn apply(
+        &self,
+        record: impl FnOnce(&mut NegotiationState),
+        native: impl FnOnce() -> std::result::Result<(), ApplyError>,
+    ) -> Result<()> {
+        if self.settings.is_none() {
+            return native().map_err(ApplyError::into_error);
+        }
+        let _applying = self.applying.lock().unwrap();
+        let before = {
+            let mut state = self.state.lock().unwrap();
+            let before = *state;
+            record(&mut state);
+            before
+        };
+        native().map_err(|e| {
+            if let ApplyError::Rejected(_) = e {
+                *self.state.lock().unwrap() = before;
+            }
+            e.into_error()
+        })
+    }
+
+    /// Track a description this side applied locally. Tests drive the
+    /// bookkeeping through this, without a native apply.
+    #[cfg(test)]
+    fn on_local_description(&self, local: &SessionDescription) {
+        self.state.lock().unwrap().on_local_description(local);
+    }
+
+    /// Track a description the peer's side applied here. Tests drive the
+    /// bookkeeping through this, without a native apply.
+    #[cfg(test)]
+    fn on_remote_description(&self, remote: &SessionDescription) {
+        self.state.lock().unwrap().on_remote_description(remote);
+    }
+}
+
+impl NegotiationState {
+    fn settle(&mut self, params: Option<Params>) {
+        if !self.settled {
+            self.settled = true;
+            self.remote = params;
+        }
+    }
+
     /// An answer that declares chunking, to an offer that did, completes the
     /// round on the answerer's side.
-    pub(crate) fn on_local_description(&self, local: &SessionDescription) {
-        if self.settings.is_none() {
-            return;
-        }
+    fn on_local_description(&mut self, local: &SessionDescription) {
         let declares = sdp::has_attribute(&local.sdp);
         match local.kind {
-            SdpType::Offer => self.local_offer_declared.store(declares, Ordering::SeqCst),
+            SdpType::Offer => self.local_offer_declared = declares,
             SdpType::Answer => {
-                let pending = self.pending.lock().unwrap().take();
+                let pending = self.pending.take();
                 self.settle(pending.filter(|_| declares));
             }
-            SdpType::Rollback => self.local_offer_declared.store(false, Ordering::SeqCst),
+            SdpType::Rollback => self.local_offer_declared = false,
             SdpType::PrAnswer => {}
         }
     }
 
-    /// Track a description the peer's side applied here.
-    ///
     /// An offer only becomes pending: it may still be rolled back, or
     /// answered without the attribute. A final answer that declares chunking,
     /// to an offer of ours that did, completes the round on the offerer's
@@ -175,29 +286,21 @@ impl DcNegotiation {
     ///
     /// Settled by the first round to complete, either way, and fixed for the
     /// connection's life: a later renegotiation neither adds nor drops it.
-    /// Each end completes that round before any SCTP data can flow, so a
-    /// channel reaches the same decision as its twin whenever it is asked.
-    /// The one way the ends can still disagree is an answer that loses the
-    /// attribute between the answerer and the offerer.
-    pub(crate) fn on_remote_description(&self, remote: &SessionDescription) {
-        if self.settings.is_none() {
-            return;
-        }
+    /// Each end records that round before it hands the description to
+    /// libwebrtc, so before any SCTP data can flow, and a channel reaches the
+    /// same decision as its twin whenever it is asked. The one way the ends
+    /// can still disagree is an answer that loses the attribute between the
+    /// answerer and the offerer.
+    fn on_remote_description(&mut self, remote: &SessionDescription) {
         let parsed = sdp::parse(&remote.sdp);
         match remote.kind {
-            SdpType::Offer => *self.pending.lock().unwrap() = parsed,
+            SdpType::Offer => self.pending = parsed,
             SdpType::Answer => {
-                let offered = self.local_offer_declared.load(Ordering::SeqCst);
+                let offered = self.local_offer_declared;
                 self.settle(parsed.filter(|_| offered));
             }
-            SdpType::Rollback => *self.pending.lock().unwrap() = None,
+            SdpType::Rollback => self.pending = None,
             SdpType::PrAnswer => {}
-        }
-    }
-
-    fn settle(&self, params: Option<Params>) {
-        if !self.settled.swap(true, Ordering::SeqCst) {
-            *self.remote.lock().unwrap() = params;
         }
     }
 }
@@ -284,6 +387,96 @@ mod tests {
         answerer.on_local_description(&second);
         offerer.on_remote_description(&second);
         assert!(offerer.remote().is_none() && answerer.remote().is_none());
+    }
+
+    fn rejected() -> std::result::Result<(), ApplyError> {
+        Err(ApplyError::Rejected(Error::Webrtc("rejected".into())))
+    }
+
+    fn timed_out() -> std::result::Result<(), ApplyError> {
+        Err(ApplyError::Unconfirmed(Error::Webrtc("timed out".into())))
+    }
+
+    #[test]
+    fn the_round_is_recorded_before_the_native_apply_runs() {
+        let offerer = negotiation();
+        offerer.on_local_description(&desc(SdpType::Offer, true));
+        offerer
+            .apply_remote(&desc(SdpType::Answer, true), || {
+                assert!(offerer.remote().is_some(), "a channel opening now");
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn a_rejected_answer_leaves_the_round_open() {
+        let offerer = negotiation();
+        offerer.on_local_description(&desc(SdpType::Offer, true));
+        // Without the attribute: recorded, it would settle the offerer plain.
+        assert!(offerer
+            .apply_remote(&desc(SdpType::Answer, false), rejected)
+            .is_err());
+        offerer
+            .apply_remote(&desc(SdpType::Answer, true), || Ok(()))
+            .unwrap();
+        assert!(offerer.remote().is_some());
+    }
+
+    #[test]
+    fn an_answer_that_timed_out_stays_recorded() {
+        // libwebrtc may still apply it, and a channel may then open.
+        let offerer = negotiation();
+        offerer.on_local_description(&desc(SdpType::Offer, true));
+        assert!(offerer
+            .apply_remote(&desc(SdpType::Answer, true), timed_out)
+            .is_err());
+        assert!(offerer.remote().is_some());
+    }
+
+    #[test]
+    fn a_rejected_offer_is_not_pending() {
+        let answerer = negotiation();
+        assert!(answerer
+            .apply_remote(&desc(SdpType::Offer, true), rejected)
+            .is_err());
+        assert!(!answerer
+            .answer(desc(SdpType::Answer, false))
+            .declares_dc_chunking());
+    }
+
+    #[test]
+    fn an_undo_never_discards_a_description_applied_meanwhile() {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let offerer = negotiation();
+        offerer.on_local_description(&desc(SdpType::Offer, true));
+        let (started, wait_started) = mpsc::channel();
+        let (release, wait_release) = mpsc::channel::<()>();
+        let first = thread::spawn({
+            let offerer = offerer.clone();
+            move || {
+                offerer.apply_remote(&desc(SdpType::Answer, false), || {
+                    started.send(()).unwrap();
+                    wait_release.recv().unwrap();
+                    rejected()
+                })
+            }
+        });
+        wait_started.recv().unwrap();
+        let second = thread::spawn({
+            let offerer = offerer.clone();
+            move || offerer.apply_remote(&desc(SdpType::Answer, true), || Ok(()))
+        });
+        // The second apply waits for the first to finish, undo included.
+        thread::sleep(Duration::from_millis(50));
+        assert!(!second.is_finished());
+        release.send(()).unwrap();
+        assert!(first.join().unwrap().is_err());
+        second.join().unwrap().unwrap();
+        assert!(offerer.remote().is_some());
     }
 
     #[test]
