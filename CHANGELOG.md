@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.22.1 — both ends of a channel chunk, or neither
+
+A connection could lose every message on a data channel. The connection
+reported open and media flowed, but nothing sent on a data channel arrived,
+and neither side logged anything. Seen on about 3 sessions in 100 between a
+runtime and a client that both offer chunking.
+
+### Fixed
+
+- **Data-channel chunking is recorded before the description is applied.**
+  `set_local_description` and `set_remote_description` recorded the chunking
+  negotiation only after libwebrtc returned. Once libwebrtc applies a
+  description, the SCTP association can come up at once, so a channel could
+  open inside that gap and stay plain for its whole life while the other end
+  sent chunked frames. A chunked end that receives plain bytes closes the
+  channel, and a plain end passes the frame headers up, so no message got
+  through. The negotiation is now recorded first, and undone when libwebrtc
+  rejects the description. After a timeout the record stays, since libwebrtc
+  may still apply the description.
+- Descriptions on a connection with chunking are now applied one at a time,
+  so an undo never discards a description applied from another thread in
+  between. Do not call `set_local_description` or `set_remote_description`
+  from an observer callback: an apply in progress on another thread waits on
+  the signaling thread, and both would stall until the timeout.
+
+No API change. All crates advance to 0.22.1.
+
 ## 0.22.0 — where a frame's time goes
 
 libwebrtc already measures how long each video frame spends in each stage on
