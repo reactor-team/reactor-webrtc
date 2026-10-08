@@ -2139,8 +2139,13 @@ impl PeerConnection {
     /// the answerer (tracks attached after the offer) without either needing to know
     /// which role it is playing.
     pub fn set_local_description(&self, sdp: &SessionDescription) -> Result<()> {
-        self.set_description(sdp, true)?;
-        self.dc_negotiation.on_local_description(sdp);
+        // Chunking is recorded before the native call: a channel can open and
+        // decide as soon as libwebrtc applies the description.
+        let before = self.dc_negotiation.on_local_description(sdp);
+        if let Err(e) = self.set_description(sdp, true) {
+            self.dc_negotiation.restore(before);
+            return Err(e);
+        }
         self.install_frame_metadata_transforms();
         self.lock_negotiated_send_codecs();
         Ok(())
@@ -2156,7 +2161,15 @@ impl PeerConnection {
     /// On an answerer this runs before [`create_answer`](Self::create_answer), which
     /// is what lets the answer mirror the offer.
     pub fn set_remote_description(&self, sdp: &SessionDescription) -> Result<()> {
-        self.set_description(sdp, false)?;
+        // Chunking is recorded before the native call, and undone if libwebrtc
+        // rejects the description: a channel can open and decide as soon as
+        // libwebrtc applies it, and one that decided first would stay plain
+        // while its twin framed.
+        let before = self.dc_negotiation.on_remote_description(sdp);
+        if let Err(e) = self.set_description(sdp, false) {
+            self.dc_negotiation.restore(before);
+            return Err(e);
+        }
         // After the native call, not before: a description libwebrtc rejected was
         // never applied, and must not move the gate.
         //
@@ -2164,7 +2177,6 @@ impl PeerConnection {
         // capability and never installs a transform.
         self.frame_metadata_gate
             .set(self.frame_metadata_enabled && sdp.declares_frame_metadata());
-        self.dc_negotiation.on_remote_description(sdp);
         self.install_frame_metadata_transforms();
         self.lock_negotiated_send_codecs();
         Ok(())

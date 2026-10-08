@@ -182,6 +182,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_rejected_answer_does_not_settle_the_negotiation() {
+        let (f1, f2) = (chunking_factory(), chunking_factory());
+        let cfg = RtcConfiguration::default();
+        let (pc1, _) = make_peer(&f1, &cfg);
+        let (pc2, _) = make_peer(&f2, &cfg);
+        let _dc = pc1.create_data_channel("probe").expect("dc");
+        let offer = pc1.create_offer().expect("offer");
+        pc1.set_local_description(&offer).expect("pc1 local");
+        pc2.set_remote_description(&offer).expect("pc2 remote");
+        let answer = pc2.create_answer().expect("answer");
+        pc2.set_local_description(&answer).expect("pc2 local");
+
+        // An answer libwebrtc cannot parse, without the attribute. Were it
+        // recorded, it would settle the offerer plain for good.
+        let garbage = SessionDescription {
+            kind: answer.kind,
+            sdp: "v=0\r\n".to_owned(),
+        };
+        assert!(pc1.set_remote_description(&garbage).is_err());
+        assert!(!pc1.dc_chunking_negotiated());
+
+        pc1.set_remote_description(&answer).expect("pc1 remote");
+        assert!(pc1.dc_chunking_negotiated() && pc2.dc_chunking_negotiated());
+    }
+
     // ── channels ────────────────────────────────────────────────────────────
 
     // GitHub Windows CI runners have no usable non-loopback interface for
