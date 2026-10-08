@@ -218,11 +218,11 @@ mod tests {
         let at_b = inbox(&mut p.b);
         let msg = pattern(200, 200 * 1000 * 1000);
         let t0 = Instant::now();
+        // How much is still queued when send returns depends on how fast
+        // loopback drains: a fast enough runner takes it all as it is pumped.
+        // buffered_amount_counts_the_queue_and_drain_waits_for_it checks the
+        // queue at any link speed.
         p.a.send(&msg, true).expect("send");
-        assert!(
-            p.a.buffered_amount() > 16 * MIB as u64,
-            "the queue holds what libwebrtc cannot"
-        );
         let (got, _) = at_b
             .recv_timeout(Duration::from_secs(300))
             .expect("arrives");

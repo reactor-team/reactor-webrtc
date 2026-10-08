@@ -1,0 +1,357 @@
+diff --git a/rtc_base/async_udp_socket.cc b/rtc_base/async_udp_socket.cc
+index b8f00addc0..7d456b3fb6 100644
+--- a/rtc_base/async_udp_socket.cc
++++ b/rtc_base/async_udp_socket.cc
+@@ -147,10 +147,27 @@ void AsyncUDPSocket::OnConnectEvent(Socket* socket) {
+ void AsyncUDPSocket::OnReadEvent(Socket* socket) {
+   RTC_DCHECK(socket_.get() == socket);
+   RTC_DCHECK_RUN_ON(&sequence_checker_);
++  // Reactor: read up to kMaxReadsPerEvent datagrams per event instead of one,
++  // so a burst (a data channel message is ~90 packets) costs one wakeup per
++  // batch rather than per packet. A handler may destroy this socket, so stop
++  // as soon as it is gone.
++  std::weak_ptr<int> alive = alive_;
++  for (int i = 0; i < kMaxReadsPerEvent; ++i) {
++    if (!ReadPacket(/*first=*/i == 0) || alive.expired()) {
++      return;
++    }
++  }
++}
+ 
++bool AsyncUDPSocket::ReadPacket(bool first) {
++  RTC_DCHECK_RUN_ON(&sequence_checker_);
+   Socket::ReceiveBuffer receive_buffer(buffer_);
+   int len = socket_->RecvFrom(receive_buffer);
+   if (len < 0) {
++    if (!first && IsBlockingError(socket_->GetError())) {
++      // Drained the socket.
++      return false;
++    }
+     // An error here typically means we got an ICMP error in response to our
+     // send datagram, indicating the remote address was unreachable.
+     // When doing ICE, this kind of thing will often happen.
+@@ -158,11 +175,11 @@ void AsyncUDPSocket::OnReadEvent(Socket* socket) {
+     SocketAddress local_addr = socket_->GetLocalAddress();
+     RTC_LOG(LS_INFO) << "AsyncUDPSocket[" << local_addr.ToSensitiveString()
+                      << "] receive failed with error " << socket_->GetError();
+-    return;
++    return false;
+   }
+   if (len == 0) {
+     // Spurios wakeup.
+-    return;
++    return false;
+   }
+ 
+   if (!receive_buffer.arrival_time) {
+@@ -184,6 +201,7 @@ void AsyncUDPSocket::OnReadEvent(Socket* socket) {
+   NotifyPacketReceived(
+       ReceivedIpPacket(receive_buffer.payload, receive_buffer.source_address,
+                        receive_buffer.arrival_time, receive_buffer.ecn));
++  return true;
+ }
+ 
+ void AsyncUDPSocket::OnWriteEvent(Socket* socket) {
+diff --git a/rtc_base/async_udp_socket.h b/rtc_base/async_udp_socket.h
+index 605b8cdaba..33b1f0986f 100644
+--- a/rtc_base/async_udp_socket.h
++++ b/rtc_base/async_udp_socket.h
+@@ -68,6 +68,9 @@ class AsyncUDPSocket : public AsyncPacketSocket {
+   void OnConnectEvent(Socket* socket);
+   // Called when the underlying socket is ready to be read from.
+   void OnReadEvent(Socket* socket);
++  // Reads and delivers one datagram; false when there was none to read.
++  // `first` is the read the event announced: only it logs a blocking error.
++  bool ReadPacket(bool first);
+   // Called when the underlying socket is ready to send.
+   void OnWriteEvent(Socket* socket);
+   // Reactor: fills `info` like CopySocketInformationToPacketInfo, but takes the
+@@ -81,6 +84,10 @@ class AsyncUDPSocket : public AsyncPacketSocket {
+   bool has_set_ect1_options_ = false;
+   // 0 until the socket's local address has a family (20 for IPv4, 40 for IPv6).
+   size_t ip_overhead_bytes_ = 0;
++  // Reactor: OnReadEvent reads at most this many datagrams per event.
++  static constexpr int kMaxReadsPerEvent = 16;
++  // Expires with the socket; OnReadEvent's loop checks it after each packet.
++  std::shared_ptr<int> alive_ = std::make_shared<int>(0);
+   Buffer buffer_ RTC_GUARDED_BY(sequence_checker_);
+   std::optional<TimeDelta> socket_time_offset_
+       RTC_GUARDED_BY(sequence_checker_);
+diff --git a/rtc_base/physical_socket_server.cc b/rtc_base/physical_socket_server.cc
+index 9d9927e85b..e5b05ce51e 100644
+--- a/rtc_base/physical_socket_server.cc
++++ b/rtc_base/physical_socket_server.cc
+@@ -201,8 +201,111 @@ class DeadlineTracker {
+   const Timestamp deadline_;
+ };
+ 
++#if defined(WEBRTC_USE_UDP_SEND_BATCH)
++struct UdpSendBatchState {
++  // Open ScopedUdpSendBatch scopes on this thread.
++  int depth = 0;
++  // Sockets with queued datagrams, flushed when the outermost scope closes.
++  std::vector<PhysicalSocket*> sockets;
++};
++
++UdpSendBatchState& ThreadUdpSendBatch() {
++  static thread_local UdpSendBatchState state;
++  return state;
++}
++#endif  // WEBRTC_USE_UDP_SEND_BATCH
++
+ }  // namespace
+ 
++#if defined(WEBRTC_USE_UDP_SEND_BATCH)
++ScopedUdpSendBatch::ScopedUdpSendBatch() {
++  ++ThreadUdpSendBatch().depth;
++}
++
++ScopedUdpSendBatch::~ScopedUdpSendBatch() {
++  UdpSendBatchState& state = ThreadUdpSendBatch();
++  RTC_DCHECK_GT(state.depth, 0);
++  if (--state.depth > 0) {
++    return;
++  }
++  // Flushing runs no callbacks, so the list cannot change under us; take it
++  // anyway so a socket is never flushed twice.
++  std::vector<PhysicalSocket*> sockets;
++  sockets.swap(state.sockets);
++  for (PhysicalSocket* socket : sockets) {
++    socket->in_send_batch_list_ = false;
++    socket->FlushSendBatch();
++  }
++}
++
++void PhysicalSocket::QueueForSendBatch(const void* buffer,
++                                       size_t length,
++                                       const sockaddr_storage& addr,
++                                       socklen_t addr_len) {
++  QueuedDatagram datagram;
++  datagram.addr = addr;
++  datagram.addr_len = addr_len;
++  datagram.offset = send_batch_bytes_.size();
++  datagram.length = length;
++  const char* bytes = static_cast<const char*>(buffer);
++  send_batch_bytes_.insert(send_batch_bytes_.end(), bytes, bytes + length);
++  send_batch_.push_back(datagram);
++  if (!in_send_batch_list_) {
++    ThreadUdpSendBatch().sockets.push_back(this);
++    in_send_batch_list_ = true;
++  }
++  if (send_batch_.size() >= ScopedUdpSendBatch::kMaxUdpSendBatch) {
++    FlushSendBatch();
++  }
++}
++
++void PhysicalSocket::FlushSendBatch() {
++  if (send_batch_.empty()) {
++    return;
++  }
++  const size_t n = send_batch_.size();
++  RTC_DCHECK_LE(n, ScopedUdpSendBatch::kMaxUdpSendBatch);
++  std::array<mmsghdr, ScopedUdpSendBatch::kMaxUdpSendBatch> msgs = {};
++  std::array<iovec, ScopedUdpSendBatch::kMaxUdpSendBatch> iovs = {};
++  for (size_t i = 0; i < n; ++i) {
++    QueuedDatagram& datagram = send_batch_[i];
++    iovs[i].iov_base = send_batch_bytes_.data() + datagram.offset;
++    iovs[i].iov_len = datagram.length;
++    msgs[i].msg_hdr.msg_name = &datagram.addr;
++    msgs[i].msg_hdr.msg_namelen = datagram.addr_len;
++    msgs[i].msg_hdr.msg_iov = &iovs[i];
++    msgs[i].msg_hdr.msg_iovlen = 1;
++  }
++  size_t done = 0;
++  while (done < n && s_ != INVALID_SOCKET) {
++    int sent = ::sendmmsg(s_, msgs.data() + done, static_cast<unsigned>(n - done),
++                          MSG_NOSIGNAL);
++    if (sent > 0) {
++      done += sent;
++      continue;
++    }
++    if (sent < 0 && errno == EINTR) {
++      continue;
++    }
++    UpdateLastError();
++    MaybeRemapSendError();
++    if (IsBlockingError(GetError())) {
++      // The rest are dropped, as a sendto() that would block drops its one.
++      EnableEvents(DE_WRITE);
++      break;
++    }
++    // The datagram at `done` failed on its own (e.g. an ICMP error for its
++    // destination); the others still go out, as separate sendto()s would.
++    ++done;
++  }
++  send_batch_.clear();
++  send_batch_bytes_.clear();
++}
++#else
++ScopedUdpSendBatch::ScopedUdpSendBatch() = default;
++ScopedUdpSendBatch::~ScopedUdpSendBatch() = default;
++#endif  // WEBRTC_USE_UDP_SEND_BATCH
++
+ 
+ PhysicalSocket::PhysicalSocket(PhysicalSocketServer* ss, SOCKET s)
+     : ss_(ss),
+@@ -224,6 +327,13 @@ PhysicalSocket::PhysicalSocket(PhysicalSocketServer* ss, SOCKET s)
+ 
+ PhysicalSocket::~PhysicalSocket() {
+   Close();
++#if defined(WEBRTC_USE_UDP_SEND_BATCH)
++  if (in_send_batch_list_) {
++    std::vector<PhysicalSocket*>& sockets = ThreadUdpSendBatch().sockets;
++    sockets.erase(std::remove(sockets.begin(), sockets.end(), this),
++                  sockets.end());
++  }
++#endif
+ }
+ 
+ bool PhysicalSocket::Create(int family, int type) {
+@@ -405,6 +515,10 @@ int PhysicalSocket::GetOption(Option opt, int* value) {
+ }
+ 
+ int PhysicalSocket::SetOption(Option opt, int value) {
++#if defined(WEBRTC_USE_UDP_SEND_BATCH)
++  // Queued datagrams were sent under the old option (e.g. ECN, DSCP).
++  FlushSendBatch();
++#endif
+   int slevel;
+   int sopt;
+   if (TranslateOption(opt, &slevel, &sopt) == -1)
+@@ -443,6 +557,9 @@ int PhysicalSocket::SetOption(Option opt, int value) {
+ }
+ 
+ int PhysicalSocket::Send(const void* pv, size_t cb) {
++#if defined(WEBRTC_USE_UDP_SEND_BATCH)
++  FlushSendBatch();
++#endif
+   int sent = DoSend(
+       s_, reinterpret_cast<const char*>(pv), static_cast<int>(cb),
+ #if defined(WEBRTC_LINUX) && !defined(WEBRTC_ANDROID)
+@@ -472,6 +589,13 @@ int PhysicalSocket::SendTo(const void* buffer,
+                            const SocketAddress& addr) {
+   sockaddr_storage saddr;
+   size_t len = addr.ToSockAddrStorage(&saddr);
++#if defined(WEBRTC_USE_UDP_SEND_BATCH)
++  if (udp_ && len > 0 && s_ != INVALID_SOCKET &&
++      ThreadUdpSendBatch().depth > 0) {
++    QueueForSendBatch(buffer, length, saddr, static_cast<socklen_t>(len));
++    return static_cast<int>(length);
++  }
++#endif
+   int sent =
+       DoSendTo(s_, static_cast<const char*>(buffer), static_cast<int>(length),
+ #if defined(WEBRTC_LINUX) && !defined(WEBRTC_ANDROID)
+@@ -671,6 +795,9 @@ Socket* PhysicalSocket::Accept(SocketAddress* out_addr) {
+ int PhysicalSocket::Close() {
+   if (s_ == INVALID_SOCKET)
+     return 0;
++#if defined(WEBRTC_USE_UDP_SEND_BATCH)
++  FlushSendBatch();
++#endif
+   int err = ::closesocket(s_);
+   UpdateLastError();
+   s_ = INVALID_SOCKET;
+diff --git a/rtc_base/physical_socket_server.h b/rtc_base/physical_socket_server.h
+index d35e8f5706..f95ba44c26 100644
+--- a/rtc_base/physical_socket_server.h
++++ b/rtc_base/physical_socket_server.h
+@@ -27,6 +27,11 @@
+ #include <sys/epoll.h>
+ 
+ #define WEBRTC_USE_EPOLL 1
++#if !defined(WEBRTC_ANDROID)
++// Reactor: queue UDP sends inside a ScopedUdpSendBatch, flush with sendmmsg().
++#include <sys/types.h>
++#define WEBRTC_USE_UDP_SEND_BATCH 1
++#endif
+ #elif defined(WEBRTC_FUCHSIA) || defined(WEBRTC_MAC)
+ // Fuchsia implements select and poll but not epoll, and testing shows that poll
+ // is faster than select.
+@@ -58,6 +63,32 @@ typedef int SOCKET;
+ namespace webrtc {
+ 
+ class Signaler;
++class PhysicalSocket;
++
++// Reactor: batches UDP sends. While a scope is open on a thread, a datagram a
++// PhysicalSocket sends on that thread is queued instead of handed to
++// sendto(), and the queue goes out with one sendmmsg() per socket when the
++// outermost scope closes, or as soon as kMaxUdpSendBatch datagrams are queued
++// so the first of a long burst does not wait for the last. Thread::Dispatch
++// opens one around each task, so a data channel message, which leaves as
++// ~1.2 KB SCTP packets, costs one syscall per batch instead of one per packet.
++// Socket events deliberately get none: what an incoming SACK releases leaves
++// at once, as before, so sends stay clocked by the SACKs. Batching those too
++// turned each round's SACKs into one back-to-back burst that overran a
++// receiver with no slower link in between. A queued datagram counts as sent: if the flush fails, it is lost
++// like any UDP datagram, and a blocking error re-arms the write event as a
++// failed sendto() would.
++//
++// Linux only (WEBRTC_USE_UDP_SEND_BATCH); elsewhere a scope does nothing.
++class RTC_EXPORT ScopedUdpSendBatch {
++ public:
++  static constexpr size_t kMaxUdpSendBatch = 16;
++
++  ScopedUdpSendBatch();
++  ~ScopedUdpSendBatch();
++  ScopedUdpSendBatch(const ScopedUdpSendBatch&) = delete;
++  ScopedUdpSendBatch& operator=(const ScopedUdpSendBatch&) = delete;
++};
+ 
+ // Event constants for the Dispatcher class.
+ enum DispatcherEvent {
+@@ -253,6 +284,27 @@ class PhysicalSocket : public Socket {
+ #endif
+ 
+  private:
++#if defined(WEBRTC_USE_UDP_SEND_BATCH)
++  friend class ScopedUdpSendBatch;
++  struct QueuedDatagram {
++    sockaddr_storage addr;
++    socklen_t addr_len;
++    size_t offset;  // into send_batch_bytes_
++    size_t length;
++  };
++  // Queues a datagram for the open ScopedUdpSendBatch.
++  void QueueForSendBatch(const void* buffer,
++                         size_t length,
++                         const sockaddr_storage& addr,
++                         socklen_t addr_len);
++  // Sends what is queued, in order. Runs no callbacks.
++  void FlushSendBatch();
++
++  std::vector<QueuedDatagram> send_batch_;
++  std::vector<char> send_batch_bytes_;
++  // Whether this socket is on its thread's list of sockets to flush.
++  bool in_send_batch_list_ = false;
++#endif
+   uint8_t enabled_events_ = 0;
+ };
+ 
+diff --git a/rtc_base/thread.cc b/rtc_base/thread.cc
+index 98267423f8..b9d8a6a0ff 100644
+--- a/rtc_base/thread.cc
++++ b/rtc_base/thread.cc
+@@ -58,6 +58,7 @@
+ #include "rtc_base/internal/default_socket_server.h"
+ #include "rtc_base/logging.h"
+ #include "rtc_base/null_socket_server.h"
++#include "rtc_base/physical_socket_server.h"
+ #include "rtc_base/synchronization/mutex.h"
+ #include "rtc_base/time_utils.h"
+ #include "rtc_base/trace_event.h"
+@@ -544,7 +545,12 @@ void Thread::Dispatch(absl::AnyInvocable<void() &&> task) {
+   TRACE_EVENT0("webrtc", "Thread::Dispatch");
+   RTC_DCHECK_RUN_ON(this);
+   int64_t start_time = TimeMillis();
+-  std::move(task)();
++  {
++    // Reactor: the UDP datagrams a task sends (e.g. the ~90 SCTP packets of a
++    // 100 KB data channel message) go out in batches when it returns.
++    ScopedUdpSendBatch send_batch;
++    std::move(task)();
++  }
+   int64_t end_time = TimeMillis();
+   int64_t diff = TimeDiff(end_time, start_time);
+   if (diff >= dispatch_warning_ms_) {
