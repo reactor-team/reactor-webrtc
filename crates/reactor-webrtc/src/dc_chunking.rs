@@ -205,6 +205,15 @@ impl DcNegotiation {
     /// description cannot change. An apply that timed out is not a rejection:
     /// libwebrtc may still apply the description, and the record stays.
     ///
+    /// The mirror case is accepted, not missed: if libwebrtc later rejects a
+    /// description whose apply timed out, the record stays settled from a
+    /// description that never ran, and a retried round cannot change it. That
+    /// description brought no association up, so no channel decided from it;
+    /// channels decide once a retried round brings one up, and between the same
+    /// two peers that round declares chunking exactly as the one that timed out
+    /// did, so both ends still agree. The alternative, undoing on a timeout,
+    /// reopens the race this ordering closes whenever libwebrtc does apply it.
+    ///
     /// The whole record–apply–undo runs under one lock, so two descriptions
     /// applied from different threads cannot interleave: an undo never
     /// discards a description that libwebrtc accepted in between, nor does
