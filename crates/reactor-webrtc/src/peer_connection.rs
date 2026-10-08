@@ -2141,11 +2141,8 @@ impl PeerConnection {
     pub fn set_local_description(&self, sdp: &SessionDescription) -> Result<()> {
         // Chunking is recorded before the native call: a channel can open and
         // decide as soon as libwebrtc applies the description.
-        let before = self.dc_negotiation.on_local_description(sdp);
-        if let Err(e) = self.set_description(sdp, true) {
-            self.dc_negotiation.restore(before);
-            return Err(e);
-        }
+        self.dc_negotiation
+            .apply_local(sdp, || self.set_description(sdp, true))?;
         self.install_frame_metadata_transforms();
         self.lock_negotiated_send_codecs();
         Ok(())
@@ -2165,11 +2162,8 @@ impl PeerConnection {
         // rejects the description: a channel can open and decide as soon as
         // libwebrtc applies it, and one that decided first would stay plain
         // while its twin framed.
-        let before = self.dc_negotiation.on_remote_description(sdp);
-        if let Err(e) = self.set_description(sdp, false) {
-            self.dc_negotiation.restore(before);
-            return Err(e);
-        }
+        self.dc_negotiation
+            .apply_remote(sdp, || self.set_description(sdp, false))?;
         // After the native call, not before: a description libwebrtc rejected was
         // never applied, and must not move the gate.
         //
