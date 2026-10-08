@@ -114,11 +114,18 @@ struct NegotiationState {
     local_offer_declared: bool,
 }
 
-impl NegotiationState {
-    fn settle(&mut self, params: Option<Params>) {
-        if !self.settled {
-            self.settled = true;
-            self.remote = params;
+/// How a description's native apply failed.
+pub(crate) enum ApplyError {
+    /// libwebrtc refused the description: it was never applied.
+    Rejected(Error),
+    /// libwebrtc did not answer in time. It may still apply the description.
+    Unconfirmed(Error),
+}
+
+impl ApplyError {
+    fn into_error(self) -> Error {
+        match self {
+            ApplyError::Rejected(e) | ApplyError::Unconfirmed(e) => e,
         }
     }
 }
@@ -167,7 +174,7 @@ impl DcNegotiation {
     pub(crate) fn apply_local(
         &self,
         local: &SessionDescription,
-        native: impl FnOnce() -> Result<()>,
+        native: impl FnOnce() -> std::result::Result<(), ApplyError>,
     ) -> Result<()> {
         self.apply(|state| state.on_local_description(local), native)
     }
@@ -177,7 +184,7 @@ impl DcNegotiation {
     pub(crate) fn apply_remote(
         &self,
         remote: &SessionDescription,
-        native: impl FnOnce() -> Result<()>,
+        native: impl FnOnce() -> std::result::Result<(), ApplyError>,
     ) -> Result<()> {
         self.apply(|state| state.on_remote_description(remote), native)
     }
@@ -195,7 +202,8 @@ impl DcNegotiation {
     /// negotiation. No channel can have decided from it in the meantime: a
     /// rejected description brings no association up, and a connection that
     /// already has an open channel settled in an earlier round, which a later
-    /// description cannot change.
+    /// description cannot change. An apply that timed out is not a rejection:
+    /// libwebrtc may still apply the description, and the record stays.
     ///
     /// The whole record–apply–undo runs under one lock, so two descriptions
     /// applied from different threads cannot interleave: an undo never
@@ -204,10 +212,10 @@ impl DcNegotiation {
     fn apply(
         &self,
         record: impl FnOnce(&mut NegotiationState),
-        native: impl FnOnce() -> Result<()>,
+        native: impl FnOnce() -> std::result::Result<(), ApplyError>,
     ) -> Result<()> {
         if self.settings.is_none() {
-            return native();
+            return native().map_err(ApplyError::into_error);
         }
         let _applying = self.applying.lock().unwrap();
         let before = {
@@ -216,7 +224,12 @@ impl DcNegotiation {
             record(&mut state);
             before
         };
-        native().inspect_err(|_| *self.state.lock().unwrap() = before)
+        native().map_err(|e| {
+            if let ApplyError::Rejected(_) = e {
+                *self.state.lock().unwrap() = before;
+            }
+            e.into_error()
+        })
     }
 
     /// Track a description this side applied locally. Tests drive the
@@ -235,6 +248,13 @@ impl DcNegotiation {
 }
 
 impl NegotiationState {
+    fn settle(&mut self, params: Option<Params>) {
+        if !self.settled {
+            self.settled = true;
+            self.remote = params;
+        }
+    }
+
     /// An answer that declares chunking, to an offer that did, completes the
     /// round on the answerer's side.
     fn on_local_description(&mut self, local: &SessionDescription) {
@@ -360,8 +380,12 @@ mod tests {
         assert!(offerer.remote().is_none() && answerer.remote().is_none());
     }
 
-    fn rejected() -> Result<()> {
-        Err(Error::Webrtc("rejected".into()))
+    fn rejected() -> std::result::Result<(), ApplyError> {
+        Err(ApplyError::Rejected(Error::Webrtc("rejected".into())))
+    }
+
+    fn timed_out() -> std::result::Result<(), ApplyError> {
+        Err(ApplyError::Unconfirmed(Error::Webrtc("timed out".into())))
     }
 
     #[test]
@@ -387,6 +411,17 @@ mod tests {
         offerer
             .apply_remote(&desc(SdpType::Answer, true), || Ok(()))
             .unwrap();
+        assert!(offerer.remote().is_some());
+    }
+
+    #[test]
+    fn an_answer_that_timed_out_stays_recorded() {
+        // libwebrtc may still apply it, and a channel may then open.
+        let offerer = negotiation();
+        offerer.on_local_description(&desc(SdpType::Offer, true));
+        assert!(offerer
+            .apply_remote(&desc(SdpType::Answer, true), timed_out)
+            .is_err());
         assert!(offerer.remote().is_some());
     }
 

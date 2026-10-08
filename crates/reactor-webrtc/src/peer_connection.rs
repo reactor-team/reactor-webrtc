@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use reactor_webrtc_sys::ReactorStatEntry;
 
+use crate::dc_chunking::ApplyError;
 use crate::encoded::{FrameTransform, VideoCodec};
 use crate::media::{MediaKind, Track};
 use crate::observer::ObserverState;
@@ -2003,13 +2004,23 @@ fn run_sdp(call: impl FnOnce(*mut c_void)) -> Result<SessionDescription> {
 }
 
 fn run_complete(call: impl FnOnce(*mut c_void)) -> Result<()> {
+    await_complete(call).unwrap_or_else(|| Err(complete_timed_out()))
+}
+
+/// [`run_complete`], telling a timeout apart: `None` when the operation did
+/// not complete within [`OP_TIMEOUT`] — libwebrtc may still complete it.
+fn await_complete(call: impl FnOnce(*mut c_void)) -> Option<Result<()>> {
     let (tx, rx) = sync_channel::<Result<()>>(1);
     let tx = Arc::new(tx);
     let p = Arc::into_raw(tx.clone());
     call(p as *mut c_void);
     let r = rx.recv_timeout(OP_TIMEOUT);
     drop(tx);
-    r.map_err(|_| Error::Webrtc("operation timed out".into()))?
+    r.ok()
+}
+
+fn complete_timed_out() -> Error {
+    Error::Webrtc("operation timed out".into())
 }
 
 /// An `RTCPeerConnection`.
@@ -2138,6 +2149,12 @@ impl PeerConnection {
     /// does. Installing at both points covers the offerer (armed by the answer) and
     /// the answerer (tracks attached after the offer) without either needing to know
     /// which role it is playing.
+    ///
+    /// On a connection that takes part in data-channel chunking, descriptions are
+    /// applied one at a time: a call waits for one in progress on another thread.
+    /// Do not call this from an observer callback, which runs on the signaling
+    /// thread: an apply in progress elsewhere waits on that thread, and both stall
+    /// until it times out.
     pub fn set_local_description(&self, sdp: &SessionDescription) -> Result<()> {
         // Chunking is recorded before the native call: a channel can open and
         // decide as soon as libwebrtc applies the description.
@@ -2157,6 +2174,9 @@ impl PeerConnection {
     ///
     /// On an answerer this runs before [`create_answer`](Self::create_answer), which
     /// is what lets the answer mirror the offer.
+    ///
+    /// Like [`set_local_description`](Self::set_local_description), not to be
+    /// called from an observer callback.
     pub fn set_remote_description(&self, sdp: &SessionDescription) -> Result<()> {
         // Chunking is recorded before the native call, and undone if libwebrtc
         // rejects the description: a channel can open and decide as soon as
@@ -2295,11 +2315,15 @@ impl PeerConnection {
         }
     }
 
-    fn set_description(&self, sdp: &SessionDescription, local: bool) -> Result<()> {
+    fn set_description(
+        &self,
+        sdp: &SessionDescription,
+        local: bool,
+    ) -> std::result::Result<(), ApplyError> {
         let ty = CString::new(sdp.kind.as_str()).unwrap();
         let body = CString::new(sdp.sdp.as_str())
-            .map_err(|_| Error::Webrtc("sdp contains a NUL byte".into()))?;
-        run_complete(|ud| unsafe {
+            .map_err(|_| ApplyError::Rejected(Error::Webrtc("sdp contains a NUL byte".into())))?;
+        let completed = await_complete(|ud| unsafe {
             if local {
                 reactor_webrtc_sys::reactor_webrtc_peer_connection_set_local_description(
                     self.raw,
@@ -2317,7 +2341,11 @@ impl PeerConnection {
                     complete_cb,
                 )
             }
-        })
+        });
+        match completed {
+            Some(r) => r.map_err(ApplyError::Rejected),
+            None => Err(ApplyError::Unconfirmed(complete_timed_out())),
+        }
     }
     /// Add a remote ICE candidate received out of band (trickle ICE).
     ///
