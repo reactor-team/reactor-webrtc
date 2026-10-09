@@ -34,7 +34,8 @@ pub struct ChunkingStats {
     /// channel, summed over `messages_sent`. A one-frame message adds zero.
     pub send_s: f64,
     /// Times the pump stopped with frames still queued because the native
-    /// buffer was at the high-water mark.
+    /// buffer was at the high-water mark, counted when it resumed. A stall
+    /// still going, or ended by the channel closing, is not counted.
     pub stalls: u64,
     /// The time the pump spent stopped that way, summed over `stalls`.
     pub stall_s: f64,
@@ -77,7 +78,10 @@ impl ChunkingTimes {
 
     /// The queue handed out `frame`.
     pub(crate) fn frame_sent(&mut self, frame: &[u8], now: Instant) {
+        // A stall is counted with its duration, when it ends, so both land in
+        // the same reading.
         if let Some(since) = self.stalled_since.take() {
+            self.stats.stalls += 1;
             self.stats.stall_s += (now - since).as_secs_f64();
         }
         let (first, waited) = *self.leaving_since.get_or_insert_with(|| {
@@ -99,10 +103,7 @@ impl ChunkingTimes {
 
     /// The pump stopped with frames still queued: the native buffer is full.
     pub(crate) fn stalled(&mut self, now: Instant) {
-        if self.stalled_since.is_none() {
-            self.stalled_since = Some(now);
-            self.stats.stalls += 1;
-        }
+        self.stalled_since.get_or_insert(now);
     }
 
     /// The queue was cleared: what it held never leaves.
@@ -192,6 +193,11 @@ mod tests {
         times.frame_sent(&frame(true), t0);
         times.stalled(ms(1));
         times.stalled(ms(3));
+        assert_eq!(
+            times.stats().stalls,
+            0,
+            "a stall still going is not counted yet"
+        );
         times.frame_sent(&frame(false), ms(41));
 
         let s = times.stats();
@@ -200,6 +206,20 @@ mod tests {
             "a stall is counted once however often the pump stops"
         );
         assert!((s.stall_s - 0.040).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_stall_ended_by_a_cleared_queue_is_not_counted() {
+        let t0 = Instant::now();
+        let mut times = ChunkingTimes::default();
+
+        times.queued(t0);
+        times.frame_sent(&frame(true), t0);
+        times.stalled(t0 + Duration::from_millis(1));
+        times.cleared();
+
+        let s = times.stats();
+        assert_eq!((s.stalls, s.stall_s), (0, 0.0));
     }
 
     #[test]

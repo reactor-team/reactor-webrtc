@@ -435,7 +435,7 @@ change in its count:
 | -- | -- | -- |
 | `queue_wait_s` | `messages_sent` | from `send` to the message's first frame leaving the queue: the wait behind earlier messages and for the native buffer to drain |
 | `send_s` | `messages_sent` | from the first frame to the last handed to the native channel |
-| `stall_s` | `stalls` | the queue held back because the native buffer was at the high-water mark |
+| `stall_s` | `stalls` | the queue held back because the native buffer was at the high-water mark; a stall is counted when it ends |
 | `reassembly_s` | `messages_received` | from a message's first frame arriving to its last |
 
 `frames_sent` and `frames_received` count the frames themselves.
