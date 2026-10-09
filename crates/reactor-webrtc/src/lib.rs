@@ -36,6 +36,7 @@
 //! works without one.
 
 mod builder;
+mod chunking_times;
 mod config;
 mod dc_chunking;
 mod encoded;
@@ -52,6 +53,7 @@ use std::os::raw::c_int;
 use std::sync::Arc;
 
 pub use builder::PeerConnectionFactoryBuilder;
+pub use chunking_times::ChunkingStats;
 pub use config::{
     BundlePolicy, ContinualGatheringPolicy, IceServer, IceTransportsType, RtcConfiguration,
     TcpCandidatePolicy,
