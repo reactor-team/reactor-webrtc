@@ -237,6 +237,35 @@ flight; with 256 everything up to the 256 KiB message limit does.
 
 ---
 
+### 0006 — expose dcsctp's metrics
+
+`0006-dcsctp-expose-metrics.patch` · touches `media/sctp/dcsctp_transport.{h,cc}` (+17 lines)
+
+**What.** Adds `std::optional<dcsctp::Metrics> DcSctpTransport::GetMetrics() const`.
+It returns the socket's own `GetMetrics()`, or `nullopt` before the socket
+exists. Called from another thread, it runs itself on the network thread, where
+the socket lives.
+
+**Why.** dcsctp tracks what explains a slow data-channel message: the congestion
+window, the smoothed RTT, the data in flight, retransmitted packets and bytes,
+and the peer's receive window. Nothing upstream exposes them outside dcsctp:
+`RTCDataChannelStats` counts messages and bytes, and `SctpTransportInformation`
+carries only the state and the size limits. Without them a slow message cannot
+be told apart into "the window is small", "the path is long" and "packets are
+being lost", which have different fixes.
+
+**How it works.** The glue reaches the transport through public API:
+`PeerConnectionInterface::GetSctpTransport()` returns the `SctpTransport`, whose
+`internal()` is the `SctpTransportInternal`, and a `dynamic_cast` (the build has
+RTTI) gives the `DcSctpTransport`. The patch adds one public method and touches
+nothing else, so a build that never calls it behaves exactly as before.
+
+**Verify.** Applies cleanly on top of 0005 at the pinned commit. The binding's
+loopback test reads non-zero `cwnd_bytes`, `srtt_ms` and packet counts once a
+data channel has carried a message.
+
+---
+
 ## Planned (not yet authored — need their target builds to validate)
 
 - **Symbol isolation** — keep WebRTC's C++ symbols from clashing when a consumer

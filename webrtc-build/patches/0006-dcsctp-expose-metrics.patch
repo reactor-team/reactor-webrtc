@@ -1,0 +1,39 @@
+diff --git a/media/sctp/dcsctp_transport.cc b/media/sctp/dcsctp_transport.cc
+index e221f21..e0ce408 100644
+--- a/media/sctp/dcsctp_transport.cc
++++ b/media/sctp/dcsctp_transport.cc
+@@ -434,6 +434,16 @@ size_t DcSctpTransport::buffered_amount(int sid) const {
+   return socket_->buffered_amount(dcsctp::StreamID(sid));
+ }
+ 
++// Reactor: see the declaration and webrtc-build/patches/README.md (0006).
++std::optional<dcsctp::Metrics> DcSctpTransport::GetMetrics() const {
++  if (!network_thread_->IsCurrent()) {
++    return network_thread_->BlockingCall([this] { return GetMetrics(); });
++  }
++  if (!socket_)
++    return std::nullopt;
++  return socket_->GetMetrics();
++}
++
+ size_t DcSctpTransport::buffered_amount_low_threshold(int sid) const {
+   if (!socket_)
+     return 0;
+diff --git a/media/sctp/dcsctp_transport.h b/media/sctp/dcsctp_transport.h
+index 26dd14c..7620673 100644
+--- a/media/sctp/dcsctp_transport.h
++++ b/media/sctp/dcsctp_transport.h
+@@ -85,6 +85,13 @@ class DcSctpTransport : public SctpTransportInternal,
+   // SCTP socket to be created. See `early_received_packets_`.
+   size_t EarlyReceivedPacketCountForTesting() const override;
+ 
++  // Reactor: the socket's metrics (congestion window, smoothed RTT, data in
++  // flight, retransmissions, ...), or nullopt before the socket exists. Safe
++  // to call from any thread: it runs on the network thread, where the socket
++  // lives. Nothing upstream exposes these outside dcsctp. See
++  // webrtc-build/patches/README.md (0006).
++  std::optional<dcsctp::Metrics> GetMetrics() const;
++
+  private:
+   // dcsctp::DcSctpSocketCallbacks
+   dcsctp::SendPacketStatus SendPacketWithStatus(
