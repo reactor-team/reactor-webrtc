@@ -239,3 +239,18 @@ async def test_a_held_message_reaches_a_callback_that_reads_the_channel(factory)
     dc_b.on_message(on_message)
     await wait_for(lambda: seen)
     assert seen == [(b"held for later", True, rw.DataChannelState.Open)]
+
+
+async def test_stats_count_each_channels_messages_and_bytes(factory):
+    a, b, dc_a, dc_b = await connect(factory, chunk_a=False, chunk_b=False)
+    got = inbox(dc_b)
+
+    dc_a.send(b"ping")
+    await wait_for(lambda: got)
+
+    report = await a.pc.get_stats()
+    [data] = [c for c in report.data_channels if c.label == "data"]
+    assert data.state == rw.DataChannelState.Open
+    assert data.id is not None
+    assert (data.messages_sent, data.bytes_sent) == (1, 4)
+    assert (data.messages_received, data.bytes_received) == (0, 0)
