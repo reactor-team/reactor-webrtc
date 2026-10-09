@@ -246,7 +246,10 @@ struct ReactorStatEntry {
   uint32_t messages_received;
   // RTCDataChannelStats::label, NUL-terminated. A label that does not fit is
   // left empty rather than cut, so it can never name the wrong channel.
-  char     data_channel_label[64];
+  // data_channel_label_present tells that apart from a channel whose label is
+  // the empty string, which is a valid label.
+  char     data_channel_label[63];
+  uint8_t  data_channel_label_present;  // 0/1
 };
 
 // The layout guard, and the reason it is a size and not a comment: this struct
@@ -1236,6 +1239,8 @@ class StatsCallback : public webrtc::RTCStatsCollectorCallback {
           e.bytes_sent         = stat_val(s.bytes_sent);
           e.bytes_received     = stat_val(s.bytes_received);
           stat_str(s.label, e.data_channel_label);
+          e.data_channel_label_present =
+              s.label && s.label->size() < sizeof(e.data_channel_label) ? 1 : 0;
           entries.push_back(e);
         }
       }

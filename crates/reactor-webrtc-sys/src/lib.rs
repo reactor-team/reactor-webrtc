@@ -386,7 +386,10 @@ pub struct ReactorStatEntry {
     pub messages_received: u32,
     /// Data channel (kind 3): the label, NUL-terminated; empty when it did not
     /// fit.
-    pub data_channel_label: [c_char; 64],
+    pub data_channel_label: [c_char; 63],
+    /// Data channel (kind 3): 1 when `data_channel_label` holds the label,
+    /// which may be empty; 0 when it was absent or did not fit.
+    pub data_channel_label_present: u8,
 }
 
 // The other half of the layout guard in

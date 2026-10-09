@@ -352,7 +352,7 @@ class DataChannelStats:
     as a message, so these count frames there.
     """
 
-    #: The channel's label; None when absent or longer than 63 bytes.
+    #: The channel's label, which may be empty; None when absent or longer than 62 bytes.
     label: Optional[str]
     #: The SCTP stream id; None before it is assigned.
     id: Optional[int]

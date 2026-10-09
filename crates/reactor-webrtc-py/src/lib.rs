@@ -1233,7 +1233,8 @@ impl From<rw::IceCandidatePairStats> for IceCandidatePairStats {
 #[pyclass(get_all)]
 #[derive(Clone)]
 pub struct DataChannelStats {
-    /// The channel's label; `None` when absent or longer than 63 bytes.
+    /// The channel's label, which may be empty; `None` when absent or longer
+    /// than 62 bytes.
     pub label: Option<String>,
     /// The SCTP stream id; `None` before it is assigned.
     pub id: Option<u16>,
