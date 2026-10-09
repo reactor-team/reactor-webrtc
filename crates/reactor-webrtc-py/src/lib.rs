@@ -1325,6 +1325,59 @@ impl From<rw::ChunkingStats> for ChunkingStats {
     }
 }
 
+/// The SCTP association that carries a connection's data channels, as dcsctp
+/// tracks it. Counters are cumulative; the rest are its state when read.
+#[pyclass(get_all)]
+#[derive(Clone)]
+pub struct SctpStats {
+    pub packets_sent: u64,
+    pub messages_sent: u64,
+    /// Packets that carried a retransmitted chunk.
+    pub packets_retransmitted: u64,
+    /// Retransmitted payload and chunk headers.
+    pub bytes_retransmitted: u64,
+    pub packets_received: u64,
+    pub messages_received: u64,
+    /// How much may be in flight before an acknowledgement.
+    pub congestion_window_bytes: u64,
+    /// Chunks in flight, not yet acknowledged.
+    pub unacked_chunks: u64,
+    /// The smoothed round trip time, in milliseconds.
+    pub smoothed_rtt_ms: i32,
+    /// The receive window the peer last announced.
+    pub peer_receive_window_bytes: u32,
+    /// Whether both ends negotiated message interleaving.
+    pub message_interleaving: bool,
+}
+
+#[pymethods]
+impl SctpStats {
+    fn __repr__(&self) -> String {
+        format!(
+            "SctpStats(cwnd={}, srtt_ms={})",
+            self.congestion_window_bytes, self.smoothed_rtt_ms
+        )
+    }
+}
+
+impl From<rw::SctpStats> for SctpStats {
+    fn from(s: rw::SctpStats) -> Self {
+        Self {
+            packets_sent: s.packets_sent,
+            messages_sent: s.messages_sent,
+            packets_retransmitted: s.packets_retransmitted,
+            bytes_retransmitted: s.bytes_retransmitted,
+            packets_received: s.packets_received,
+            messages_received: s.messages_received,
+            congestion_window_bytes: s.congestion_window_bytes,
+            unacked_chunks: s.unacked_chunks,
+            smoothed_rtt_ms: s.smoothed_rtt_ms,
+            peer_receive_window_bytes: s.peer_receive_window_bytes,
+            message_interleaving: s.message_interleaving,
+        }
+    }
+}
+
 /// Snapshot delivered by `PeerConnection.get_stats()`.
 #[pyclass(get_all)]
 #[derive(Clone)]
@@ -1333,6 +1386,8 @@ pub struct StatsReport {
     pub outbound_rtp: Vec<OutboundRtpStats>,
     pub candidate_pairs: Vec<IceCandidatePairStats>,
     pub data_channels: Vec<DataChannelStats>,
+    /// The SCTP association; `None` before a data channel has created it.
+    pub sctp: Option<SctpStats>,
 }
 
 #[pymethods]
@@ -1355,6 +1410,7 @@ impl From<rw::StatsReport> for StatsReport {
             outbound_rtp: r.outbound_rtp.into_iter().map(Into::into).collect(),
             candidate_pairs: r.candidate_pairs.into_iter().map(Into::into).collect(),
             data_channels: r.data_channels.into_iter().map(Into::into).collect(),
+            sctp: r.sctp.map(Into::into),
         }
     }
 }
@@ -3504,6 +3560,7 @@ fn reactor_webrtc(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<IceCandidatePairStats>()?;
     m.add_class::<DataChannelStats>()?;
     m.add_class::<ChunkingStats>()?;
+    m.add_class::<SctpStats>()?;
     m.add_class::<StatsReport>()?;
     m.add_class::<FrameMetadata>()?;
     m.add_class::<FrameMetadataGate>()?;
