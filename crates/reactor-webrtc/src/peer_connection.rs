@@ -5,10 +5,11 @@ use std::os::raw::{c_char, c_int};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use reactor_webrtc_sys::ReactorStatEntry;
 
+use crate::chunking_times::ChunkingTimes;
 use crate::dc_chunking::ApplyError;
 use crate::encoded::{FrameTransform, VideoCodec};
 use crate::media::{MediaKind, Track};
@@ -1300,6 +1301,8 @@ struct Chunked {
     pump: Mutex<()>,
     pump_again: AtomicBool,
     reassembler: Mutex<reactor_webrtc_dc_chunking::Reassembler>,
+    // Where this channel's messages spend their time; see `chunking_times`.
+    times: Mutex<ChunkingTimes>,
     // Whole messages that arrived before on_message was set: libwebrtc holds
     // messages for a channel with no observer, and this keeps that promise
     // for the frames the pump's observer had to accept. Bounded by
@@ -1356,6 +1359,7 @@ impl ChannelCore {
                     reassembler: Mutex::new(reactor_webrtc_dc_chunking::Reassembler::new(
                         settings.max_message_size,
                     )),
+                    times: Mutex::new(ChunkingTimes::default()),
                     pending: Mutex::new(std::collections::VecDeque::new()),
                     pending_bytes: AtomicU64::new(0),
                     pending_limit: settings.send_buffer_limit,
@@ -1421,17 +1425,26 @@ impl ChannelCore {
             };
             while c.pump_again.swap(false, Ordering::SeqCst) {
                 loop {
-                    let frame = c
-                        .queue
-                        .lock()
-                        .unwrap()
-                        .next_frame(self.raw.buffered_amount());
-                    let Some(frame) = frame else { break };
+                    let (frame, queued_left) = {
+                        let mut queue = c.queue.lock().unwrap();
+                        let frame = queue.next_frame(self.raw.buffered_amount());
+                        (frame, !queue.is_empty())
+                    };
+                    let Some(frame) = frame else {
+                        // Frames left behind wait for the native buffer to
+                        // drain to the low-water mark.
+                        if queued_left {
+                            c.times.lock().unwrap().stalled(Instant::now());
+                        }
+                        break;
+                    };
+                    c.times.lock().unwrap().frame_sent(&frame, Instant::now());
                     if !self.raw.send(&frame, true) {
                         // libwebrtc closes the channel on a failed send. The
                         // peer may hold part of a message; nothing more can
                         // follow it.
                         c.queue.lock().unwrap().clear();
+                        c.times.lock().unwrap().cleared();
                         return;
                     }
                 }
@@ -1491,6 +1504,13 @@ extern "C" fn dc_on_message(ud: *mut c_void, data: *const u8, len: usize, binary
     } else {
         Err(reactor_webrtc_dc_chunking::FrameError::TypeChanged)
     };
+    if let Ok(d) = &delivery {
+        let completes = !matches!(d, reactor_webrtc_dc_chunking::Delivery::Pending);
+        c.times
+            .lock()
+            .unwrap()
+            .frame_received(completes, Instant::now());
+    }
     match delivery {
         Ok(reactor_webrtc_dc_chunking::Delivery::Message { data, binary }) => {
             core.deliver(c, data, binary)
@@ -1502,6 +1522,7 @@ extern "C" fn dc_on_message(ud: *mut c_void, data: *const u8, len: usize, binary
         // The peer broke the wire format; the stream cannot be trusted.
         Err(_) => {
             c.reassembler.lock().unwrap().reset();
+            c.times.lock().unwrap().reset_receive();
             core.raw.close();
         }
     }
@@ -1520,6 +1541,9 @@ extern "C" fn dc_on_state_change(ud: *mut c_void, state: c_int) {
             if let Some(Some(c)) = core.decided.get() {
                 c.queue.lock().unwrap().clear();
                 c.reassembler.lock().unwrap().reset();
+                let mut times = c.times.lock().unwrap();
+                times.cleared();
+                times.reset_receive();
             }
         }
         _ => {}
@@ -1624,6 +1648,18 @@ impl DataChannel {
         self.core.chunked().is_some()
     }
 
+    /// Where this channel's messages have spent their time since it opened,
+    /// as running totals; `None` on a channel that is not chunked.
+    ///
+    /// On the sending side: the wait in the queue before a message's first
+    /// frame leaves, the time from its first frame to its last, and how often
+    /// and how long the native buffer held the queue back. On the receiving
+    /// side: the time from a message's first frame to its last. See
+    /// [`ChunkingStats`](crate::ChunkingStats).
+    pub fn chunking_stats(&self) -> Option<crate::ChunkingStats> {
+        self.core.chunked().map(|c| c.times.lock().unwrap().stats())
+    }
+
     /// Whether the channel delivers messages in order.
     pub fn ordered(&self) -> bool {
         unsafe { reactor_webrtc_sys::reactor_webrtc_data_channel_ordered(self.raw) != 0 }
@@ -1702,11 +1738,15 @@ impl DataChannel {
         if self.state() != DataChannelState::Open {
             return Err(Error::Webrtc("data channel send failed".into()));
         }
-        c.queue
-            .lock()
-            .unwrap()
-            .push(data.to_vec(), binary)
-            .map_err(Error::DataChannel)?;
+        {
+            // Held across both, so the queue and the send times stay in step
+            // when several threads send at once.
+            let mut queue = c.queue.lock().unwrap();
+            queue
+                .push(data.to_vec(), binary)
+                .map_err(Error::DataChannel)?;
+            c.times.lock().unwrap().queued(Instant::now());
+        }
         c.user_low_armed.store(true, Ordering::SeqCst);
         self.core.pump(c);
         Ok(())

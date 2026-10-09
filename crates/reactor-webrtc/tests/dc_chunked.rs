@@ -559,10 +559,52 @@ mod tests {
 
     #[test]
     #[cfg_attr(target_os = "windows", ignore)]
+    fn each_side_times_its_messages() {
+        let (f1, f2) = (chunking(), chunking());
+        let mut p = connect(&f1, &f2);
+        let at_b = inbox(&mut p.b);
+        // 16 MiB: hundreds of 64 KiB frames. Whether the native buffer holds
+        // the queue back depends on how fast loopback drains it, so stalls
+        // are covered by the unit tests instead.
+        let msg = pattern(9, 16 * 1024 * 1024);
+        p.a.send(&msg, true).expect("send");
+        p.a.send(b"ping", true).expect("send");
+        let (got, _) = arrival(&at_b, &p.a, "the large message", Duration::from_secs(60));
+        assert!(got == msg);
+        arrival(&at_b, &p.a, "the small message", Duration::from_secs(10));
+
+        let sent = p.a.chunking_stats().expect("a chunked channel has stats");
+        assert_eq!(sent.messages_sent, 2);
+        assert!(
+            sent.frames_sent > 256,
+            "the large message left as many frames"
+        );
+        assert!(
+            sent.send_s > 0.0,
+            "a many-frame message takes time to leave"
+        );
+        assert!(
+            sent.queue_wait_s > 0.0,
+            "the small message waited behind the large one"
+        );
+        assert_eq!((sent.messages_received, sent.frames_received), (0, 0));
+
+        let received = p.b.chunking_stats().expect("a chunked channel has stats");
+        assert_eq!(received.messages_received, 2);
+        assert_eq!(received.frames_received, sent.frames_sent);
+        assert!(
+            received.reassembly_s > 0.0,
+            "the large message arrived over time"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(target_os = "windows", ignore)]
     fn a_plain_channel_behaves_as_before() {
         let (f1, f2) = (factory(None), factory(None));
         let mut p = connect(&f1, &f2);
         assert!(!p.a.is_chunked() && !p.b.is_chunked());
+        assert!(p.a.chunking_stats().is_none());
         let at_b = inbox(&mut p.b);
         let msg = pattern(3, 100 * 1024);
         p.a.send(&msg, true).expect("send");
