@@ -344,10 +344,29 @@ class IceCandidatePairStats:
     local_candidate_type: IceCandidateType
     local_relay_protocol: RelayProtocol
 
+class DataChannelStats:
+    """One data channel's counters (`RTCDataChannelStats`).
+
+    A message is what the application sent or received in one call, however
+    many SCTP chunks carried it. On a chunked channel libwebrtc sees each frame
+    as a message, so these count frames there.
+    """
+
+    #: The channel's label; None when absent or longer than 63 bytes.
+    label: Optional[str]
+    #: The SCTP stream id; None before it is assigned.
+    id: Optional[int]
+    state: DataChannelState
+    messages_sent: int
+    bytes_sent: int
+    messages_received: int
+    bytes_received: int
+
 class StatsReport:
     inbound_rtp: list[InboundRtpStats]
     outbound_rtp: list[OutboundRtpStats]
     candidate_pairs: list[IceCandidatePairStats]
+    data_channels: list[DataChannelStats]
 
 # ── Frame metadata ────────────────────────────────────────────────────────────
 

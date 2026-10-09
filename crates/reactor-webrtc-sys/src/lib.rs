@@ -375,6 +375,18 @@ pub struct ReactorStatEntry {
     pub timing_receive_finish_ms: i64,
     pub timing_decode_start_ms: i64,
     pub timing_decode_finish_ms: i64,
+    /// Data channel (kind 3): the SCTP stream id, -1 before it is assigned.
+    /// Its byte counts ride in `bytes_sent` and `bytes_received`.
+    pub data_channel_id: i32,
+    /// Data channel (kind 3): 0=connecting 1=open 2=closing 3=closed.
+    pub data_channel_state: i32,
+    /// Data channel (kind 3): messages the application sent and received,
+    /// however many SCTP chunks carried each one.
+    pub messages_sent: u32,
+    pub messages_received: u32,
+    /// Data channel (kind 3): the label, NUL-terminated; empty when it did not
+    /// fit.
+    pub data_channel_label: [c_char; 64],
 }
 
 // The other half of the layout guard in
@@ -388,7 +400,7 @@ pub struct ReactorStatEntry {
 // with their neighbours are pinned too, on both sides.
 const _: () = {
     assert!(
-        core::mem::size_of::<ReactorStatEntry>() == 408,
+        core::mem::size_of::<ReactorStatEntry>() == 488,
         "ReactorStatEntry changed size — update the C struct in \
          glue/reactor_webrtc.cpp and both assertions"
     );
@@ -444,6 +456,18 @@ const _: () = {
     assert!(
         core::mem::offset_of!(ReactorStatEntry, timing_capture_ms) == 336,
         "the timing frame stamps moved — see above"
+    );
+    assert!(
+        core::mem::offset_of!(ReactorStatEntry, data_channel_id) == 408,
+        "the data channel fields moved — see above"
+    );
+    assert!(
+        core::mem::offset_of!(ReactorStatEntry, messages_sent) == 416,
+        "the data channel counters moved — see above"
+    );
+    assert!(
+        core::mem::offset_of!(ReactorStatEntry, data_channel_label) == 424,
+        "the data channel label moved — see above"
     );
 };
 

@@ -106,6 +106,7 @@ extern "C" {
 //   kind 0 = inbound_rtp   (RTCInboundRtpStreamStats)
 //   kind 1 = outbound_rtp  (RTCOutboundRtpStreamStats)
 //   kind 2 = candidate_pair (RTCIceCandidatePairStats)
+//   kind 3 = data_channel   (RTCDataChannelStats)
 // Fields are ordered to avoid padding; the layout must match the repr(C)
 // struct in reactor-webrtc-sys/src/lib.rs.
 struct ReactorStatEntry {
@@ -236,6 +237,16 @@ struct ReactorStatEntry {
   int64_t  timing_receive_finish_ms;
   int64_t  timing_decode_start_ms;
   int64_t  timing_decode_finish_ms;
+  // Data channel (kind 3): RTCDataChannelStats. Its byte counts ride in
+  // bytes_sent and bytes_received above. A message is what the application
+  // sent or received in one call, however many SCTP chunks carried it.
+  int32_t  data_channel_id;     // the SCTP stream id, -1 before it is assigned
+  int32_t  data_channel_state;  // 0=connecting 1=open 2=closing 3=closed
+  uint32_t messages_sent;
+  uint32_t messages_received;
+  // RTCDataChannelStats::label, NUL-terminated. A label that does not fit is
+  // left empty rather than cut, so it can never name the wrong channel.
+  char     data_channel_label[64];
 };
 
 // The layout guard, and the reason it is a size and not a comment: this struct
@@ -247,7 +258,7 @@ struct ReactorStatEntry {
 //
 // The Rust side carries the same assertion against the same number. If you are
 // here because one of them failed: you changed the struct on one side only.
-static_assert(sizeof(struct ReactorStatEntry) == 408,
+static_assert(sizeof(struct ReactorStatEntry) == 488,
               "ReactorStatEntry changed size — update the repr(C) mirror in "
               "reactor-webrtc-sys/src/lib.rs and both assertions");
 static_assert(offsetof(struct ReactorStatEntry, bytes_received) == 72,
@@ -285,6 +296,12 @@ static_assert(offsetof(struct ReactorStatEntry, timing_frame_present) == 328,
               "the timing frame fields moved — see above");
 static_assert(offsetof(struct ReactorStatEntry, timing_capture_ms) == 336,
               "the timing frame stamps moved — see above");
+static_assert(offsetof(struct ReactorStatEntry, data_channel_id) == 408,
+              "the data channel fields moved — see above");
+static_assert(offsetof(struct ReactorStatEntry, messages_sent) == 416,
+              "the data channel counters moved — see above");
+static_assert(offsetof(struct ReactorStatEntry, data_channel_label) == 424,
+              "the data channel label moved — see above");
 
 // PeerConnectionObserver events, forwarded to the safe crate. Any pointer may
 // be null (the field is `Option<extern "C" fn>` on the Rust side).
@@ -979,6 +996,18 @@ static int parse_pair_state(const S& m) {
   return 0;  // "waiting" or unknown
 }
 
+// Parse RTCDataChannelStats::state to the integer encoding used in
+// ReactorStatEntry::data_channel_state, which is the one DataChannelState uses.
+template <typename S>
+static int parse_data_channel_state(const S& m) {
+  if (!m) return 3;
+  const std::string& s = *m;
+  if (s == "connecting") return 0;
+  if (s == "open")       return 1;
+  if (s == "closing")    return 2;
+  return 3;  // "closed" or unknown
+}
+
 // Parse RTCRtpStreamStats::kind to the integer encoding used in
 // ReactorStatEntry::stream_kind.
 template <typename S>
@@ -1194,6 +1223,19 @@ class StatsCallback : public webrtc::RTCStatsCollectorCallback {
               e.local_relay_protocol = parse_relay_protocol(c.relay_protocol);
             }
           }
+          entries.push_back(e);
+        } else if (stats.type() == webrtc::RTCDataChannelStats::kType) {
+          const auto& s = stats.cast_to<webrtc::RTCDataChannelStats>();
+          e.kind               = 3;
+          e.data_channel_id    = s.data_channel_identifier
+                                     ? *s.data_channel_identifier
+                                     : -1;
+          e.data_channel_state = parse_data_channel_state(s.state);
+          e.messages_sent      = stat_val(s.messages_sent);
+          e.messages_received  = stat_val(s.messages_received);
+          e.bytes_sent         = stat_val(s.bytes_sent);
+          e.bytes_received     = stat_val(s.bytes_received);
+          stat_str(s.label, e.data_channel_label);
           entries.push_back(e);
         }
       }

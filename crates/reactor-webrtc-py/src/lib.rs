@@ -1225,6 +1225,49 @@ impl From<rw::IceCandidatePairStats> for IceCandidatePairStats {
     }
 }
 
+/// One data channel's counters (`RTCDataChannelStats`).
+///
+/// A message is what the application sent or received in one call, however
+/// many SCTP chunks carried it. On a chunked channel libwebrtc sees each frame
+/// as a message, so these count frames there.
+#[pyclass(get_all)]
+#[derive(Clone)]
+pub struct DataChannelStats {
+    /// The channel's label; `None` when absent or longer than 63 bytes.
+    pub label: Option<String>,
+    /// The SCTP stream id; `None` before it is assigned.
+    pub id: Option<u16>,
+    pub state: DataChannelState,
+    pub messages_sent: u32,
+    pub bytes_sent: u64,
+    pub messages_received: u32,
+    pub bytes_received: u64,
+}
+
+#[pymethods]
+impl DataChannelStats {
+    fn __repr__(&self) -> String {
+        format!(
+            "DataChannelStats(label={:?}, sent={}, received={})",
+            self.label, self.messages_sent, self.messages_received
+        )
+    }
+}
+
+impl From<rw::DataChannelStats> for DataChannelStats {
+    fn from(s: rw::DataChannelStats) -> Self {
+        Self {
+            label: s.label,
+            id: s.id,
+            state: DataChannelState::from(s.state),
+            messages_sent: s.messages_sent,
+            bytes_sent: s.bytes_sent,
+            messages_received: s.messages_received,
+            bytes_received: s.bytes_received,
+        }
+    }
+}
+
 /// Snapshot delivered by `PeerConnection.get_stats()`.
 #[pyclass(get_all)]
 #[derive(Clone)]
@@ -1232,16 +1275,18 @@ pub struct StatsReport {
     pub inbound_rtp: Vec<InboundRtpStats>,
     pub outbound_rtp: Vec<OutboundRtpStats>,
     pub candidate_pairs: Vec<IceCandidatePairStats>,
+    pub data_channels: Vec<DataChannelStats>,
 }
 
 #[pymethods]
 impl StatsReport {
     fn __repr__(&self) -> String {
         format!(
-            "StatsReport(inbound={}, outbound={}, pairs={})",
+            "StatsReport(inbound={}, outbound={}, pairs={}, data_channels={})",
             self.inbound_rtp.len(),
             self.outbound_rtp.len(),
-            self.candidate_pairs.len()
+            self.candidate_pairs.len(),
+            self.data_channels.len()
         )
     }
 }
@@ -1252,6 +1297,7 @@ impl From<rw::StatsReport> for StatsReport {
             inbound_rtp: r.inbound_rtp.into_iter().map(Into::into).collect(),
             outbound_rtp: r.outbound_rtp.into_iter().map(Into::into).collect(),
             candidate_pairs: r.candidate_pairs.into_iter().map(Into::into).collect(),
+            data_channels: r.data_channels.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -3392,6 +3438,7 @@ fn reactor_webrtc(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TimingFrameReceiverTimestamps>()?;
     m.add_class::<OutboundRtpStats>()?;
     m.add_class::<IceCandidatePairStats>()?;
+    m.add_class::<DataChannelStats>()?;
     m.add_class::<StatsReport>()?;
     m.add_class::<FrameMetadata>()?;
     m.add_class::<FrameMetadataGate>()?;

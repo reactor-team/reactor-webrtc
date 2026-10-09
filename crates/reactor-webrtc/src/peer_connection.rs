@@ -1199,12 +1199,32 @@ pub struct IceCandidatePairStats {
     pub local_relay_protocol: RelayProtocol,
 }
 
+/// One data channel's counters (`RTCDataChannelStats`).
+///
+/// A message is what the application sent or received in one call, however
+/// many SCTP chunks carried it. On a chunked channel (see
+/// [`crate::DcChunking`]), libwebrtc sees each frame as a message, so these
+/// count frames there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataChannelStats {
+    /// The channel's label; `None` when absent or longer than 63 bytes.
+    pub label: Option<String>,
+    /// The SCTP stream id; `None` before it is assigned.
+    pub id: Option<u16>,
+    pub state: DataChannelState,
+    pub messages_sent: u32,
+    pub bytes_sent: u64,
+    pub messages_received: u32,
+    pub bytes_received: u64,
+}
+
 /// A snapshot of the stats delivered by [`PeerConnection::get_stats`].
 #[derive(Debug, Clone, Default)]
 pub struct StatsReport {
     pub inbound_rtp: Vec<InboundRtpStats>,
     pub outbound_rtp: Vec<OutboundRtpStats>,
     pub candidate_pairs: Vec<IceCandidatePairStats>,
+    pub data_channels: Vec<DataChannelStats>,
 }
 
 // ── Data channel callbacks ────────────────────────────────────────────────────
@@ -1952,6 +1972,15 @@ extern "C" fn stats_cb(ud: *mut c_void, entries: *const ReactorStatEntry, count:
                 packets_received: e.pair_packets_received,
                 local_candidate_type: IceCandidateType::from_raw(e.local_candidate_type),
                 local_relay_protocol: RelayProtocol::from_raw(e.local_relay_protocol),
+            }),
+            3 => report.data_channels.push(DataChannelStats {
+                label: stat_str(&e.data_channel_label),
+                id: u16::try_from(e.data_channel_id).ok(),
+                state: DataChannelState::from_raw(e.data_channel_state),
+                messages_sent: e.messages_sent,
+                bytes_sent: e.bytes_sent,
+                messages_received: e.messages_received,
+                bytes_received: e.bytes_received,
             }),
             _ => {}
         }
