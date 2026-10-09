@@ -1438,7 +1438,6 @@ impl ChannelCore {
                         }
                         break;
                     };
-                    c.times.lock().unwrap().frame_sent(&frame, Instant::now());
                     if !self.raw.send(&frame, true) {
                         // libwebrtc closes the channel on a failed send. The
                         // peer may hold part of a message; nothing more can
@@ -1447,6 +1446,8 @@ impl ChannelCore {
                         c.times.lock().unwrap().cleared();
                         return;
                     }
+                    // Counted once libwebrtc took it: a refused frame never left.
+                    c.times.lock().unwrap().frame_sent(&frame, Instant::now());
                 }
             }
             drop(_guard);
