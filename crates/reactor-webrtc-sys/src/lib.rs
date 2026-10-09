@@ -474,6 +474,38 @@ const _: () = {
     );
 };
 
+/// The SCTP association's metrics, as dcsctp tracks them. Mirrors the C struct
+/// in `glue/reactor_webrtc.cpp`, read by
+/// `reactor_webrtc_peer_connection_sctp_metrics`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ReactorSctpMetrics {
+    pub tx_packets: u64,
+    pub tx_messages: u64,
+    /// Packets that carried a retransmitted chunk.
+    pub rtx_packets: u64,
+    /// Retransmitted payload and chunk headers.
+    pub rtx_bytes: u64,
+    pub rx_packets: u64,
+    pub rx_messages: u64,
+    /// The congestion window.
+    pub cwnd_bytes: u64,
+    /// Chunks in flight, not yet acknowledged.
+    pub unack_data: u64,
+    /// The smoothed round trip time.
+    pub srtt_ms: i32,
+    /// The peer's last announced receive window.
+    pub peer_rwnd_bytes: u32,
+    /// 1 when both ends negotiated message interleaving.
+    pub uses_message_interleaving: u8,
+}
+
+const _: () = assert!(
+    core::mem::size_of::<ReactorSctpMetrics>() == 80,
+    "ReactorSctpMetrics changed size — update the C struct in \
+     glue/reactor_webrtc.cpp and both assertions"
+);
+
 /// PeerConnectionObserver callbacks, forwarded from the C++ glue. Every field
 /// is optional (`None` = a null function pointer on the C side). `userdata` is
 /// passed back verbatim to each callback. State arguments are the integer value
@@ -1034,6 +1066,14 @@ extern "C" {
             count: c_int,
         ),
     );
+
+    /// Fill `out` with the SCTP association's metrics and return 1, or return
+    /// 0 when there are none (no data channel has created the association
+    /// yet). Blocks while the network thread reads them.
+    pub fn reactor_webrtc_peer_connection_sctp_metrics(
+        pc: *mut PeerConnection,
+        out: *mut ReactorSctpMetrics,
+    ) -> c_int;
 
     // ── Platform bootstrap ───────────────────────────────────────────────────
     /// Android: hand the JavaVM to libwebrtc (call from JNI_OnLoad).

@@ -1220,6 +1220,37 @@ pub struct DataChannelStats {
     pub bytes_received: u64,
 }
 
+/// The SCTP association that carries a connection's data channels, as dcsctp
+/// tracks it.
+///
+/// Counters are cumulative for the association; the rest are its state when
+/// read. Together they say why a data-channel message is slow: a small
+/// congestion window, a long round trip, or loss and retransmission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SctpStats {
+    pub packets_sent: u64,
+    pub messages_sent: u64,
+    /// Packets that carried a retransmitted chunk: an upper bound on the
+    /// packets resent, since one packet can carry new and resent chunks.
+    pub packets_retransmitted: u64,
+    /// Retransmitted payload and chunk headers.
+    pub bytes_retransmitted: u64,
+    pub packets_received: u64,
+    pub messages_received: u64,
+    /// The congestion window: how much may be in flight before an
+    /// acknowledgement.
+    pub congestion_window_bytes: u64,
+    /// Chunks in flight, not yet acknowledged.
+    pub unacked_chunks: u64,
+    /// The smoothed round trip time, in milliseconds.
+    pub smoothed_rtt_ms: i32,
+    /// The receive window the peer last announced.
+    pub peer_receive_window_bytes: u32,
+    /// Whether both ends negotiated message interleaving, which lets a small
+    /// message go out between the chunks of a large one.
+    pub message_interleaving: bool,
+}
+
 /// A snapshot of the stats delivered by [`PeerConnection::get_stats`].
 #[derive(Debug, Clone, Default)]
 pub struct StatsReport {
@@ -1227,6 +1258,8 @@ pub struct StatsReport {
     pub outbound_rtp: Vec<OutboundRtpStats>,
     pub candidate_pairs: Vec<IceCandidatePairStats>,
     pub data_channels: Vec<DataChannelStats>,
+    /// The SCTP association; `None` before a data channel has created it.
+    pub sctp: Option<SctpStats>,
 }
 
 // ── Data channel callbacks ────────────────────────────────────────────────────
@@ -2552,8 +2585,30 @@ impl PeerConnection {
     ///   (bytes sent, target bitrate, RTT).
     /// - [`StatsReport::candidate_pairs`] — ICE candidate pair state and RTT.
     pub fn get_stats(&self) -> Result<StatsReport> {
-        run_stats(|ud| unsafe {
+        let mut report = run_stats(|ud| unsafe {
             reactor_webrtc_sys::reactor_webrtc_peer_connection_get_stats(self.raw, ud, stats_cb)
+        })?;
+        report.sctp = self.sctp_stats();
+        Ok(report)
+    }
+
+    fn sctp_stats(&self) -> Option<SctpStats> {
+        let mut m = reactor_webrtc_sys::ReactorSctpMetrics::default();
+        let filled = unsafe {
+            reactor_webrtc_sys::reactor_webrtc_peer_connection_sctp_metrics(self.raw, &mut m)
+        };
+        (filled == 1).then_some(SctpStats {
+            packets_sent: m.tx_packets,
+            messages_sent: m.tx_messages,
+            packets_retransmitted: m.rtx_packets,
+            bytes_retransmitted: m.rtx_bytes,
+            packets_received: m.rx_packets,
+            messages_received: m.rx_messages,
+            congestion_window_bytes: m.cwnd_bytes,
+            unacked_chunks: m.unack_data,
+            smoothed_rtt_ms: m.srtt_ms,
+            peer_receive_window_bytes: m.peer_rwnd_bytes,
+            message_interleaving: m.uses_message_interleaving != 0,
         })
     }
 
