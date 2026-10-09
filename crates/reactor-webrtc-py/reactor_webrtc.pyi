@@ -389,11 +389,37 @@ class ChunkingStats:
     #: From a message's first frame arriving to its last.
     reassembly_s: float
 
+class SctpStats:
+    """The SCTP association that carries a connection's data channels, as
+    dcsctp tracks it. Counters are cumulative; the rest are its state when read.
+    """
+
+    packets_sent: int
+    messages_sent: int
+    #: Packets that carried a retransmitted chunk.
+    packets_retransmitted: int
+    #: Retransmitted payload and chunk headers.
+    bytes_retransmitted: int
+    packets_received: int
+    messages_received: int
+    #: How much may be in flight before an acknowledgement.
+    congestion_window_bytes: int
+    #: Chunks in flight, not yet acknowledged.
+    unacked_chunks: int
+    #: The smoothed round trip time, in milliseconds.
+    smoothed_rtt_ms: int
+    #: The receive window the peer last announced.
+    peer_receive_window_bytes: int
+    #: Whether both ends negotiated message interleaving.
+    message_interleaving: bool
+
 class StatsReport:
     inbound_rtp: list[InboundRtpStats]
     outbound_rtp: list[OutboundRtpStats]
     candidate_pairs: list[IceCandidatePairStats]
     data_channels: list[DataChannelStats]
+    #: The SCTP association; None before a data channel has created it.
+    sctp: Optional[SctpStats]
 
 # ── Frame metadata ────────────────────────────────────────────────────────────
 
