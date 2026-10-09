@@ -54,8 +54,11 @@ pub(crate) struct ChunkingTimes {
     stats: ChunkingStats,
     /// When each queued message was sent, oldest first, in the queue's order.
     sent_at: VecDeque<Instant>,
-    /// When the message leaving now handed over its first frame.
-    leaving_since: Option<Instant>,
+    /// When the message leaving now handed over its first frame, and how long
+    /// it had waited in the queue. The wait joins the totals only with the
+    /// message's last frame, so a message that never finishes leaving adds
+    /// nothing.
+    leaving_since: Option<(Instant, f64)>,
     /// When the pump stopped with frames still queued.
     stalled_since: Option<Instant>,
     /// When the message arriving now delivered its first frame.
@@ -77,18 +80,16 @@ impl ChunkingTimes {
         if let Some(since) = self.stalled_since.take() {
             self.stats.stall_s += (now - since).as_secs_f64();
         }
-        let first = match self.leaving_since {
-            Some(first) => first,
-            None => {
-                if let Some(sent) = self.sent_at.front() {
-                    self.stats.queue_wait_s += (now - *sent).as_secs_f64();
-                }
-                self.leaving_since = Some(now);
-                now
-            }
-        };
+        let (first, waited) = *self.leaving_since.get_or_insert_with(|| {
+            let waited = self
+                .sent_at
+                .front()
+                .map_or(0.0, |sent| (now - *sent).as_secs_f64());
+            (now, waited)
+        });
         self.stats.frames_sent += 1;
         if !more(frame) {
+            self.stats.queue_wait_s += waited;
             self.stats.send_s += (now - first).as_secs_f64();
             self.stats.messages_sent += 1;
             self.sent_at.pop_front();
@@ -215,6 +216,23 @@ mod tests {
         let s = times.stats();
         assert_eq!(s.messages_sent, 1);
         assert!((s.queue_wait_s - 0.001).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_message_that_never_finishes_leaving_adds_no_wait() {
+        let t0 = Instant::now();
+        let mut times = ChunkingTimes::default();
+
+        times.queued(t0);
+        times.frame_sent(&frame(true), t0 + Duration::from_millis(50));
+        times.cleared();
+
+        let s = times.stats();
+        assert_eq!((s.messages_sent, s.frames_sent), (0, 1));
+        assert_eq!(
+            s.queue_wait_s, 0.0,
+            "the wait goes with a message that left"
+        );
     }
 
     #[test]
