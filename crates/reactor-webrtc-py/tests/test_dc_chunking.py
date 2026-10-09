@@ -254,3 +254,26 @@ async def test_stats_count_each_channels_messages_and_bytes(factory):
     assert data.id is not None
     assert (data.messages_sent, data.bytes_sent) == (1, 4)
     assert (data.messages_received, data.bytes_received) == (0, 0)
+
+
+async def test_a_chunked_channel_times_its_messages(factory):
+    a, b, dc_a, dc_b = await connect(factory)
+    got = inbox(dc_b)
+    msg = pattern(5, 4 * MIB)
+
+    dc_a.send(msg)
+    await wait_for(lambda: got)
+
+    sent = dc_a.chunking_stats()
+    assert sent.messages_sent == 1
+    assert sent.frames_sent > 1
+    assert sent.send_s > 0
+    received = dc_b.chunking_stats()
+    assert received.messages_received == 1
+    assert received.frames_received == sent.frames_sent
+    assert received.reassembly_s > 0
+
+
+async def test_a_plain_channel_has_no_chunking_stats(factory):
+    _, _, dc_a, _ = await connect(factory, chunk_a=False, chunk_b=False)
+    assert dc_a.chunking_stats() is None

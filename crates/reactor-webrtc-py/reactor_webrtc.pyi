@@ -362,6 +362,33 @@ class DataChannelStats:
     messages_received: int
     bytes_received: int
 
+class ChunkingStats:
+    """Running totals of a chunked channel's messages, since it opened.
+
+    Every time is in seconds and summed over the messages that finished the
+    step, so the average over an interval is the change in a time divided by
+    the change in its count.
+    """
+
+    #: Messages whose last frame was handed to the native channel.
+    messages_sent: int
+    #: Frames handed to the native channel.
+    frames_sent: int
+    #: From `send` to the message's first frame leaving the queue.
+    queue_wait_s: float
+    #: From a message's first frame to its last being handed to the native channel.
+    send_s: float
+    #: Times the pump stopped with frames queued because the native buffer was full.
+    stalls: int
+    #: The time the pump spent stopped that way.
+    stall_s: float
+    #: Messages the reassembler completed, including dropped oversized ones.
+    messages_received: int
+    #: Frames received.
+    frames_received: int
+    #: From a message's first frame arriving to its last.
+    reassembly_s: float
+
 class StatsReport:
     inbound_rtp: list[InboundRtpStats]
     outbound_rtp: list[OutboundRtpStats]
@@ -700,6 +727,10 @@ class DataChannel:
         """Whether this channel carries chunked messages: its connection
         negotiated chunking and it is ordered and fully reliable. Decided once
         the channel is open; `False` before."""
+        ...
+    def chunking_stats(self) -> Optional[ChunkingStats]:
+        """Where this channel's messages have spent their time since it opened,
+        as running totals; `None` on a channel that is not chunked."""
         ...
     def ordered(self) -> bool: ...
     def reliable(self) -> bool: ...
