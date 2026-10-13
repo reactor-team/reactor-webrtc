@@ -1199,12 +1199,33 @@ pub struct IceCandidatePairStats {
     pub local_relay_protocol: RelayProtocol,
 }
 
+/// One data channel's counters (`RTCDataChannelStats`).
+///
+/// A message is what the application sent or received in one call, however
+/// many SCTP chunks carried it. On a chunked channel (see
+/// [`crate::DcChunking`]), libwebrtc sees each frame as a message, so these
+/// count frames there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataChannelStats {
+    /// The channel's label, which may be empty; `None` when absent or longer
+    /// than 62 bytes.
+    pub label: Option<String>,
+    /// The SCTP stream id; `None` before it is assigned.
+    pub id: Option<u16>,
+    pub state: DataChannelState,
+    pub messages_sent: u32,
+    pub bytes_sent: u64,
+    pub messages_received: u32,
+    pub bytes_received: u64,
+}
+
 /// A snapshot of the stats delivered by [`PeerConnection::get_stats`].
 #[derive(Debug, Clone, Default)]
 pub struct StatsReport {
     pub inbound_rtp: Vec<InboundRtpStats>,
     pub outbound_rtp: Vec<OutboundRtpStats>,
     pub candidate_pairs: Vec<IceCandidatePairStats>,
+    pub data_channels: Vec<DataChannelStats>,
 }
 
 // ── Data channel callbacks ────────────────────────────────────────────────────
@@ -1953,10 +1974,25 @@ extern "C" fn stats_cb(ud: *mut c_void, entries: *const ReactorStatEntry, count:
                 local_candidate_type: IceCandidateType::from_raw(e.local_candidate_type),
                 local_relay_protocol: RelayProtocol::from_raw(e.local_relay_protocol),
             }),
+            3 => report.data_channels.push(DataChannelStats {
+                label: data_channel_label(e),
+                id: u16::try_from(e.data_channel_id).ok(),
+                state: DataChannelState::from_raw(e.data_channel_state),
+                messages_sent: e.messages_sent,
+                bytes_sent: e.bytes_sent,
+                messages_received: e.messages_received,
+                bytes_received: e.bytes_received,
+            }),
             _ => {}
         }
     }
     let _ = tx.try_send(report);
+}
+
+/// A data channel's label from its stats entry. An empty label is a valid
+/// label, so presence comes from its own flag rather than from emptiness.
+fn data_channel_label(e: &ReactorStatEntry) -> Option<String> {
+    (e.data_channel_label_present != 0).then(|| stat_str(&e.data_channel_label).unwrap_or_default())
 }
 
 // `call` dispatches onto a libwebrtc thread that invokes the C callback
@@ -2540,6 +2576,39 @@ impl Drop for PeerConnection {
         }
         // Destroy the native PC (stops callbacks) before the observer box drops.
         unsafe { reactor_webrtc_sys::reactor_webrtc_peer_connection_destroy(self.raw) }
+    }
+}
+
+#[cfg(test)]
+mod data_channel_label_tests {
+    use super::*;
+
+    fn entry(label: &[u8], present: bool) -> ReactorStatEntry {
+        // SAFETY: every field is a plain number or byte array.
+        let mut e: ReactorStatEntry = unsafe { std::mem::zeroed() };
+        for (dst, &b) in e.data_channel_label.iter_mut().zip(label) {
+            *dst = b as c_char;
+        }
+        e.data_channel_label_present = present as u8;
+        e
+    }
+
+    #[test]
+    fn an_empty_label_is_a_label() {
+        assert_eq!(data_channel_label(&entry(b"", true)), Some(String::new()));
+    }
+
+    #[test]
+    fn a_label_reads_as_itself() {
+        assert_eq!(
+            data_channel_label(&entry(b"chat", true)),
+            Some("chat".into())
+        );
+    }
+
+    #[test]
+    fn an_absent_or_overlong_label_is_none() {
+        assert_eq!(data_channel_label(&entry(b"", false)), None);
     }
 }
 

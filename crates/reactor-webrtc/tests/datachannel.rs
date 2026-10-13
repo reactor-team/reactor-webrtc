@@ -11,8 +11,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use reactor_webrtc::{
-    DataChannel, IceCandidate, PeerConnection, PeerConnectionFactory, PeerConnectionObserver,
-    PeerConnectionState, RtcConfiguration,
+    DataChannel, DataChannelState, IceCandidate, PeerConnection, PeerConnectionFactory,
+    PeerConnectionObserver, PeerConnectionState, RtcConfiguration,
 };
 
 #[derive(Default)]
@@ -149,6 +149,19 @@ fn data_channel_round_trip() {
             ),
             "pc1 did not receive the pong",
         );
+
+        // Each side's report counts the one message it sent and the one it
+        // received on the channel, by its label.
+        let report = pc1.get_stats().expect("stats");
+        let chat = report
+            .data_channels
+            .iter()
+            .find(|c| c.label.as_deref() == Some("chat"))
+            .expect("the channel is in the report");
+        assert_eq!(chat.state, DataChannelState::Open);
+        assert!(chat.id.is_some(), "an open channel has a stream id");
+        assert_eq!((chat.messages_sent, chat.bytes_sent), (1, 4));
+        assert_eq!((chat.messages_received, chat.bytes_received), (1, 4));
         stop.store(true, Ordering::SeqCst);
     });
 

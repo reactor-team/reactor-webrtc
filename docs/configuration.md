@@ -572,13 +572,18 @@ want a series. In Python it is one of the awaitable methods (see
 [`architecture.md`](architecture.md#threading-model)); the Rust API is
 synchronous and blocks the calling thread until the engine delivers the report.
 
-The report carries a **subset** of libwebrtc's, in three lists:
+The report carries a **subset** of libwebrtc's, in four lists:
 
 | List | libwebrtc type | What it describes |
 | -- | -- | -- |
 | `inbound_rtp` | `RTCInboundRtpStreamStats` | one receive stream each |
 | `outbound_rtp` | `RTCOutboundRtpStreamStats` | one send stream each |
 | `candidate_pairs` | `RTCIceCandidatePairStats` | one ICE candidate pair each |
+| `data_channels` | `RTCDataChannelStats` | one data channel each: label, stream id, state, and messages and bytes each way |
+
+A data channel's message is one `send` or one delivered message, however many
+SCTP chunks carried it. On a chunked channel libwebrtc sees each frame as a
+message, so its counts there are frames.
 
 <details>
 <summary>🦀 Example using Rust</summary>

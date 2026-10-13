@@ -79,11 +79,11 @@ pub use metadata::{
 };
 pub use observer::PeerConnectionObserver;
 pub use peer_connection::{
-    DataChannel, DataChannelState, IceCandidate, IceCandidatePairState, IceCandidatePairStats,
-    IceCandidateType, IceGatheringState, InboundRtpStats, OutboundRtpStats, PeerConnection,
-    PeerConnectionState, RelayProtocol, SdpType, SessionDescription, StatsReport, StreamKind,
-    TimingFrameInfo, TimingFrameReceiverTimestamps, TimingFrameSenderTimestamps, Transceiver,
-    TransceiverDirection,
+    DataChannel, DataChannelState, DataChannelStats, IceCandidate, IceCandidatePairState,
+    IceCandidatePairStats, IceCandidateType, IceGatheringState, InboundRtpStats, OutboundRtpStats,
+    PeerConnection, PeerConnectionState, RelayProtocol, SdpType, SessionDescription, StatsReport,
+    StreamKind, TimingFrameInfo, TimingFrameReceiverTimestamps, TimingFrameSenderTimestamps,
+    Transceiver, TransceiverDirection,
 };
 pub use playout::PlayoutDelay;
 /// Runtime download/verification/caching of Cisco's OpenH264 shared library,

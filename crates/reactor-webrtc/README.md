@@ -56,7 +56,7 @@ pc.set_local_description(&offer)?;
 | `H264Backend` | Per-track H.264 selection: `VideoToolbox` / `OpenH264` (Auto = platform default) |
 | `EncoderFeedback` | `KeyFrameRequest` + `RateUpdate { bitrate_bps, framerate_fps }` for custom-encoded tracks |
 | `Transceiver` | RTP send/recv direction + MID; `set_codec_preferences` for video codec choice |
-| `StatsReport` | `inbound_rtp`, `outbound_rtp`, `candidate_pairs` |
+| `StatsReport` | `inbound_rtp`, `outbound_rtp`, `candidate_pairs`, `data_channels` |
 | `SessionDescription` | SDP offer or answer; `ice_ufrags`, `with_ice_credentials`, `declares_frame_metadata`, `with_frame_metadata` |
 | `FrameMetadataGate` | What the remote declared about per-frame metadata |
 | `IceCandidate` | Trickled ICE candidate |
