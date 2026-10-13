@@ -1269,6 +1269,62 @@ impl From<rw::DataChannelStats> for DataChannelStats {
     }
 }
 
+/// Running totals of a chunked channel's messages, since it opened.
+///
+/// Every time is in seconds and summed over the messages that finished the
+/// step, so the average over an interval is the change in a time divided by
+/// the change in its count.
+#[pyclass(get_all)]
+#[derive(Clone)]
+pub struct ChunkingStats {
+    /// Messages whose last frame was handed to the native channel.
+    pub messages_sent: u64,
+    /// Frames handed to the native channel.
+    pub frames_sent: u64,
+    /// From `send` to the message's first frame leaving the queue.
+    pub queue_wait_s: f64,
+    /// From a message's first frame to its last being handed to the native
+    /// channel.
+    pub send_s: f64,
+    /// Times the pump stopped with frames still queued because the native
+    /// buffer was at the high-water mark.
+    pub stalls: u64,
+    /// The time the pump spent stopped that way.
+    pub stall_s: f64,
+    /// Messages the reassembler completed, including dropped oversized ones.
+    pub messages_received: u64,
+    /// Frames received.
+    pub frames_received: u64,
+    /// From a message's first frame arriving to its last.
+    pub reassembly_s: f64,
+}
+
+#[pymethods]
+impl ChunkingStats {
+    fn __repr__(&self) -> String {
+        format!(
+            "ChunkingStats(messages_sent={}, messages_received={})",
+            self.messages_sent, self.messages_received
+        )
+    }
+}
+
+impl From<rw::ChunkingStats> for ChunkingStats {
+    fn from(s: rw::ChunkingStats) -> Self {
+        Self {
+            messages_sent: s.messages_sent,
+            frames_sent: s.frames_sent,
+            queue_wait_s: s.queue_wait_s,
+            send_s: s.send_s,
+            stalls: s.stalls,
+            stall_s: s.stall_s,
+            messages_received: s.messages_received,
+            frames_received: s.frames_received,
+            reassembly_s: s.reassembly_s,
+        }
+    }
+}
+
 /// Snapshot delivered by `PeerConnection.get_stats()`.
 #[pyclass(get_all)]
 #[derive(Clone)]
@@ -2239,6 +2295,13 @@ impl DataChannel {
     /// the channel is open; `False` before.
     fn is_chunked(&self, py: Python) -> bool {
         py.allow_threads(|| self.inner.is_chunked())
+    }
+
+    /// Where this channel's messages have spent their time since it opened, as
+    /// running totals; `None` on a channel that is not chunked.
+    fn chunking_stats(&self, py: Python) -> Option<ChunkingStats> {
+        py.allow_threads(|| self.inner.chunking_stats())
+            .map(ChunkingStats::from)
     }
 
     /// Whether the channel delivers messages in order.
@@ -3440,6 +3503,7 @@ fn reactor_webrtc(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<OutboundRtpStats>()?;
     m.add_class::<IceCandidatePairStats>()?;
     m.add_class::<DataChannelStats>()?;
+    m.add_class::<ChunkingStats>()?;
     m.add_class::<StatsReport>()?;
     m.add_class::<FrameMetadata>()?;
     m.add_class::<FrameMetadataGate>()?;

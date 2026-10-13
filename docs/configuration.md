@@ -424,6 +424,24 @@ await dc.drain(timeout=30.0)     # wait for the queue to empty
 In Python a refused send raises `DataChannelMessageTooLarge` or
 `DataChannelQueueFull`, both subclasses of `RuntimeError`.
 
+### Where a chunked message spends its time
+
+`chunking_stats()` on a chunked channel returns running totals since it opened
+(`None` on a plain channel). Each time is summed over the messages that
+finished the step, so an interval's average is the change in a time over the
+change in its count:
+
+| Total | Count | What it measures |
+| -- | -- | -- |
+| `queue_wait_s` | `messages_sent` | from `send` to the message's first frame leaving the queue: the wait behind earlier messages and for the native buffer to drain |
+| `send_s` | `messages_sent` | from the first frame to the last handed to the native channel |
+| `stall_s` | `stalls` | the queue held back because the native buffer was at the high-water mark; a stall is counted when it ends |
+| `reassembly_s` | `messages_received` | from a message's first frame arriving to its last |
+
+`frames_sent` and `frames_received` count the frames themselves.
+`reassembly_s` is the closest a receiver gets to the time a message's body
+took on the wire, on its own clock.
+
 ## Congestion-control bitrate limits
 
 `set_bitrate` is a `PeerConnection` method, not an `RtcConfiguration` field —
