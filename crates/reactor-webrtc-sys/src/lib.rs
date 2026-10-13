@@ -1067,13 +1067,20 @@ extern "C" {
         ),
     );
 
-    /// Fill `out` with the SCTP association's metrics and return 1, or return
-    /// 0 when there are none (no data channel has created the association
-    /// yet). Blocks while the network thread reads them.
+    /// Read the SCTP association's metrics on the network thread. `callback`
+    /// fires exactly once, on that thread: with the metrics and 1, or with
+    /// null and 0 when there are none (no data channel has created the
+    /// association yet). Never blocks the caller; the safe crate bounds the
+    /// wait.
     pub fn reactor_webrtc_peer_connection_sctp_metrics(
         pc: *mut PeerConnection,
-        out: *mut ReactorSctpMetrics,
-    ) -> c_int;
+        userdata: *mut c_void,
+        callback: extern "C" fn(
+            userdata: *mut c_void,
+            metrics: *const ReactorSctpMetrics,
+            ok: c_int,
+        ),
+    );
 
     // ── Platform bootstrap ───────────────────────────────────────────────────
     /// Android: hand the JavaVM to libwebrtc (call from JNI_OnLoad).

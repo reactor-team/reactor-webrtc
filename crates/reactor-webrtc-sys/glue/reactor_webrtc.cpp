@@ -308,8 +308,8 @@ static_assert(offsetof(struct ReactorStatEntry, messages_sent) == 416,
 static_assert(offsetof(struct ReactorStatEntry, data_channel_label) == 424,
               "the data channel label moved — see above");
 
-// The SCTP association's metrics, as dcsctp tracks them (patch 0006). Read by
-// reactor_webrtc_peer_connection_sctp_metrics; mirrored by `repr(C) struct
+// The SCTP association's metrics, as dcsctp tracks them (patch 0006). Handed
+// to the callback of reactor_webrtc_peer_connection_sctp_metrics; mirrored by `repr(C) struct
 // ReactorSctpMetrics` in crates/reactor-webrtc-sys/src/lib.rs. Counters are
 // cumulative for the association; the rest are its state when read.
 struct ReactorSctpMetrics {
@@ -3150,39 +3150,53 @@ void reactor_webrtc_peer_connection_get_stats(
   rpc->pc->GetStats(cb.get());
 }
 
-// Fill `out` with the SCTP association's metrics and return 1, or return 0
-// when there are none: no data channel has created the association yet, or it
-// is not a dcsctp one. Blocks while the network thread reads them.
-int reactor_webrtc_peer_connection_sctp_metrics(void* pc,
-                                                ReactorSctpMetrics* out) {
+// Read the SCTP association's metrics on the network thread and hand them to
+// `callback` exactly once: with the metrics and 1, or with null and 0 when
+// there are none (no data channel has created the association yet, or it is
+// not a dcsctp one). Never blocks the caller; `callback` runs on the network
+// thread, and the metrics pointer is valid only during the call.
+void reactor_webrtc_peer_connection_sctp_metrics(
+    void* pc, void* userdata,
+    void (*callback)(void* userdata, const ReactorSctpMetrics* metrics, int ok)) {
   auto* rpc = reinterpret_cast<ReactorPeerConnection*>(pc);
-  if (!rpc || !rpc->pc || !rpc->network_thread || !out) return 0;
-  webrtc::scoped_refptr<webrtc::SctpTransportInterface> transport =
-      rpc->pc->GetSctpTransport();
-  if (!transport) return 0;
-  // GetSctpTransport hands back the concrete transport, not a proxy, and its
-  // internal() may only be read on the network thread.
-  auto* sctp = dynamic_cast<webrtc::SctpTransport*>(transport.get());
-  if (!sctp) return 0;
-  std::optional<dcsctp::Metrics> metrics = rpc->network_thread->BlockingCall(
-      [sctp]() -> std::optional<dcsctp::Metrics> {
-        auto* dc = dynamic_cast<webrtc::DcSctpTransport*>(sctp->internal());
-        return dc ? dc->GetMetrics() : std::nullopt;
-      });
-  if (!metrics) return 0;
-  *out = ReactorSctpMetrics{};
-  out->tx_packets                = metrics->tx_packets_count;
-  out->tx_messages               = metrics->tx_messages_count;
-  out->rtx_packets               = metrics->rtx_packets_count;
-  out->rtx_bytes                 = metrics->rtx_bytes_count;
-  out->rx_packets                = metrics->rx_packets_count;
-  out->rx_messages               = metrics->rx_messages_count;
-  out->cwnd_bytes                = metrics->cwnd_bytes;
-  out->unack_data                = metrics->unack_data_count;
-  out->srtt_ms                   = metrics->srtt_ms;
-  out->peer_rwnd_bytes           = metrics->peer_rwnd_bytes;
-  out->uses_message_interleaving = metrics->uses_message_interleaving ? 1 : 0;
-  return 1;
+  if (!rpc || !rpc->pc || !rpc->network_thread) {
+    if (callback) callback(userdata, nullptr, 0);
+    return;
+  }
+  webrtc::scoped_refptr<webrtc::PeerConnectionInterface> conn = rpc->pc;
+  rpc->network_thread->PostTask([conn, userdata, callback] {
+    // Already on the network thread: the proxy runs GetSctpTransport() here
+    // directly, internal() may be read here, and the patch's own hop in
+    // GetMetrics() is for callers on other threads. Two hops are kept on
+    // purpose: this one, so the caller never blocks, and the patch's, so the
+    // method stays safe to call from anywhere.
+    std::optional<dcsctp::Metrics> metrics;
+    webrtc::scoped_refptr<webrtc::SctpTransportInterface> transport =
+        conn->GetSctpTransport();
+    // GetSctpTransport hands back the concrete transport, not a proxy.
+    if (auto* sctp = dynamic_cast<webrtc::SctpTransport*>(transport.get())) {
+      if (auto* dc = dynamic_cast<webrtc::DcSctpTransport*>(sctp->internal())) {
+        metrics = dc->GetMetrics();
+      }
+    }
+    if (!metrics) {
+      if (callback) callback(userdata, nullptr, 0);
+      return;
+    }
+    ReactorSctpMetrics out{};
+    out.tx_packets                = metrics->tx_packets_count;
+    out.tx_messages               = metrics->tx_messages_count;
+    out.rtx_packets               = metrics->rtx_packets_count;
+    out.rtx_bytes                 = metrics->rtx_bytes_count;
+    out.rx_packets                = metrics->rx_packets_count;
+    out.rx_messages               = metrics->rx_messages_count;
+    out.cwnd_bytes                = metrics->cwnd_bytes;
+    out.unack_data                = metrics->unack_data_count;
+    out.srtt_ms                   = metrics->srtt_ms;
+    out.peer_rwnd_bytes           = metrics->peer_rwnd_bytes;
+    out.uses_message_interleaving = metrics->uses_message_interleaving ? 1 : 0;
+    if (callback) callback(userdata, &out, 1);
+  });
 }
 
 }  // extern "C"

@@ -2069,6 +2069,31 @@ fn data_channel_label(e: &ReactorStatEntry) -> Option<String> {
     (e.data_channel_label_present != 0).then(|| stat_str(&e.data_channel_label).unwrap_or_default())
 }
 
+extern "C" fn sctp_cb(
+    ud: *mut c_void,
+    m: *const reactor_webrtc_sys::ReactorSctpMetrics,
+    ok: c_int,
+) {
+    let tx = unsafe { Arc::from_raw(ud as *const SyncSender<Option<SctpStats>>) };
+    let stats = (ok == 1 && !m.is_null()).then(|| {
+        let m = unsafe { &*m };
+        SctpStats {
+            packets_sent: m.tx_packets,
+            messages_sent: m.tx_messages,
+            packets_retransmitted: m.rtx_packets,
+            bytes_retransmitted: m.rtx_bytes,
+            packets_received: m.rx_packets,
+            messages_received: m.rx_messages,
+            congestion_window_bytes: m.cwnd_bytes,
+            unacked_chunks: m.unack_data,
+            smoothed_rtt_ms: m.srtt_ms,
+            peer_receive_window_bytes: m.peer_rwnd_bytes,
+            message_interleaving: m.uses_message_interleaving != 0,
+        }
+    });
+    let _ = tx.try_send(stats);
+}
+
 // `call` dispatches onto a libwebrtc thread that invokes the C callback
 // asynchronously; the public API gives no guarantee that thread has finished
 // unwinding out of the callback (still touching `tx` inside its own `notify()`
@@ -2592,24 +2617,23 @@ impl PeerConnection {
         Ok(report)
     }
 
+    /// The SCTP association's metrics, read on the network thread and waited
+    /// for no longer than the stats report is. `None` when there are none, or
+    /// when the network thread does not answer in time.
     fn sctp_stats(&self) -> Option<SctpStats> {
-        let mut m = reactor_webrtc_sys::ReactorSctpMetrics::default();
-        let filled = unsafe {
-            reactor_webrtc_sys::reactor_webrtc_peer_connection_sctp_metrics(self.raw, &mut m)
+        let (tx, rx) = sync_channel::<Option<SctpStats>>(1);
+        let tx = Arc::new(tx);
+        let p = Arc::into_raw(tx.clone());
+        unsafe {
+            reactor_webrtc_sys::reactor_webrtc_peer_connection_sctp_metrics(
+                self.raw,
+                p as *mut c_void,
+                sctp_cb,
+            )
         };
-        (filled == 1).then_some(SctpStats {
-            packets_sent: m.tx_packets,
-            messages_sent: m.tx_messages,
-            packets_retransmitted: m.rtx_packets,
-            bytes_retransmitted: m.rtx_bytes,
-            packets_received: m.rx_packets,
-            messages_received: m.rx_messages,
-            congestion_window_bytes: m.cwnd_bytes,
-            unacked_chunks: m.unack_data,
-            smoothed_rtt_ms: m.srtt_ms,
-            peer_receive_window_bytes: m.peer_rwnd_bytes,
-            message_interleaving: m.uses_message_interleaving != 0,
-        })
+        let r = rx.recv_timeout(OP_TIMEOUT);
+        drop(tx);
+        r.ok().flatten()
     }
 
     /// Set aggregate bitrate limits on the peer connection.
