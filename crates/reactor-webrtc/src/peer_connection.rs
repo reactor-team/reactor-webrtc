@@ -1024,6 +1024,12 @@ pub struct InboundRtpStats {
     /// The slowest timing frame of the last second, or `None` if none arrived
     /// in it. Video only.
     pub timing_frame: Option<TimingFrameInfo>,
+    /// The decoder libwebrtc uses for this stream, e.g. `"libvpx"` or
+    /// `"VideoToolbox"`; `None` before the first frame is decoded, for audio,
+    /// and for a name longer than 63 bytes.
+    pub decoder_implementation: Option<String>,
+    /// Whether that decoder is the hardware one; `None` when not reported.
+    pub power_efficient_decoder: Option<bool>,
 }
 
 impl InboundRtpStats {
@@ -1169,6 +1175,12 @@ pub struct OutboundRtpStats {
     /// seconds. Summed over packets, not frames: divide by
     /// [`OutboundRtpStats::packets_sent`].
     pub total_packet_send_delay_s: f64,
+    /// The encoder libwebrtc uses for this stream, e.g. `"libvpx"` or
+    /// `"VideoToolbox"`; `None` before the first frame is encoded, for audio,
+    /// and for a name longer than 63 bytes.
+    pub encoder_implementation: Option<String>,
+    /// Whether that encoder is the hardware one; `None` when not reported.
+    pub power_efficient_encoder: Option<bool>,
 }
 
 /// `RTCIceCandidatePairStats` subset.
@@ -2006,6 +2018,8 @@ extern "C" fn stats_cb(ud: *mut c_void, entries: *const ReactorStatEntry, count:
                         decode_finish_ms: e.timing_decode_finish_ms,
                     },
                 }),
+                decoder_implementation: stat_str(&e.codec_implementation),
+                power_efficient_decoder: power_efficient(e.power_efficient),
             }),
             1 => report.outbound_rtp.push(OutboundRtpStats {
                 ssrc: e.ssrc,
@@ -2030,6 +2044,8 @@ extern "C" fn stats_cb(ud: *mut c_void, entries: *const ReactorStatEntry, count:
                 frames_encoded: e.frames_encoded,
                 total_encode_time_s: e.total_encode_time,
                 total_packet_send_delay_s: e.total_packet_send_delay,
+                encoder_implementation: stat_str(&e.codec_implementation),
+                power_efficient_encoder: power_efficient(e.power_efficient),
             }),
             2 => report.candidate_pairs.push(IceCandidatePairStats {
                 current_round_trip_time_s: e.current_round_trip_time,
@@ -2061,6 +2077,11 @@ extern "C" fn stats_cb(ud: *mut c_void, entries: *const ReactorStatEntry, count:
         }
     }
     let _ = tx.try_send(report);
+}
+
+/// The stats entry's power-efficient flag: -1 unknown, 0 no, 1 yes.
+fn power_efficient(v: i8) -> Option<bool> {
+    (v >= 0).then_some(v == 1)
 }
 
 /// A data channel's label from its stats entry. An empty label is a valid

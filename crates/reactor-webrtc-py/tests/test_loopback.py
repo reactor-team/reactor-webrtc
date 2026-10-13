@@ -578,6 +578,8 @@ class TestStats:
         assert inbound.jitter_buffer_emitted_count > 0
         assert inbound.jitter_buffer_delay_s > 0.0
         assert inbound.total_processing_delay_s > 0.0
+        assert outbound.encoder_implementation, "no encoder implementation"
+        assert inbound.decoder_implementation, "no decoder implementation"
 
         t = inbound.timing_frame
         assert t is not None, "no timing frame reported within ~15 s"

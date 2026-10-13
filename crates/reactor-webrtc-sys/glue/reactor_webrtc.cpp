@@ -252,6 +252,16 @@ struct ReactorStatEntry {
   // the empty string, which is a valid label.
   char     data_channel_label[63];
   uint8_t  data_channel_label_present;  // 0/1
+  // Video, kinds 0 and 1: the codec implementation libwebrtc reports,
+  // RTCInboundRtpStreamStats::decoder_implementation for kind 0 and
+  // RTCOutboundRtpStreamStats::encoder_implementation for kind 1, e.g.
+  // "libvpx" or "VideoToolbox". NUL-terminated; empty when absent or when it
+  // does not fit.
+  char     codec_implementation[64];
+  // power_efficient_decoder / power_efficient_encoder: whether that
+  // implementation is the hardware one. -1 unknown, 0 no, 1 yes.
+  int8_t   power_efficient;
+  // Seven bytes of padding, so the size stays a multiple of 8.
 };
 
 // The layout guard, and the reason it is a size and not a comment: this struct
@@ -263,7 +273,7 @@ struct ReactorStatEntry {
 //
 // The Rust side carries the same assertion against the same number. If you are
 // here because one of them failed: you changed the struct on one side only.
-static_assert(sizeof(struct ReactorStatEntry) == 488,
+static_assert(sizeof(struct ReactorStatEntry) == 560,
               "ReactorStatEntry changed size — update the repr(C) mirror in "
               "reactor-webrtc-sys/src/lib.rs and both assertions");
 static_assert(offsetof(struct ReactorStatEntry, bytes_received) == 72,
@@ -307,6 +317,10 @@ static_assert(offsetof(struct ReactorStatEntry, messages_sent) == 416,
               "the data channel counters moved — see above");
 static_assert(offsetof(struct ReactorStatEntry, data_channel_label) == 424,
               "the data channel label moved — see above");
+static_assert(offsetof(struct ReactorStatEntry, codec_implementation) == 488,
+              "the codec implementation moved — see above");
+static_assert(offsetof(struct ReactorStatEntry, power_efficient) == 552,
+              "the power-efficient flag moved — see above");
 
 // The SCTP association's metrics, as dcsctp tracks them (patch 0006). Handed
 // to the callback of reactor_webrtc_peer_connection_sctp_metrics; mirrored by `repr(C) struct
@@ -1145,6 +1159,7 @@ class StatsCallback : public webrtc::RTCStatsCollectorCallback {
         e.stream_kind          = -1;
         e.local_candidate_type = -1;
         e.local_relay_protocol = -1;
+        e.power_efficient      = -1;
         if (stats.type() == webrtc::RTCInboundRtpStreamStats::kType) {
           const auto& s = stats.cast_to<webrtc::RTCInboundRtpStreamStats>();
           e.kind              = 0;
@@ -1171,6 +1186,10 @@ class StatsCallback : public webrtc::RTCStatsCollectorCallback {
           e.jitter_buffer_minimum_delay = stat_val(s.jitter_buffer_minimum_delay);
           e.jitter_buffer_emitted_count = stat_val(s.jitter_buffer_emitted_count);
           e.total_processing_delay      = stat_val(s.total_processing_delay);
+          stat_str(s.decoder_implementation, e.codec_implementation);
+          e.power_efficient = s.power_efficient_decoder
+                                  ? (*s.power_efficient_decoder ? 1 : 0)
+                                  : -1;
           if (s.goog_timing_frame_info) {
             parse_timing_frame_info(*s.goog_timing_frame_info, e);
           }
@@ -1199,6 +1218,10 @@ class StatsCallback : public webrtc::RTCStatsCollectorCallback {
           e.frames_encoded             = stat_val(s.frames_encoded);
           e.total_encode_time          = stat_val(s.total_encode_time);
           e.total_packet_send_delay    = stat_val(s.total_packet_send_delay);
+          stat_str(s.encoder_implementation, e.codec_implementation);
+          e.power_efficient = s.power_efficient_encoder
+                                  ? (*s.power_efficient_encoder ? 1 : 0)
+                                  : -1;
           // round_trip_time was removed from RTCOutboundRtpStreamStats in M7907
           // and the send path's RTT moved to RTCRemoteInboundRtpStreamStats —
           // the receiver's report about us. remote_id points straight at it, so

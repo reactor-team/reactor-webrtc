@@ -252,6 +252,10 @@ class InboundRtpStats:
     #: The slowest timing frame of the last second, or None if none arrived in
     #: it. Video only.
     timing_frame: Optional[TimingFrameInfo]
+    #: The decoder libwebrtc uses, e.g. "libvpx"; None before the first decoded frame.
+    decoder_implementation: Optional[str]
+    #: Whether that decoder is the hardware one; None when not reported.
+    power_efficient_decoder: Optional[bool]
     @property
     def average_jitter_buffer_delay_s(self) -> Optional[float]:
         """Average seconds a frame spent in the jitter buffer; None before the
@@ -325,6 +329,10 @@ class OutboundRtpStats:
     total_encode_time_s: float
     #: Cumulative seconds packets waited in the pacer; per packet, not per frame.
     total_packet_send_delay_s: float
+    #: The encoder libwebrtc uses, e.g. "libvpx"; None before the first encoded frame.
+    encoder_implementation: Optional[str]
+    #: Whether that encoder is the hardware one; None when not reported.
+    power_efficient_encoder: Optional[bool]
 
 class IceCandidatePairStats:
     current_round_trip_time_s: float

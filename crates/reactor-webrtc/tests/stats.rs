@@ -359,6 +359,23 @@ mod tests {
             inbound.total_processing_delay_s > 0.0,
             "no processing delay"
         );
+        // Which codec implementation each side runs, e.g. "libvpx".
+        assert!(
+            outbound
+                .encoder_implementation
+                .as_deref()
+                .is_some_and(|s| !s.is_empty()),
+            "no encoder implementation: {:?}",
+            outbound.encoder_implementation
+        );
+        assert!(
+            inbound
+                .decoder_implementation
+                .as_deref()
+                .is_some_and(|s| !s.is_empty()),
+            "no decoder implementation: {:?}",
+            inbound.decoder_implementation
+        );
 
         let t = inbound.timing_frame.expect("timing frame");
         let (s, r) = (t.sender, t.receiver);

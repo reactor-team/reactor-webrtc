@@ -919,6 +919,11 @@ pub struct InboundRtpStats {
     /// The slowest timing frame of the last second, or `None` if none arrived
     /// in it. Video only.
     pub timing_frame: Option<TimingFrameInfo>,
+    /// The decoder libwebrtc uses, e.g. "libvpx"; `None` before the first
+    /// decoded frame, for audio, and for a name longer than 63 bytes.
+    pub decoder_implementation: Option<String>,
+    /// Whether that decoder is the hardware one; `None` when not reported.
+    pub power_efficient_decoder: Option<bool>,
 }
 
 /// One frame libwebrtc stamped at each stage of its trip, as the receiver
@@ -1071,6 +1076,8 @@ impl From<rw::InboundRtpStats> for InboundRtpStats {
             jitter_buffer_emitted_count: s.jitter_buffer_emitted_count,
             total_processing_delay_s: s.total_processing_delay_s,
             timing_frame: s.timing_frame.map(TimingFrameInfo::from),
+            decoder_implementation: s.decoder_implementation,
+            power_efficient_decoder: s.power_efficient_decoder,
         }
     }
 }
@@ -1129,6 +1136,11 @@ pub struct OutboundRtpStats {
     /// Cumulative time packets waited in the pacer, in seconds. Summed over
     /// packets, not frames: divide by `packets_sent`.
     pub total_packet_send_delay_s: f64,
+    /// The encoder libwebrtc uses, e.g. "libvpx"; `None` before the first
+    /// encoded frame, for audio, and for a name longer than 63 bytes.
+    pub encoder_implementation: Option<String>,
+    /// Whether that encoder is the hardware one; `None` when not reported.
+    pub power_efficient_encoder: Option<bool>,
 }
 
 #[pymethods]
@@ -1163,6 +1175,8 @@ impl From<rw::OutboundRtpStats> for OutboundRtpStats {
             frames_encoded: s.frames_encoded,
             total_encode_time_s: s.total_encode_time_s,
             total_packet_send_delay_s: s.total_packet_send_delay_s,
+            encoder_implementation: s.encoder_implementation,
+            power_efficient_encoder: s.power_efficient_encoder,
         }
     }
 }
