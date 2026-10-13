@@ -603,6 +603,14 @@ A data channel's message is one `send` or one delivered message, however many
 SCTP chunks carried it. On a chunked channel libwebrtc sees each frame as a
 message, so its counts there are frames.
 
+Beside the lists, `sctp` describes the SCTP association that carries every data
+channel of the connection, as dcsctp tracks it (`None` before a data channel
+has created it): packets and messages each way, retransmitted packets and
+bytes, the congestion window, the chunks in flight, the smoothed round trip time
+and the peer's receive window. They tell a slow message's causes apart: a small
+congestion window, a long round trip, or loss and retransmission. libwebrtc does
+not expose these; patch 0006 does (see `webrtc-build/patches/README.md`).
+
 <details>
 <summary>🦀 Example using Rust</summary>
 

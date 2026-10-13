@@ -82,10 +82,12 @@
 #include "apple_hw/apple_hw_codec.h"
 #endif
 #include "media/base/video_broadcaster.h"
+#include "media/sctp/dcsctp_transport.h"
 #include "modules/audio_device/include/audio_device_default.h"
 #include "modules/video_coding/codecs/interface/common_constants.h"
 #include "modules/video_coding/include/video_codec_interface.h"
 #include "modules/video_coding/include/video_error_codes.h"
+#include "pc/sctp_transport.h"
 #include "pc/video_track_source.h"
 #include "rtc_base/copy_on_write_buffer.h"
 #include "rtc_base/thread.h"
@@ -305,6 +307,28 @@ static_assert(offsetof(struct ReactorStatEntry, messages_sent) == 416,
               "the data channel counters moved — see above");
 static_assert(offsetof(struct ReactorStatEntry, data_channel_label) == 424,
               "the data channel label moved — see above");
+
+// The SCTP association's metrics, as dcsctp tracks them (patch 0006). Handed
+// to the callback of reactor_webrtc_peer_connection_sctp_metrics; mirrored by `repr(C) struct
+// ReactorSctpMetrics` in crates/reactor-webrtc-sys/src/lib.rs. Counters are
+// cumulative for the association; the rest are its state when read.
+struct ReactorSctpMetrics {
+  uint64_t tx_packets;
+  uint64_t tx_messages;
+  uint64_t rtx_packets;   // packets that carried a retransmitted chunk
+  uint64_t rtx_bytes;     // retransmitted payload and chunk headers
+  uint64_t rx_packets;
+  uint64_t rx_messages;
+  uint64_t cwnd_bytes;    // congestion window
+  uint64_t unack_data;    // chunks in flight, not yet acknowledged
+  int32_t  srtt_ms;       // smoothed round trip time
+  uint32_t peer_rwnd_bytes;  // the peer's last announced receive window
+  uint8_t  uses_message_interleaving;  // 0/1
+  // Seven bytes of padding, so the size is a multiple of 8.
+};
+static_assert(sizeof(struct ReactorSctpMetrics) == 80,
+              "ReactorSctpMetrics changed size — update the repr(C) mirror in "
+              "crates/reactor-webrtc-sys/src/lib.rs and both assertions");
 
 // PeerConnectionObserver events, forwarded to the safe crate. Any pointer may
 // be null (the field is `Option<extern "C" fn>` on the Rust side).
@@ -810,6 +834,10 @@ struct ReactorPeerConnection {
   // not the connection, so transceiver handles need it too — see
   // ReactorTransceiver::factory.
   webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> factory;
+  // The factory's network thread, where the SCTP transport lives. The safe
+  // crate keeps the factory, and so this thread, alive as long as the
+  // connection.
+  webrtc::Thread* network_thread = nullptr;
 };
 
 // Forwards CreateOffer/CreateAnswer results to C callbacks.
@@ -1352,6 +1380,7 @@ void* reactor_webrtc_peer_connection_create(void* factory,
 
   auto rpc = std::make_unique<ReactorPeerConnection>();
   rpc->factory = rf->factory;
+  rpc->network_thread = rf->network_thread.get();
   ReactorPcCallbacks cb{};
   if (callbacks) cb = *callbacks;
   rpc->observer = std::make_unique<ReactorPcObserver>(cb);
@@ -3119,6 +3148,55 @@ void reactor_webrtc_peer_connection_get_stats(
       webrtc::make_ref_counted<StatsCallback>(userdata, callback);
   cb->AddRef();
   rpc->pc->GetStats(cb.get());
+}
+
+// Read the SCTP association's metrics on the network thread and hand them to
+// `callback` exactly once: with the metrics and 1, or with null and 0 when
+// there are none (no data channel has created the association yet, or it is
+// not a dcsctp one). Never blocks the caller; `callback` runs on the network
+// thread, and the metrics pointer is valid only during the call.
+void reactor_webrtc_peer_connection_sctp_metrics(
+    void* pc, void* userdata,
+    void (*callback)(void* userdata, const ReactorSctpMetrics* metrics, int ok)) {
+  auto* rpc = reinterpret_cast<ReactorPeerConnection*>(pc);
+  if (!rpc || !rpc->pc || !rpc->network_thread) {
+    if (callback) callback(userdata, nullptr, 0);
+    return;
+  }
+  webrtc::scoped_refptr<webrtc::PeerConnectionInterface> conn = rpc->pc;
+  rpc->network_thread->PostTask([conn, userdata, callback] {
+    // Already on the network thread: the proxy runs GetSctpTransport() here
+    // directly, internal() may be read here, and the patch's own hop in
+    // GetMetrics() is for callers on other threads. Two hops are kept on
+    // purpose: this one, so the caller never blocks, and the patch's, so the
+    // method stays safe to call from anywhere.
+    std::optional<dcsctp::Metrics> metrics;
+    webrtc::scoped_refptr<webrtc::SctpTransportInterface> transport =
+        conn->GetSctpTransport();
+    // GetSctpTransport hands back the concrete transport, not a proxy.
+    if (auto* sctp = dynamic_cast<webrtc::SctpTransport*>(transport.get())) {
+      if (auto* dc = dynamic_cast<webrtc::DcSctpTransport*>(sctp->internal())) {
+        metrics = dc->GetMetrics();
+      }
+    }
+    if (!metrics) {
+      if (callback) callback(userdata, nullptr, 0);
+      return;
+    }
+    ReactorSctpMetrics out{};
+    out.tx_packets                = metrics->tx_packets_count;
+    out.tx_messages               = metrics->tx_messages_count;
+    out.rtx_packets               = metrics->rtx_packets_count;
+    out.rtx_bytes                 = metrics->rtx_bytes_count;
+    out.rx_packets                = metrics->rx_packets_count;
+    out.rx_messages               = metrics->rx_messages_count;
+    out.cwnd_bytes                = metrics->cwnd_bytes;
+    out.unack_data                = metrics->unack_data_count;
+    out.srtt_ms                   = metrics->srtt_ms;
+    out.peer_rwnd_bytes           = metrics->peer_rwnd_bytes;
+    out.uses_message_interleaving = metrics->uses_message_interleaving ? 1 : 0;
+    if (callback) callback(userdata, &out, 1);
+  });
 }
 
 }  // extern "C"

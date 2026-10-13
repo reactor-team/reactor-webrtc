@@ -254,6 +254,9 @@ async def test_stats_count_each_channels_messages_and_bytes(factory):
     assert data.id is not None
     assert (data.messages_sent, data.bytes_sent) == (1, 4)
     assert (data.messages_received, data.bytes_received) == (0, 0)
+    assert report.sctp is not None
+    assert report.sctp.messages_sent >= 1
+    assert report.sctp.congestion_window_bytes > 0
 
 
 async def test_a_chunked_channel_times_its_messages(factory):

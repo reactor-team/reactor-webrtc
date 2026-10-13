@@ -162,6 +162,12 @@ fn data_channel_round_trip() {
         assert!(chat.id.is_some(), "an open channel has a stream id");
         assert_eq!((chat.messages_sent, chat.bytes_sent), (1, 4));
         assert_eq!((chat.messages_received, chat.bytes_received), (1, 4));
+        // The association that carried them.
+        let sctp = report.sctp.expect("a data channel created the association");
+        assert!(sctp.messages_sent >= 1 && sctp.messages_received >= 1);
+        assert!(sctp.packets_sent > 0 && sctp.packets_received > 0);
+        assert!(sctp.congestion_window_bytes > 0);
+        assert!(sctp.smoothed_rtt_ms >= 0);
         stop.store(true, Ordering::SeqCst);
     });
 
