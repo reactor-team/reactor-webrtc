@@ -578,6 +578,16 @@ class TestStats:
         assert inbound.jitter_buffer_emitted_count > 0
         assert inbound.jitter_buffer_delay_s > 0.0
         assert inbound.total_processing_delay_s > 0.0
+        assert outbound.encoder_implementation, "no encoder implementation"
+        assert inbound.decoder_implementation, "no decoder implementation"
+        # libvpx is software, so a libvpx side reports False rather than None.
+        for implementation, power_efficient in (
+            (outbound.encoder_implementation, outbound.power_efficient_encoder),
+            (inbound.decoder_implementation, inbound.power_efficient_decoder),
+        ):
+            assert power_efficient is not None, f"no power-efficient flag for {implementation}"
+            if implementation == "libvpx":
+                assert power_efficient is False, "libvpx is software"
 
         t = inbound.timing_frame
         assert t is not None, "no timing frame reported within ~15 s"

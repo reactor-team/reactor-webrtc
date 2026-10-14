@@ -359,6 +359,43 @@ mod tests {
             inbound.total_processing_delay_s > 0.0,
             "no processing delay"
         );
+        // Which codec implementation each side runs, e.g. "libvpx".
+        assert!(
+            outbound
+                .encoder_implementation
+                .as_deref()
+                .is_some_and(|s| !s.is_empty()),
+            "no encoder implementation: {:?}",
+            outbound.encoder_implementation
+        );
+        assert!(
+            inbound
+                .decoder_implementation
+                .as_deref()
+                .is_some_and(|s| !s.is_empty()),
+            "no decoder implementation: {:?}",
+            inbound.decoder_implementation
+        );
+        // Whether each implementation is the hardware one. libvpx is software,
+        // so a libvpx side reports false rather than leaving it unknown.
+        for (implementation, power_efficient) in [
+            (
+                &outbound.encoder_implementation,
+                outbound.power_efficient_encoder,
+            ),
+            (
+                &inbound.decoder_implementation,
+                inbound.power_efficient_decoder,
+            ),
+        ] {
+            assert!(
+                power_efficient.is_some(),
+                "no power-efficient flag for {implementation:?}"
+            );
+            if implementation.as_deref() == Some("libvpx") {
+                assert_eq!(power_efficient, Some(false), "libvpx is software");
+            }
+        }
 
         let t = inbound.timing_frame.expect("timing frame");
         let (s, r) = (t.sender, t.receiver);
