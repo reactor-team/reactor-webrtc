@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.23.0 — where a data-channel message's time goes
+
+0.22.0 showed where a video frame spends its time. A data-channel message had
+no such view: the stats copy carried RTP streams and candidate pairs only, so a
+slow message could not be told apart into time queued, a small congestion
+window, a long round trip or loss. This release reports each of those, and
+names the encoder and decoder a video stream runs, since those decide much of
+its encode and decode times.
+
+Additive. Nothing removed, nothing renamed.
+
+### Added
+
+In Rust and Python:
+
+- **`StatsReport::data_channels`**: one `DataChannelStats` per channel, with
+  its label, SCTP stream id, state, and messages and bytes each way. On a
+  chunked channel libwebrtc sees each frame as a message, so its counts there
+  are frames.
+- **`DataChannel::chunking_stats()`**, a `ChunkingStats` with running totals
+  since the channel opened: `queue_wait_s` and `send_s` over `messages_sent`,
+  `stall_s` over `stalls` (the native buffer at its high-water mark with frames
+  still queued), and `reassembly_s` over `messages_received`, with frame counts
+  both ways. `None` on a plain channel.
+- **`StatsReport::sctp`**, an `Option<SctpStats>` for the association: packets
+  and messages each way, retransmitted packets and bytes, congestion window,
+  chunks in flight, smoothed RTT, the peer's receive window, and whether
+  message interleaving was negotiated. `None` before a data channel has created
+  the association.
+- **`OutboundRtpStats::encoder_implementation`** and
+  `power_efficient_encoder`, **`InboundRtpStats::decoder_implementation`** and
+  `power_efficient_decoder`: which implementation runs the stream and whether
+  it is the hardware one.
+
+### Notes
+
+`StatsReport`, `InboundRtpStats` and `OutboundRtpStats` gain public fields,
+which is why this is a minor rather than a patch release.
+
+The SCTP metrics need patch 0006 (`DcSctpTransport::GetMetrics()`), so the
+prebuilt libwebrtc moves to `webrtc-7907-a5ddff60-p11`.
+
+`ReactorStatEntry` grew from 408 to 560 bytes, with the new fields appended and
+their offsets pinned on both the C++ and Rust sides; the SCTP metrics come in
+their own 80-byte struct. The glue is compiled from source, so no ABI version
+changed.
+
+All crates advance to 0.23.0.
+
 ## 0.22.1 — both ends of a channel chunk, or neither
 
 A connection could lose every message on a data channel. The connection
