@@ -1025,8 +1025,8 @@ pub struct InboundRtpStats {
     /// in it. Video only.
     pub timing_frame: Option<TimingFrameInfo>,
     /// The decoder libwebrtc uses for this stream, e.g. `"libvpx"` or
-    /// `"VideoToolbox"`; `None` before the first frame is decoded, for audio,
-    /// and for a name longer than 63 bytes.
+    /// `"VideoToolbox"`; `None` before the first frame is decoded and for
+    /// audio. A name longer than 127 bytes is cut to them.
     pub decoder_implementation: Option<String>,
     /// Whether that decoder is the hardware one; `None` when not reported.
     pub power_efficient_decoder: Option<bool>,
@@ -1176,8 +1176,9 @@ pub struct OutboundRtpStats {
     /// [`OutboundRtpStats::packets_sent`].
     pub total_packet_send_delay_s: f64,
     /// The encoder libwebrtc uses for this stream, e.g. `"libvpx"` or
-    /// `"VideoToolbox"`; `None` before the first frame is encoded, for audio,
-    /// and for a name longer than 63 bytes.
+    /// `"VideoToolbox"`; `None` before the first frame is encoded and for
+    /// audio. A name longer than 127 bytes, such as a simulcast adapter's
+    /// composed name, is cut to them.
     pub encoder_implementation: Option<String>,
     /// Whether that encoder is the hardware one; `None` when not reported.
     pub power_efficient_encoder: Option<bool>,
@@ -1967,6 +1968,25 @@ fn stat_str(buf: &[c_char]) -> Option<String> {
     (!bytes.is_empty()).then(|| String::from_utf8_lossy(&bytes).into_owned())
 }
 
+/// A stats string the C side cuts to fit its buffer rather than drop. The cut
+/// counts bytes, so a UTF-8 character it split is dropped here instead of
+/// showing up as a replacement character.
+fn stat_str_prefix(buf: &[c_char]) -> Option<String> {
+    let bytes: Vec<u8> = buf
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect();
+    let text = match std::str::from_utf8(&bytes) {
+        Ok(text) => text.to_owned(),
+        Err(e) if e.error_len().is_none() => {
+            String::from_utf8_lossy(&bytes[..e.valid_up_to()]).into_owned()
+        }
+        Err(_) => String::from_utf8_lossy(&bytes).into_owned(),
+    };
+    (!text.is_empty()).then_some(text)
+}
+
 extern "C" fn stats_cb(ud: *mut c_void, entries: *const ReactorStatEntry, count: c_int) {
     let tx = unsafe { Arc::from_raw(ud as *const StatsTx) };
     let slice = if entries.is_null() || count <= 0 {
@@ -2018,7 +2038,7 @@ extern "C" fn stats_cb(ud: *mut c_void, entries: *const ReactorStatEntry, count:
                         decode_finish_ms: e.timing_decode_finish_ms,
                     },
                 }),
-                decoder_implementation: stat_str(&e.codec_implementation),
+                decoder_implementation: stat_str_prefix(&e.codec_implementation),
                 power_efficient_decoder: power_efficient(e.power_efficient),
             }),
             1 => report.outbound_rtp.push(OutboundRtpStats {
@@ -2044,7 +2064,7 @@ extern "C" fn stats_cb(ud: *mut c_void, entries: *const ReactorStatEntry, count:
                 frames_encoded: e.frames_encoded,
                 total_encode_time_s: e.total_encode_time,
                 total_packet_send_delay_s: e.total_packet_send_delay,
-                encoder_implementation: stat_str(&e.codec_implementation),
+                encoder_implementation: stat_str_prefix(&e.codec_implementation),
                 power_efficient_encoder: power_efficient(e.power_efficient),
             }),
             2 => report.candidate_pairs.push(IceCandidatePairStats {
@@ -2717,6 +2737,62 @@ impl Drop for PeerConnection {
         }
         // Destroy the native PC (stops callbacks) before the observer box drops.
         unsafe { reactor_webrtc_sys::reactor_webrtc_peer_connection_destroy(self.raw) }
+    }
+}
+
+#[cfg(test)]
+mod codec_implementation_tests {
+    use super::*;
+
+    fn buf(bytes: &[u8]) -> [c_char; 128] {
+        let mut out = [0 as c_char; 128];
+        for (o, &b) in out.iter_mut().zip(bytes) {
+            *o = b as c_char;
+        }
+        out
+    }
+
+    #[test]
+    fn a_name_that_fits_reads_back_whole() {
+        assert_eq!(
+            stat_str_prefix(&buf(b"VideoToolbox")).as_deref(),
+            Some("VideoToolbox")
+        );
+    }
+
+    #[test]
+    fn an_empty_name_is_none() {
+        assert_eq!(stat_str_prefix(&buf(b"")), None);
+    }
+
+    #[test]
+    fn a_character_the_cut_split_is_dropped() {
+        // "é" is two bytes; the C side kept only the first of them.
+        let cut = [b"SimulcastEncoderAdapter (caf".as_slice(), &[0xC3]].concat();
+        assert_eq!(
+            stat_str_prefix(&buf(&cut)).as_deref(),
+            Some("SimulcastEncoderAdapter (caf")
+        );
+    }
+
+    #[test]
+    fn a_name_cut_to_the_buffer_keeps_its_prefix() {
+        let long = format!(
+            "SimulcastEncoderAdapter ({})",
+            ["VideoToolbox"; 10].join(", ")
+        );
+        let mut bytes = long.as_bytes()[..127].to_vec();
+        bytes.push(0);
+        let name = stat_str_prefix(&buf(&bytes)).expect("a name");
+        assert_eq!(name.len(), 127);
+        assert!(long.starts_with(&name));
+    }
+
+    #[test]
+    fn the_power_efficient_flag_is_tri_state() {
+        assert_eq!(power_efficient(-1), None);
+        assert_eq!(power_efficient(0), Some(false));
+        assert_eq!(power_efficient(1), Some(true));
     }
 }
 

@@ -391,9 +391,10 @@ pub struct ReactorStatEntry {
     /// which may be empty; 0 when it was absent or did not fit.
     pub data_channel_label_present: u8,
     /// Video, kinds 0 and 1: the decoder (kind 0) or encoder (kind 1)
-    /// implementation libwebrtc reports, NUL-terminated; empty when absent or
-    /// when it did not fit.
-    pub codec_implementation: [c_char; 64],
+    /// implementation libwebrtc reports, NUL-terminated; empty when absent. A
+    /// name too long to fit is cut to its first 127 bytes, which can split a
+    /// UTF-8 character.
+    pub codec_implementation: [c_char; 128],
     /// Whether that implementation is the hardware one: -1 unknown, 0 no,
     /// 1 yes.
     pub power_efficient: i8,
@@ -410,7 +411,7 @@ pub struct ReactorStatEntry {
 // with their neighbours are pinned too, on both sides.
 const _: () = {
     assert!(
-        core::mem::size_of::<ReactorStatEntry>() == 560,
+        core::mem::size_of::<ReactorStatEntry>() == 624,
         "ReactorStatEntry changed size — update the C struct in \
          glue/reactor_webrtc.cpp and both assertions"
     );
@@ -484,7 +485,7 @@ const _: () = {
         "the codec implementation moved — see above"
     );
     assert!(
-        core::mem::offset_of!(ReactorStatEntry, power_efficient) == 552,
+        core::mem::offset_of!(ReactorStatEntry, power_efficient) == 616,
         "the power-efficient flag moved — see above"
     );
 };

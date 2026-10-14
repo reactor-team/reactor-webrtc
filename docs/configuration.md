@@ -603,7 +603,9 @@ On a video stream, `encoder_implementation` (outbound) and
 `decoder_implementation` (inbound) name the codec implementation libwebrtc
 runs, for example `libvpx` or `VideoToolbox`, and `power_efficient_encoder` /
 `power_efficient_decoder` say whether it is the hardware one. Both are `None`
-until the first frame is encoded or decoded.
+until the first frame is encoded or decoded. An implementation name longer than
+127 bytes, such as the composed name of a simulcast adapter, is cut to its first
+127 bytes.
 
 A data channel's message is one `send` or one delivered message, however many
 SCTP chunks carried it. On a chunked channel libwebrtc sees each frame as a

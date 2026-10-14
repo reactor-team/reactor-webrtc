@@ -376,6 +376,26 @@ mod tests {
             "no decoder implementation: {:?}",
             inbound.decoder_implementation
         );
+        // Whether each implementation is the hardware one. libvpx is software,
+        // so a libvpx side reports false rather than leaving it unknown.
+        for (implementation, power_efficient) in [
+            (
+                &outbound.encoder_implementation,
+                outbound.power_efficient_encoder,
+            ),
+            (
+                &inbound.decoder_implementation,
+                inbound.power_efficient_decoder,
+            ),
+        ] {
+            assert!(
+                power_efficient.is_some(),
+                "no power-efficient flag for {implementation:?}"
+            );
+            if implementation.as_deref() == Some("libvpx") {
+                assert_eq!(power_efficient, Some(false), "libvpx is software");
+            }
+        }
 
         let t = inbound.timing_frame.expect("timing frame");
         let (s, r) = (t.sender, t.receiver);

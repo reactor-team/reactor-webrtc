@@ -253,6 +253,7 @@ class InboundRtpStats:
     #: it. Video only.
     timing_frame: Optional[TimingFrameInfo]
     #: The decoder libwebrtc uses, e.g. "libvpx"; None before the first decoded frame.
+    #: A name longer than 127 bytes is cut to them.
     decoder_implementation: Optional[str]
     #: Whether that decoder is the hardware one; None when not reported.
     power_efficient_decoder: Optional[bool]
@@ -330,6 +331,7 @@ class OutboundRtpStats:
     #: Cumulative seconds packets waited in the pacer; per packet, not per frame.
     total_packet_send_delay_s: float
     #: The encoder libwebrtc uses, e.g. "libvpx"; None before the first encoded frame.
+    #: A name longer than 127 bytes is cut to them.
     encoder_implementation: Optional[str]
     #: Whether that encoder is the hardware one; None when not reported.
     power_efficient_encoder: Optional[bool]

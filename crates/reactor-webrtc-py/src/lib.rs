@@ -920,7 +920,7 @@ pub struct InboundRtpStats {
     /// in it. Video only.
     pub timing_frame: Option<TimingFrameInfo>,
     /// The decoder libwebrtc uses, e.g. "libvpx"; `None` before the first
-    /// decoded frame, for audio, and for a name longer than 63 bytes.
+    /// decoded frame and for audio. A name longer than 127 bytes is cut to them.
     pub decoder_implementation: Option<String>,
     /// Whether that decoder is the hardware one; `None` when not reported.
     pub power_efficient_decoder: Option<bool>,
@@ -1137,7 +1137,7 @@ pub struct OutboundRtpStats {
     /// packets, not frames: divide by `packets_sent`.
     pub total_packet_send_delay_s: f64,
     /// The encoder libwebrtc uses, e.g. "libvpx"; `None` before the first
-    /// encoded frame, for audio, and for a name longer than 63 bytes.
+    /// encoded frame and for audio. A name longer than 127 bytes is cut to them.
     pub encoder_implementation: Option<String>,
     /// Whether that encoder is the hardware one; `None` when not reported.
     pub power_efficient_encoder: Option<bool>,
