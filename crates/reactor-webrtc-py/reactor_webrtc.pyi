@@ -602,6 +602,17 @@ class Track:
         Note: all-zero frames (empty jitter buffer from peers with no incoming
         RTP) are suppressed and will not trigger this callback."""
         ...
+    def handoff_totals(self) -> tuple[float, float, int]:
+        """How long this remote video track took to hand decoded frames to the
+        `on_video_frame` callback, added up since the callback was set:
+        `(convert_seconds, handoff_seconds, frames)`.
+
+        `convert` runs from libwebrtc handing over the decoded frame, before its
+        conversion to BGRA, until the native side has it. `handoff` runs from
+        there until the callback is called: the wait for the GIL and the copy
+        into `bytes`. Divide each by `frames` for a frame's mean. All zero
+        before a callback is set; raises on an audio track."""
+        ...
     def on_encoder_feedback(
         self,
         callback: Callable[[Union[KeyFrameRequest, RateUpdate]], None],
@@ -800,6 +811,13 @@ class DataChannel:
         """`callback(data, binary)` for every incoming message. On a chunked
         channel it fires once per whole message, including messages that
         arrived before it was set."""
+        ...
+    def handoff_totals(self) -> tuple[float, int]:
+        """How long this channel took to hand whole messages to the
+        `on_message` callback, added up since the callback was set:
+        `(handoff_seconds, messages)`. It runs from the engine handing over a
+        whole message (after its reassembly, on a chunked channel) until the
+        callback is called: the wait for the GIL and the copy into `bytes`."""
         ...
     def on_state_change(self, callback: Callable[[DataChannelState], None]) -> None: ...
     def on_open(self, callback: Callable[[], None]) -> None:
