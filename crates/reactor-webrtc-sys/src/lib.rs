@@ -735,11 +735,24 @@ extern "C" {
         pc: *mut PeerConnection,
         label: *const c_char,
     ) -> *mut DataChannel;
-    /// Send bytes over a data channel. Returns 1 on success, 0 on failure.
+    /// Send bytes over a data channel. Returns 1 once the message is queued
+    /// for the network thread, 0 if the channel is not open. The send itself
+    /// happens later; a failure there closes the channel.
     pub fn reactor_webrtc_data_channel_send(
         data_channel: *mut DataChannel,
         data: *const u8,
         len: usize,
+        binary: c_int,
+    ) -> c_int;
+    /// Send `count` messages in order, each of type `binary`: `messages[i]`
+    /// points at `lens[i]` bytes, read before the call returns. Returns 1 once
+    /// they are queued for the network thread, 0 if the channel is not open.
+    /// A failure later closes the channel.
+    pub fn reactor_webrtc_data_channel_send_many(
+        data_channel: *mut DataChannel,
+        messages: *const *const u8,
+        lens: *const usize,
+        count: usize,
         binary: c_int,
     ) -> c_int;
     /// Register data-channel callbacks. `on_message` fires per received message

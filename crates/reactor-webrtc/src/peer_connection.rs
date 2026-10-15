@@ -1331,6 +1331,20 @@ impl RawDc {
             ) == 1
         }
     }
+    /// Sends `frames` in order as binary messages, in one call.
+    fn send_many(self, frames: &[Vec<u8>]) -> bool {
+        let ptrs: Vec<*const u8> = frames.iter().map(|f| f.as_ptr()).collect();
+        let lens: Vec<usize> = frames.iter().map(Vec::len).collect();
+        unsafe {
+            reactor_webrtc_sys::reactor_webrtc_data_channel_send_many(
+                self.0,
+                ptrs.as_ptr(),
+                lens.as_ptr(),
+                frames.len(),
+                1,
+            ) == 1
+        }
+    }
     fn close(self) {
         unsafe { reactor_webrtc_sys::reactor_webrtc_data_channel_close(self.0) }
     }
@@ -1471,29 +1485,45 @@ impl ChannelCore {
             };
             while c.pump_again.swap(false, Ordering::SeqCst) {
                 loop {
-                    let (frame, queued_left) = {
+                    // One read of the native buffer and one send per batch,
+                    // each a call into the network thread, rather than both
+                    // per frame. The batch counts toward the high-water mark
+                    // as it grows; the next read runs after the batch's send
+                    // on the network thread, so it counts it too.
+                    let (frames, queued_left) = {
                         let mut queue = c.queue.lock().unwrap();
-                        let frame = queue.next_frame(self.raw.buffered_amount());
-                        (frame, !queue.is_empty())
+                        let native = self.raw.buffered_amount();
+                        let mut batched = 0;
+                        let mut frames = Vec::new();
+                        while let Some(frame) = queue.next_frame(native + batched) {
+                            batched += frame.len() as u64;
+                            frames.push(frame);
+                        }
+                        (frames, !queue.is_empty())
                     };
-                    let Some(frame) = frame else {
+                    if frames.is_empty() {
                         // Frames left behind wait for the native buffer to
                         // drain to the low-water mark.
                         if queued_left {
                             c.times.lock().unwrap().stalled(Instant::now());
                         }
                         break;
-                    };
-                    if !self.raw.send(&frame, true) {
-                        // libwebrtc closes the channel on a failed send. The
-                        // peer may hold part of a message; nothing more can
-                        // follow it.
+                    }
+                    if !self.raw.send_many(&frames) {
+                        // The channel is no longer open (a failed send closes
+                        // it). The peer may hold part of a message; nothing
+                        // more can follow it.
                         c.queue.lock().unwrap().clear();
                         c.times.lock().unwrap().cleared();
                         return;
                     }
-                    // Counted once libwebrtc took it: a refused frame never left.
-                    c.times.lock().unwrap().frame_sent(&frame, Instant::now());
+                    // Counted once libwebrtc took them: a refused frame never
+                    // left.
+                    let now = Instant::now();
+                    let mut times = c.times.lock().unwrap();
+                    for frame in &frames {
+                        times.frame_sent(frame, now);
+                    }
                 }
             }
             drop(_guard);
@@ -1772,6 +1802,12 @@ impl DataChannel {
     /// effective max message size; a full queue or an oversized message is
     /// an [`Error::DataChannel`] and nothing is sent. Elsewhere this is a
     /// plain libwebrtc send.
+    ///
+    /// Either way it returns once libwebrtc's network thread has the message
+    /// queued, without waiting for it to be packetized and written to the
+    /// socket. A channel that is not open is an error. A send that fails
+    /// later on the network thread closes the channel, which `on_close` and
+    /// `on_state_change` report.
     pub fn send(&self, data: &[u8], binary: bool) -> Result<()> {
         let Some(c) = self.core.chunked() else {
             return if self.core.raw.send(data, binary) {
