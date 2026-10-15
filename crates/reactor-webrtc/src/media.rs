@@ -207,17 +207,20 @@ extern "C" fn video_sink_tramp(
     height: c_int,
     ssrc: u32,
     rtp_timestamp: u32,
-    received_us: i64,
+    convert_us: i64,
 ) {
+    // The native sink timed its own share; this one adds the work here, until
+    // the callback, on a clock as fine.
+    let entered = std::time::Instant::now();
     let st = unsafe { &*(ud as *const VideoSinkState) };
     let len = (width as usize) * (height as usize) * 4;
     let slice = unsafe { std::slice::from_raw_parts(bgra, len) };
     let metadata = crate::sender_meta::take_receiver_meta(&st.receiver_meta, ssrc, rtp_timestamp);
     if let Ok(mut cb) = st.cb.lock() {
-        let convert_us = (crate::time_micros() - received_us).max(0) as u64;
+        let here_us = entered.elapsed().as_micros() as u64;
         st.timings
             .convert_us
-            .fetch_add(convert_us, Ordering::Relaxed);
+            .fetch_add(convert_us.max(0) as u64 + here_us, Ordering::Relaxed);
         st.timings.frames.fetch_add(1, Ordering::Relaxed);
         cb(VideoFrame {
             bgra: slice,

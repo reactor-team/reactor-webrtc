@@ -611,9 +611,10 @@ class FrameSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
       : userdata_(userdata), on_frame_(on_frame) {}
   void OnFrame(const webrtc::VideoFrame& frame) override {
     if (!on_frame_) return;
-    // When libwebrtc handed the frame over, before the conversion below, on
-    // reactor_webrtc_time_micros's clock: the callback times its own share from it.
-    const int64_t received_us = webrtc::TimeMicros();
+    // Time this sink's own work, from libwebrtc handing the frame over to the
+    // callback, on steady_clock: libwebrtc's TimeMicros is millisecond-coarse
+    // on some platforms, which would read a sub-millisecond conversion as 0.
+    const auto received = std::chrono::steady_clock::now();
     webrtc::scoped_refptr<webrtc::I420BufferInterface> i420 =
         frame.video_frame_buffer()->ToI420();
     if (!i420) return;
@@ -627,7 +628,10 @@ class FrameSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
     // SSRC. 0 when the list is empty (a frame that did not come off the wire).
     const webrtc::RtpPacketInfos& packets = frame.packet_infos();
     const uint32_t ssrc = packets.empty() ? 0 : packets.begin()->ssrc();
-    on_frame_(userdata_, bgra_.data(), w, h, ssrc, frame.rtp_timestamp(), received_us);
+    const int64_t convert_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                   std::chrono::steady_clock::now() - received)
+                                   .count();
+    on_frame_(userdata_, bgra_.data(), w, h, ssrc, frame.rtp_timestamp(), convert_us);
   }
 
  private:
@@ -1906,9 +1910,10 @@ void reactor_webrtc_audio_track_add_sink(
 }
 
 // Attach a frame sink to a (video) track. `on_frame(userdata, bgra, width,
-// height, ssrc, rtp_timestamp, received_us)` fires per decoded frame;
-// `received_us` is when libwebrtc handed the frame to the sink, before its
-// conversion to BGRA. The sink lives until the track handle is destroyed.
+// height, ssrc, rtp_timestamp, convert_us)` fires per decoded frame;
+// `convert_us` is how long the sink took from libwebrtc handing it the frame
+// to the call, its conversion to BGRA included, in microseconds. The sink
+// lives until the track handle is destroyed.
 //
 // Same ordering requirement as the audio sink above: `AddOrUpdateSink` only
 // updates in place when the pointer already registered is the *same*

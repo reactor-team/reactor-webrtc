@@ -828,8 +828,8 @@ extern "C" {
     /// `width*height*4` bytes, valid only during the call) until the track is
     /// destroyed. `ssrc` and `rtp_timestamp` are the ones the receive transform
     /// saw for it; `ssrc` is 0 when the frame carries no packet information.
-    /// `received_us` is when libwebrtc handed the frame to the sink, before its
-    /// conversion to BGRA, on [`reactor_webrtc_time_micros`]'s clock.
+    /// `convert_us` is how long the sink took, in microseconds, from libwebrtc
+    /// handing it the frame to this call, its conversion to BGRA included.
     pub fn reactor_webrtc_video_track_add_sink(
         track: *mut MediaStreamTrack,
         userdata: *mut c_void,
@@ -840,7 +840,7 @@ extern "C" {
             height: c_int,
             ssrc: u32,
             rtp_timestamp: u32,
-            received_us: i64,
+            convert_us: i64,
         ),
     );
     /// Kind of a track handle: 0 = audio, 1 = video, -1 = unknown.
