@@ -363,6 +363,61 @@ data channel has carried a message.
 
 ---
 
+### 0009 — batch UDP sends on macOS with sendmsg_x()
+
+`0009-macos-sendmsg-x-udp-send-batch.patch` · touches
+`rtc_base/physical_socket_server.{h,cc}` (+96 lines)
+
+**What.** Turns on 0008's send batch on macOS and flushes it with `sendmsg_x()`,
+XNU's counterpart of `sendmmsg()`. Unlike Linux, macOS also batches what each
+socket read event sends.
+
+- **The call.** `sendmsg_x()` takes an array of `msghdr_x` (a `msghdr` plus
+  `msg_datalen`). Each message carries its own destination, so a batch mixes ICE
+  candidates freely. The SDK has neither the struct nor the prototype; they come
+  from XNU's private `bsd/sys/socket_private.h`. The symbol is weak-imported, so
+  a macOS without it still loads, and a missing symbol or `ENOSYS` falls back to
+  one `sendto()` per datagram.
+- **Read events batch too.** In a data channel transfer most packets leave when
+  an incoming SACK frees the congestion window, which runs in a read event, not
+  a task. With 0008's tasks-only batch, ~3% of datagrams went through
+  `sendmsg_x()`, in flushes of about 4, and end-to-end latency did not move. With
+  read events batched too, ~8.6 datagrams go per call.
+- **A would-block error drops one datagram, not the rest.** macOS reports
+  `ENOBUFS` (mapped to would-block) per destination, for example a VPN
+  interface's queue during ICE. Since a read event's batch mixes checks to many
+  candidates, the flush skips just the datagram that would block and keeps
+  going, as separate `sendto()`s would.
+- **Not on iOS.** It is private API, so App Store review may flag the symbol.
+  `WEBRTC_IOS` builds never reference it, and any build that must not can
+  define `WEBRTC_DISABLE_APPLE_SENDMSG_X`.
+
+**Why not on Linux, and why not `recvmsg_x()`.** 0008 tried batching read events
+on Linux and dropped it: on loopback, the burst a round of SACKs released
+overran the receiver's socket buffer. On macOS the same change showed no extra
+drops from 100 KB to 4 MB messages, plain and chunked (max_burst 256), and
+macOS's default UDP receive buffer is much larger (786 KB against Linux's
+~208 KB). A read-ahead with `recvmsg_x()` (16 datagrams per call) was prototyped
+and dropped: inside libwebrtc each call cost ~3.6 µs per datagram against 1.5–1.9
+µs for `recvmsg()`, it raised latency at every batch size from 2 to 16, and it
+overflowed the receive buffer under streaming load.
+
+**Verify.** On an M5 Pro over loopback, `examples/dc_bench` (two peers, each
+with its own network thread; three alternating runs each), 0008 → 0009:
+
+| Message | One-way latency, mean | p99 | Throughput |
+|---|---|---|---|
+| 100 KB, plain | 674 → 589 µs | 916 → 687 µs | 151 → 188 MB/s |
+| 100 KB, chunked | 714 → 593 µs | 1040 → 681 µs | 153 → 179 MB/s |
+| 1 MB, chunked | 7.04 → 5.97 ms | — | 152 → 178 MB/s |
+| 4 MB, chunked | 26.9 → 23.1 ms | — | 155 → 184 MB/s |
+
+UDP drops for full socket buffers did not change. The Rust data channel suites
+fail as often on 0008 as on 0009 on that machine (ICE connect timeouts under
+load), and `sctp_snap` passes 10 of 10 on both.
+
+---
+
 ## Planned (not yet authored — need their target builds to validate)
 
 - **Symbol isolation** — keep WebRTC's C++ symbols from clashing when a consumer
