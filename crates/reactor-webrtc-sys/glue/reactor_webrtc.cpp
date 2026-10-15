@@ -1613,13 +1613,58 @@ void* reactor_webrtc_peer_connection_create_data_channel(void* pc,
   return new ReactorDataChannel{result.MoveValue(), nullptr};
 }
 
-// Send bytes over a data channel. Returns 1 on success, 0 on failure.
+// Send bytes over a data channel. Returns 1 once the message is queued for the
+// network thread, 0 if the channel is not open.
+//
+// Send() is a blocking call into the network thread, which then also packetizes,
+// encrypts and writes every packet of the message before the caller resumes.
+// SendAsync() posts the message instead. Messages still leave in call order (the
+// thread runs its tasks in order), and a later blocking call such as
+// buffered_amount() runs after them, so it counts them. A failed send closes the
+// channel, as it does for Send(), and the state change reports it, so the
+// completion callback has nothing to add. The open check is the one Send()
+// makes first; with patch 0007 it reads the state without a blocking call.
 int reactor_webrtc_data_channel_send(void* data_channel, const uint8_t* data,
                                      size_t len, int binary) {
   auto* h = reinterpret_cast<ReactorDataChannel*>(data_channel);
   if (!h || !h->channel) return 0;
-  webrtc::CopyOnWriteBuffer buffer(data, len);
-  return h->channel->Send(webrtc::DataBuffer(buffer, binary != 0)) ? 1 : 0;
+  if (h->channel->state() != webrtc::DataChannelInterface::kOpen) return 0;
+  h->channel->SendAsync(
+      webrtc::DataBuffer(webrtc::CopyOnWriteBuffer(data, len), binary != 0),
+      nullptr);
+  return 1;
+}
+
+// Send `count` messages, each of type `binary`, in order: messages[i] holds
+// lens[i] bytes. Returns 1 once they are queued for the network thread, 0 if
+// the channel is not open.
+//
+// With patch 0007 the batch is one task on the network thread, and SCTP packs
+// and flushes it once (see webrtc-build/patches/README.md). Without it, each
+// message is its own SendAsync.
+int reactor_webrtc_data_channel_send_many(void* data_channel,
+                                          const uint8_t* const* messages,
+                                          const size_t* lens, size_t count,
+                                          int binary) {
+  auto* h = reinterpret_cast<ReactorDataChannel*>(data_channel);
+  if (!h || !h->channel) return 0;
+  if (h->channel->state() != webrtc::DataChannelInterface::kOpen) return 0;
+#if defined(REACTOR_WEBRTC_DC_SEND_MANY_ASYNC)
+  std::vector<std::vector<uint8_t>> batch;
+  batch.reserve(count);
+  for (size_t i = 0; i < count; ++i) {
+    batch.emplace_back(messages[i], messages[i] + lens[i]);
+  }
+  h->channel->SendManyAsync(std::move(batch), binary != 0, nullptr);
+#else
+  for (size_t i = 0; i < count; ++i) {
+    h->channel->SendAsync(
+        webrtc::DataBuffer(webrtc::CopyOnWriteBuffer(messages[i], lens[i]),
+                           binary != 0),
+        nullptr);
+  }
+#endif
+  return 1;
 }
 
 // Register callbacks for a data channel.
