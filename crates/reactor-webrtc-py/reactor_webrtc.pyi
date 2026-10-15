@@ -386,6 +386,16 @@ class ChunkingStats:
     frames_sent: int
     #: From `send` to the message's first frame leaving the queue.
     queue_wait_s: float
+    #: From `send` until the message is in the queue: its copy into the queue.
+    enqueue_s: float
+    #: Within `queue_wait_s`: reading libwebrtc's buffered amount before the first frame.
+    first_check_s: float
+    #: Within `queue_wait_s`: cutting the message's first frame off the queue.
+    first_build_s: float
+    #: Within `queue_wait_s`: libwebrtc's `Send` of the message's first frame.
+    first_native_s: float
+    #: libwebrtc's `Send` of every frame, summed over `frames_sent`.
+    native_send_s: float
     #: From a message's first frame to its last being handed to the native channel.
     send_s: float
     #: Times the pump stopped with frames queued because the native buffer was full.
