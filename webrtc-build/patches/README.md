@@ -266,6 +266,57 @@ data channel has carried a message.
 
 ---
 
+### 0007 — send a batch of data channel messages at once
+
+`0007-data-channel-send-many.patch` · touches `api/data_channel_interface.h`,
+`api/transport/data_channel_transport_interface.h`, `pc/proxy.h`,
+`pc/sctp_data_channel.{h,cc}`, `pc/data_channel_controller.{h,cc}`,
+`pc/sctp_transport.{h,cc}`, `media/sctp/sctp_transport_internal.h`,
+`media/sctp/dcsctp_transport.{h,cc}` (+260 lines)
+
+**What.** Adds `DataChannelInterface::SendManyAsync(messages, binary,
+on_complete)`, which sends a batch of messages in order. Each layer between the
+channel and dcsctp gets a `SendDataMany` next to its `SendData`:
+`SctpDataChannelControllerInterface`, `DataChannelTransportInterface` and
+`SctpTransportInternal`. `DcSctpTransport` implements it with dcsctp's own
+`SendMany`. Each base class has a default that loops over `SendData`, so other
+implementations (test fakes, mocks) keep building unchanged. The header defines
+`REACTOR_WEBRTC_DC_SEND_MANY_ASYNC`, so the glue can tell a prebuilt that has it
+from one that does not.
+
+**Why.** `Send` is a blocking call into the network thread for every message,
+and each message flushes SCTP on its own, so N small messages become about N
+packets, each with its own encryption and `sendto`. `SendAsync` removes the
+wait but still posts one task, and flushes once, per message. A batch costs one
+task and one flush: dcsctp packs the batch's DATA chunks together and then
+sends. The payloads move from the caller down to dcsctp. `SendData` copies each
+one from a `CopyOnWriteBuffer` into dcsctp's `std::vector`; this path skips that
+copy.
+
+**How it works.** Like `SendAsync`, `SendManyAsync` bypasses the proxy and
+posts to the network thread. That one task checks the whole batch against the
+max message size before it sends anything, then hands it to `SendMany`.
+`on_complete` runs once with the first error. A channel already detached from
+its transport reports `INVALID_STATE`, where `SendAsync` would drop the message
+silently. A failed send closes the channel, as it does for `Send`. While a data
+channel event observer is set, the controller keeps the per-message path, so
+the observer still sees every message.
+
+The patch also makes `state()` lock-free off the network thread. It bypasses
+the proxy, but from any thread other than the signaling one (where it reads a
+cached value) it made a blocking call into the network thread, queued behind
+packets and pending sends. The glue checks it on every send, so that call cost
+as much as the blocking `Send` it replaces. `SetState` now also stores the
+state in an atomic, and other threads read that. The value is no older than
+what the blocking call returned, since the state could change as soon as that
+call returned.
+
+**Verify.** Applies cleanly on top of 0006 at the pinned commit. The binding's
+data channel tests send through it: the chunked pump sends each round of
+frames as one batch.
+
+---
+
 ## Planned (not yet authored — need their target builds to validate)
 
 - **Symbol isolation** — keep WebRTC's C++ symbols from clashing when a consumer

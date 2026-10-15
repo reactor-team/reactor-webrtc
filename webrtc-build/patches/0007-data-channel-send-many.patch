@@ -1,0 +1,526 @@
+diff --git a/api/data_channel_interface.h b/api/data_channel_interface.h
+index 1ae6494..a8addba 100644
+--- a/api/data_channel_interface.h
++++ b/api/data_channel_interface.h
+@@ -19,6 +19,8 @@
+ 
+ #include <optional>
+ #include <string>
++#include <utility>
++#include <vector>
+ 
+ #include "absl/functional/any_invocable.h"
+ #include "api/priority.h"
+@@ -28,6 +30,9 @@
+ #include "rtc_base/copy_on_write_buffer.h"
+ #include "rtc_base/system/rtc_export.h"
+ 
++// Reactor: DataChannelInterface::SendManyAsync exists (0007).
++#define REACTOR_WEBRTC_DC_SEND_MANY_ASYNC 1
++
+ namespace webrtc {
+ 
+ // C++ version of: https://www.w3.org/TR/webrtc/#idl-def-rtcdatachannelinit
+@@ -215,6 +220,22 @@ class RTC_EXPORT DataChannelInterface : public RefCountInterface {
+   virtual void SendAsync(DataBuffer buffer,
+                          absl::AnyInvocable<void(RTCError) &&> on_complete);
+ 
++  // Reactor: sends `messages` in order, each of type `binary`, as one task on
++  // the network thread: one thread hop for the batch rather than one per
++  // message, and SCTP packs them into packets and flushes them together
++  // (dcsctp's SendMany). The payloads are moved down to SCTP, not copied.
++  // `on_complete` runs once, on the network thread, with the first error or
++  // OK. Only SCTP data channels implement it. See
++  // webrtc-build/patches/README.md (0007).
++  virtual void SendManyAsync(
++      std::vector<std::vector<uint8_t>> /* messages */,
++      bool /* binary */,
++      absl::AnyInvocable<void(RTCError) &&> on_complete) {
++    if (on_complete) {
++      std::move(on_complete)(RTCError(RTCErrorType::UNSUPPORTED_OPERATION));
++    }
++  }
++
+   // Amount of bytes that can be queued for sending on the data channel.
+   // Those are bytes that have not yet been processed at the SCTP level.
+   static uint64_t MaxSendQueueSize();
+diff --git a/api/transport/data_channel_transport_interface.h b/api/transport/data_channel_transport_interface.h
+index bdf2fd4..07f9817 100644
+--- a/api/transport/data_channel_transport_interface.h
++++ b/api/transport/data_channel_transport_interface.h
+@@ -13,7 +13,9 @@
+ #define API_TRANSPORT_DATA_CHANNEL_TRANSPORT_INTERFACE_H_
+ 
+ #include <cstddef>
++#include <cstdint>
+ #include <optional>
++#include <vector>
+ 
+ #include "api/priority.h"
+ #include "api/rtc_error.h"
+@@ -117,6 +119,21 @@ class DataChannelTransportInterface {
+                             const SendDataParams& params,
+                             const CopyOnWriteBuffer& buffer) = 0;
+ 
++  // Reactor: sends `buffers` in order and flushes them together (0007). The
++  // default sends each with SendData, stopping at the first error.
++  virtual RTCError SendDataMany(int channel_id,
++                                const SendDataParams& params,
++                                std::vector<std::vector<uint8_t>> buffers) {
++    for (const std::vector<uint8_t>& buffer : buffers) {
++      RTCError error = SendData(channel_id, params,
++                                CopyOnWriteBuffer(buffer.data(), buffer.size()));
++      if (!error.ok()) {
++        return error;
++      }
++    }
++    return RTCError::OK();
++  }
++
+   // Closes `channel_id` gracefully.  Returns an error if `channel_id` is not
+   // open.  Data sent after the closing procedure begins will not be
+   // transmitted. The channel becomes closed after pending data is transmitted.
+diff --git a/media/sctp/dcsctp_transport.cc b/media/sctp/dcsctp_transport.cc
+index e0ce408..af392ba 100644
+--- a/media/sctp/dcsctp_transport.cc
++++ b/media/sctp/dcsctp_transport.cc
+@@ -400,6 +400,85 @@ RTCError DcSctpTransport::SendData(int sid,
+   }
+ }
+ 
++// Reactor (0007): SendData for a batch. The same checks, but the payloads
++// move into dcsctp instead of being copied, and dcsctp's SendMany packs and
++// flushes them once rather than once per message.
++RTCError DcSctpTransport::SendDataMany(
++    int sid,
++    const SendDataParams& params,
++    std::vector<std::vector<uint8_t>> payloads) {
++  RTC_DCHECK_RUN_ON(network_thread_);
++  if (!socket_) {
++    RTC_LOG(LS_ERROR) << debug_name_
++                      << "->SendDataMany(...): Transport is not started.";
++    return RTCError(RTCErrorType::INVALID_STATE);
++  }
++  auto stream_state =
++      stream_states_.find(dcsctp::StreamID(static_cast<uint16_t>(sid)));
++  if (stream_state == stream_states_.end() ||
++      stream_state->second.closure_initiated ||
++      stream_state->second.incoming_reset_done ||
++      stream_state->second.outgoing_reset_done) {
++    RTC_LOG(LS_VERBOSE) << "Skipping messages on non-open stream with sid: "
++                        << sid;
++    return RTCError(RTCErrorType::INVALID_STATE);
++  }
++
++  // Checked for the whole batch first, so a rejected one sends nothing.
++  auto max_message_size = socket_->options().max_message_size;
++  for (const std::vector<uint8_t>& payload : payloads) {
++    if (max_message_size > 0 && payload.size() > max_message_size) {
++      RTC_LOG(LS_WARNING) << debug_name_
++                          << "->SendDataMany(...): "
++                             "Trying to send packet bigger "
++                             "than the max message size: "
++                          << payload.size() << " vs max of "
++                          << max_message_size;
++      return RTCError(RTCErrorType::INVALID_RANGE);
++    }
++  }
++
++  std::vector<dcsctp::DcSctpMessage> messages;
++  messages.reserve(payloads.size());
++  for (std::vector<uint8_t>& payload : payloads) {
++    // Taken before the empty-message byte below, as SendData does.
++    auto ppid =
++        dcsctp::PPID(static_cast<uint16_t>(ToPPID(params.type, payload.size())));
++    if (payload.empty()) {
++      // See SendData: SCTP cannot send an empty user message.
++      payload.push_back('\0');
++    }
++    messages.emplace_back(dcsctp::StreamID(static_cast<uint16_t>(sid)), ppid,
++                          std::move(payload));
++  }
++
++  dcsctp::SendOptions send_options;
++  send_options.unordered = dcsctp::IsUnordered(!params.ordered);
++  if (params.max_rtx_ms.has_value()) {
++    send_options.lifetime = dcsctp::DurationMs(*params.max_rtx_ms);
++  }
++  if (params.max_rtx_count.has_value()) {
++    send_options.max_retransmissions = *params.max_rtx_count;
++  }
++
++  for (dcsctp::SendStatus error : socket_->SendMany(messages, send_options)) {
++    switch (error) {
++      case dcsctp::SendStatus::kSuccess:
++        break;
++      case dcsctp::SendStatus::kErrorResourceExhaustion:
++        ready_to_send_data_ = false;
++        return RTCError(RTCErrorType::RESOURCE_EXHAUSTED);
++      default:
++        absl::string_view error_message = dcsctp::ToString(error);
++        RTC_LOG(LS_ERROR) << debug_name_
++                          << "->SendDataMany(...): send() failed with error "
++                          << error_message << ".";
++        return RTCError(RTCErrorType::NETWORK_ERROR, error_message);
++    }
++  }
++  return RTCError::OK();
++}
++
+ bool DcSctpTransport::ReadyToSendData() {
+   RTC_DCHECK_RUN_ON(network_thread_);
+   return ready_to_send_data_;
+diff --git a/media/sctp/dcsctp_transport.h b/media/sctp/dcsctp_transport.h
+index 7620673..ede4afc 100644
+--- a/media/sctp/dcsctp_transport.h
++++ b/media/sctp/dcsctp_transport.h
+@@ -71,6 +71,9 @@ class DcSctpTransport : public SctpTransportInternal,
+   RTCError SendData(int sid,
+                     const SendDataParams& params,
+                     const CopyOnWriteBuffer& payload) override;
++  RTCError SendDataMany(int sid,
++                        const SendDataParams& params,
++                        std::vector<std::vector<uint8_t>> payloads) override;
+   bool ReadyToSendData() override;
+   int max_message_size() const override;
+   std::optional<int> max_outbound_streams() const override;
+diff --git a/media/sctp/sctp_transport_internal.h b/media/sctp/sctp_transport_internal.h
+index d535f99..664e1f3 100644
+--- a/media/sctp/sctp_transport_internal.h
++++ b/media/sctp/sctp_transport_internal.h
+@@ -15,8 +15,10 @@
+ // anything in media/.
+ 
+ #include <cstddef>
++#include <cstdint>
+ #include <functional>
+ #include <optional>
++#include <vector>
+ 
+ #include "api/priority.h"
+ #include "api/rtc_error.h"
+@@ -69,6 +71,20 @@ class SctpTransportInternal {
+   virtual RTCError SendData(int sid,
+                             const SendDataParams& params,
+                             const CopyOnWriteBuffer& payload) = 0;
++  // Reactor: sends `payloads` in order and flushes them together (0007). The
++  // default sends each with SendData, stopping at the first error.
++  virtual RTCError SendDataMany(int sid,
++                                const SendDataParams& params,
++                                std::vector<std::vector<uint8_t>> payloads) {
++    for (const std::vector<uint8_t>& payload : payloads) {
++      RTCError error =
++          SendData(sid, params, CopyOnWriteBuffer(payload.data(), payload.size()));
++      if (!error.ok()) {
++        return error;
++      }
++    }
++    return RTCError::OK();
++  }
+ 
+   // Indicates when the SCTP socket is created and not blocked by congestion
+   // control. This changes to false when SDR_BLOCK is returned from SendData,
+diff --git a/pc/data_channel_controller.cc b/pc/data_channel_controller.cc
+index 6477e7b..36a7628 100644
+--- a/pc/data_channel_controller.cc
++++ b/pc/data_channel_controller.cc
+@@ -91,6 +91,21 @@ RTCError DataChannelController::SendData(StreamId sid,
+   return result;
+ }
+ 
++RTCError DataChannelController::SendDataMany(
++    StreamId sid,
++    const SendDataParams& params,
++    std::vector<std::vector<uint8_t>> payloads) {
++  RTC_DCHECK_RUN_ON(network_thread());
++  // Reactor (0007): an event observer sees each message as SendData reports
++  // it, so it keeps the per-message path.
++  if (!data_channel_transport_ || event_observer_) {
++    return SctpDataChannelControllerInterface::SendDataMany(
++        sid, params, std::move(payloads));
++  }
++  return data_channel_transport_->SendDataMany(sid.stream_id_int(), params,
++                                               std::move(payloads));
++}
++
+ RTCError DataChannelController::AddSctpDataStream(StreamId sid,
+                                                   PriorityValue priority) {
+   RTC_DCHECK_RUN_ON(network_thread());
+diff --git a/pc/data_channel_controller.h b/pc/data_channel_controller.h
+index 910bafb..2433f89 100644
+--- a/pc/data_channel_controller.h
++++ b/pc/data_channel_controller.h
+@@ -57,6 +57,9 @@ class DataChannelController : public SctpDataChannelControllerInterface,
+   RTCError SendData(StreamId sid,
+                     const SendDataParams& params,
+                     const CopyOnWriteBuffer& payload) override;
++  RTCError SendDataMany(StreamId sid,
++                        const SendDataParams& params,
++                        std::vector<std::vector<uint8_t>> payloads) override;
+   RTCError AddSctpDataStream(StreamId sid, PriorityValue priority) override;
+   void RemoveSctpDataStream(StreamId sid) override;
+   void OnChannelStateChanged(SctpDataChannel* channel,
+diff --git a/pc/proxy.h b/pc/proxy.h
+index dfcf77c..85ddb0d 100644
+--- a/pc/proxy.h
++++ b/pc/proxy.h
+@@ -482,6 +482,13 @@ class ConstMethodCall {
+     TRACE_BOILERPLATE(method);                       \
+     return c_->method(std::move(a1), std::move(a2)); \
+   }
++
++// Reactor: the 3 argument version of `BYPASS_PROXY_METHOD0` (0007).
++#define BYPASS_PROXY_METHOD3(r, method, t1, t2, t3)                  \
++  r method(t1 a1, t2 a2, t3 a3) override {                           \
++    TRACE_BOILERPLATE(method);                                       \
++    return c_->method(std::move(a1), std::move(a2), std::move(a3)); \
++  }
+ }  // namespace webrtc
+ 
+ #endif  //  PC_PROXY_H_
+diff --git a/pc/sctp_data_channel.cc b/pc/sctp_data_channel.cc
+index 3332134..4998abe 100644
+--- a/pc/sctp_data_channel.cc
++++ b/pc/sctp_data_channel.cc
+@@ -18,6 +18,7 @@
+ #include <optional>
+ #include <string>
+ #include <utility>
++#include <vector>
+ 
+ #include "absl/base/nullability.h"
+ #include "absl/functional/any_invocable.h"
+@@ -81,6 +82,11 @@ BYPASS_PROXY_METHOD2(void,
+                      SendAsync,
+                      DataBuffer,
+                      absl::AnyInvocable<void(RTCError) &&>)
++BYPASS_PROXY_METHOD3(void,
++                     SendManyAsync,
++                     std::vector<std::vector<uint8_t>>,
++                     bool,
++                     absl::AnyInvocable<void(RTCError) &&>)
+ END_PROXY_MAP(DataChannel)
+ }  // namespace
+ 
+@@ -487,14 +493,16 @@ SctpDataChannel::DataState SctpDataChannel::state() const {
+     }
+   }
+ 
+-  auto return_state = [&] {
+-    RTC_DCHECK_RUN_ON(network_thread_);
+-    return state_;
+-  };
+-
+-  return current_thread == network_thread_
+-             ? return_state()
+-             : network_thread_->BlockingCall(std::move(return_state));
++  // Reactor (0007): any other thread reads the network thread's state as of
++  // its last change instead of queueing behind the network thread's tasks
++  // (packets and every pending send). The upstream blocking read is no
++  // fresher: the state may change as soon as it returns. A send checks
++  // state() on every call, so the blocking read cost as much as the send.
++  if (current_thread != network_thread_) {
++    return state_mirror_.load(std::memory_order_acquire);
++  }
++  RTC_DCHECK_RUN_ON(network_thread_);
++  return state_;
+ }
+ 
+ RTCError SctpDataChannel::error() const {
+@@ -583,6 +591,65 @@ void SctpDataChannel::SendAsync(
+   });
+ }
+ 
++void SctpDataChannel::SendManyAsync(
++    std::vector<std::vector<uint8_t>> messages,
++    bool binary,
++    absl::AnyInvocable<void(RTCError) &&> on_complete) {
++  // Reactor (0007): posted like SendAsync, whatever the calling thread. Unlike
++  // SendAsync, a channel already detached from its transport still reports
++  // back, so the caller is never left waiting on `on_complete`.
++  scoped_refptr<SctpDataChannel> me(this);
++  network_thread_->PostTask([me = std::move(me), messages = std::move(messages),
++                             binary,
++                             on_complete = std::move(on_complete)]() mutable {
++    RTC_DCHECK_RUN_ON(me->network_thread_);
++    RTCError err = me->connected_to_transport()
++                       ? me->SendManyImpl(std::move(messages), binary)
++                       : RTCError(RTCErrorType::INVALID_STATE);
++    if (on_complete)
++      std::move(on_complete)(err);
++  });
++}
++
++// RTC_RUN_ON(network_thread_);
++RTCError SctpDataChannel::SendManyImpl(
++    std::vector<std::vector<uint8_t>> messages,
++    bool binary) {
++  // As SendImpl and SendDataMessage, for every message at once.
++  size_t bytes = 0;
++  for (const std::vector<uint8_t>& message : messages) {
++    bytes += message.size();
++  }
++  expected_buffer_amount_ += bytes;
++  if (state_ != kOpen || !controller_ || !id_n_.has_value()) {
++    error_ = RTCError(RTCErrorType::INVALID_STATE);
++    return error_;
++  }
++
++  SendDataParams send_params;
++  // Send as ordered if it is still going through OPEN/ACK signaling.
++  send_params.ordered = ordered_ || handshake_state_ != kHandshakeReady;
++  send_params.max_rtx_count = max_retransmits_;
++  send_params.max_rtx_ms = max_retransmit_time_;
++  send_params.type = binary ? DataMessageType::kBinary : DataMessageType::kText;
++
++  const size_t count = messages.size();
++  error_ = controller_->SendDataMany(*id_n_, send_params, std::move(messages));
++  MaybeSendOnBufferedAmountChanged();
++  if (error_.ok()) {
++    messages_sent_ += count;
++    bytes_sent_ += bytes;
++    return error_;
++  }
++
++  RTC_LOG(LS_ERROR) << "Closing the DataChannel due to a failure to send data, "
++                       "send_result = "
++                    << ToString(error_.type()) << ":" << error_.message();
++  CloseAbruptlyWithError(
++      RTCError(RTCErrorType::NETWORK_ERROR, "Failure to send data"));
++  return error_;
++}
++
+ void SctpDataChannel::SetSctpSid_n(StreamId sid) {
+   RTC_DCHECK_RUN_ON(network_thread_);
+   RTC_DCHECK(!id_n_.has_value());
+@@ -845,6 +912,7 @@ void SctpDataChannel::SetState(DataState state) {
+   }
+ 
+   state_ = state;
++  state_mirror_.store(state, std::memory_order_release);
+ 
+   if (observer_) {
+     observer_->OnStateChange();
+diff --git a/pc/sctp_data_channel.h b/pc/sctp_data_channel.h
+index dfefb43..bdd33fd 100644
+--- a/pc/sctp_data_channel.h
++++ b/pc/sctp_data_channel.h
+@@ -11,11 +11,13 @@
+ #ifndef PC_SCTP_DATA_CHANNEL_H_
+ #define PC_SCTP_DATA_CHANNEL_H_
+ 
++#include <atomic>
+ #include <cstddef>
+ #include <cstdint>
+ #include <memory>
+ #include <optional>
+ #include <string>
++#include <vector>
+ 
+ #include "absl/base/nullability.h"
+ #include "absl/functional/any_invocable.h"
+@@ -51,6 +53,20 @@ class SctpDataChannelControllerInterface {
+   virtual RTCError SendData(StreamId sid,
+                             const SendDataParams& params,
+                             const CopyOnWriteBuffer& payload) = 0;
++  // Reactor: sends `payloads` in order and flushes them together (0007). The
++  // default sends each with SendData, stopping at the first error.
++  virtual RTCError SendDataMany(StreamId sid,
++                                const SendDataParams& params,
++                                std::vector<std::vector<uint8_t>> payloads) {
++    for (const std::vector<uint8_t>& payload : payloads) {
++      RTCError error =
++          SendData(sid, params, CopyOnWriteBuffer(payload.data(), payload.size()));
++      if (!error.ok()) {
++        return error;
++      }
++    }
++    return RTCError::OK();
++  }
+   // Adds the data channel SID to the transport for SCTP.
+   virtual RTCError AddSctpDataStream(StreamId sid, PriorityValue priority) = 0;
+   // Begins the closing procedure by sending an outgoing stream reset. Still
+@@ -186,6 +202,10 @@ class SctpDataChannel : public DataChannelInterface {
+   bool Send(const DataBuffer& buffer) override;
+   void SendAsync(DataBuffer buffer,
+                  absl::AnyInvocable<void(RTCError) &&> on_complete) override;
++  void SendManyAsync(
++      std::vector<std::vector<uint8_t>> messages,
++      bool binary,
++      absl::AnyInvocable<void(RTCError) &&> on_complete) override;
+ 
+   // Close immediately, ignoring any queued data or closing procedure.
+   // This is called when the underlying SctpTransport is being destroyed.
+@@ -277,6 +297,9 @@ class SctpDataChannel : public DataChannelInterface {
+   };
+ 
+   RTCError SendImpl(DataBuffer buffer) RTC_RUN_ON(network_thread_);
++  // Reactor: SendImpl for a batch (0007).
++  RTCError SendManyImpl(std::vector<std::vector<uint8_t>> messages,
++                        bool binary) RTC_RUN_ON(network_thread_);
+   void UpdateState() RTC_RUN_ON(network_thread_);
+   void SetState(DataState state) RTC_RUN_ON(network_thread_);
+ 
+@@ -311,6 +334,9 @@ class SctpDataChannel : public DataChannelInterface {
+   std::unique_ptr<ObserverAdapter> observer_adapter_;
+   CachedState* cached_state_ RTC_GUARDED_BY(signaling_thread_) = nullptr;
+   DataState state_ RTC_GUARDED_BY(network_thread_) = kConnecting;
++  // Reactor (0007): `state_`, for state() on a thread that is neither the
++  // network nor the signaling thread, without a blocking call.
++  std::atomic<DataState> state_mirror_{kConnecting};
+   RTCError error_ RTC_GUARDED_BY(network_thread_);
+   uint32_t messages_sent_ RTC_GUARDED_BY(network_thread_) = 0;
+   uint64_t bytes_sent_ RTC_GUARDED_BY(network_thread_) = 0;
+diff --git a/pc/sctp_transport.cc b/pc/sctp_transport.cc
+index 243de86..e16d27c 100644
+--- a/pc/sctp_transport.cc
++++ b/pc/sctp_transport.cc
+@@ -15,6 +15,7 @@
+ #include <memory>
+ #include <optional>
+ #include <utility>
++#include <vector>
+ 
+ #include "api/dtls_transport_interface.h"
+ #include "api/priority.h"
+@@ -100,6 +101,15 @@ RTCError SctpTransport::SendData(int channel_id,
+   return internal_sctp_transport_->SendData(channel_id, params, buffer);
+ }
+ 
++RTCError SctpTransport::SendDataMany(
++    int channel_id,
++    const SendDataParams& params,
++    std::vector<std::vector<uint8_t>> buffers) {
++  RTC_DCHECK_RUN_ON(owner_thread_);
++  return internal_sctp_transport_->SendDataMany(channel_id, params,
++                                                std::move(buffers));
++}
++
+ RTCError SctpTransport::CloseChannel(int channel_id) {
+   RTC_DCHECK_RUN_ON(owner_thread_);
+   RTC_DCHECK(internal_sctp_transport_);
+diff --git a/pc/sctp_transport.h b/pc/sctp_transport.h
+index c6908a9..a4d3179 100644
+--- a/pc/sctp_transport.h
++++ b/pc/sctp_transport.h
+@@ -12,8 +12,10 @@
+ #define PC_SCTP_TRANSPORT_H_
+ 
+ #include <cstddef>
++#include <cstdint>
+ #include <memory>
+ #include <optional>
++#include <vector>
+ 
+ #include "api/dtls_transport_interface.h"
+ #include "api/priority.h"
+@@ -54,6 +56,9 @@ class SctpTransport : public SctpTransportInterface,
+   RTCError SendData(int channel_id,
+                     const SendDataParams& params,
+                     const CopyOnWriteBuffer& buffer) override;
++  RTCError SendDataMany(int channel_id,
++                        const SendDataParams& params,
++                        std::vector<std::vector<uint8_t>> buffers) override;
+   RTCError CloseChannel(int channel_id) override;
+   void SetDataSink(DataChannelSink* sink) override;
+   bool IsReadyToSend() const override;
