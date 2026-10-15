@@ -672,6 +672,8 @@ class TestFrameMetadata:
 
         convert_s, handoff_s, count = recv_track_ref[0].handoff_totals()
         assert count >= len(frames)
+        # Both are real work timed on a fine clock (steady_clock in the native
+        # sink, Instant in Rust): a 320x240 conversion takes well over 1 us.
         assert convert_s > 0
         assert handoff_s > 0
 
