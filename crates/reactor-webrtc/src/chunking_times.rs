@@ -76,17 +76,30 @@ pub(crate) struct FrameTimes {
     pub(crate) native_s: f64,
 }
 
+/// The message leaving now: what its first frame recorded, kept until its
+/// last frame leaves.
+#[derive(Clone, Copy)]
+struct Leaving {
+    /// When the message handed over its first frame.
+    first_at: Instant,
+    /// How long it waited in the queue before that.
+    waited_s: f64,
+    /// The steps of handing over its first frame.
+    first_steps: FrameTimes,
+    /// How long its copy into the queue took.
+    enqueue_s: f64,
+}
+
 #[derive(Default)]
 pub(crate) struct ChunkingTimes {
     stats: ChunkingStats,
     /// When each queued message was sent, oldest first, in the queue's order,
     /// and how long its copy into the queue took.
     sent_at: VecDeque<(Instant, f64)>,
-    /// When the message leaving now handed over its first frame, and how long
-    /// it had waited in the queue. The wait joins the totals only with the
+    /// The message leaving now. Its times join the totals only with the
     /// message's last frame, so a message that never finishes leaving adds
     /// nothing.
-    leaving_since: Option<(Instant, f64, FrameTimes, f64)>,
+    leaving: Option<Leaving>,
     /// When the pump stopped with frames still queued.
     stalled_since: Option<Instant>,
     /// When the message arriving now delivered its first frame.
@@ -114,27 +127,31 @@ impl ChunkingTimes {
             self.stats.stalls += 1;
             self.stats.stall_s += (now - since).as_secs_f64();
         }
-        let (first, waited, first_steps, enqueue_s) =
-            *self.leaving_since.get_or_insert_with(|| {
-                let (waited, enqueue_s) = self
-                    .sent_at
-                    .front()
-                    .map_or((0.0, 0.0), |(sent, enqueue_s)| {
-                        ((now - *sent).as_secs_f64(), *enqueue_s)
-                    });
-                (now, waited, steps, enqueue_s)
-            });
+        let leaving = *self.leaving.get_or_insert_with(|| {
+            let (waited_s, enqueue_s) = self
+                .sent_at
+                .front()
+                .map_or((0.0, 0.0), |(sent, enqueue_s)| {
+                    ((now - *sent).as_secs_f64(), *enqueue_s)
+                });
+            Leaving {
+                first_at: now,
+                waited_s,
+                first_steps: steps,
+                enqueue_s,
+            }
+        });
         self.stats.frames_sent += 1;
         if !more(frame) {
-            self.stats.queue_wait_s += waited;
-            self.stats.enqueue_s += enqueue_s;
-            self.stats.first_check_s += first_steps.check_s;
-            self.stats.first_build_s += first_steps.build_s;
-            self.stats.first_native_s += first_steps.native_s;
-            self.stats.send_s += (now - first).as_secs_f64();
+            self.stats.queue_wait_s += leaving.waited_s;
+            self.stats.enqueue_s += leaving.enqueue_s;
+            self.stats.first_check_s += leaving.first_steps.check_s;
+            self.stats.first_build_s += leaving.first_steps.build_s;
+            self.stats.first_native_s += leaving.first_steps.native_s;
+            self.stats.send_s += (now - leaving.first_at).as_secs_f64();
             self.stats.messages_sent += 1;
             self.sent_at.pop_front();
-            self.leaving_since = None;
+            self.leaving = None;
         }
     }
 
@@ -146,7 +163,7 @@ impl ChunkingTimes {
     /// The queue was cleared: what it held never leaves.
     pub(crate) fn cleared(&mut self) {
         self.sent_at.clear();
-        self.leaving_since = None;
+        self.leaving = None;
         self.stalled_since = None;
     }
 
