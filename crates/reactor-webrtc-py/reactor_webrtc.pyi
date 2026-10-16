@@ -372,6 +372,32 @@ class DataChannelStats:
     messages_received: int
     bytes_received: int
 
+class HandoffStats:
+    """How long a remote video track took to hand decoded frames to its
+    `on_video_frame` callback, added up since the callback was set.
+
+    Divide a time by `frames` for a frame's mean.
+    """
+
+    #: From libwebrtc handing over a decoded frame, before its conversion to BGRA, until the native closure has it.
+    convert_s: float
+    #: From the native closure until the callback is called: the wait for the GIL and the copy into `bytes`.
+    handoff_s: float
+    #: The frames the callback received.
+    frames: int
+
+class MessageHandoffStats:
+    """How long a data channel took to hand whole messages to its
+    `on_message` callback, added up since the callback was set.
+
+    Divide `handoff_s` by `messages` for a message's mean.
+    """
+
+    #: From the engine handing over a whole message (after its reassembly, on a chunked channel) until the callback is called.
+    handoff_s: float
+    #: The messages the callback received.
+    messages: int
+
 class ChunkingStats:
     """Running totals of a chunked channel's messages, since it opened.
 
@@ -602,16 +628,10 @@ class Track:
         Note: all-zero frames (empty jitter buffer from peers with no incoming
         RTP) are suppressed and will not trigger this callback."""
         ...
-    def handoff_totals(self) -> tuple[float, float, int]:
+    def handoff_stats(self) -> HandoffStats:
         """How long this remote video track took to hand decoded frames to the
-        `on_video_frame` callback, added up since the callback was set:
-        `(convert_seconds, handoff_seconds, frames)`.
-
-        `convert` runs from libwebrtc handing over the decoded frame, before its
-        conversion to BGRA, until the native side has it. `handoff` runs from
-        there until the callback is called: the wait for the GIL and the copy
-        into `bytes`. Divide each by `frames` for a frame's mean. All zero
-        before a callback is set; raises on an audio track."""
+        `on_video_frame` callback, added up since the callback was set. All
+        zero before a callback is set."""
         ...
     def on_encoder_feedback(
         self,
@@ -812,12 +832,9 @@ class DataChannel:
         channel it fires once per whole message, including messages that
         arrived before it was set."""
         ...
-    def handoff_totals(self) -> tuple[float, int]:
+    def handoff_stats(self) -> MessageHandoffStats:
         """How long this channel took to hand whole messages to the
-        `on_message` callback, added up since the callback was set:
-        `(handoff_seconds, messages)`. It runs from the engine handing over a
-        whole message (after its reassembly, on a chunked channel) until the
-        callback is called: the wait for the GIL and the copy into `bytes`."""
+        `on_message` callback, added up since the callback was set."""
         ...
     def on_state_change(self, callback: Callable[[DataChannelState], None]) -> None: ...
     def on_open(self, callback: Callable[[], None]) -> None:

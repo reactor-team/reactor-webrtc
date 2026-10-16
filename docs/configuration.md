@@ -451,8 +451,8 @@ libwebrtc's network thread while the caller waits. `first_native_s` and
 `reassembly_s` is the closest a receiver gets to the time a message's body
 took on the wire, on its own clock.
 
-In Python, `DataChannel.handoff_totals()` returns `(handoff_seconds,
-messages)` on any channel: the time from the engine handing over a whole
+In Python, `DataChannel.handoff_stats()` returns a `MessageHandoffStats` with
+`handoff_s` and `messages` on any channel: the time from the engine handing over a whole
 message (after its reassembly, on a chunked channel) until the `on_message`
 callback is called, which is the wait for the GIL and the copy into `bytes`.
 It counts from the last `on_message` call.

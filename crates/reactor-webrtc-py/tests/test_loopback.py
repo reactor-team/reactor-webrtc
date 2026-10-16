@@ -645,14 +645,15 @@ class TestFrameMetadata:
         assert meta.capture_time_us > 0, "capture_time_us must be non-zero"
 
     async def test_a_remote_track_times_handing_its_frames_to_python(self, factory):
-        """handoff_totals adds up the native sink's work and the wait to enter Python."""
+        """handoff_stats adds up the native sink's work and the wait to enter Python."""
         recv_track_ref: list = []
         frames: list = []
 
         def on_track(kind, track):
             if kind == rw.MediaKind.Video:
                 recv_track_ref.append(track)
-                assert track.handoff_totals() == (0.0, 0.0, 0)
+                before = track.handoff_stats()
+                assert (before.convert_s, before.handoff_s, before.frames) == (0.0, 0.0, 0)
                 track.on_video_frame(lambda *_: frames.append(None))
 
         p1 = make_peer(factory)
@@ -670,12 +671,11 @@ class TestFrameMetadata:
             await asyncio.sleep(0.033)
         assert len(frames) >= 5, "too few frames decoded"
 
-        convert_s, handoff_s, count = recv_track_ref[0].handoff_totals()
-        assert count >= len(frames)
-        # Both are real work timed on a fine clock (steady_clock in the native
-        # sink, Instant in Rust): a 320x240 conversion takes well over 1 us.
-        assert convert_s > 0
-        assert handoff_s > 0
+        stats = recv_track_ref[0].handoff_stats()
+        assert stats.frames >= len(frames)
+        # Both are real work, timed and added up in nanoseconds.
+        assert stats.convert_s > 0
+        assert stats.handoff_s > 0
 
     async def test_a_declared_capture_time_arrives_exactly(self, factory):
         """The stamp the caller puts on a frame is the stamp the receiver reads.

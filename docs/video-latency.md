@@ -138,12 +138,10 @@ number to compare before and after changing any of the above.
 After the decoder, a remote video track's sink converts each frame to BGRA and
 hands it to the `on_frame` closure. `VideoTrack::sink_timings()` (Rust) adds up
 that conversion (`convert`) since the sink was attached. In Python,
-`Track.handoff_totals()` returns `(convert_seconds, handoff_seconds, frames)`:
-`handoff` adds the time from the closure to the `on_video_frame` callback being
-called, which is the wait for the GIL and the copy into `bytes`. Both are
-timed on monotonic clocks finer than a microsecond (`steady_clock` in the native
-sink, `Instant` in Rust), and `convert` is counted in whole microseconds per
-frame, so a total that stays at 0 while `frames` grows means a step below that
-resolution, not a step that is free.
+`Track.handoff_stats()` returns a `HandoffStats` with `convert_s`, `handoff_s`
+and `frames`: `handoff` adds the time from the closure to the `on_video_frame`
+callback being called, which is the wait for the GIL and the copy into `bytes`.
+Both are timed on monotonic clocks (`steady_clock` in the native sink, `Instant`
+in Rust) and added up in nanoseconds.
 
 [`PlayoutDelay::IMMEDIATE`]: ../crates/reactor-webrtc/src/playout.rs

@@ -1588,6 +1588,58 @@ impl HandoffTotals {
     }
 }
 
+/// How long a remote video track took to hand decoded frames to its
+/// `on_video_frame` callback, added up since the callback was set.
+///
+/// Divide a time by `frames` for a frame's mean.
+#[pyclass(get_all)]
+#[derive(Clone)]
+pub struct HandoffStats {
+    /// From libwebrtc handing over a decoded frame, before its conversion to
+    /// BGRA, until the native closure has it.
+    pub convert_s: f64,
+    /// From the native closure until the callback is called: the wait for the
+    /// GIL and the copy into `bytes`.
+    pub handoff_s: f64,
+    /// The frames the callback received.
+    pub frames: u64,
+}
+
+#[pymethods]
+impl HandoffStats {
+    fn __repr__(&self) -> String {
+        format!(
+            "HandoffStats(convert_s={}, handoff_s={}, frames={})",
+            self.convert_s, self.handoff_s, self.frames
+        )
+    }
+}
+
+/// How long a data channel took to hand whole messages to its `on_message`
+/// callback, added up since the callback was set.
+///
+/// Divide `handoff_s` by `messages` for a message's mean.
+#[pyclass(get_all)]
+#[derive(Clone)]
+pub struct MessageHandoffStats {
+    /// From the engine handing over a whole message (after its reassembly, on
+    /// a chunked channel) until the callback is called: the wait for the GIL
+    /// and the copy into `bytes`.
+    pub handoff_s: f64,
+    /// The messages the callback received.
+    pub messages: u64,
+}
+
+#[pymethods]
+impl MessageHandoffStats {
+    fn __repr__(&self) -> String {
+        format!(
+            "MessageHandoffStats(handoff_s={}, messages={})",
+            self.handoff_s, self.messages
+        )
+    }
+}
+
 #[pyclass]
 pub struct Track {
     // Arc, not ManuallyDrop, so Transceiver.set_track can clone a handle into a
@@ -1756,19 +1808,17 @@ impl Track {
     }
 
     /// How long this remote video track took to hand decoded frames to the
-    /// `on_video_frame` callback, added up since the callback was set:
-    /// `(convert_seconds, handoff_seconds, frames)`.
-    ///
-    /// `convert` runs from libwebrtc handing over the decoded frame, before its
-    /// conversion to BGRA, until the native closure has it. `handoff` runs from
-    /// there until the callback is called: the wait for the GIL and the copy
-    /// into `bytes`. Divide each by `frames` for a frame's mean. All zero before
-    /// a callback is set.
-    fn handoff_totals(&self, py: Python) -> PyResult<(f64, f64, u64)> {
+    /// `on_video_frame` callback, added up since the callback was set. All
+    /// zero before a callback is set.
+    fn handoff_stats(&self, py: Python) -> PyResult<HandoffStats> {
         let native = Arc::clone(self.video()?);
         let sink = py.allow_threads(|| native.sink_timings());
         let handoff = Arc::clone(&self.handoff.lock().unwrap());
-        Ok((sink.convert.as_secs_f64(), handoff.seconds(), sink.frames))
+        Ok(HandoffStats {
+            convert_s: sink.convert.as_secs_f64(),
+            handoff_s: handoff.seconds(),
+            frames: sink.frames,
+        })
     }
 
     /// Push interleaved signed 16-bit little-endian PCM to a local audio track
@@ -2512,13 +2562,13 @@ impl DataChannel {
     }
 
     /// How long this channel took to hand whole messages to the `on_message`
-    /// callback, added up since the callback was set: `(handoff_seconds,
-    /// messages)`. It runs from the engine handing over a whole message (after
-    /// its reassembly, on a chunked channel) until the callback is called: the
-    /// wait for the GIL and the copy into `bytes`.
-    fn handoff_totals(&self) -> (f64, u64) {
+    /// callback, added up since the callback was set.
+    fn handoff_stats(&self) -> MessageHandoffStats {
         let handoff = Arc::clone(&self.handoff.lock().unwrap());
-        (handoff.seconds(), handoff.count.load(Ordering::Relaxed))
+        MessageHandoffStats {
+            handoff_s: handoff.seconds(),
+            messages: handoff.count.load(Ordering::Relaxed),
+        }
     }
 
     /// Register `callback(state: DataChannelState)` for state transitions.
@@ -3656,6 +3706,8 @@ fn reactor_webrtc(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<IceCandidatePairStats>()?;
     m.add_class::<DataChannelStats>()?;
     m.add_class::<ChunkingStats>()?;
+    m.add_class::<HandoffStats>()?;
+    m.add_class::<MessageHandoffStats>()?;
     m.add_class::<SctpStats>()?;
     m.add_class::<StatsReport>()?;
     m.add_class::<FrameMetadata>()?;
