@@ -279,6 +279,25 @@ async def test_a_chunked_channel_times_its_messages(factory):
     assert received.reassembly_s > 0
 
 
+async def test_a_channel_times_handing_its_messages_to_python(factory):
+    a, b, dc_a, dc_b = await connect(factory)
+    before = dc_b.handoff_stats()
+    assert (before.handoff_s, before.messages) == (0.0, 0)
+    got = inbox(dc_b)
+
+    for i in range(3):
+        dc_a.send(pattern(i, 64 * 1024))
+    await wait_for(lambda: len(got) == 3)
+
+    stats = dc_b.handoff_stats()
+    assert stats.messages == 3
+    assert stats.handoff_s > 0
+    # A new callback starts its own totals.
+    inbox(dc_b)
+    after = dc_b.handoff_stats()
+    assert (after.handoff_s, after.messages) == (0.0, 0)
+
+
 async def test_a_plain_channel_has_no_chunking_stats(factory):
     _, _, dc_a, _ = await connect(factory, chunk_a=False, chunk_b=False)
     assert dc_a.chunking_stats() is None

@@ -170,9 +170,27 @@ impl crate::sender_meta::SenderMetaSource for CaptureTimeMeta {
 // shift it.
 use crate::sender_meta::ReceiverMetaQueue;
 
+/// How long a remote video track's sink took to hand its decoded frames on,
+/// added up since the sink was attached ([`VideoTrack::sink_timings`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VideoSinkTimings {
+    /// From libwebrtc handing a decoded frame to the sink, before its conversion
+    /// to BGRA, until the frame reaches the `on_frame` closure.
+    pub convert: std::time::Duration,
+    /// The frames the closure received.
+    pub frames: u64,
+}
+
+#[derive(Default)]
+struct SinkTimingTotals {
+    convert_ns: AtomicU64,
+    frames: AtomicU64,
+}
+
 // Heap-pinned sink state behind the C userdata pointer.
 struct VideoSinkState {
     cb: Mutex<VideoSinkCb>,
+    timings: SinkTimingTotals,
     // The track's inbound metadata queue, always present. It is simply empty when
     // no strip transform is installed or the sender attached no trailer, so there
     // is no state to switch on and no back-fill ordering to get right.
@@ -189,12 +207,21 @@ extern "C" fn video_sink_tramp(
     height: c_int,
     ssrc: u32,
     rtp_timestamp: u32,
+    convert_ns: i64,
 ) {
+    // The native sink timed its own share; this one adds the work here, until
+    // the callback, on a clock as fine.
+    let entered = std::time::Instant::now();
     let st = unsafe { &*(ud as *const VideoSinkState) };
     let len = (width as usize) * (height as usize) * 4;
     let slice = unsafe { std::slice::from_raw_parts(bgra, len) };
     let metadata = crate::sender_meta::take_receiver_meta(&st.receiver_meta, ssrc, rtp_timestamp);
     if let Ok(mut cb) = st.cb.lock() {
+        let here_ns = u64::try_from(entered.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        st.timings
+            .convert_ns
+            .fetch_add(convert_ns.max(0) as u64 + here_ns, Ordering::Relaxed);
+        st.timings.frames.fetch_add(1, Ordering::Relaxed);
         cb(VideoFrame {
             bgra: slice,
             width: width as u32,
@@ -494,6 +521,7 @@ impl Track {
     ) {
         let state = Box::new(VideoSinkState {
             cb: Mutex::new(Box::new(cb)),
+            timings: SinkTimingTotals::default(),
             receiver_meta: self.receiver_meta.clone(),
         });
         let ud = &*state as *const VideoSinkState as *mut c_void;
@@ -621,6 +649,20 @@ impl VideoTrack {
     /// runs on a WebRTC thread.
     pub fn on_frame(&self, cb: impl for<'a> FnMut(VideoFrame<'a>) + Send + 'static) {
         self.0.attach_video_sink(cb);
+    }
+
+    /// How long the sink took to hand decoded frames to the [`on_frame`](Self::on_frame)
+    /// closure, added up since it was attached. Zero before any sink is attached.
+    pub fn sink_timings(&self) -> VideoSinkTimings {
+        let guard = self.0.video_sink.lock().expect("video_sink mutex poisoned");
+        guard
+            .as_ref()
+            .map_or_else(VideoSinkTimings::default, |st| VideoSinkTimings {
+                convert: std::time::Duration::from_nanos(
+                    st.timings.convert_ns.load(Ordering::Relaxed),
+                ),
+                frames: st.timings.frames.load(Ordering::Relaxed),
+            })
     }
 
     /// Push a BGRA frame (`width*height*4` bytes), captured now — on a local

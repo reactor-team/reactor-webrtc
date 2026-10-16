@@ -644,6 +644,39 @@ class TestFrameMetadata:
         assert meta.frame_id > 0, "frame_id must be non-zero"
         assert meta.capture_time_us > 0, "capture_time_us must be non-zero"
 
+    async def test_a_remote_track_times_handing_its_frames_to_python(self, factory):
+        """handoff_stats adds up the native sink's work and the wait to enter Python."""
+        recv_track_ref: list = []
+        frames: list = []
+
+        def on_track(kind, track):
+            if kind == rw.MediaKind.Video:
+                recv_track_ref.append(track)
+                before = track.handoff_stats()
+                assert (before.convert_s, before.handoff_s, before.frames) == (0.0, 0.0, 0)
+                track.on_video_frame(lambda *_: frames.append(None))
+
+        p1 = make_peer(factory)
+        p2 = make_peer(factory, on_track=on_track)
+        video = factory.create_video_track("handoff-video")
+        tx1 = p1.pc.add_transceiver(rw.MediaKind.Video, rw.TransceiverDirection.SendOnly)
+        await tx1.set_track(video)
+        assert await connect(p1, p2), "peers did not connect within timeout"
+
+        bgra = bytes(320 * 240 * 4)
+        for _ in range(150):
+            if len(frames) >= 5:
+                break
+            video.push_video_frame(bgra, 320, 240)
+            await asyncio.sleep(0.033)
+        assert len(frames) >= 5, "too few frames decoded"
+
+        stats = recv_track_ref[0].handoff_stats()
+        assert stats.frames >= len(frames)
+        # Both are real work, timed and added up in nanoseconds.
+        assert stats.convert_s > 0
+        assert stats.handoff_s > 0
+
     async def test_a_declared_capture_time_arrives_exactly(self, factory):
         """The stamp the caller puts on a frame is the stamp the receiver reads.
 

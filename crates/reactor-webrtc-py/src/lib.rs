@@ -27,7 +27,7 @@ use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyTuple};
 use std::mem::ManuallyDrop;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 // Process-wide guard: libwebrtc starts global threads on factory creation and
@@ -1566,11 +1566,86 @@ pub(crate) enum NativeTrack {
     Audio(Arc<rw::AudioTrack>),
 }
 
+/// Time a callback spent getting into Python, added up: from the native side
+/// handing over a frame or a message until the Python callback is called. That
+/// is the wait for the GIL and the copy into `bytes`.
+#[derive(Default)]
+struct HandoffTotals {
+    nanos: AtomicU64,
+    count: AtomicU64,
+}
+
+impl HandoffTotals {
+    fn add(&self, since: std::time::Instant) {
+        let nanos = u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.nanos.fetch_add(nanos, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn seconds(&self) -> f64 {
+        self.nanos.load(Ordering::Relaxed) as f64 / 1e9
+    }
+}
+
+/// How long a remote video track took to hand decoded frames to its
+/// `on_video_frame` callback, added up since the callback was set.
+///
+/// Divide a time by `frames` for a frame's mean.
+#[pyclass(get_all)]
+#[derive(Clone)]
+pub struct HandoffStats {
+    /// From libwebrtc handing over a decoded frame, before its conversion to
+    /// BGRA, until the native closure has it.
+    pub convert_s: f64,
+    /// From the native closure until the callback is called: the wait for the
+    /// GIL and the copy into `bytes`.
+    pub handoff_s: f64,
+    /// The frames the callback received.
+    pub frames: u64,
+}
+
+#[pymethods]
+impl HandoffStats {
+    fn __repr__(&self) -> String {
+        format!(
+            "HandoffStats(convert_s={}, handoff_s={}, frames={})",
+            self.convert_s, self.handoff_s, self.frames
+        )
+    }
+}
+
+/// How long a data channel took to hand whole messages to its `on_message`
+/// callback, added up since the callback was set.
+///
+/// Divide `handoff_s` by `messages` for a message's mean.
+#[pyclass(get_all)]
+#[derive(Clone)]
+pub struct MessageHandoffStats {
+    /// From the engine handing over a whole message (after its reassembly, on
+    /// a chunked channel) until the callback is called: the wait for the GIL
+    /// and the copy into `bytes`.
+    pub handoff_s: f64,
+    /// The messages the callback received.
+    pub messages: u64,
+}
+
+#[pymethods]
+impl MessageHandoffStats {
+    fn __repr__(&self) -> String {
+        format!(
+            "MessageHandoffStats(handoff_s={}, messages={})",
+            self.handoff_s, self.messages
+        )
+    }
+}
+
 #[pyclass]
 pub struct Track {
     // Arc, not ManuallyDrop, so Transceiver.set_track can clone a handle into a
     // spawn_blocking future while this Python object keeps its own handle.
     inner: Option<NativeTrack>,
+    // The totals of the frame callback attached last; a new one starts at zero.
+    handoff: Mutex<Arc<HandoffTotals>>,
 }
 
 impl Track {
@@ -1696,11 +1771,14 @@ impl Track {
     /// 3-argument call on `TypeError` when `metadata` is `None`.
     fn on_video_frame(&mut self, py: Python, callback: PyObject) -> PyResult<()> {
         let native = Arc::clone(self.video()?);
+        let handoff = Arc::new(HandoffTotals::default());
+        *self.handoff.lock().unwrap() = Arc::clone(&handoff);
         // Attaching a sink dispatches synchronously to the worker thread, which
         // is also where another track's frame callback re-enters Python. The GIL
         // has to be free across the dispatch or the two deadlock.
         py.allow_threads(|| {
             native.on_frame(move |frame| {
+                let handed_at = std::time::Instant::now();
                 Python::with_gil(|py| {
                     let bytes = PyBytes::new_bound(py, frame.bgra);
                     let meta = frame.metadata.map(|m| {
@@ -1708,6 +1786,7 @@ impl Track {
                             .map(|p| p.into_any())
                             .unwrap_or_else(|_| py.None())
                     });
+                    handoff.add(handed_at);
                     match meta {
                         Some(m) => {
                             let _ = callback.call1(py, (bytes, frame.width, frame.height, m));
@@ -1725,6 +1804,20 @@ impl Track {
             });
         });
         Ok(())
+    }
+
+    /// How long this remote video track took to hand decoded frames to the
+    /// `on_video_frame` callback, added up since the callback was set. All
+    /// zero before a callback is set.
+    fn handoff_stats(&self, py: Python) -> PyResult<HandoffStats> {
+        let native = Arc::clone(self.video()?);
+        let sink = py.allow_threads(|| native.sink_timings());
+        let handoff = Arc::clone(&self.handoff.lock().unwrap());
+        Ok(HandoffStats {
+            convert_s: sink.convert.as_secs_f64(),
+            handoff_s: handoff.seconds(),
+            frames: sink.frames,
+        })
     }
 
     /// Push interleaved signed 16-bit little-endian PCM to a local audio track
@@ -1820,12 +1913,14 @@ impl Track {
     fn from_video(track: rw::VideoTrack) -> Self {
         Self {
             inner: Some(NativeTrack::Video(Arc::new(track))),
+            handoff: Mutex::default(),
         }
     }
 
     fn from_audio(track: rw::AudioTrack) -> Self {
         Self {
             inner: Some(NativeTrack::Audio(Arc::new(track))),
+            handoff: Mutex::default(),
         }
     }
 
@@ -2343,6 +2438,8 @@ impl Transceiver {
 pub struct DataChannel {
     // Arc so `drain()` can hand a handle to a spawn_blocking future.
     inner: ManuallyDrop<Arc<rw::DataChannel>>,
+    // The totals of the message callback set last; a new one starts at zero.
+    handoff: Mutex<Arc<HandoffTotals>>,
 }
 
 impl Drop for DataChannel {
@@ -2447,16 +2544,30 @@ impl DataChannel {
 
     /// Register `callback(data: bytes, binary: bool)` for incoming messages.
     fn on_message(&self, py: Python, callback: PyObject) {
+        let handoff = Arc::new(HandoffTotals::default());
+        *self.handoff.lock().unwrap() = Arc::clone(&handoff);
         // Registering re-registers the native observer, which dispatches to the
         // thread that delivers messages into Python. The GIL has to be free.
         py.allow_threads(|| {
             self.inner.on_message(move |data, binary| {
+                let handed_at = std::time::Instant::now();
                 Python::with_gil(|py| {
                     let bytes = PyBytes::new_bound(py, data);
+                    handoff.add(handed_at);
                     let _ = callback.call1(py, (bytes, binary));
                 });
             });
         });
+    }
+
+    /// How long this channel took to hand whole messages to the `on_message`
+    /// callback, added up since the callback was set.
+    fn handoff_stats(&self) -> MessageHandoffStats {
+        let handoff = Arc::clone(&self.handoff.lock().unwrap());
+        MessageHandoffStats {
+            handoff_s: handoff.seconds(),
+            messages: handoff.count.load(Ordering::Relaxed),
+        }
     }
 
     /// Register `callback(state: DataChannelState)` for state transitions.
@@ -2629,6 +2740,7 @@ impl PeerConnectionObserver {
                         py,
                         DataChannel {
                             inner: ManuallyDrop::new(Arc::new(dc)),
+                            handoff: Mutex::default(),
                         },
                     ) {
                         Ok(py_dc) => {
@@ -2804,6 +2916,7 @@ impl PeerConnection {
         py.allow_threads(|| self.pc().create_data_channel(label))
             .map(|inner| DataChannel {
                 inner: ManuallyDrop::new(Arc::new(inner)),
+                handoff: Mutex::default(),
             })
             .map_err(err)
     }
@@ -3592,6 +3705,8 @@ fn reactor_webrtc(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<IceCandidatePairStats>()?;
     m.add_class::<DataChannelStats>()?;
     m.add_class::<ChunkingStats>()?;
+    m.add_class::<HandoffStats>()?;
+    m.add_class::<MessageHandoffStats>()?;
     m.add_class::<SctpStats>()?;
     m.add_class::<StatsReport>()?;
     m.add_class::<FrameMetadata>()?;
