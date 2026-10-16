@@ -266,6 +266,160 @@ data channel has carried a message.
 
 ---
 
+### 0007 — no worker-thread task per untracked sent packet
+
+`0007-skip-sent-packet-task-for-untracked-packets.patch` · touches
+`call/rtp_transport_controller_send.cc` (+10 lines)
+
+**What.** `RtpTransportControllerSend::OnSentPacket` returns early, on the
+network thread, for a packet with no transport sequence number
+(`packet_id == -1`) that is neither `included_in_feedback` nor
+`included_in_allocation`.
+
+**Why.** Every UDP packet the transport sends is reported here, and upstream
+posts a task to the worker thread for each one (a `futex_wake` / condition
+broadcast per packet). For exactly those packets the task is a no-op:
+`TransportFeedbackAdapter::ProcessSentPacket` only tracks packets with a
+sequence number or in the allocation, and returns `nullopt` for the rest, which
+ends `ProcessSentPacket` before anything else runs. SCTP data channel packets
+(and STUN) are all such packets, and a 100 KB message is ~90 of them, plus a SACK
+per two on the receiving side. Profiled under a 100 KB message loop (perf on
+Linux, `sample` on macOS), posting these tasks was 24% of the sender's network
+thread and 29% of the receiver's, more than the `sendto()` syscalls themselves.
+
+**How it works.** The early return mirrors the adapter's own condition, so the
+worker thread sees the same state as before. RTP keeps its path:
+`RtpTransportControllerSend` sets `included_in_allocation` for every RTP packet
+it sends, and transport-wide CC packets carry a `packet_id`.
+
+### 0008 — cache the IP overhead of a UDP socket
+
+`0008-cache-udp-ip-overhead.patch` · touches `rtc_base/async_udp_socket.{h,cc}`
+(+21 lines)
+
+**What.** `AsyncUDPSocket::Send`/`SendTo` fill `SentPacketInfo` through a new
+`FillPacketInfo`, which caches `ip_overhead_bytes` (20 for IPv4, 40 for IPv6)
+once the socket has a local address.
+
+**Why.** Upstream's `CopySocketInformationToPacketInfo` asks the socket for its
+local address on every send, which is a `getsockname()` syscall per packet, only
+to read the address family. That was 4–5% of the sender's network thread.
+
+**How it works.** The family of a bound socket never changes. Until the socket
+has an address the overhead reads as 0 and is not cached, so it is looked up
+again on the next send, as before.
+
+### 0009 — batch UDP sends (Linux) and reads
+
+`0009-batch-udp-sends-and-reads.patch` · touches
+`rtc_base/physical_socket_server.{h,cc}`, `rtc_base/thread.cc`,
+`rtc_base/async_udp_socket.{h,cc}` (+218 lines)
+
+**What.** Two changes, so a data channel message, which leaves as ~1.2 KB SCTP
+packets, stops costing a syscall and a wakeup per packet:
+
+- **Sends (Linux, not Android).** A new `ScopedUdpSendBatch` makes a
+  `PhysicalSocket` queue the datagrams `SendTo()` sends on that thread while a
+  scope is open; they go out with one `sendmmsg()` per socket when the
+  outermost scope closes, or as soon as 16 are queued, so the first packet of a
+  long burst does not wait for the last. `Thread::Dispatch` opens a scope around
+  every task: a data channel `Send` runs as one, so the packets of a message go
+  out in batches. Elsewhere the scope does nothing.
+- **Not socket events.** What an incoming SACK releases still leaves at once,
+  so sends stay clocked by the SACKs, as upstream. A first version also batched
+  each round of epoll events; that turned the data released by a round's SACKs
+  into one back-to-back burst, which overran a receiver with no slower link in
+  between (loopback): drops in its socket buffer, retransmission timeouts, and
+  1 MB+ messages 2–3× slower. Behind any link of 1 Gbps or less it made no
+  difference.
+- **Reads (all platforms).** `AsyncUDPSocket::OnReadEvent` reads up to 16
+  datagrams per read event instead of one, stopping when the socket would
+  block. A burst costs one wakeup per 16 packets.
+
+**Why.** After 0007 and 0008, one `sendto()` per packet was the largest
+remaining cost of the sender's network thread (21% on Linux, more on macOS),
+and on the receiver one `epoll_wait()` + `recvmsg()` per packet plus one
+`sendto()` per SACK. dcsctp builds and sends each packet synchronously, so
+nothing above the socket can batch them.
+
+**How it works.**
+
+- A queued datagram counts as sent, as UDP allows: if the flush fails it is
+  lost (SCTP retransmits it), and a would-block error re-arms the socket's write
+  event as a failed `sendto()` would. A datagram that fails on its own (an ICMP
+  error for its destination) does not stop the others.
+- Order is kept: `Send()`, `SetOption()` (ECN, DSCP) and `Close()` flush the
+  socket's queue first, and a destroyed socket leaves its thread's flush list.
+- `RTC_EXPORT`ed `ScopedUdpSendBatch` lives in `physical_socket_server.h`;
+  `thread.cc` is in the same `rtc_base:threading` target, so there are no new
+  deps.
+- The read loop keeps a weak liveness flag, since a packet handler may destroy
+  the socket.
+
+**Verify.** The send batch is compiled only on Linux. On macOS 0007–0009 cut the
+SDK's CPU per 100 KB command from ~1.85 to ~1.1 ms and the receiver's time per
+packet from ~35 to ~22 µs. On Linux they halve the time per packet on both
+sides. reactor-webrtc's Rust and Python suites pass on both, and a data channel
+stress run (thousands of messages of 0 B–16 MB on several channels, both
+directions, with integrity and order checks) finds no loss or corruption.
+
+---
+
+### 0010 — batch UDP sends on macOS with sendmsg_x()
+
+`0010-macos-sendmsg-x-udp-send-batch.patch` · touches
+`rtc_base/physical_socket_server.{h,cc}` (+96 lines)
+
+**What.** Turns on 0009's send batch on macOS and flushes it with `sendmsg_x()`,
+XNU's counterpart of `sendmmsg()`. Unlike Linux, macOS also batches what each
+socket read event sends.
+
+- **The call.** `sendmsg_x()` takes an array of `msghdr_x` (a `msghdr` plus
+  `msg_datalen`). Each message carries its own destination, so a batch mixes ICE
+  candidates freely. The SDK has neither the struct nor the prototype; they come
+  from XNU's private `bsd/sys/socket_private.h`. The symbol is weak-imported, so
+  a macOS without it still loads, and a missing symbol or `ENOSYS` falls back to
+  one `sendto()` per datagram.
+- **Read events batch too.** In a data channel transfer most packets leave when
+  an incoming SACK frees the congestion window, which runs in a read event, not
+  a task. With 0009's tasks-only batch, ~3% of datagrams went through
+  `sendmsg_x()`, in flushes of about 4, and end-to-end latency did not move. With
+  read events batched too, ~8.6 datagrams go per call.
+- **A would-block error drops one datagram, not the rest.** macOS reports
+  `ENOBUFS` (mapped to would-block) per destination, for example a VPN
+  interface's queue during ICE. Since a read event's batch mixes checks to many
+  candidates, the flush skips just the datagram that would block and keeps
+  going, as separate `sendto()`s would.
+- **Not on iOS.** It is private API, so App Store review may flag the symbol.
+  `WEBRTC_IOS` builds never reference it, and any build that must not can
+  define `WEBRTC_DISABLE_APPLE_SENDMSG_X`.
+
+**Why not on Linux, and why not `recvmsg_x()`.** 0009 tried batching read events
+on Linux and dropped it: on loopback, the burst a round of SACKs released
+overran the receiver's socket buffer. On macOS the same change showed no extra
+drops from 100 KB to 4 MB messages, plain and chunked (max_burst 256), and
+macOS's default UDP receive buffer is much larger (786 KB against Linux's
+~208 KB). A read-ahead with `recvmsg_x()` (16 datagrams per call) was prototyped
+and dropped: inside libwebrtc each call cost ~3.6 µs per datagram against 1.5–1.9
+µs for `recvmsg()`, it raised latency at every batch size from 2 to 16, and it
+overflowed the receive buffer under streaming load.
+
+**Verify.** On an M5 Pro over loopback, `examples/dc_bench` (two peers, each
+with its own network thread; three alternating runs each), 0009 → 0010:
+
+| Message | One-way latency, mean | p99 | Throughput |
+|---|---|---|---|
+| 100 KB, plain | 674 → 589 µs | 916 → 687 µs | 151 → 188 MB/s |
+| 100 KB, chunked | 714 → 593 µs | 1040 → 681 µs | 153 → 179 MB/s |
+| 1 MB, chunked | 7.04 → 5.97 ms | — | 152 → 178 MB/s |
+| 4 MB, chunked | 26.9 → 23.1 ms | — | 155 → 184 MB/s |
+
+UDP drops for full socket buffers did not change. The Rust data channel suites
+fail as often on 0009 as on 0010 on that machine (ICE connect timeouts under
+load), and `sctp_snap` passes 10 of 10 on both.
+
+---
+
 ## Planned (not yet authored — need their target builds to validate)
 
 - **Symbol isolation** — keep WebRTC's C++ symbols from clashing when a consumer

@@ -1,0 +1,21 @@
+diff --git a/call/rtp_transport_controller_send.cc b/call/rtp_transport_controller_send.cc
+index a224a4941b..ae4711b5b1 100644
+--- a/call/rtp_transport_controller_send.cc
++++ b/call/rtp_transport_controller_send.cc
+@@ -459,6 +459,16 @@ void RtpTransportControllerSend::OnSentPacket(
+   // TODO(crbug.com/1373439): Clarify other thread contexts calling in,
+   // and simplify task posting logic now that the combined network/worker
+   // project has launched.
++  //
++  // Reactor: a packet with no transport sequence number that is neither in
++  // feedback nor in the allocation (SCTP data channel traffic, STUN) is a no-op
++  // in TransportFeedbackAdapter::ProcessSentPacket, so don't post a task (and
++  // wake the worker thread) for each one: a 100 KB data channel message is ~90
++  // such packets.
++  if (sent_packet.packet_id == -1 && !sent_packet.info.included_in_feedback &&
++      !sent_packet.info.included_in_allocation) {
++    return;
++  }
+   if (TaskQueueBase::Current() != worker_thread_) {
+     worker_thread_->PostTask(SafeTask(safety_.flag(), [this, sent_packet]() {
+       RTC_DCHECK_RUN_ON(worker_thread_);
