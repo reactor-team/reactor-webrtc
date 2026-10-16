@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use reactor_webrtc_sys::ReactorStatEntry;
 
-use crate::chunking_times::ChunkingTimes;
+use crate::chunking_times::{ChunkingTimes, FrameTimes};
 use crate::dc_chunking::ApplyError;
 use crate::encoded::{FrameTransform, VideoCodec};
 use crate::media::{MediaKind, Track};
@@ -1471,9 +1471,12 @@ impl ChannelCore {
             };
             while c.pump_again.swap(false, Ordering::SeqCst) {
                 loop {
+                    let check_start = Instant::now();
+                    let buffered = self.raw.buffered_amount();
+                    let build_start = Instant::now();
                     let (frame, queued_left) = {
                         let mut queue = c.queue.lock().unwrap();
-                        let frame = queue.next_frame(self.raw.buffered_amount());
+                        let frame = queue.next_frame(buffered);
                         (frame, !queue.is_empty())
                     };
                     let Some(frame) = frame else {
@@ -1484,7 +1487,15 @@ impl ChannelCore {
                         }
                         break;
                     };
-                    if !self.raw.send(&frame, true) {
+                    let native_start = Instant::now();
+                    let sent = self.raw.send(&frame, true);
+                    let native_end = Instant::now();
+                    let steps = FrameTimes {
+                        check_s: (build_start - check_start).as_secs_f64(),
+                        build_s: (native_start - build_start).as_secs_f64(),
+                        native_s: (native_end - native_start).as_secs_f64(),
+                    };
+                    if !sent {
                         // libwebrtc closes the channel on a failed send. The
                         // peer may hold part of a message; nothing more can
                         // follow it.
@@ -1493,7 +1504,10 @@ impl ChannelCore {
                         return;
                     }
                     // Counted once libwebrtc took it: a refused frame never left.
-                    c.times.lock().unwrap().frame_sent(&frame, Instant::now());
+                    c.times
+                        .lock()
+                        .unwrap()
+                        .frame_sent(&frame, native_end, steps);
                 }
             }
             drop(_guard);
@@ -1780,6 +1794,9 @@ impl DataChannel {
                 Err(Error::Webrtc("data channel send failed".into()))
             };
         };
+        // Before the state check: libwebrtc answers it on the network thread,
+        // so it can wait there, and that wait is part of the enqueue.
+        let entered = Instant::now();
         // A closed channel would take the message and drop it on the first
         // native send; refuse it as the plain path does.
         if self.state() != DataChannelState::Open {
@@ -1792,7 +1809,11 @@ impl DataChannel {
             queue
                 .push(data.to_vec(), binary)
                 .map_err(Error::DataChannel)?;
-            c.times.lock().unwrap().queued(Instant::now());
+            let now = Instant::now();
+            c.times
+                .lock()
+                .unwrap()
+                .queued(now, (now - entered).as_secs_f64());
         }
         c.user_low_armed.store(true, Ordering::SeqCst);
         self.core.pump(c);

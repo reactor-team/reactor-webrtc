@@ -271,6 +271,8 @@ async def test_a_chunked_channel_times_its_messages(factory):
     assert sent.messages_sent == 1
     assert sent.frames_sent > 1
     assert sent.send_s > 0
+    assert 0 < sent.first_native_s <= sent.native_send_s
+    assert sent.enqueue_s >= 0
     received = dc_b.chunking_stats()
     assert received.messages_received == 1
     assert received.frames_received == sent.frames_sent
