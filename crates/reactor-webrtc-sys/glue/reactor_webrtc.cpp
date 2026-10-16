@@ -628,10 +628,10 @@ class FrameSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
     // SSRC. 0 when the list is empty (a frame that did not come off the wire).
     const webrtc::RtpPacketInfos& packets = frame.packet_infos();
     const uint32_t ssrc = packets.empty() ? 0 : packets.begin()->ssrc();
-    const int64_t convert_us = std::chrono::duration_cast<std::chrono::microseconds>(
+    const int64_t convert_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                    std::chrono::steady_clock::now() - received)
                                    .count();
-    on_frame_(userdata_, bgra_.data(), w, h, ssrc, frame.rtp_timestamp(), convert_us);
+    on_frame_(userdata_, bgra_.data(), w, h, ssrc, frame.rtp_timestamp(), convert_ns);
   }
 
  private:
@@ -1910,9 +1910,9 @@ void reactor_webrtc_audio_track_add_sink(
 }
 
 // Attach a frame sink to a (video) track. `on_frame(userdata, bgra, width,
-// height, ssrc, rtp_timestamp, convert_us)` fires per decoded frame;
-// `convert_us` is how long the sink took from libwebrtc handing it the frame
-// to the call, its conversion to BGRA included, in microseconds. The sink
+// height, ssrc, rtp_timestamp, convert_ns)` fires per decoded frame;
+// `convert_ns` is how long the sink took from libwebrtc handing it the frame
+// to the call, its conversion to BGRA included, in nanoseconds. The sink
 // lives until the track handle is destroyed.
 //
 // Same ordering requirement as the audio sink above: `AddOrUpdateSink` only

@@ -183,7 +183,7 @@ pub struct VideoSinkTimings {
 
 #[derive(Default)]
 struct SinkTimingTotals {
-    convert_us: AtomicU64,
+    convert_ns: AtomicU64,
     frames: AtomicU64,
 }
 
@@ -207,7 +207,7 @@ extern "C" fn video_sink_tramp(
     height: c_int,
     ssrc: u32,
     rtp_timestamp: u32,
-    convert_us: i64,
+    convert_ns: i64,
 ) {
     // The native sink timed its own share; this one adds the work here, until
     // the callback, on a clock as fine.
@@ -217,10 +217,10 @@ extern "C" fn video_sink_tramp(
     let slice = unsafe { std::slice::from_raw_parts(bgra, len) };
     let metadata = crate::sender_meta::take_receiver_meta(&st.receiver_meta, ssrc, rtp_timestamp);
     if let Ok(mut cb) = st.cb.lock() {
-        let here_us = entered.elapsed().as_micros() as u64;
+        let here_ns = u64::try_from(entered.elapsed().as_nanos()).unwrap_or(u64::MAX);
         st.timings
-            .convert_us
-            .fetch_add(convert_us.max(0) as u64 + here_us, Ordering::Relaxed);
+            .convert_ns
+            .fetch_add(convert_ns.max(0) as u64 + here_ns, Ordering::Relaxed);
         st.timings.frames.fetch_add(1, Ordering::Relaxed);
         cb(VideoFrame {
             bgra: slice,
@@ -658,8 +658,8 @@ impl VideoTrack {
         guard
             .as_ref()
             .map_or_else(VideoSinkTimings::default, |st| VideoSinkTimings {
-                convert: std::time::Duration::from_micros(
-                    st.timings.convert_us.load(Ordering::Relaxed),
+                convert: std::time::Duration::from_nanos(
+                    st.timings.convert_ns.load(Ordering::Relaxed),
                 ),
                 frames: st.timings.frames.load(Ordering::Relaxed),
             })
