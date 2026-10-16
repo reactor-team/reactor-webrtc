@@ -1794,13 +1794,15 @@ impl DataChannel {
                 Err(Error::Webrtc("data channel send failed".into()))
             };
         };
+        // Before the state check: libwebrtc answers it on the network thread,
+        // so it can wait there, and that wait is part of the enqueue.
+        let entered = Instant::now();
         // A closed channel would take the message and drop it on the first
         // native send; refuse it as the plain path does.
         if self.state() != DataChannelState::Open {
             return Err(Error::Webrtc("data channel send failed".into()));
         }
         {
-            let entered = Instant::now();
             // Held across both, so the queue and the send times stay in step
             // when several threads send at once.
             let mut queue = c.queue.lock().unwrap();

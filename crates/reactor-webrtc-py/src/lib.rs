@@ -1298,8 +1298,8 @@ pub struct ChunkingStats {
     /// From the message being in the queue (when `enqueue_s` ends) to its
     /// first frame leaving it.
     pub queue_wait_s: f64,
-    /// From `send` until the message is in the queue: the wait for the
-    /// queue's lock and the copy into it. `queue_wait_s` starts after it.
+    /// From `send` until the message is in the queue: the channel state
+    /// check, the wait for the queue's lock and the copy into it. `queue_wait_s` starts after it.
     pub enqueue_s: f64,
     /// Within `queue_wait_s`, for each message's first frame: reading
     /// libwebrtc's buffered amount before taking the frame.

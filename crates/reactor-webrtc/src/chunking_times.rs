@@ -32,7 +32,8 @@ pub struct ChunkingStats {
     /// high-water mark.
     pub queue_wait_s: f64,
     /// From `send` until the message is in the queue, summed over
-    /// `messages_sent`: the wait for the queue's lock and the copy of the
+    /// `messages_sent`: the channel state check (answered on libwebrtc's
+    /// network thread), the wait for the queue's lock and the copy of the
     /// message into it. `queue_wait_s` starts when it ends, so the two do not
     /// overlap.
     pub enqueue_s: f64,
