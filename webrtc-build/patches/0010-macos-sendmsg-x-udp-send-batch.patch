@@ -15,7 +15,7 @@ index e5b05ce..6fd888c 100644
  #endif  // defined(WEBRTC_LINUX)
  
 +#if defined(WEBRTC_USE_APPLE_SENDMSG_X)
-+// Reactor (0009): from XNU's bsd/sys/socket_private.h, which the SDK does not
++// Reactor (0010): from XNU's bsd/sys/socket_private.h, which the SDK does not
 +// ship. Weak, so a macOS without it still loads and falls back to sendto();
 +// an ENOSYS at runtime does the same.
 +struct msghdr_x {
@@ -83,7 +83,7 @@ index e5b05ce..6fd888c 100644
    size_t done = 0;
    while (done < n && s_ != INVALID_SOCKET) {
 +#if defined(WEBRTC_USE_APPLE_SENDMSG_X)
-+    // Reactor (0009): sendmsg_x() where available, else one sendto().
++    // Reactor (0010): sendmsg_x() where available, else one sendto().
 +    int sent;
 +    if (SendmsgXAvailable()) {
 +      sent = static_cast<int>(sendmsg_x(s_, msgs.data() + done,
@@ -118,7 +118,7 @@ index e5b05ce..6fd888c 100644
        // The rest are dropped, as a sendto() that would block drops its one.
        EnableEvents(DE_WRITE);
 +#if defined(WEBRTC_USE_APPLE_SENDMSG_X)
-+      // Reactor (0009): except on macOS, where the error is often one
++      // Reactor (0010): except on macOS, where the error is often one
 +      // destination's (ENOBUFS from a VPN or other interface's queue) and a
 +      // read event's batch mixes ICE checks to many candidates: only the
 +      // datagram that would block is dropped, as with separate sendto()s.
@@ -135,10 +135,10 @@ index e5b05ce..6fd888c 100644
    if ((ff & DE_READ) != 0) {
      DisableEvents(DE_READ);
 +#if defined(WEBRTC_USE_APPLE_SENDMSG_X)
-+    // Reactor (0009): on macOS a read event's sends batch too: in a data
++    // Reactor (0010): on macOS a read event's sends batch too: in a data
 +    // channel transfer most packets leave when an incoming SACK frees the
 +    // congestion window, so batching only tasks reached ~3% of them. Linux
-+    // leaves events unbatched (see 0008); macOS showed no receiver drops with
++    // leaves events unbatched (see 0009); macOS showed no receiver drops with
 +    // it, from 100 KB to 4 MB messages over loopback.
 +    ScopedUdpSendBatch send_batch;
 +#endif
@@ -155,7 +155,7 @@ index f95ba44..611c937 100644
  #define WEBRTC_USE_POLL 1
 +#if defined(WEBRTC_MAC) && !defined(WEBRTC_IOS) && \
 +    !defined(WEBRTC_DISABLE_APPLE_SENDMSG_X)
-+// Reactor (0009): flush the UDP send batch with sendmsg_x(), macOS's
++// Reactor (0010): flush the UDP send batch with sendmsg_x(), macOS's
 +// counterpart of sendmmsg(). It is private API (XNU's socket_private.h), so
 +// never on iOS, and a build that must not reference it defines
 +// WEBRTC_DISABLE_APPLE_SENDMSG_X.
@@ -171,7 +171,7 @@ index f95ba44..611c937 100644
  // failed sendto() would.
  //
 -// Linux only (WEBRTC_USE_UDP_SEND_BATCH); elsewhere a scope does nothing.
-+// Linux, and macOS with sendmsg_x() (0009); elsewhere a scope does nothing.
++// Linux, and macOS with sendmsg_x() (0010); elsewhere a scope does nothing.
  class RTC_EXPORT ScopedUdpSendBatch {
   public:
    static constexpr size_t kMaxUdpSendBatch = 16;
