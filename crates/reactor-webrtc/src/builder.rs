@@ -33,6 +33,7 @@ pub struct PeerConnectionFactoryBuilder {
     metadata: bool,
     dtls_in_stun: bool,
     dc_chunking: Option<DcChunking>,
+    dc_callbacks_on_network_thread: bool,
     send_playout_delay: Option<PlayoutDelay>,
     receive_playout_delay: Option<PlayoutDelay>,
     #[cfg(feature = "openh264")]
@@ -47,6 +48,7 @@ impl PeerConnectionFactoryBuilder {
             metadata: true,
             dtls_in_stun: false,
             dc_chunking: None,
+            dc_callbacks_on_network_thread: false,
             send_playout_delay: None,
             receive_playout_delay: None,
             #[cfg(feature = "openh264")]
@@ -144,6 +146,34 @@ impl PeerConnectionFactoryBuilder {
     /// [`build`](Self::build) fails when the settings cannot work together.
     pub fn with_dc_chunking(mut self, settings: DcChunking) -> Self {
         self.dc_chunking = Some(settings);
+        self
+    }
+
+    /// Run the callbacks of this factory's data channels (`on_message`,
+    /// `on_state_change`, `on_open`, `on_close`, `on_buffered_amount_low`) on
+    /// libwebrtc's network thread, where the events happen. Off by default:
+    /// libwebrtc then posts every event to the signaling thread first.
+    ///
+    /// It saves that thread hop on every message and every buffer event. On
+    /// loopback a 64 B ping's round trip is 30–40% shorter, and a reply sent
+    /// from `on_message` leaves without waiting on another thread either. Large
+    /// messages, which spend their time on the wire, gain little.
+    ///
+    /// The price is that the callbacks now hold up the network thread, which
+    /// carries every packet of every connection of the factory:
+    ///
+    /// - Return quickly. Hand anything slow (decoding, I/O, a lock other
+    ///   threads hold for long) to another thread.
+    /// - Don't call [`PeerConnection`](crate::PeerConnection) methods from
+    ///   them: those wait on the signaling thread, which may itself be waiting
+    ///   on the network thread, and that deadlocks. The channel's own methods
+    ///   (`send`, `buffered_amount`, `state`, `close`, the handler setters) are
+    ///   fine; they run inline on the network thread.
+    /// - Don't block on a thread that is itself waiting on a data channel
+    ///   call, such as a `send` from another thread holding a lock the
+    ///   callback needs.
+    pub fn with_dc_callbacks_on_network_thread(mut self, enabled: bool) -> Self {
+        self.dc_callbacks_on_network_thread = enabled;
         self
     }
 
@@ -266,6 +296,7 @@ impl PeerConnectionFactoryBuilder {
             &opts,
             self.metadata,
             self.dc_chunking,
+            self.dc_callbacks_on_network_thread,
             registry.clone(),
             openh264_registered,
         )

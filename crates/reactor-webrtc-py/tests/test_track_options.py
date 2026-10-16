@@ -33,6 +33,12 @@ class TestBuilder:
         b.with_dtls_in_stun(False)
         assert isinstance(b, rw.PeerConnectionFactoryBuilder)
 
+    def test_builder_takes_the_dc_callbacks_on_network_thread_knob(self, factory):
+        b = rw.PeerConnectionFactoryBuilder()
+        b.with_dc_callbacks_on_network_thread(True)
+        b.with_dc_callbacks_on_network_thread(False)
+        assert isinstance(b, rw.PeerConnectionFactoryBuilder)
+
 
 class TestVideoTrackOptions:
     def test_plain_options_returns_track(self, factory):

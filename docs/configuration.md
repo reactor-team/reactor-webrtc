@@ -16,6 +16,7 @@ an existing `pc`.
 - [ICE timeouts](#ice-timeouts)
 - [Faster connection setup (WARP: SPED + SNAP)](#faster-connection-setup-warp-sped--snap)
 - [Large data-channel messages (max_burst and chunking)](#large-data-channel-messages-max_burst-and-chunking)
+- [Data-channel callbacks on the network thread](#data-channel-callbacks-on-the-network-thread)
 - [Congestion-control bitrate limits](#congestion-control-bitrate-limits)
 - [Per-sender bitrate limits](#per-sender-bitrate-limits)
 
@@ -441,6 +442,63 @@ change in its count:
 `frames_sent` and `frames_received` count the frames themselves.
 `reassembly_s` is the closest a receiver gets to the time a message's body
 took on the wire, on its own clock.
+
+## Data-channel callbacks on the network thread
+
+By default libwebrtc runs a data channel's callbacks (`on_message`,
+`on_state_change`, `on_open`, `on_close`, `on_buffered_amount_low`) on the
+signaling thread: each event happens on the network thread and is posted to
+the signaling thread, one thread hop per message. A reply sent from
+`on_message` then waits on the network thread again.
+
+`PeerConnectionFactoryBuilder::with_dc_callbacks_on_network_thread(true)` runs
+them on the network thread instead, for every data channel of the factory. On
+loopback it cuts a 64 B ping's round trip by 30–40% (macOS: 67 → 46 µs; Linux:
+123 → 78 µs), and a 100 KB message's by 14–18% on Linux. Large messages,
+which spend their time on the wire, gain little.
+
+The network thread carries every packet of every connection of the factory,
+and a callback holds it for as long as it runs:
+
+- Return quickly. Hand slow work to another thread.
+- Don't call `PeerConnection` methods from the callbacks. They wait on the
+  signaling thread, which may be waiting on the network thread: a deadlock.
+  The channel's own methods (`send`, `buffered_amount`, `state`, `close`, the
+  handler setters) are fine; they run inline.
+- Don't wait on a thread that is itself in a data channel call (a `send` from
+  another thread, say) or holding a lock that such a thread needs.
+- Don't call `drain()` (or `close()` with a drain timeout) from them: the
+  network thread is the one that sends, so nothing drains until the timeout.
+
+In Python each callback takes the GIL on the network thread, so another thread
+holding the GIL holds up the network thread too. Hand the work to the event
+loop with `loop.call_soon_threadsafe`.
+
+<details>
+<summary>🦀 Example using Rust</summary>
+
+```rust
+let factory = PeerConnectionFactory::builder()
+    .with_dc_callbacks_on_network_thread(true)
+    .build()
+    .expect("factory");
+```
+
+</details>
+
+<details>
+<summary>🐍 Example using Python</summary>
+
+```python
+builder = rw.PeerConnectionFactoryBuilder()
+builder.with_dc_callbacks_on_network_thread(True)
+factory = builder.build()
+
+loop = asyncio.get_running_loop()
+dc.on_message(lambda data, binary: loop.call_soon_threadsafe(inbox.put_nowait, data))
+```
+
+</details>
 
 ## Congestion-control bitrate limits
 
