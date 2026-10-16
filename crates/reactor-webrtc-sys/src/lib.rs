@@ -748,6 +748,9 @@ extern "C" {
     /// `on_buffered_amount_low` fires when buffered_amount drops at or below the
     /// threshold set by `reactor_webrtc_data_channel_set_low_threshold`. Any
     /// pointer may be null. Replaces any previously registered observer.
+    /// `on_network_thread` nonzero runs the callbacks on the network thread,
+    /// where the events happen; 0 runs them on the signaling thread, as
+    /// libwebrtc does by default.
     pub fn reactor_webrtc_data_channel_register_observer(
         data_channel: *mut DataChannel,
         userdata: *mut c_void,
@@ -759,6 +762,7 @@ extern "C" {
         ),
         on_state_change: extern "C" fn(userdata: *mut c_void, state: c_int),
         on_buffered_amount_low: extern "C" fn(userdata: *mut c_void),
+        on_network_thread: c_int,
     );
     /// Number of bytes currently queued for sending on the data channel.
     pub fn reactor_webrtc_data_channel_buffered_amount(data_channel: *mut DataChannel) -> u64;

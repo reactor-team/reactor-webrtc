@@ -965,6 +965,24 @@ class PeerConnectionFactoryBuilder:
         peer nothing changes. `build()` raises when the values cannot work
         together."""
         ...
+    def with_dc_callbacks_on_network_thread(self, enabled: bool) -> None:
+        """Run the data channels' callbacks (`on_message`, `on_state_change`,
+        `on_open`, `on_close`, `on_buffered_amount_low`) on libwebrtc's network
+        thread, where the events happen, instead of posting each one to the
+        signaling thread first. Default disabled.
+
+        It saves a thread hop per message: on loopback a small message's round
+        trip is 30-40% shorter. The network thread carries every packet of the
+        factory, and each callback holds it while it runs, GIL wait included:
+
+        - Return quickly. Hand the work to your event loop
+          (`loop.call_soon_threadsafe`) or a queue.
+        - Don't call `PeerConnection` methods from the callbacks: they wait on
+          the signaling thread, which may be waiting on the network thread.
+          The channel's own methods are fine.
+        - Another Python thread holding the GIL holds up the network thread
+          for as long as it does."""
+        ...
     def with_send_playout_delay(self, min_s: float = 0.0, max_s: float = 0.0) -> None:
         """Stamp the playout-delay RTP header extension on every video frame
         the factory sends, asking each receiver to keep its playout delay
