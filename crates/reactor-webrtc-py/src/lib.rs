@@ -3243,6 +3243,19 @@ impl PeerConnectionFactoryBuilder {
         Ok(())
     }
 
+    /// Run the data channels' callbacks on libwebrtc's network thread instead
+    /// of posting each event to the signaling thread first. Default disabled.
+    /// Saves a thread hop per message; every callback then takes the GIL on
+    /// the network thread, so keep them short. See the stub for the rules.
+    fn with_dc_callbacks_on_network_thread(&mut self, enabled: bool) -> PyResult<()> {
+        let b = self
+            .pending
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("builder already consumed by build()"))?;
+        self.pending = Some(b.with_dc_callbacks_on_network_thread(enabled));
+        Ok(())
+    }
+
     /// Stamp the playout-delay RTP header extension on every video frame the
     /// factory sends, asking each receiver to keep its playout delay between
     /// `min_s` and `max_s` seconds. The defaults (both 0) ask for immediate
