@@ -181,11 +181,10 @@ pub struct VideoSinkTimings {
     pub frames: u64,
 }
 
+/// A sink's totals, updated and read as one pair so a reading's time and count
+/// describe the same frames.
 #[derive(Default)]
-struct SinkTimingTotals {
-    convert_ns: AtomicU64,
-    frames: AtomicU64,
-}
+struct SinkTimingTotals(Mutex<VideoSinkTimings>);
 
 // Heap-pinned sink state behind the C userdata pointer.
 struct VideoSinkState {
@@ -220,8 +219,12 @@ extern "C" fn video_sink_tramp(
     if let Ok(mut cb) = st.cb.lock() {
         let here_ns = u64::try_from(entered.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let convert = (convert_ns.max(0) as u64).saturating_add(here_ns);
-        st.timings.convert_ns.fetch_add(convert, Ordering::Relaxed);
-        st.timings.frames.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut totals) = st.timings.0.lock() {
+            totals.convert = totals
+                .convert
+                .saturating_add(std::time::Duration::from_nanos(convert));
+            totals.frames += 1;
+        }
         cb(
             VideoFrame {
                 bgra: slice,
@@ -687,10 +690,8 @@ impl VideoTrack {
                 .lock()
                 .expect("video_sink_timings mutex poisoned"),
         );
-        VideoSinkTimings {
-            convert: std::time::Duration::from_nanos(timings.convert_ns.load(Ordering::Relaxed)),
-            frames: timings.frames.load(Ordering::Relaxed),
-        }
+        let totals = *timings.0.lock().expect("sink timings mutex poisoned");
+        totals
     }
 
     /// Push a BGRA frame (`width*height*4` bytes), captured now — on a local
