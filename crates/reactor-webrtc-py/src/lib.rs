@@ -27,7 +27,7 @@ use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyTuple};
 use std::mem::ManuallyDrop;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 // Process-wide guard: libwebrtc starts global threads on factory creation and
@@ -1567,24 +1567,34 @@ pub(crate) enum NativeTrack {
     Audio(Arc<rw::AudioTrack>),
 }
 
-/// Time a callback spent getting into Python, added up: from the native side
-/// handing over a frame or a message until the Python callback is called. That
-/// is the wait for the GIL and the copy into `bytes`.
+/// Time a callback spent getting into Python, added up just before each call,
+/// all under one lock so a reading's times and count describe the same frames
+/// or messages. The hand-off runs from the native side handing over a frame or
+/// a message until the Python callback is called: the wait for the GIL and the
+/// copy into `bytes`.
 #[derive(Default)]
-struct HandoffTotals {
-    nanos: AtomicU64,
-    count: AtomicU64,
+struct HandoffTotals(Mutex<HandoffSums>);
+
+#[derive(Default, Clone, Copy)]
+struct HandoffSums {
+    /// The native sink's conversion, for video frames.
+    convert_ns: u64,
+    handoff_ns: u64,
+    count: u64,
 }
 
 impl HandoffTotals {
-    fn add(&self, since: std::time::Instant) {
-        let nanos = u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        self.nanos.fetch_add(nanos, Ordering::Relaxed);
-        self.count.fetch_add(1, Ordering::Relaxed);
+    fn add(&self, convert: std::time::Duration, since: std::time::Instant) {
+        let ns = |d: std::time::Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+        let handoff_ns = ns(since.elapsed());
+        let mut sums = self.0.lock().unwrap();
+        sums.convert_ns = sums.convert_ns.saturating_add(ns(convert));
+        sums.handoff_ns = sums.handoff_ns.saturating_add(handoff_ns);
+        sums.count += 1;
     }
 
-    fn seconds(&self) -> f64 {
-        self.nanos.load(Ordering::Relaxed) as f64 / 1e9
+    fn sums(&self) -> HandoffSums {
+        *self.0.lock().unwrap()
     }
 }
 
@@ -1778,7 +1788,7 @@ impl Track {
         // is also where another track's frame callback re-enters Python. The GIL
         // has to be free across the dispatch or the two deadlock.
         py.allow_threads(|| {
-            native.on_frame(move |frame| {
+            native.on_frame_timed(move |frame, convert| {
                 let handed_at = std::time::Instant::now();
                 Python::with_gil(|py| {
                     let bytes = PyBytes::new_bound(py, frame.bgra);
@@ -1787,7 +1797,7 @@ impl Track {
                             .map(|p| p.into_any())
                             .unwrap_or_else(|_| py.None())
                     });
-                    handoff.add(handed_at);
+                    handoff.add(convert, handed_at);
                     match meta {
                         Some(m) => {
                             let _ = callback.call1(py, (bytes, frame.width, frame.height, m));
@@ -1810,14 +1820,13 @@ impl Track {
     /// How long this remote video track took to hand decoded frames to the
     /// `on_video_frame` callback, added up since the callback was set. All
     /// zero before a callback is set.
-    fn handoff_stats(&self, py: Python) -> PyResult<HandoffStats> {
-        let native = Arc::clone(self.video()?);
-        let sink = py.allow_threads(|| native.sink_timings());
-        let handoff = Arc::clone(&self.handoff.lock().unwrap());
+    fn handoff_stats(&self) -> PyResult<HandoffStats> {
+        self.video()?;
+        let sums = self.handoff.lock().unwrap().sums();
         Ok(HandoffStats {
-            convert_s: sink.convert.as_secs_f64(),
-            handoff_s: handoff.seconds(),
-            frames: sink.frames,
+            convert_s: sums.convert_ns as f64 / 1e9,
+            handoff_s: sums.handoff_ns as f64 / 1e9,
+            frames: sums.count,
         })
     }
 
@@ -2441,6 +2450,9 @@ pub struct DataChannel {
     inner: ManuallyDrop<Arc<rw::DataChannel>>,
     // The totals of the message callback set last; a new one starts at zero.
     handoff: Mutex<Arc<HandoffTotals>>,
+    // Held across installing a message callback and publishing its totals, so
+    // concurrent registrations leave the totals of the callback installed last.
+    registering: Mutex<()>,
 }
 
 impl Drop for DataChannel {
@@ -2546,28 +2558,32 @@ impl DataChannel {
     /// Register `callback(data: bytes, binary: bool)` for incoming messages.
     fn on_message(&self, py: Python, callback: PyObject) {
         let handoff = Arc::new(HandoffTotals::default());
-        *self.handoff.lock().unwrap() = Arc::clone(&handoff);
+        let totals = Arc::clone(&handoff);
         // Registering re-registers the native observer, which dispatches to the
-        // thread that delivers messages into Python. The GIL has to be free.
+        // thread that delivers messages into Python. The GIL has to be free,
+        // also while waiting for `registering`: its holder may be in that
+        // dispatch.
         py.allow_threads(|| {
+            let _registering = self.registering.lock().unwrap();
             self.inner.on_message(move |data, binary| {
                 let handed_at = std::time::Instant::now();
                 Python::with_gil(|py| {
                     let bytes = PyBytes::new_bound(py, data);
-                    handoff.add(handed_at);
+                    totals.add(std::time::Duration::ZERO, handed_at);
                     let _ = callback.call1(py, (bytes, binary));
                 });
             });
+            *self.handoff.lock().unwrap() = handoff;
         });
     }
 
     /// How long this channel took to hand whole messages to the `on_message`
     /// callback, added up since the callback was set.
     fn handoff_stats(&self) -> MessageHandoffStats {
-        let handoff = Arc::clone(&self.handoff.lock().unwrap());
+        let sums = self.handoff.lock().unwrap().sums();
         MessageHandoffStats {
-            handoff_s: handoff.seconds(),
-            messages: handoff.count.load(Ordering::Relaxed),
+            handoff_s: sums.handoff_ns as f64 / 1e9,
+            messages: sums.count,
         }
     }
 
@@ -2742,6 +2758,7 @@ impl PeerConnectionObserver {
                         DataChannel {
                             inner: ManuallyDrop::new(Arc::new(dc)),
                             handoff: Mutex::default(),
+                            registering: Mutex::default(),
                         },
                     ) {
                         Ok(py_dc) => {
@@ -2918,6 +2935,7 @@ impl PeerConnection {
             .map(|inner| DataChannel {
                 inner: ManuallyDrop::new(Arc::new(inner)),
                 handoff: Mutex::default(),
+                registering: Mutex::default(),
             })
             .map_err(err)
     }
