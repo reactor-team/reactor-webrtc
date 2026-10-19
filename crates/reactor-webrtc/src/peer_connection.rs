@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use reactor_webrtc_sys::ReactorStatEntry;
 
-use crate::chunking_times::{ChunkingTimes, FrameTimes};
+use crate::chunking_times::{ChunkingTimes, FrameSteps};
 use crate::dc_chunking::ApplyError;
 use crate::encoded::{FrameTransform, VideoCodec};
 use crate::media::{MediaKind, Track};
@@ -1490,10 +1490,10 @@ impl ChannelCore {
                     let native_start = Instant::now();
                     let sent = self.raw.send(&frame, true);
                     let native_end = Instant::now();
-                    let steps = FrameTimes {
-                        check_s: (build_start - check_start).as_secs_f64(),
-                        build_s: (native_start - build_start).as_secs_f64(),
-                        native_s: (native_end - native_start).as_secs_f64(),
+                    let steps = FrameSteps {
+                        check_start,
+                        build_start,
+                        native_start,
                     };
                     if !sent {
                         // libwebrtc closes the channel on a failed send. The
@@ -1787,6 +1787,10 @@ impl DataChannel {
     /// an [`Error::DataChannel`] and nothing is sent. Elsewhere this is a
     /// plain libwebrtc send.
     pub fn send(&self, data: &[u8], binary: bool) -> Result<()> {
+        // Before anything else: deciding the chunking on a first send and the
+        // state check below are answered on libwebrtc's network thread, so
+        // they can wait there, and that wait is part of the enqueue.
+        let entered = Instant::now();
         let Some(c) = self.core.chunked() else {
             return if self.core.raw.send(data, binary) {
                 Ok(())
@@ -1794,9 +1798,6 @@ impl DataChannel {
                 Err(Error::Webrtc("data channel send failed".into()))
             };
         };
-        // Before the state check: libwebrtc answers it on the network thread,
-        // so it can wait there, and that wait is part of the enqueue.
-        let entered = Instant::now();
         // A closed channel would take the message and drop it on the first
         // native send; refuse it as the plain path does.
         if self.state() != DataChannelState::Open {

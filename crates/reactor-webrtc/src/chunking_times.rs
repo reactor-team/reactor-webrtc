@@ -32,17 +32,18 @@ pub struct ChunkingStats {
     /// high-water mark.
     pub queue_wait_s: f64,
     /// From `send` until the message is in the queue, summed over
-    /// `messages_sent`: the channel state check (answered on libwebrtc's
-    /// network thread), the wait for the queue's lock and the copy of the
+    /// `messages_sent`: deciding the chunking on the channel's first send and
+    /// the channel state check (both answered on libwebrtc's network thread),
+    /// the wait for the queue's lock and the copy of the
     /// message into it. `queue_wait_s` starts when it ends, so the two do not
     /// overlap.
     pub enqueue_s: f64,
-    /// Within `queue_wait`, for each message's first frame, summed over
+    /// Within `queue_wait_s`, for each message's first frame, summed over
     /// `messages_sent`: reading libwebrtc's buffered amount before taking it.
     pub first_check_s: f64,
-    /// Within `queue_wait`: cutting the message's first frame off the queue.
+    /// Within `queue_wait_s`: cutting the message's first frame off the queue.
     pub first_build_s: f64,
-    /// Within `queue_wait`: libwebrtc's `Send` of the message's first frame.
+    /// Within `queue_wait_s`: libwebrtc's `Send` of the message's first frame.
     pub first_native_s: f64,
     /// libwebrtc's `Send` of every frame, summed over `frames_sent`.
     pub native_send_s: f64,
@@ -66,15 +67,27 @@ pub struct ChunkingStats {
     pub reassembly_s: f64,
 }
 
+/// When the steps of handing one frame to libwebrtc started. The last ends
+/// when the frame was handed over.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct FrameSteps {
+    /// Before reading libwebrtc's buffered amount.
+    pub(crate) check_start: Instant,
+    /// Before cutting the frame off the queue.
+    pub(crate) build_start: Instant,
+    /// Before libwebrtc's `Send` of the frame.
+    pub(crate) native_start: Instant,
+}
+
 /// How long the steps of handing one frame to libwebrtc took, in seconds.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub(crate) struct FrameTimes {
+struct FrameTimes {
     /// Reading libwebrtc's buffered amount.
-    pub(crate) check_s: f64,
+    check_s: f64,
     /// Cutting the frame off the queue.
-    pub(crate) build_s: f64,
+    build_s: f64,
     /// libwebrtc's `Send` of the frame.
-    pub(crate) native_s: f64,
+    native_s: f64,
 }
 
 /// The message leaving now: what its first frame recorded, kept until its
@@ -118,10 +131,10 @@ impl ChunkingTimes {
         self.sent_at.push_back((now, enqueue_s));
     }
 
-    /// The queue handed out `frame`, the steps of handing it over having
-    /// taken *steps*.
-    pub(crate) fn frame_sent(&mut self, frame: &[u8], now: Instant, steps: FrameTimes) {
-        self.stats.native_send_s += steps.native_s;
+    /// The queue handed out `frame`, its steps having started at *steps*
+    /// and the last ending at *now*.
+    pub(crate) fn frame_sent(&mut self, frame: &[u8], now: Instant, steps: FrameSteps) {
+        self.stats.native_send_s += (now - steps.native_start).as_secs_f64();
         // A stall is counted with its duration, when it ends, so both land in
         // the same reading.
         if let Some(since) = self.stalled_since.take() {
@@ -129,16 +142,19 @@ impl ChunkingTimes {
             self.stats.stall_s += (now - since).as_secs_f64();
         }
         let leaving = *self.leaving.get_or_insert_with(|| {
-            let (waited_s, enqueue_s) = self
-                .sent_at
-                .front()
-                .map_or((0.0, 0.0), |(sent, enqueue_s)| {
-                    ((now - *sent).as_secs_f64(), *enqueue_s)
-                });
+            let (sent, enqueue_s) = self.sent_at.front().copied().unwrap_or((now, 0.0));
+            // A pump waiting on the queue's lock while a sender copied this
+            // message in started its steps before the message was queued.
+            // Count them from then, so they stay within its queue wait.
+            let from = |t: Instant| t.max(sent);
             Leaving {
                 first_at: now,
-                waited_s,
-                first_steps: steps,
+                waited_s: (now - sent).as_secs_f64(),
+                first_steps: FrameTimes {
+                    check_s: (from(steps.build_start) - from(steps.check_start)).as_secs_f64(),
+                    build_s: (from(steps.native_start) - from(steps.build_start)).as_secs_f64(),
+                    native_s: (now - from(steps.native_start)).as_secs_f64(),
+                },
                 enqueue_s,
             }
         });
@@ -203,6 +219,15 @@ mod tests {
         vec![Header { more, text: false }.encode(), 0]
     }
 
+    /// Steps that all started at `t`: a frame handed over at `t` took no time.
+    fn at(t: Instant) -> FrameSteps {
+        FrameSteps {
+            check_start: t,
+            build_start: t,
+            native_start: t,
+        }
+    }
+
     #[test]
     fn a_message_waits_in_the_queue_then_leaves_frame_by_frame() {
         let t0 = Instant::now();
@@ -210,9 +235,9 @@ mod tests {
         let mut times = ChunkingTimes::default();
 
         times.queued(t0, 0.0);
-        times.frame_sent(&frame(true), ms(5), FrameTimes::default());
-        times.frame_sent(&frame(true), ms(7), FrameTimes::default());
-        times.frame_sent(&frame(false), ms(12), FrameTimes::default());
+        times.frame_sent(&frame(true), ms(5), at(ms(5)));
+        times.frame_sent(&frame(true), ms(7), at(ms(7)));
+        times.frame_sent(&frame(false), ms(12), at(ms(12)));
 
         let s = times.stats();
         assert_eq!((s.messages_sent, s.frames_sent), (1, 3));
@@ -228,8 +253,8 @@ mod tests {
 
         times.queued(t0, 0.0);
         times.queued(ms(1), 0.0);
-        times.frame_sent(&frame(false), ms(2), FrameTimes::default());
-        times.frame_sent(&frame(false), ms(10), FrameTimes::default());
+        times.frame_sent(&frame(false), ms(2), at(ms(2)));
+        times.frame_sent(&frame(false), ms(10), at(ms(10)));
 
         let s = times.stats();
         assert_eq!(s.messages_sent, 2);
@@ -245,7 +270,7 @@ mod tests {
         let mut times = ChunkingTimes::default();
 
         times.queued(t0, 0.0);
-        times.frame_sent(&frame(true), t0, FrameTimes::default());
+        times.frame_sent(&frame(true), t0, at(t0));
         times.stalled(ms(1));
         times.stalled(ms(3));
         assert_eq!(
@@ -253,7 +278,7 @@ mod tests {
             0,
             "a stall still going is not counted yet"
         );
-        times.frame_sent(&frame(false), ms(41), FrameTimes::default());
+        times.frame_sent(&frame(false), ms(41), at(ms(41)));
 
         let s = times.stats();
         assert_eq!(
@@ -269,7 +294,7 @@ mod tests {
         let mut times = ChunkingTimes::default();
 
         times.queued(t0, 0.0);
-        times.frame_sent(&frame(true), t0, FrameTimes::default());
+        times.frame_sent(&frame(true), t0, at(t0));
         times.stalled(t0 + Duration::from_millis(1));
         times.cleared();
 
@@ -283,13 +308,13 @@ mod tests {
         let mut times = ChunkingTimes::default();
 
         times.queued(t0, 0.0);
-        times.frame_sent(&frame(true), t0, FrameTimes::default());
+        times.frame_sent(&frame(true), t0, at(t0));
         times.cleared();
         times.queued(t0 + Duration::from_millis(100), 0.0);
         times.frame_sent(
             &frame(false),
             t0 + Duration::from_millis(101),
-            FrameTimes::default(),
+            at(t0 + Duration::from_millis(101)),
         );
 
         let s = times.stats();
@@ -306,7 +331,7 @@ mod tests {
         times.frame_sent(
             &frame(true),
             t0 + Duration::from_millis(50),
-            FrameTimes::default(),
+            at(t0 + Duration::from_millis(50)),
         );
         times.cleared();
 
@@ -337,16 +362,17 @@ mod tests {
     #[test]
     fn the_steps_of_the_first_frame_and_every_send_are_summed() {
         let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
         let mut times = ChunkingTimes::default();
-        let step = |native_s| FrameTimes {
-            check_s: 0.001,
-            build_s: 0.002,
-            native_s,
+        let steps = |start: Instant| FrameSteps {
+            check_start: start,
+            build_start: start + Duration::from_millis(1),
+            native_start: start + Duration::from_millis(3),
         };
 
         times.queued(t0, 0.004);
-        times.frame_sent(&frame(true), t0, step(0.010));
-        times.frame_sent(&frame(false), t0, step(0.020));
+        times.frame_sent(&frame(true), ms(13), steps(ms(0)));
+        times.frame_sent(&frame(false), ms(33), steps(ms(10)));
 
         let s = times.stats();
         assert_eq!(s.messages_sent, 1);
@@ -358,5 +384,34 @@ mod tests {
             "only the first frame's Send"
         );
         assert!((s.native_send_s - 0.030).abs() < 1e-9, "every frame's Send");
+    }
+
+    #[test]
+    fn first_frame_steps_begun_before_the_message_was_queued_count_from_then() {
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        let mut times = ChunkingTimes::default();
+
+        // The pump read the buffered amount and waited on the queue's lock
+        // while the sender copied the message in, until 2 ms.
+        times.queued(ms(2), 0.0);
+        let steps = FrameSteps {
+            check_start: ms(0),
+            build_start: ms(1),
+            native_start: ms(3),
+        };
+        times.frame_sent(&frame(false), ms(4), steps);
+
+        let s = times.stats();
+        assert!((s.queue_wait_s - 0.002).abs() < 1e-9);
+        assert_eq!(s.first_check_s, 0.0, "the check was before the queue");
+        assert!((s.first_build_s - 0.001).abs() < 1e-9);
+        assert!((s.first_native_s - 0.001).abs() < 1e-9);
+        let steps_s = s.first_check_s + s.first_build_s + s.first_native_s;
+        assert!(steps_s <= s.queue_wait_s + 1e-9, "within queue_wait_s");
+        assert!(
+            (s.native_send_s - 0.001).abs() < 1e-9,
+            "Send itself is not clamped"
+        );
     }
 }

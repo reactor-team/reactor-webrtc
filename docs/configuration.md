@@ -433,7 +433,7 @@ change in its count:
 
 | Total | Count | What it measures |
 | -- | -- | -- |
-| `enqueue_s` | `messages_sent` | from `send` until the message is in the queue: the channel state check (answered on libwebrtc's network thread), the wait for the queue's lock and the copy into it |
+| `enqueue_s` | `messages_sent` | from `send` until the message is in the queue: deciding the chunking on the channel's first send and the channel state check (both answered on libwebrtc's network thread), the wait for the queue's lock and the copy into it |
 | `queue_wait_s` | `messages_sent` | from the message being in the queue (when `enqueue_s` ends) to its first frame leaving it: the wait behind earlier messages and for the native buffer to drain. With `enqueue_s`, it covers `send` to the first frame leaving, without overlap |
 | `first_check_s` | `messages_sent` | within `queue_wait_s`: reading libwebrtc's buffered amount before taking the message's first frame |
 | `first_build_s` | `messages_sent` | within `queue_wait_s`: cutting the message's first frame off the queue |
