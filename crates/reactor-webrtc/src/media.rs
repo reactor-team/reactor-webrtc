@@ -137,7 +137,7 @@ pub struct AudioTrackOptions {
     pub high_pass_filter: Option<bool>,
 }
 
-type VideoSinkCb = Box<dyn for<'a> FnMut(VideoFrame<'a>) + Send>;
+type VideoSinkCb = Box<dyn for<'a> FnMut(VideoFrame<'a>, std::time::Duration) + Send>;
 type AudioSinkCb = Box<dyn for<'a> FnMut(AudioFrame<'a>) + Send>;
 
 // sender: HashMap keyed by capture_time_ms (no-erase for simulcast), evicted
@@ -170,9 +170,27 @@ impl crate::sender_meta::SenderMetaSource for CaptureTimeMeta {
 // shift it.
 use crate::sender_meta::ReceiverMetaQueue;
 
+/// How long a remote video track's sink took to hand its decoded frames on,
+/// added up since the sink was attached ([`VideoTrack::sink_timings`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VideoSinkTimings {
+    /// From libwebrtc handing a decoded frame to the sink, before its conversion
+    /// to BGRA, until the frame reaches the `on_frame` closure.
+    pub convert: std::time::Duration,
+    /// The frames the closure received.
+    pub frames: u64,
+}
+
+/// A sink's totals, updated and read as one pair so a reading's time and count
+/// describe the same frames.
+#[derive(Default)]
+struct SinkTimingTotals(Mutex<VideoSinkTimings>);
+
 // Heap-pinned sink state behind the C userdata pointer.
 struct VideoSinkState {
     cb: Mutex<VideoSinkCb>,
+    // Shared with Track::video_sink_timings, which sink_timings reads.
+    timings: Arc<SinkTimingTotals>,
     // The track's inbound metadata queue, always present. It is simply empty when
     // no strip transform is installed or the sender attached no trailer, so there
     // is no state to switch on and no back-fill ordering to get right.
@@ -189,18 +207,33 @@ extern "C" fn video_sink_tramp(
     height: c_int,
     ssrc: u32,
     rtp_timestamp: u32,
+    convert_ns: i64,
 ) {
+    // The native sink timed its own share; this one adds the work here, until
+    // the callback, on a clock as fine.
+    let entered = std::time::Instant::now();
     let st = unsafe { &*(ud as *const VideoSinkState) };
     let len = (width as usize) * (height as usize) * 4;
     let slice = unsafe { std::slice::from_raw_parts(bgra, len) };
     let metadata = crate::sender_meta::take_receiver_meta(&st.receiver_meta, ssrc, rtp_timestamp);
     if let Ok(mut cb) = st.cb.lock() {
-        cb(VideoFrame {
-            bgra: slice,
-            width: width as u32,
-            height: height as u32,
-            metadata,
-        });
+        let here_ns = u64::try_from(entered.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let convert = (convert_ns.max(0) as u64).saturating_add(here_ns);
+        if let Ok(mut totals) = st.timings.0.lock() {
+            totals.convert = totals
+                .convert
+                .saturating_add(std::time::Duration::from_nanos(convert));
+            totals.frames += 1;
+        }
+        cb(
+            VideoFrame {
+                bgra: slice,
+                width: width as u32,
+                height: height as u32,
+                metadata,
+            },
+            std::time::Duration::from_nanos(convert),
+        );
     }
 }
 
@@ -233,6 +266,11 @@ pub struct Track {
     // Transceiver.set_track needs to share a Track behind an Arc (for the Python
     // binding's spawn_blocking future), which rules out ever taking &mut self.
     video_sink: Mutex<Option<Box<VideoSinkState>>>,
+    // The totals of the video sink attached last, apart from `video_sink`:
+    // attaching holds that lock while it waits on the worker thread, which runs
+    // the frame callbacks, so a callback reading the totals through it could
+    // deadlock. This lock is only ever held to swap or clone the Arc.
+    video_sink_timings: Mutex<Arc<SinkTimingTotals>>,
     audio_sink: Mutex<Option<Box<AudioSinkState>>>,
     // Always present: push_video_frame_with_metadata fills it, and the sender
     // transform the peer connection installs after negotiation reads it. There is
@@ -310,6 +348,7 @@ impl Track {
             raw,
             kind,
             video_sink: Mutex::new(None),
+            video_sink_timings: Mutex::default(),
             audio_sink: Mutex::new(None),
             sender_meta,
             native_id,
@@ -490,10 +529,12 @@ impl Track {
     /// negotiated. Nothing here has to be arranged for it.
     pub(crate) fn attach_video_sink(
         &self,
-        cb: impl for<'a> FnMut(VideoFrame<'a>) + Send + 'static,
+        cb: impl for<'a> FnMut(VideoFrame<'a>, std::time::Duration) + Send + 'static,
     ) {
+        let timings = Arc::new(SinkTimingTotals::default());
         let state = Box::new(VideoSinkState {
             cb: Mutex::new(Box::new(cb)),
+            timings: Arc::clone(&timings),
             receiver_meta: self.receiver_meta.clone(),
         });
         let ud = &*state as *const VideoSinkState as *mut c_void;
@@ -510,6 +551,10 @@ impl Track {
         }
         // Drops the previous sink Box, if any, same as an `Option` field replace.
         *guard = Some(state);
+        *self
+            .video_sink_timings
+            .lock()
+            .expect("video_sink_timings mutex poisoned") = timings;
     }
 
     /// Shared body of [`AudioTrack::push_frame`] / [`push_frame_at`]:
@@ -619,8 +664,34 @@ impl VideoTrack {
 
     /// Subscribe to decoded frames. Replaces any previous sink. The closure
     /// runs on a WebRTC thread.
-    pub fn on_frame(&self, cb: impl for<'a> FnMut(VideoFrame<'a>) + Send + 'static) {
+    pub fn on_frame(&self, mut cb: impl for<'a> FnMut(VideoFrame<'a>) + Send + 'static) {
+        self.0.attach_video_sink(move |frame, _| cb(frame));
+    }
+
+    /// [`on_frame`](Self::on_frame), with each frame's share of
+    /// [`VideoSinkTimings::convert`]: how long it took from libwebrtc handing it
+    /// to the sink until the closure. For a caller adding up its own totals
+    /// alongside that time, so they all count the same frames.
+    pub fn on_frame_timed(
+        &self,
+        cb: impl for<'a> FnMut(VideoFrame<'a>, std::time::Duration) + Send + 'static,
+    ) {
         self.0.attach_video_sink(cb);
+    }
+
+    /// How long the sink took to hand decoded frames to the [`on_frame`](Self::on_frame)
+    /// closure, added up since it was attached. Zero before any sink is attached.
+    /// It can be called from the closure.
+    pub fn sink_timings(&self) -> VideoSinkTimings {
+        let timings = Arc::clone(
+            &self
+                .0
+                .video_sink_timings
+                .lock()
+                .expect("video_sink_timings mutex poisoned"),
+        );
+        let totals = *timings.0.lock().expect("sink timings mutex poisoned");
+        totals
     }
 
     /// Push a BGRA frame (`width*height*4` bytes), captured now — on a local
