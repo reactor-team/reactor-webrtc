@@ -1,5 +1,64 @@
 # Changelog
 
+## 0.24.0 — where the engine's hand-offs spend their time
+
+0.23.0 showed where a data-channel message's time goes on the wire. Two
+hand-offs on this side were still in no stage: a chunked message's way from
+`send` into libwebrtc, and a decoded frame's or a received message's way from
+libwebrtc into the caller's callback. This release times both, as running
+totals the caller samples.
+
+### Breaking (`reactor-webrtc-sys` only)
+
+- The video sink C callback that `reactor_webrtc_video_track_add_sink` takes
+  gains a 7th argument, `convert_ns: i64`: the nanoseconds the native sink took
+  with the frame, its conversion to BGRA included. A direct user of the sys
+  crate's C API has to add it. `reactor-webrtc` and the Python binding are
+  updated, and their APIs only gain methods and types.
+
+### Added
+
+In Rust and Python:
+
+- **`ChunkingStats`** gains the steps of handing a chunked message to
+  libwebrtc: `enqueue_s`, from `send` until the message is in the queue
+  (deciding the chunking on a channel's first send, the state check, the
+  queue's lock and the copy); `first_check_s`, `first_build_s` and
+  `first_native_s`, the steps of handing over a message's first frame, all
+  within `queue_wait_s`; and `native_send_s`, libwebrtc's `Send` of every
+  frame, over `frames_sent`. `enqueue_s` and `queue_wait_s` together cover
+  `send` to the first frame leaving, without overlap.
+
+In Rust:
+
+- **`VideoTrack::sink_timings()`**, a `VideoSinkTimings` with `convert`, from
+  libwebrtc handing a decoded frame to the sink until the `on_frame` closure
+  has it, and `frames`, added up since the sink was attached. It can be called
+  from the closure.
+- **`VideoTrack::on_frame_timed`**: `on_frame`, with each frame's share of
+  `convert`, for a caller adding up its own totals alongside it.
+
+In Python:
+
+- **`Track.handoff_stats()`**, a `HandoffStats` with `convert_s`,
+  `handoff_s` (from the native closure until `on_video_frame`'s callback is
+  called: the wait for the GIL and the copy into `bytes`) and `frames`, added
+  up since the callback was set.
+- **`DataChannel.handoff_stats()`**, a `MessageHandoffStats` with `handoff_s`
+  and `messages`, the same for `on_message`.
+
+Each reading's times and counts describe the same frames or messages.
+
+### Notes
+
+The native sink times its share on `steady_clock` and hands it over in
+nanoseconds. libwebrtc's `TimeMicros` is millisecond-coarse on Windows and read
+a sub-millisecond conversion as zero.
+
+The sys crate's C callback changes, which is why this is a minor release.
+
+All crates advance to 0.24.0.
+
 ## 0.23.0 — where a data-channel message's time goes
 
 0.22.0 showed where a video frame spends its time. A data-channel message had
