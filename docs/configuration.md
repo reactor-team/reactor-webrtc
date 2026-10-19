@@ -433,12 +433,21 @@ change in its count:
 
 | Total | Count | What it measures |
 | -- | -- | -- |
-| `queue_wait_s` | `messages_sent` | from `send` to the message's first frame leaving the queue: the wait behind earlier messages and for the native buffer to drain |
+| `enqueue_s` | `messages_sent` | from `send` until the message is in the queue: deciding the chunking on the channel's first send and the channel state check (both answered on libwebrtc's network thread), the wait for the queue's lock and the copy into it |
+| `queue_wait_s` | `messages_sent` | from the message being in the queue (when `enqueue_s` ends) to its first frame leaving it: the wait behind earlier messages and for the native buffer to drain. With `enqueue_s`, it covers `send` to the first frame leaving, without overlap |
+| `first_check_s` | `messages_sent` | within `queue_wait_s`: reading libwebrtc's buffered amount before taking the message's first frame |
+| `first_build_s` | `messages_sent` | within `queue_wait_s`: cutting the message's first frame off the queue |
+| `first_native_s` | `messages_sent` | within `queue_wait_s`: libwebrtc's `Send` of the message's first frame |
+| `native_send_s` | `frames_sent` | libwebrtc's `Send` of every frame; the part for frames after the first is within `send_s` |
 | `send_s` | `messages_sent` | from the first frame to the last handed to the native channel |
 | `stall_s` | `stalls` | the queue held back because the native buffer was at the high-water mark; a stall is counted when it ends |
 | `reassembly_s` | `messages_received` | from a message's first frame arriving to its last |
 
 `frames_sent` and `frames_received` count the frames themselves.
+libwebrtc's `Send` runs the whole transmission of a frame before it returns:
+SCTP packetization, DTLS encryption and one UDP send for each packet, on
+libwebrtc's network thread while the caller waits. `first_native_s` and
+`native_send_s` show how much of a message's time that takes.
 `reassembly_s` is the closest a receiver gets to the time a message's body
 took on the wire, on its own clock.
 

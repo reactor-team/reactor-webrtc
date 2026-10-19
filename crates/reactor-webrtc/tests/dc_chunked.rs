@@ -587,6 +587,14 @@ mod tests {
             sent.queue_wait_s > 0.0,
             "the small message waited behind the large one"
         );
+        assert!(
+            sent.native_send_s > 0.0 && sent.first_native_s > 0.0,
+            "libwebrtc's Send takes time for every frame"
+        );
+        assert!(
+            sent.first_native_s <= sent.native_send_s,
+            "the first frames' Send is part of every frame's"
+        );
         assert_eq!((sent.messages_received, sent.frames_received), (0, 0));
 
         let received = p.b.chunking_stats().expect("a chunked channel has stats");

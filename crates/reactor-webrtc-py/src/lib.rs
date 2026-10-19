@@ -1295,8 +1295,22 @@ pub struct ChunkingStats {
     pub messages_sent: u64,
     /// Frames handed to the native channel.
     pub frames_sent: u64,
-    /// From `send` to the message's first frame leaving the queue.
+    /// From the message being in the queue (when `enqueue_s` ends) to its
+    /// first frame leaving it.
     pub queue_wait_s: f64,
+    /// From `send` until the message is in the queue: deciding the chunking
+    /// on the channel's first send, the channel state check, the wait for the
+    /// queue's lock and the copy into it. `queue_wait_s` starts after it.
+    pub enqueue_s: f64,
+    /// Within `queue_wait_s`, for each message's first frame: reading
+    /// libwebrtc's buffered amount before taking the frame.
+    pub first_check_s: f64,
+    /// Within `queue_wait_s`: cutting the message's first frame off the queue.
+    pub first_build_s: f64,
+    /// Within `queue_wait_s`: libwebrtc's `Send` of the message's first frame.
+    pub first_native_s: f64,
+    /// libwebrtc's `Send` of every frame, summed over `frames_sent`.
+    pub native_send_s: f64,
     /// From a message's first frame to its last being handed to the native
     /// channel.
     pub send_s: f64,
@@ -1329,6 +1343,11 @@ impl From<rw::ChunkingStats> for ChunkingStats {
             messages_sent: s.messages_sent,
             frames_sent: s.frames_sent,
             queue_wait_s: s.queue_wait_s,
+            enqueue_s: s.enqueue_s,
+            first_check_s: s.first_check_s,
+            first_build_s: s.first_build_s,
+            first_native_s: s.first_native_s,
+            native_send_s: s.native_send_s,
             send_s: s.send_s,
             stalls: s.stalls,
             stall_s: s.stall_s,
