@@ -137,8 +137,7 @@ factories — VP8/VP9/AV1; H.264 is off via `rtc_use_h264=false`). Notes:
 ## Target matrix
 
 Green today: `macos arm64/x64` · `ios device+sim` · `linux x64/arm64` ·
-`android arm64` · `windows x64`. (`visionos` has no upstream gn `target_os`;
-more android ABIs are a matrix add.)
+`android arm64/x64` · `windows x64`. (`visionos` has no upstream gn `target_os`.)
 
 **CI split**: the fast public checks (fmt / check / clippy, dev-mode) run on
 GitHub Actions (`.github/workflows/ci.yml`). The heavy per-target libwebrtc
