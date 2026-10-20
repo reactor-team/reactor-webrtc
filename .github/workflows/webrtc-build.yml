@@ -65,6 +65,7 @@ jobs:
       matrix: ${{ steps.gen.outputs.matrix }}
       profile: ${{ steps.gen.outputs.profile }}
       publish_release: ${{ steps.gen.outputs.publish_release }}
+      host_tests: ${{ steps.gen.outputs.host_tests }}
     steps:
       # Full history: the publish gate below diffs github.event.before, which a
       # shallow clone does not contain once a push batches more than one commit.
@@ -136,6 +137,15 @@ jobs:
           echo "matrix={\"include\":[$inc]}" >> "$GITHUB_OUTPUT"
           echo "profile=${prof:-release}" >> "$GITHUB_OUTPUT"
           echo "publish_release=$publish_release" >> "$GITHUB_OUTPUT"
+          # The post-build jobs test the five host prebuilts (linux x64/arm64, mac arm64/x64,
+          # win x64) and download each one from this run, so only the full set can feed them.
+          # Any narrower selection skips them rather than failing on artifacts it never built —
+          # which is what lets the standalone android-x64 backfill reach `publish`.
+          if [ "$t" = full ]; then
+            echo "host_tests=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "host_tests=false" >> "$GITHUB_OUTPUT"
+          fi
 
   build:
     needs: setup
@@ -249,7 +259,9 @@ jobs:
 
   sys:
     name: reactor-webrtc-sys build + check (${{ matrix.os }}-${{ matrix.arch }})
-    needs: build
+    needs: [setup, build]
+    # webrtc, build-wheel and test-py all chain off this, so they skip with it.
+    if: needs.setup.outputs.host_tests == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -554,10 +566,18 @@ jobs:
     needs: [setup, build, sys, webrtc, build-wheel, test-py]
     # Manual releases and qualifying merges consume the exact same build
     # artifacts produced by `build`; this job never invokes build.sh again.
+    # The host tests may be skipped only when the selection did not build the host prebuilts
+    # (see host_tests in setup); whenever they ran, every one of them must have passed. Without
+    # the explicit check a skipped dependency would skip this job outright, and the standalone
+    # android-x64 backfill could never publish.
     if: >-
-      (github.event_name == 'workflow_dispatch' && inputs.publish) ||
-      (github.event_name == 'push' && github.ref == 'refs/heads/main' &&
-       needs.setup.outputs.publish_release == 'true')
+      !cancelled() && needs.build.result == 'success' &&
+      (needs.setup.outputs.host_tests != 'true' ||
+       (needs.sys.result == 'success' && needs.webrtc.result == 'success' &&
+        needs.build-wheel.result == 'success' && needs.test-py.result == 'success')) &&
+      ((github.event_name == 'workflow_dispatch' && inputs.publish) ||
+       (github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+        needs.setup.outputs.publish_release == 'true'))
     runs-on: ubuntu-latest
     # Cutting a release ships prebuilt native binaries that downstream packages
     # link against, so the publish is gated on the `release` environment: its
