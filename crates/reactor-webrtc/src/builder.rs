@@ -1,7 +1,9 @@
 //! [`PeerConnectionFactoryBuilder`] — the composable entry point for every
 //! [`PeerConnectionFactory`].
 
-use crate::{AdmMode, ApmConfig, DcChunking, PeerConnectionFactory, PlayoutDelay, Result};
+use crate::{
+    AdmMode, ApmConfig, DcChunking, PeerConnectionFactory, PlayoutDelay, Result, SctpTuning,
+};
 
 /// Builds a [`PeerConnectionFactory`] knob by knob — the single entry point
 /// that replaced the old mutually-exclusive constructors (they could not
@@ -33,6 +35,7 @@ pub struct PeerConnectionFactoryBuilder {
     metadata: bool,
     dtls_in_stun: bool,
     dc_chunking: Option<DcChunking>,
+    sctp_tuning: Option<SctpTuning>,
     send_playout_delay: Option<PlayoutDelay>,
     receive_playout_delay: Option<PlayoutDelay>,
     #[cfg(feature = "openh264")]
@@ -47,6 +50,7 @@ impl PeerConnectionFactoryBuilder {
             metadata: true,
             dtls_in_stun: false,
             dc_chunking: None,
+            sctp_tuning: None,
             send_playout_delay: None,
             receive_playout_delay: None,
             #[cfg(feature = "openh264")]
@@ -147,6 +151,22 @@ impl PeerConnectionFactoryBuilder {
         self
     }
 
+    /// dcsctp's congestion control and timers for every data channel of the
+    /// factory (see [`SctpTuning`]): the window it starts with and falls back
+    /// to after a loss, and how quickly the receiver acknowledges. Off by
+    /// default, which keeps upstream's values, tuned for bulk transfers.
+    ///
+    /// [`SctpTuning::low_latency`] is the setting for commands on a long or
+    /// lossy path. Set it on both ends: the sender's window and the receiver's
+    /// acknowledgements decide each transfer together. A factory knob, like
+    /// [`with_dc_chunking`](Self::with_dc_chunking): libwebrtc reads it from
+    /// field trials in the factory's `Environment` (libwebrtc patch 0011).
+    /// [`build`](Self::build) fails on a value out of range.
+    pub fn with_sctp_tuning(mut self, tuning: SctpTuning) -> Self {
+        self.sctp_tuning = Some(tuning);
+        self
+    }
+
     /// Ask every receiver of this factory's video to hold its playout delay
     /// within `delay`, by stamping the playout-delay RTP header extension on
     /// every frame sent. Off by default: libwebrtc's own encoders never ask for
@@ -210,6 +230,9 @@ impl PeerConnectionFactoryBuilder {
         if let Some(chunking) = &self.dc_chunking {
             chunking.validate()?;
         }
+        if let Some(tuning) = &self.sctp_tuning {
+            tuning.validate()?;
+        }
         let send_playout = self.send_playout_delay.map(|d| d.validate()).transpose()?;
         let recv_playout = self
             .receive_playout_delay
@@ -248,6 +271,9 @@ impl PeerConnectionFactoryBuilder {
             openh264_lib_path: openh264_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
             ..Default::default()
         };
+        if let Some(tuning) = &self.sctp_tuning {
+            tuning.apply(&mut opts);
+        }
         registry.install_into(&mut opts);
         #[cfg(feature = "openh264")]
         let openh264_registered = self.openh264.is_some();

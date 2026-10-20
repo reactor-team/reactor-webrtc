@@ -16,6 +16,7 @@ an existing `pc`.
 - [ICE timeouts](#ice-timeouts)
 - [Faster connection setup (WARP: SPED + SNAP)](#faster-connection-setup-warp-sped--snap)
 - [Large data-channel messages (max_burst and chunking)](#large-data-channel-messages-max_burst-and-chunking)
+- [Data-channel latency on long paths (SCTP tuning)](#data-channel-latency-on-long-paths-sctp-tuning)
 - [Congestion-control bitrate limits](#congestion-control-bitrate-limits)
 - [Per-sender bitrate limits](#per-sender-bitrate-limits)
 
@@ -441,6 +442,67 @@ change in its count:
 `frames_sent` and `frames_received` count the frames themselves.
 `reassembly_s` is the closest a receiver gets to the time a message's body
 took on the wire, on its own clock.
+
+## Data-channel latency on long paths (SCTP tuning)
+
+On a long path, a data-channel command's latency is a count of round trips, and
+dcsctp's defaults, tuned for bulk transfers, add round trips in two places:
+
+- After a lost packet the sending window halves (to no less than 4 packets) and
+  grows back one packet per round trip. At 200 ms and 0.1% loss a 100 KB
+  command then takes two or three round trips, and 1 MB about five seconds.
+- The receiver holds each SACK for up to 200 ms. Over a 200 ms path that
+  reaches the retransmission timeout, which then fires for nothing and drops
+  the window to one packet: after an idle pause, the next large command starts
+  over from one packet.
+
+`PeerConnectionFactoryBuilder::with_sctp_tuning(SctpTuning::low_latency())`
+changes both for every data channel of the factory (libwebrtc patch 0011): the
+window starts at 200 packets and falls no lower than 100 after a loss, and SACKs
+are sent at once. Set it on both ends: the sender's window and the receiver's
+acknowledgements decide each transfer together. On an emulated 200 ms path:
+
+| Command | Upstream (median) | `low_latency()` (median) |
+|---|---|---|
+| 100 KB, 0.1% loss | 605 ms | 203 ms |
+| 1 MB, 0.1% loss | 5.5 s | 1.8 s |
+| 1 MB after a 1 s pause, no loss | 1.4 s | 214 ms |
+
+Pings and back-to-back commands on a clean path already take one round trip and
+do not change. The window floor is the aggressive part: after a loss the
+channel keeps sending about 120 KB per round trip instead of backing off as TCP
+would. That suits commands; a channel moving tens of megabytes over congested
+links may lose more with it. Every field of `SctpTuning` can be set on its own;
+`None` keeps upstream's value.
+
+<details>
+<summary>🦀 Example using Rust</summary>
+
+```rust
+use reactor_webrtc::{PeerConnectionFactory, SctpTuning};
+
+let factory = PeerConnectionFactory::builder()
+    .with_sctp_tuning(SctpTuning::low_latency())
+    .build()
+    .expect("factory");
+
+// Or one value at a time; the rest keep upstream's.
+let mut tuning = SctpTuning::default();
+tuning.delayed_ack_max_ms = Some(20);
+```
+
+</details>
+
+<details>
+<summary>🐍 Example using Python</summary>
+
+```python
+builder = rw.PeerConnectionFactoryBuilder()
+builder.with_sctp_tuning(low_latency=True)          # or e.g. min_cwnd_mtus=64
+factory = builder.build()
+```
+
+</details>
 
 ## Congestion-control bitrate limits
 

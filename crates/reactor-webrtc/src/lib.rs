@@ -46,6 +46,7 @@ mod observer;
 mod peer_connection;
 pub mod platform;
 mod playout;
+mod sctp_tuning;
 mod sender_meta;
 
 use std::ffi::CString;
@@ -93,6 +94,7 @@ pub use playout::PlayoutDelay;
 /// [`PeerConnectionFactoryBuilder::with_openh264`].
 #[cfg(feature = "openh264")]
 pub use reactor_webrtc_sys::openh264;
+pub use sctp_tuning::SctpTuning;
 
 /// The ABI version of the linked native build. Used to assert that the safe
 /// crate and the prebuilt `libwebrtc` agree.
