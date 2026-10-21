@@ -323,6 +323,12 @@ mod tests {
 
     #[test]
     #[cfg_attr(target_os = "windows", ignore)]
+    // The macos-15-intel runner is 4-5x slower than every other one, and against a debug libwebrtc
+    // this does not drain within 120 s there (45 s on linux-x64, 32 s on mac-arm64).
+    #[cfg_attr(
+        all(target_os = "macos", target_arch = "x86_64"),
+        ignore = "does not drain within 120 s on the macOS Intel runner; covered on the others"
+    )]
     fn buffered_amount_counts_the_queue_and_drain_waits_for_it() {
         let (f1, f2) = (chunking(), chunking());
         let mut p = connect(&f1, &f2);
