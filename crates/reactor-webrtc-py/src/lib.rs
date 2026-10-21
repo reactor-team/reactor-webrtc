@@ -3117,6 +3117,11 @@ impl PeerConnectionFactoryBuilder {
         delayed_ack_max_ms: Option<u32>,
         immediate_sack_under_cwnd_mtus: Option<u32>,
     ) -> PyResult<()> {
+    /// Run the data channels' callbacks on libwebrtc's network thread instead
+    /// of posting each event to the signaling thread first. Default disabled.
+    /// Saves a thread hop per message; every callback then takes the GIL on
+    /// the network thread, so keep them short. See the stub for the rules.
+    fn with_dc_callbacks_on_network_thread(&mut self, enabled: bool) -> PyResult<()> {
         let b = self
             .pending
             .take()
@@ -3134,6 +3139,7 @@ impl PeerConnectionFactoryBuilder {
         t.immediate_sack_under_cwnd_mtus =
             immediate_sack_under_cwnd_mtus.or(t.immediate_sack_under_cwnd_mtus);
         self.pending = Some(b.with_sctp_tuning(t));
+        self.pending = Some(b.with_dc_callbacks_on_network_thread(enabled));
         Ok(())
     }
 

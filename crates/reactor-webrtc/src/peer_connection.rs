@@ -1372,6 +1372,9 @@ struct ChannelCore {
     on_close: Slot<EventCb>,
     on_buffered_amount_low: Slot<EventCb>,
     registered: AtomicBool,
+    // Whether the native observer asks libwebrtc for the network thread; see
+    // `PeerConnectionFactoryBuilder::with_dc_callbacks_on_network_thread`.
+    on_network_thread: bool,
     // The owning connection's chunking negotiation, and this channel's
     // decision, made once it is open.
     negotiation: Option<Arc<crate::dc_chunking::DcNegotiation>>,
@@ -1445,6 +1448,7 @@ impl ChannelCore {
                 dc_on_message,
                 dc_on_state_change,
                 dc_on_buffered_amount_low,
+                self.on_network_thread as c_int,
             );
         }
     }
@@ -1471,9 +1475,13 @@ impl ChannelCore {
             };
             while c.pump_again.swap(false, Ordering::SeqCst) {
                 loop {
+                    // Read before taking the queue's lock: off the network
+                    // thread it waits on that thread, whose callbacks may be
+                    // waiting on the lock.
+                    let native = self.raw.buffered_amount();
                     let (frame, queued_left) = {
                         let mut queue = c.queue.lock().unwrap();
-                        let frame = queue.next_frame(self.raw.buffered_amount());
+                        let frame = queue.next_frame(native);
                         (frame, !queue.is_empty())
                     };
                     let Some(frame) = frame else {
@@ -1666,6 +1674,7 @@ impl DataChannel {
                 on_close: Slot::empty(),
                 on_buffered_amount_low: Slot::empty(),
                 registered: AtomicBool::new(false),
+                on_network_thread: factory.dc_callbacks_on_network_thread,
                 negotiation: None,
                 decided: std::sync::OnceLock::new(),
                 early_low_threshold: AtomicU64::new(0),
@@ -1803,8 +1812,10 @@ impl DataChannel {
     /// own buffer is empty, or `timeout` passes. Returns whether it drained.
     ///
     /// Don't call it (or [`close`](Self::close) with a drain timeout) from
-    /// this channel's callbacks: they run on libwebrtc's network thread, which
-    /// is the thread that sends, so nothing drains until the timeout passes.
+    /// this channel's callbacks: it holds up the thread that runs them, and
+    /// with [network-thread callbacks](crate::PeerConnectionFactoryBuilder::with_dc_callbacks_on_network_thread)
+    /// that is the thread that sends, so nothing drains until the timeout
+    /// passes.
     pub fn drain(&self, timeout: std::time::Duration) -> bool {
         // A timeout too large to add to now never expires.
         let deadline = std::time::Instant::now().checked_add(timeout);
@@ -1836,7 +1847,9 @@ impl DataChannel {
     }
 
     /// Receive handler — fires on every incoming message. The closure runs on
-    /// a WebRTC network thread; return quickly or offload heavy work. On a
+    /// the factory's signaling thread, or on its network thread with
+    /// [`with_dc_callbacks_on_network_thread`](crate::PeerConnectionFactoryBuilder::with_dc_callbacks_on_network_thread);
+    /// return quickly or offload heavy work. On a
     /// chunked channel it fires once per whole message, including any that
     /// arrived before it was set.
     pub fn on_message(&self, cb: impl for<'a> FnMut(&'a [u8], bool) + Send + 'static) {

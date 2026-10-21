@@ -203,7 +203,12 @@ impl ApmConfig {
 /// down as soon as its own handle goes out of scope, and any object it produced
 /// that outlives it is left holding a pointer into what those threads used to
 /// back.
-pub(crate) struct FactoryHandle(*mut reactor_webrtc_sys::PeerConnectionFactory);
+pub(crate) struct FactoryHandle {
+    raw: *mut reactor_webrtc_sys::PeerConnectionFactory,
+    /// [`PeerConnectionFactoryBuilder::with_dc_callbacks_on_network_thread`]:
+    /// where the data channels of this factory run their callbacks.
+    pub(crate) dc_callbacks_on_network_thread: bool,
+}
 
 // SAFETY: the native factory is internally thread-safe (it owns the WebRTC
 // signaling/worker/network threads).
@@ -212,13 +217,13 @@ unsafe impl Sync for FactoryHandle {}
 
 impl FactoryHandle {
     pub(crate) fn raw(&self) -> *mut reactor_webrtc_sys::PeerConnectionFactory {
-        self.0
+        self.raw
     }
 }
 
 impl Drop for FactoryHandle {
     fn drop(&mut self) {
-        unsafe { reactor_webrtc_sys::reactor_webrtc_factory_destroy(self.0) }
+        unsafe { reactor_webrtc_sys::reactor_webrtc_factory_destroy(self.raw) }
     }
 }
 
@@ -277,6 +282,7 @@ impl PeerConnectionFactory {
         opts: &reactor_webrtc_sys::ReactorFactoryOptions,
         metadata_enabled: bool,
         dc_chunking: Option<DcChunking>,
+        dc_callbacks_on_network_thread: bool,
         registry: Arc<crate::encoded::EncoderRegistry>,
         openh264_registered: bool,
     ) -> Result<Self> {
@@ -299,7 +305,10 @@ impl PeerConnectionFactory {
             }));
         }
         Ok(Self {
-            handle: Arc::new(FactoryHandle(raw)),
+            handle: Arc::new(FactoryHandle {
+                raw,
+                dc_callbacks_on_network_thread,
+            }),
             metadata_enabled,
             dc_chunking,
             registry,

@@ -37,6 +37,10 @@ class TestBuilder:
         b = rw.PeerConnectionFactoryBuilder()
         b.with_sctp_tuning(low_latency=True)
         b.with_sctp_tuning(min_cwnd_mtus=64, delayed_ack_max_ms=40)
+    def test_builder_takes_the_dc_callbacks_on_network_thread_knob(self, factory):
+        b = rw.PeerConnectionFactoryBuilder()
+        b.with_dc_callbacks_on_network_thread(True)
+        b.with_dc_callbacks_on_network_thread(False)
         assert isinstance(b, rw.PeerConnectionFactoryBuilder)
 
 

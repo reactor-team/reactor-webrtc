@@ -709,15 +709,22 @@ class ReactorDcObserver : public webrtc::DataChannelObserver {
                     void (*on_message)(void*, const uint8_t*, size_t, int),
                     void (*on_state_change)(void*, int),
                     void (*on_buffered_amount_low)(void*),
-                    uint64_t low_threshold)
+                    uint64_t low_threshold, bool on_network_thread)
       : channel_(channel),
         userdata_(userdata),
         on_message_(on_message),
         on_state_change_(on_state_change),
         on_buffered_amount_low_(on_buffered_amount_low),
-        low_threshold_(low_threshold) {}
+        low_threshold_(low_threshold),
+        on_network_thread_(on_network_thread) {}
 
   void SetLowThreshold(uint64_t t) { low_threshold_ = t; }
+
+  // True: libwebrtc calls this observer on its network thread, where the
+  // event happens. False (upstream's default): it posts every event to the
+  // signaling thread first, one thread hop per message. Read once, when the
+  // observer is registered.
+  bool IsOkToCallOnTheNetworkThread() override { return on_network_thread_; }
 
   void OnStateChange() override {
     if (!on_state_change_) return;
@@ -750,6 +757,7 @@ class ReactorDcObserver : public webrtc::DataChannelObserver {
   void (*on_state_change_)(void*, int);
   void (*on_buffered_amount_low_)(void*);
   uint64_t low_threshold_;
+  bool on_network_thread_;
 };
 
 // A data-channel handle (the `DataChannel` in the Rust API): the channel plus
@@ -1630,17 +1638,19 @@ int reactor_webrtc_data_channel_send(void* data_channel, const uint8_t* data,
 // `on_buffered_amount_low(userdata)` fires when buffered_amount drops at or
 //   below the threshold set by reactor_webrtc_data_channel_set_low_threshold.
 // Any pointer may be null. Replaces any previously registered observer.
+// `on_network_thread` nonzero: the callbacks run on the network thread, where
+// the events happen; 0: on the signaling thread, as upstream does by default.
 void reactor_webrtc_data_channel_register_observer(
     void* data_channel, void* userdata,
     void (*on_message)(void*, const uint8_t*, size_t, int),
     void (*on_state_change)(void*, int),
-    void (*on_buffered_amount_low)(void*)) {
+    void (*on_buffered_amount_low)(void*), int on_network_thread) {
   auto* h = reinterpret_cast<ReactorDataChannel*>(data_channel);
   if (!h || !h->channel) return;
   if (h->observer) h->channel->UnregisterObserver();
   h->observer = std::make_unique<ReactorDcObserver>(
       h->channel.get(), userdata, on_message, on_state_change,
-      on_buffered_amount_low, h->low_threshold);
+      on_buffered_amount_low, h->low_threshold, on_network_thread != 0);
   h->channel->RegisterObserver(h->observer.get());
 }
 
