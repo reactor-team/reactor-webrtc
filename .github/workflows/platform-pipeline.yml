@@ -24,7 +24,7 @@ env:
   # Mirrors ci.yml's workflow-level env. The `with:` block of a job that
   # calls a reusable workflow can't reach the `env` context, so this can't be
   # threaded through as an input — keep MISE_VERSION in sync with ci.yml's.
-  MISE_VERSION: "2026.6.14"   # pinned; must be >= mise.toml min_version
+  MISE_VERSION: "2026.10.17"   # pinned; must be >= mise.toml min_version
   MISE_LOCKED: "1"
   MISE_DISABLE_TOOLS: "rust,rustup,aqua:rust-lang/rustup"
 

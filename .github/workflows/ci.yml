@@ -10,7 +10,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  MISE_VERSION: "2026.6.14"   # pinned; must be >= mise.toml min_version
+  MISE_VERSION: "2026.10.17"   # pinned; must be >= mise.toml min_version
   # Workflow-level so every step (mise-action AND the `mise run` steps) sees it.
   MISE_LOCKED: "1"            # install/run only mise.lock versions; never float
   # CI installs the Rust toolchain via actions-rust-lang/setup-rust-toolchain
