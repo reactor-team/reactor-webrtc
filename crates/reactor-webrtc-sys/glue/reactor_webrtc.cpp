@@ -766,6 +766,10 @@ struct ReactorDataChannel {
   webrtc::scoped_refptr<webrtc::DataChannelInterface> channel;
   std::unique_ptr<ReactorDcObserver> observer;
   uint64_t low_threshold = 0;  // persisted across observer re-registrations
+  // The factory's network thread, where the channel's Send and
+  // buffered_amount run. Null when unknown; the measured send then takes the
+  // proxy's two hops instead of one.
+  webrtc::Thread* network_thread = nullptr;
 };
 
 // A transceiver handle (the `RtpTransceiver` in the Rust API).
@@ -794,6 +798,9 @@ class ReactorPcObserver : public webrtc::PeerConnectionObserver {
  public:
   explicit ReactorPcObserver(const ReactorPcCallbacks& cb) : cb_(cb) {}
 
+  // Set right after construction, before any callback can fire.
+  void SetNetworkThread(webrtc::Thread* t) { network_thread_ = t; }
+
   void OnSignalingChange(
       webrtc::PeerConnectionInterface::SignalingState new_state) override {
     if (cb_.on_signaling_change)
@@ -819,8 +826,9 @@ class ReactorPcObserver : public webrtc::PeerConnectionObserver {
   void OnDataChannel(
       webrtc::scoped_refptr<webrtc::DataChannelInterface> dc) override {
     if (!cb_.on_data_channel) return;
-    cb_.on_data_channel(cb_.userdata,
-                        new ReactorDataChannel{std::move(dc), nullptr});
+    auto* h = new ReactorDataChannel{std::move(dc), nullptr};
+    h->network_thread = network_thread_;
+    cb_.on_data_channel(cb_.userdata, h);
   }
   // Forward both the legacy and the spec-compliant negotiation signals.
   void OnRenegotiationNeeded() override { fire_renegotiation(); }
@@ -847,6 +855,7 @@ class ReactorPcObserver : public webrtc::PeerConnectionObserver {
     if (cb_.on_renegotiation_needed) cb_.on_renegotiation_needed(cb_.userdata);
   }
   ReactorPcCallbacks cb_;
+  webrtc::Thread* network_thread_ = nullptr;
 };
 
 // Holds the observer alongside the peer connection. The PC holds a raw pointer
@@ -1432,6 +1441,7 @@ void* reactor_webrtc_peer_connection_create(void* factory,
   ReactorPcCallbacks cb{};
   if (callbacks) cb = *callbacks;
   rpc->observer = std::make_unique<ReactorPcObserver>(cb);
+  rpc->observer->SetNetworkThread(rpc->network_thread);
 
   webrtc::PeerConnectionInterface::RTCConfiguration rtc_config;
   rtc_config.sdp_semantics = webrtc::SdpSemantics::kUnifiedPlan;
@@ -1619,7 +1629,9 @@ void* reactor_webrtc_peer_connection_create_data_channel(void* pc,
   webrtc::DataChannelInit init;
   auto result = rpc->pc->CreateDataChannelOrError(label ? label : "", &init);
   if (!result.ok()) return nullptr;
-  return new ReactorDataChannel{result.MoveValue(), nullptr};
+  auto* h = new ReactorDataChannel{result.MoveValue(), nullptr};
+  h->network_thread = rpc->network_thread;
+  return h;
 }
 
 // Send bytes over a data channel. Returns 1 on success, 0 on failure.
@@ -1629,6 +1641,31 @@ int reactor_webrtc_data_channel_send(void* data_channel, const uint8_t* data,
   if (!h || !h->channel) return 0;
   webrtc::CopyOnWriteBuffer buffer(data, len);
   return h->channel->Send(webrtc::DataBuffer(buffer, binary != 0)) ? 1 : 0;
+}
+
+// Send bytes and read the channel's buffered amount after the send, in one
+// trip to the network thread. Through the proxy each is its own blocking call;
+// called on the network thread, both run inline. Returns 1 on success, 0 on
+// failure; `buffered_after` (may be null) receives the amount either way.
+int reactor_webrtc_data_channel_send_measured(void* data_channel, const uint8_t* data,
+                                              size_t len, int binary,
+                                              uint64_t* buffered_after) {
+  auto* h = reinterpret_cast<ReactorDataChannel*>(data_channel);
+  if (!h || !h->channel) return 0;
+  webrtc::CopyOnWriteBuffer buffer(data, len);
+  bool ok = false;
+  uint64_t amount = 0;
+  auto send = [&] {
+    ok = h->channel->Send(webrtc::DataBuffer(buffer, binary != 0));
+    amount = h->channel->buffered_amount();
+  };
+  if (h->network_thread) {
+    h->network_thread->BlockingCall(send);
+  } else {
+    send();
+  }
+  if (buffered_after) *buffered_after = amount;
+  return ok ? 1 : 0;
 }
 
 // Register callbacks for a data channel.

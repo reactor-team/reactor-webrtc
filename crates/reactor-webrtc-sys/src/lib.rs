@@ -785,6 +785,16 @@ extern "C" {
         on_buffered_amount_low: extern "C" fn(userdata: *mut c_void),
         on_network_thread: c_int,
     );
+    /// Send, then read the buffered amount, in one trip to the network
+    /// thread. Returns 1 on success, 0 on failure; `buffered_after` (may be
+    /// null) receives the amount after the send either way.
+    pub fn reactor_webrtc_data_channel_send_measured(
+        data_channel: *mut DataChannel,
+        data: *const u8,
+        len: usize,
+        binary: c_int,
+        buffered_after: *mut u64,
+    ) -> c_int;
     /// Number of bytes currently queued for sending on the data channel.
     pub fn reactor_webrtc_data_channel_buffered_amount(data_channel: *mut DataChannel) -> u64;
     /// Copy the channel's label into `out` (NUL-terminated, capped at `cap`).

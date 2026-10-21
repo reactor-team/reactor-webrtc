@@ -284,6 +284,40 @@ mod tests {
     /// Small messages from many threads keep libwebrtc's buffer far below
     /// the low-water mark, so no native callback would come to move a
     /// message a lost pump request left behind: every one must arrive.
+    // A large message fills libwebrtc's buffer past the low-water mark, where
+    // the pump stops trusting the buffered amount its last send read back and
+    // asks libwebrtc again; the small messages behind it go out on that
+    // reading. Every one arrives whole and in order, and nothing stays queued.
+    #[test]
+    #[cfg_attr(target_os = "windows", ignore)]
+    fn small_sends_after_a_large_one_arrive_in_order_and_drain() {
+        let (f1, f2) = (chunking(), chunking());
+        let mut p = connect(&f1, &f2);
+        let at_b = inbox(&mut p.b);
+        let big = pattern(7, 24 * MIB);
+        p.a.send(&big, true).expect("send large");
+        const SMALL: u64 = 500;
+        for i in 0..SMALL {
+            p.a.send(&pattern(i, 64 + (i as usize % 4000)), true)
+                .expect("send small");
+        }
+        let (got, _) = arrival(&at_b, &p.a, "the large message", Duration::from_secs(60));
+        assert_eq!(got, big, "the large message arrived corrupted");
+        for i in 0..SMALL {
+            let (got, _) = arrival(&at_b, &p.a, "a small message", Duration::from_secs(10));
+            assert_eq!(
+                got,
+                pattern(i, 64 + (i as usize % 4000)),
+                "small message {i} out of order or corrupted"
+            );
+        }
+        assert!(
+            p.a.drain(Duration::from_secs(30)),
+            "the channel did not drain"
+        );
+        assert_eq!(p.a.buffered_amount(), 0);
+    }
+
     #[test]
     #[cfg_attr(target_os = "windows", ignore)]
     fn small_concurrent_sends_are_never_left_queued() {
