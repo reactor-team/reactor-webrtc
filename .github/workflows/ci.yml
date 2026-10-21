@@ -10,7 +10,6 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  MISE_VERSION: "2026.10.17"   # pinned; must be >= mise.toml min_version
   # Workflow-level so every step (mise-action AND the `mise run` steps) sees it.
   MISE_LOCKED: "1"            # install/run only mise.lock versions; never float
   # CI installs the Rust toolchain via actions-rust-lang/setup-rust-toolchain
@@ -43,9 +42,20 @@ jobs:
           echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm.list
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends clang-21
+      - name: Read mise pin
+        shell: bash
+        run: bash .github/scripts/mise-pin.sh >> "$GITHUB_ENV"
+
       - uses: jdx/mise-action@v4
         with:
           version: ${{ env.MISE_VERSION }}
+          sha256: ${{ env.MISE_SHA256 }}
+      - name: Test mise pin reader
+        run: python3 .github/scripts/test-mise-pin.py
+
+      - name: Test review bootstrap
+        run: python3 .github/scripts/test-mise-review-bootstrap.py
+
       - run: hk validate   # the hk.pkl that drives local git hooks parses
       - run: mise run fmt:check
       - run: mise run clippy
