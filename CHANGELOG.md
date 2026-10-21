@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.24.1 — the android x64 prebuilt
+
+An `x86_64-linux-android` build, the ABI an Android emulator on an x86_64 host
+runs, found no prebuilt and fell back to API/check-only, so linking failed.
+
+### Added
+
+- **`x86_64-linux-android` links the `android-x64` prebuilt**, published in
+  `webrtc-7907-a5ddff60-p11` next to `android-arm64`, downloaded and checked
+  against its `.sha256` the same way.
+
 ## 0.24.0 — where the engine's hand-offs spend their time
 
 0.23.0 showed where a data-channel message's time goes on the wire. Two
