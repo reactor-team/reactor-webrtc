@@ -32,6 +32,7 @@ pub fn prebuilt_platform(
         },
         "android" => match arch {
             "aarch64" => Some("android-arm64"),
+            "x86_64" => Some("android-x64"),
             _ => None,
         },
         "windows" => match arch {
@@ -71,6 +72,7 @@ mod tests {
             ("ios", "aarch64", "", "", "ios-arm64-device"),
             ("ios", "aarch64", "sim", "", "ios-arm64-simulator"),
             ("android", "aarch64", "", "", "android-arm64"),
+            ("android", "x86_64", "", "", "android-x64"),
             ("windows", "x86_64", "", "msvc", "win-x64"),
         ] {
             assert_eq!(prebuilt_platform(os, arch, abi, target_env), Some(expected));
