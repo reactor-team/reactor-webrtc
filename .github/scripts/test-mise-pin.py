@@ -54,7 +54,10 @@ class MisePinTests(unittest.TestCase):
             with self.subTest(runner_os=runner_os, runner_arch=runner_arch):
                 result = self._run_helper(CONFIG, runner_os, runner_arch)
                 assert result.returncode == 0, result.stderr
-                assert result.stdout == f"MISE_VERSION={VERSION}\nMISE_SHA256={HASHES[key]}\n"
+                assert (
+                    result.stdout
+                    == f"MISE_VERSION={VERSION}\nMISE_SHA256={HASHES[key]}\n"
+                )
 
     def test_comments_and_windows_line_endings(self):
         """Accept checkout line endings and ignore unrelated table keys."""
@@ -62,7 +65,10 @@ class MisePinTests(unittest.TestCase):
         config += '\n[tools]\nmin_version = "ignore this table"\n'
         result = self._run_helper(config.replace("\n", "\r\n"))
         assert result.returncode == 0, result.stderr
-        assert result.stdout == f"MISE_VERSION={VERSION}\nMISE_SHA256={HASHES['linux_x64']}\n"
+        assert (
+            result.stdout
+            == f"MISE_VERSION={VERSION}\nMISE_SHA256={HASHES['linux_x64']}\n"
+        )
 
     def test_invalid_config_emits_no_environment(self):
         """Reject incomplete or invalid pins without partial output."""
@@ -81,6 +87,7 @@ class MisePinTests(unittest.TestCase):
             "duplicate checksum": CONFIG + digest,
             "short checksum": CONFIG.replace(HASHES["linux_x64"], "a" * 63),
             "nonhex checksum": CONFIG.replace(HASHES["linux_x64"], "z" * 64),
+            "uppercase checksum": CONFIG.replace(HASHES["linux_x64"], "A" * 64),
             "misplaced checksum": CONFIG.replace("[_]\n", "[tools]\n"),
             "misplaced version": "[tools]\n" + CONFIG,
         }
@@ -89,6 +96,17 @@ class MisePinTests(unittest.TestCase):
                 result = self._run_helper(config)
                 assert result.returncode != 0
                 assert result.stdout == ""
+
+    def test_unrelated_checksum_metadata_is_ignored(self):
+        """Read supported checksum keys without limiting other metadata."""
+        config = CONFIG + 'mise_sha256_notes = "release notes"\n'
+        config += 'mise_sha256_linux_riscv64 = "not a supported runner"\n'
+        result = self._run_helper(config)
+        assert result.returncode == 0, result.stderr
+        assert (
+            result.stdout
+            == f"MISE_VERSION={VERSION}\nMISE_SHA256={HASHES['linux_x64']}\n"
+        )
 
     def test_unsupported_or_missing_runner(self):
         """Reject runners without a pinned binary."""
