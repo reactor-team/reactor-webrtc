@@ -20,13 +20,22 @@ doctest = false
 # see reactor-webrtc-sys/README.md "OpenH264" section). Off by default: pulls
 # in an HTTP client + hashing + decompression + cache-dir crates that a
 # consumer who doesn't want H.264 shouldn't have to build.
-openh264 = ["dep:ureq", "dep:sha1", "dep:bzip2", "dep:dirs"]
+openh264 = [
+    "dep:ureq", "dep:sha1", "dep:bzip2", "dep:dirs",
+    "dep:rustls", "dep:rustls-webpki", "dep:webpki-roots", "dep:webpki-roots-compat",
+]
 
 [dependencies]
 # openh264 feature: download (ureq), verify (sha1, matching Cisco's published
 # .sha1 sidecars), decompress (bzip2 — Cisco ships .bz2, and stock Windows has
 # no system libbz2 to shell out to), and cache (dirs) the prebuilt library.
-ureq = { version = "2", optional = true, default-features = false, features = ["tls"] }
+ureq = { version = "2.12.1", optional = true, default-features = false, features = ["tls"] }
+# Keep ureq on the TLS dependency paths that include the CA fixes.
+rustls = { version = "0.23.24", optional = true, default-features = false }
+rustls-webpki = { version = "0.103.16", optional = true, default-features = false }
+webpki-roots = { version = "1.0.10", optional = true, default-features = false }
+# The 0.26 shim must use the updated 1.x root bundle.
+webpki-roots-compat = { package = "webpki-roots", version = "0.26.11", optional = true, default-features = false }
 sha1 = { version = "0.10", optional = true }
 bzip2 = { version = "0.4", optional = true }
 dirs = { version = "5", optional = true }
