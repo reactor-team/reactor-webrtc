@@ -166,6 +166,9 @@ impl PeerConnectionFactoryBuilder {
     /// [`build`](Self::build) fails on a value out of range.
     pub fn with_sctp_tuning(mut self, tuning: SctpTuning) -> Self {
         self.sctp_tuning = Some(tuning);
+        self
+    }
+
     /// Run the callbacks of this factory's data channels (`on_message`,
     /// `on_state_change`, `on_open`, `on_close`, `on_buffered_amount_low`) on
     /// libwebrtc's network thread, where the events happen. Off by default:

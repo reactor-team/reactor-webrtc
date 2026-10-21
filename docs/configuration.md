@@ -475,6 +475,36 @@ channel keeps sending about 120 KB per round trip instead of backing off as TCP
 would. That suits commands; a channel moving tens of megabytes over congested
 links may lose more with it. Every field of `SctpTuning` can be set on its own;
 `None` keeps upstream's value.
+
+<details>
+<summary>🦀 Example using Rust</summary>
+
+```rust
+use reactor_webrtc::{PeerConnectionFactory, SctpTuning};
+
+let factory = PeerConnectionFactory::builder()
+    .with_sctp_tuning(SctpTuning::low_latency())
+    .build()
+    .expect("factory");
+
+// Or one value at a time; the rest keep upstream's.
+let mut tuning = SctpTuning::default();
+tuning.delayed_ack_max_ms = Some(20);
+```
+
+</details>
+
+<details>
+<summary>🐍 Example using Python</summary>
+
+```python
+builder = rw.PeerConnectionFactoryBuilder()
+builder.with_sctp_tuning(low_latency=True)          # or e.g. min_cwnd_mtus=64
+factory = builder.build()
+```
+
+</details>
+
 ## Data-channel callbacks on the network thread
 
 By default libwebrtc runs a data channel's callbacks (`on_message`,
@@ -510,16 +540,6 @@ loop with `loop.call_soon_threadsafe`.
 <summary>🦀 Example using Rust</summary>
 
 ```rust
-use reactor_webrtc::{PeerConnectionFactory, SctpTuning};
-
-let factory = PeerConnectionFactory::builder()
-    .with_sctp_tuning(SctpTuning::low_latency())
-    .build()
-    .expect("factory");
-
-// Or one value at a time; the rest keep upstream's.
-let mut tuning = SctpTuning::default();
-tuning.delayed_ack_max_ms = Some(20);
 let factory = PeerConnectionFactory::builder()
     .with_dc_callbacks_on_network_thread(true)
     .build()
@@ -533,8 +553,6 @@ let factory = PeerConnectionFactory::builder()
 
 ```python
 builder = rw.PeerConnectionFactoryBuilder()
-builder.with_sctp_tuning(low_latency=True)          # or e.g. min_cwnd_mtus=64
-factory = builder.build()
 builder.with_dc_callbacks_on_network_thread(True)
 factory = builder.build()
 
