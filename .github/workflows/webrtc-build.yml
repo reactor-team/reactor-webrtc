@@ -287,7 +287,6 @@ jobs:
       run:
         shell: bash
     env:
-      MISE_VERSION: "2026.6.14"
       MISE_LOCKED: "1"
       MISE_DISABLE_TOOLS: "rust,rustup,aqua:rust-lang/rustup"
     steps:
@@ -325,9 +324,14 @@ jobs:
         if: matrix.os == 'mac' && matrix.arch == 'x64'
         run: echo "MISE_DISABLE_TOOLS=${{ env.MISE_DISABLE_TOOLS }},hk" >> "$GITHUB_ENV"
 
+      - name: Read mise pin
+        shell: bash
+        run: bash .github/scripts/mise-pin.sh >> "$GITHUB_ENV"
+
       - uses: jdx/mise-action@v4
         with:
           version: ${{ env.MISE_VERSION }}
+          sha256: ${{ env.MISE_SHA256 }}
 
       # GitHub Windows runners have no usable non-loopback network interface
       # for WebRTC ICE — skip cargo tests on Windows entirely.
@@ -365,7 +369,6 @@ jobs:
       run:
         shell: bash
     env:
-      MISE_VERSION: "2026.6.14"
       MISE_LOCKED: "1"
       MISE_DISABLE_TOOLS: "rust,rustup,aqua:rust-lang/rustup"
     steps:
@@ -403,9 +406,14 @@ jobs:
         if: matrix.os == 'mac' && matrix.arch == 'x64'
         run: echo "MISE_DISABLE_TOOLS=${{ env.MISE_DISABLE_TOOLS }},hk" >> "$GITHUB_ENV"
 
+      - name: Read mise pin
+        shell: bash
+        run: bash .github/scripts/mise-pin.sh >> "$GITHUB_ENV"
+
       - uses: jdx/mise-action@v4
         with:
           version: ${{ env.MISE_VERSION }}
+          sha256: ${{ env.MISE_SHA256 }}
 
       # GitHub Windows runners have no usable non-loopback network interface
       # for WebRTC ICE — skip cargo tests on Windows entirely.
@@ -443,7 +451,6 @@ jobs:
       run:
         shell: bash
     env:
-      MISE_VERSION: "2026.6.14"
       MISE_LOCKED: "1"
       MISE_DISABLE_TOOLS: "rust,rustup,aqua:rust-lang/rustup"
     steps:
@@ -481,9 +488,14 @@ jobs:
         if: matrix.os == 'mac' && matrix.arch == 'x64'
         run: echo "MISE_DISABLE_TOOLS=${{ env.MISE_DISABLE_TOOLS }},hk" >> "$GITHUB_ENV"
 
+      - name: Read mise pin
+        shell: bash
+        run: bash .github/scripts/mise-pin.sh >> "$GITHUB_ENV"
+
       - uses: jdx/mise-action@v4
         with:
           version: ${{ env.MISE_VERSION }}
+          sha256: ${{ env.MISE_SHA256 }}
 
       - name: Build wheel (non-Windows)
         if: runner.os != 'Windows'
@@ -542,7 +554,6 @@ jobs:
       run:
         shell: bash
     env:
-      MISE_VERSION: "2026.6.14"
       MISE_LOCKED: "1"
       MISE_DISABLE_TOOLS: "rust,rustup,aqua:rust-lang/rustup"
     steps:
@@ -556,9 +567,14 @@ jobs:
       - name: Disable hk on mac-x64
         if: matrix.os == 'mac' && matrix.arch == 'x64'
         run: echo "MISE_DISABLE_TOOLS=${{ env.MISE_DISABLE_TOOLS }},hk" >> "$GITHUB_ENV"
+      - name: Read mise pin
+        shell: bash
+        run: bash .github/scripts/mise-pin.sh >> "$GITHUB_ENV"
+
       - uses: jdx/mise-action@v4
         with:
           version: ${{ env.MISE_VERSION }}
+          sha256: ${{ env.MISE_SHA256 }}
       - run: mise run //crates/reactor-webrtc-py:test
 
   # Publish the per-target prebuilts as a GitHub Release (opt-in via dispatch).
