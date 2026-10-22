@@ -168,7 +168,10 @@ impl PeerConnectionFactoryBuilder {
     ///   them: those wait on the signaling thread, which may itself be waiting
     ///   on the network thread, and that deadlocks. The channel's own methods
     ///   (`send`, `buffered_amount`, `state`, `close`, the handler setters) are
-    ///   fine; they run inline on the network thread.
+    ///   fine; they run inline on the network thread. A state change or
+    ///   `on_buffered_amount_low` they raise from inside a handler reaches the
+    ///   handlers once that one returns, and dropping the channel's last
+    ///   handle there finishes its release on another thread.
     /// - Don't block on a thread that is itself waiting on a data channel
     ///   call, such as a `send` from another thread holding a lock the
     ///   callback needs.

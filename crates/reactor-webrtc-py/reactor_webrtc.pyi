@@ -1024,7 +1024,9 @@ class PeerConnectionFactoryBuilder:
           (`loop.call_soon_threadsafe`) or a queue.
         - Don't call `PeerConnection` methods from the callbacks: they wait on
           the signaling thread, which may be waiting on the network thread.
-          The channel's own methods are fine.
+          The channel's own methods are fine: a state change or
+          `on_buffered_amount_low` they raise from inside a callback runs once
+          that callback returns.
         - Another Python thread holding the GIL holds up the network thread
           for as long as it does."""
         ...

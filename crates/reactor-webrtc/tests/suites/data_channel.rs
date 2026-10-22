@@ -271,6 +271,178 @@ mod tests {
         );
     }
 
+    // ── calls back into the channel from its handlers ────────────────────────
+
+    /// A deadlocked callback thread would hang the teardown after a failed
+    /// assert, so a timeout here ends the run instead.
+    fn or_exit(ok: bool, what: &str) {
+        if !ok {
+            eprintln!("{what}");
+            std::process::exit(1);
+        }
+    }
+
+    // With network-thread callbacks `close` runs inline and changes the state
+    // while on_state_change(Open) is still running; the change waits for it.
+    #[test]
+    #[cfg_attr(target_os = "windows", ignore)]
+    fn close_from_on_state_change_reports_closing_and_closed_after_open() {
+        let factory = factory();
+        let cfg = RtcConfiguration::default();
+        let (pc1, s1) = make_peer(&factory, &cfg);
+        let (pc2, s2) = make_peer(&factory, &cfg);
+        let dc1 = Arc::new(pc1.create_data_channel("close-on-open").expect("dc"));
+        let states = Arc::new(Mutex::new(Vec::new()));
+        dc1.on_state_change({
+            let dc1 = Arc::downgrade(&dc1);
+            let states = states.clone();
+            move |s| {
+                states.lock().unwrap().push(s);
+                if s == DataChannelState::Open {
+                    if let Some(dc1) = dc1.upgrade() {
+                        dc1.close(Duration::ZERO);
+                    }
+                }
+            }
+        });
+        negotiate(&pc1, &pc2);
+        let ok = wait_for(&s1, &s2, &pc1, &pc2, || {
+            states.lock().unwrap().contains(&DataChannelState::Closed)
+        });
+        or_exit(ok, "close from on_state_change(Open) never reached Closed");
+        let states = states.lock().unwrap();
+        assert!(
+            states.ends_with(&[
+                DataChannelState::Open,
+                DataChannelState::Closing,
+                DataChannelState::Closed
+            ]),
+            "states: {states:?}"
+        );
+    }
+
+    // The refill pattern: with network-thread callbacks a send can report the
+    // buffer draining before it returns, from inside the handler that sent.
+    #[test]
+    #[cfg_attr(target_os = "windows", ignore)]
+    fn send_from_on_buffered_amount_low_refills_the_channel() {
+        const MESSAGES: u32 = 64;
+        const HIGH: u64 = 1024 * 1024;
+        let payload = vec![7u8; 64 * 1024];
+        fn refill(dc: &DataChannel, sent: &AtomicU32, payload: &[u8]) {
+            while dc.buffered_amount() < HIGH {
+                let reserved =
+                    sent.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                        (n < MESSAGES).then_some(n + 1)
+                    });
+                if reserved.is_err() {
+                    return;
+                }
+                dc.send(payload, true).expect("send");
+            }
+        }
+
+        let factory = factory();
+        let cfg = RtcConfiguration::default();
+        let (pc1, s1) = make_peer(&factory, &cfg);
+        let (pc2, s2) = make_peer(&factory, &cfg);
+        let dc1 = Arc::new(pc1.create_data_channel("refill").expect("dc"));
+        negotiate(&pc1, &pc2);
+        let ok = wait_for(&s1, &s2, &pc1, &pc2, || {
+            dc1.state() == DataChannelState::Open && !s2.data_channels.lock().unwrap().is_empty()
+        });
+        or_exit(ok, "timed out waiting for the channel to open");
+        let dc2 = s2.data_channels.lock().unwrap().pop().unwrap();
+        let received = Arc::new(AtomicU32::new(0));
+        dc2.on_message({
+            let received = received.clone();
+            move |_, _| {
+                received.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        let sent = Arc::new(AtomicU32::new(0));
+        dc1.set_buffered_amount_low_threshold(256 * 1024);
+        dc1.on_buffered_amount_low({
+            let dc1 = Arc::downgrade(&dc1);
+            let sent = sent.clone();
+            let payload = payload.clone();
+            move || {
+                if let Some(dc1) = dc1.upgrade() {
+                    refill(&dc1, &sent, &payload);
+                }
+            }
+        });
+        refill(&dc1, &sent, &payload);
+        let ok = wait_for(&s1, &s2, &pc1, &pc2, || {
+            received.load(Ordering::SeqCst) == MESSAGES
+        });
+        or_exit(
+            ok,
+            &format!(
+                "refilling from on_buffered_amount_low stalled: {} sent, {} received",
+                sent.load(Ordering::SeqCst),
+                received.load(Ordering::SeqCst)
+            ),
+        );
+    }
+
+    // A callback can end up holding the last handle, here by taking it out of
+    // a holder. The release must wait for the callback to return and must not
+    // unregister on the network thread.
+    #[test]
+    #[cfg_attr(target_os = "windows", ignore)]
+    fn dropping_the_last_handle_inside_a_callback_releases_the_channel() {
+        let factory = factory();
+        let cfg = RtcConfiguration::default();
+        let (pc1, s1) = make_peer(&factory, &cfg);
+        let (pc2, s2) = make_peer(&factory, &cfg);
+        let released1 = pc1.create_data_channel("released").expect("dc");
+        let kept1 = pc1.create_data_channel("kept").expect("dc");
+        negotiate(&pc1, &pc2);
+        let ok = wait_for(&s1, &s2, &pc1, &pc2, || {
+            released1.state() == DataChannelState::Open
+                && kept1.state() == DataChannelState::Open
+                && s2.data_channels.lock().unwrap().len() == 2
+        });
+        or_exit(ok, "timed out waiting for both channels to open");
+        let mut channels = std::mem::take(&mut *s2.data_channels.lock().unwrap());
+        let i = channels
+            .iter()
+            .position(|dc| dc.label() == "released")
+            .expect("the released channel");
+        let holder = Arc::new(Mutex::new(Some(channels.remove(i))));
+        let kept2 = channels.pop().expect("the kept channel");
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        holder.lock().unwrap().as_ref().unwrap().on_message({
+            let holder = holder.clone();
+            let dropped = dropped.clone();
+            move |_, _| {
+                let last = holder.lock().unwrap().take();
+                drop(last);
+                dropped.store(true, Ordering::SeqCst);
+            }
+        });
+        let received = Arc::new(AtomicU32::new(0));
+        kept2.on_message({
+            let received = received.clone();
+            move |_, _| {
+                received.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        released1.send(b"release", true).expect("send");
+        let ok = wait_for(&s1, &s2, &pc1, &pc2, || dropped.load(Ordering::SeqCst));
+        or_exit(ok, "the callback never released the channel");
+        // The callbacks' thread is still free: another channel still delivers.
+        kept1.send(b"still here", true).expect("send");
+        let ok = wait_for(&s1, &s2, &pc1, &pc2, || {
+            received.load(Ordering::SeqCst) == 1
+        });
+        or_exit(ok, "no message arrived after the release");
+    }
+
     // ── label and buffered_amount ────────────────────────────────────────────
 
     #[test]

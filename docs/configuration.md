@@ -479,7 +479,10 @@ and a callback holds it for as long as it runs:
 - Don't call `PeerConnection` methods from the callbacks. They wait on the
   signaling thread, which may be waiting on the network thread: a deadlock.
   The channel's own methods (`send`, `buffered_amount`, `state`, `close`, the
-  handler setters) are fine; they run inline.
+  handler setters) are fine; they run inline. A state change or
+  `on_buffered_amount_low` they raise from inside a handler reaches the
+  handlers once that one returns, and dropping the channel's last handle there
+  finishes its release on another thread.
 - Don't wait on a thread that is itself in a data channel call (a `send` from
   another thread, say) or holding a lock that such a thread needs.
 - Don't call `drain()` (or `close()` with a drain timeout) from them: the
