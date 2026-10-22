@@ -1,10 +1,9 @@
 --- a/rtc_base/physical_socket_server.cc
 +++ b/rtc_base/physical_socket_server.cc
-@@ -113,6 +113,30 @@
-                              u_int cnt,
+@@ -114,6 +114,31 @@
                               int flags) __attribute__((weak_import));
  #endif  // WEBRTC_USE_APPLE_SENDMSG_X
-+
+ 
 +#include <atomic>
 +#include "rtc_base/time_utils.h"
 +
@@ -13,7 +12,8 @@
 +// message received: 0 kernel arrival (utc), 1 DTLS read (utc), 2 DTLS read,
 +// 3 SCTP read (decrypted), 4 message delivered. The last message sent: 5
 +// SendData entry, 6 its first DTLS send, 7 its first datagram handed to the
-+// kernel, 8 SendData return, 9 1 when 7 came from a batch flush.
++// kernel, 8 SendData return, 9 1 when 7 came from a batch flush. Arrival (0)
++// is in the TimeMicros() base: AsyncUDPSocket maps the kernel stamp to it.
 +namespace reactor_bench {
 +std::atomic<int64_t> g_stamps[16];
 +thread_local int64_t g_cur[4];
@@ -28,10 +28,11 @@
 +    out[i] = reactor_bench::g_stamps[i].load(std::memory_order_relaxed);
 +  }
 +}
- 
++
  namespace webrtc {
  
-@@ -377,6 +401,11 @@
+ namespace {
+@@ -377,6 +402,11 @@
    }
    send_batch_.clear();
    send_batch_bytes_.clear();
@@ -43,7 +44,7 @@
  }
  #else
  ScopedUdpSendBatch::ScopedUdpSendBatch() = default;
-@@ -682,6 +711,11 @@
+@@ -682,6 +712,11 @@
                 0,
  #endif
                 reinterpret_cast<sockaddr*>(&saddr), static_cast<int>(len));
@@ -57,10 +58,11 @@
    // We have seen minidumps where this may be false.
 --- a/media/sctp/dcsctp_transport.cc
 +++ b/media/sctp/dcsctp_transport.cc
-@@ -57,6 +57,29 @@
+@@ -56,6 +56,30 @@
+ #include "rtc_base/thread.h"
  #include "rtc_base/trace_event.h"
  #include "system_wrappers/include/clock.h"
- 
++
 +#include <atomic>
 +#include "rtc_base/time_utils.h"
 +
@@ -75,19 +77,19 @@
 +namespace {
 +// Stamps SendData's return (8), whichever path it returns by.
 +struct ReactorBenchSendReturn {
++  // The kernel stamp (7) stays armed: a batched datagram leaves when the
++  // network thread's batch scope closes, after SendData returns.
 +  ~ReactorBenchSendReturn() {
 +    reactor_bench::g_pend_dtls = false;
-+    reactor_bench::g_pend_sock = false;
 +    reactor_bench::g_stamps[8].store(webrtc::TimeMicros(),
 +                                     std::memory_order_relaxed);
 +  }
 +};
 +}  // namespace
-+
+ 
  namespace webrtc {
  
- namespace {
-@@ -313,6 +336,12 @@
+@@ -313,6 +337,12 @@
                                     const SendDataParams& params,
                                     const CopyOnWriteBuffer& payload) {
    RTC_DCHECK_RUN_ON(network_thread_);
@@ -100,7 +102,7 @@
    RTC_DLOG(LS_VERBOSE) << debug_name_ << "->SendData(sid=" << sid
                         << ", type=" << static_cast<int>(params.type)
                         << ", length=" << payload.size() << ").";
-@@ -526,6 +555,11 @@
+@@ -526,6 +556,11 @@
  
  void DcSctpTransport::OnMessageReceived(dcsctp::DcSctpMessage message) {
    RTC_DCHECK_RUN_ON(network_thread_);
@@ -112,7 +114,7 @@
    RTC_DLOG(LS_VERBOSE) << debug_name_ << "->OnMessageReceived(sid="
                         << message.stream_id().value()
                         << ", ppid=" << message.ppid().value()
-@@ -756,6 +790,7 @@
+@@ -756,6 +791,7 @@
      PacketTransportInternal* /* transport */,
      const ReceivedIpPacket& packet) {
    RTC_DCHECK_RUN_ON(network_thread_);
