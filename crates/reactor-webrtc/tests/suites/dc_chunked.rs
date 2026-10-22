@@ -605,6 +605,52 @@ mod tests {
         );
     }
 
+    // A chunked channel hands a whole message to on_message from its own
+    // path; `close` from there still reports Closing only once it returns.
+    #[test]
+    #[cfg_attr(target_os = "windows", ignore)]
+    fn close_from_on_message_reports_closing_after_the_handler_returns() {
+        let (f1, f2) = (chunking(), chunking());
+        let Pair { _pc1, _pc2, a, b } = connect(&f1, &f2);
+        assert!(b.is_chunked());
+        let b = Arc::new(b);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        b.on_state_change({
+            let events = events.clone();
+            move |s| {
+                if s == DataChannelState::Closing {
+                    events.lock().unwrap().push("closing");
+                }
+            }
+        });
+        b.on_message({
+            let b = Arc::downgrade(&b);
+            let events = events.clone();
+            move |_, _| {
+                events.lock().unwrap().push("message");
+                if let Some(b) = b.upgrade() {
+                    b.close(Duration::ZERO);
+                }
+                events.lock().unwrap().push("message returns");
+            }
+        });
+        a.send(&pattern(4, 2 * MIB), true).expect("send");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !events.lock().unwrap().contains(&"closing") {
+            // A deadlocked callback thread would hang the teardown after a
+            // failed assert, so a timeout ends the run instead.
+            if Instant::now() > deadline {
+                eprintln!("close from on_message never reported Closing");
+                std::process::exit(1);
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["message", "message returns", "closing"]
+        );
+    }
+
     #[test]
     #[cfg_attr(target_os = "windows", ignore)]
     fn a_plain_channel_behaves_as_before() {

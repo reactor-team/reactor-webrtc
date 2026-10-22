@@ -1418,8 +1418,8 @@ struct ChannelCore {
     on_close: Slot<EventCb>,
     on_buffered_amount_low: Slot<EventCb>,
     // A handler holds its own lock while it runs, so a notice raised from
-    // inside one (a `close` from `on_state_change`, a `send` from
-    // `on_buffered_amount_low`) waits here until it returns.
+    // inside one (a `close` from `on_message` or `on_state_change`, a `send`
+    // from `on_buffered_amount_low`) waits here until it returns.
     notices: Mutex<Notices>,
     registered: AtomicBool,
     // Whether the native observer asks libwebrtc for the network thread; see
@@ -1595,6 +1595,28 @@ impl ChannelCore {
             }
             notices.delivering = true;
         }
+        self.deliver_notices();
+    }
+
+    /// Run `handler`, an `on_message` call from the native callback, holding
+    /// back the notices it raises (a `close`, a `send`) until it returns, as
+    /// `notify` does for the other handlers.
+    fn run_message_handler(&self, handler: impl FnOnce()) {
+        {
+            let mut notices = self.notices.lock().unwrap();
+            if notices.delivering {
+                drop(notices);
+                return handler();
+            }
+            notices.delivering = true;
+        }
+        handler();
+        self.deliver_notices();
+    }
+
+    /// Deliver the queued notices, then clear `delivering`. Called by whoever
+    /// set it.
+    fn deliver_notices(&self) {
         loop {
             let notice = {
                 let mut notices = self.notices.lock().unwrap();
@@ -1656,7 +1678,7 @@ extern "C" fn dc_on_message(ud: *mut c_void, data: *const u8, len: usize, binary
     let bytes = unsafe { std::slice::from_raw_parts(data, len) };
     let Some(c) = core.chunked() else {
         if let Some(cb) = core.on_message.get() {
-            (*cb.lock().unwrap())(bytes, binary != 0);
+            core.run_message_handler(|| (*cb.lock().unwrap())(bytes, binary != 0));
         }
         return;
     };
@@ -1675,7 +1697,7 @@ extern "C" fn dc_on_message(ud: *mut c_void, data: *const u8, len: usize, binary
     }
     match delivery {
         Ok(reactor_webrtc_dc_chunking::Delivery::Message { data, binary }) => {
-            core.deliver(c, data, binary)
+            core.run_message_handler(|| core.deliver(c, data, binary))
         }
         Ok(reactor_webrtc_dc_chunking::Delivery::Pending) => {}
         // Larger than this side's limit: dropped without buffering, and the

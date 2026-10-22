@@ -321,6 +321,54 @@ mod tests {
         );
     }
 
+    // With network-thread callbacks `close` from on_message changes the state
+    // inline; on_state_change still runs only once on_message has returned.
+    #[test]
+    #[cfg_attr(target_os = "windows", ignore)]
+    fn close_from_on_message_reports_closing_after_the_handler_returns() {
+        let factory = factory();
+        let cfg = RtcConfiguration::default();
+        let (pc1, s1) = make_peer(&factory, &cfg);
+        let (pc2, s2) = make_peer(&factory, &cfg);
+        let dc1 = Arc::new(pc1.create_data_channel("close-on-message").expect("dc"));
+        negotiate(&pc1, &pc2);
+        let ok = wait_for(&s1, &s2, &pc1, &pc2, || {
+            dc1.state() == DataChannelState::Open && !s2.data_channels.lock().unwrap().is_empty()
+        });
+        or_exit(ok, "timed out waiting for the channel to open");
+        let dc2 = s2.data_channels.lock().unwrap().pop().unwrap();
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        dc1.on_state_change({
+            let events = events.clone();
+            move |s| {
+                if s == DataChannelState::Closing {
+                    events.lock().unwrap().push("closing");
+                }
+            }
+        });
+        dc1.on_message({
+            let dc1 = Arc::downgrade(&dc1);
+            let events = events.clone();
+            move |_, _| {
+                events.lock().unwrap().push("message");
+                if let Some(dc1) = dc1.upgrade() {
+                    dc1.close(Duration::ZERO);
+                }
+                events.lock().unwrap().push("message returns");
+            }
+        });
+        dc2.send(b"close", true).expect("send");
+        let ok = wait_for(&s1, &s2, &pc1, &pc2, || {
+            events.lock().unwrap().contains(&"closing")
+        });
+        or_exit(ok, "close from on_message never reported Closing");
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["message", "message returns", "closing"]
+        );
+    }
+
     // The refill pattern: with network-thread callbacks a send can report the
     // buffer draining before it returns, from inside the handler that sent.
     #[test]
