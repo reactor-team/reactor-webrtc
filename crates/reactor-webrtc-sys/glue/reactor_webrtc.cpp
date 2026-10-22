@@ -2513,6 +2513,18 @@ struct ReactorFactoryOptions {
 };
 }
 
+// Pins the layout against the repr(C) mirror in reactor-webrtc-sys/src/lib.rs,
+// which carries the same numbers. Both build from one checkout, so no ABI
+// version guards this struct; it only grows at its end, behind `size`. The
+// offsets catch a field added on one side only within a run of ints.
+static_assert(sizeof(void*) != 8 || sizeof(ReactorFactoryOptions) == 136,
+              "ReactorFactoryOptions changed size — update the repr(C) mirror "
+              "in reactor-webrtc-sys/src/lib.rs and both assertions");
+static_assert(sizeof(void*) != 8 ||
+              offsetof(ReactorFactoryOptions, dtls_in_stun) == 80);
+static_assert(sizeof(void*) != 8 ||
+              offsetof(ReactorFactoryOptions, sctp_initial_cwnd_mtus) == 112);
+
 struct ReactorEncoderState {
   reactor_video_encode_cb        cb;
   void*                          userdata;

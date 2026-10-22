@@ -206,6 +206,22 @@ pub struct ReactorFactoryOptions {
     pub sctp_immediate_sack_under_cwnd_mtus: c_int,
 }
 
+// Pins the layout of `ReactorFactoryOptions` against the C struct in
+// glue/reactor_webrtc.cpp, which carries the same numbers. Both sides build
+// from one checkout, so no ABI version guards this struct; it only grows at
+// its end, behind `size`. The offsets catch a field added on one side only
+// within a run of `int`s, which the size alone would not place.
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert!(
+        core::mem::size_of::<ReactorFactoryOptions>() == 136,
+        "ReactorFactoryOptions changed size — update the C struct in \
+         glue/reactor_webrtc.cpp and both assertions"
+    );
+    assert!(core::mem::offset_of!(ReactorFactoryOptions, dtls_in_stun) == 80);
+    assert!(core::mem::offset_of!(ReactorFactoryOptions, sctp_initial_cwnd_mtus) == 112);
+};
+
 impl Default for ReactorFactoryOptions {
     fn default() -> Self {
         Self {
