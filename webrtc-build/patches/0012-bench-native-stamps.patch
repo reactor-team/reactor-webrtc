@@ -1,0 +1,164 @@
+--- a/rtc_base/physical_socket_server.cc
++++ b/rtc_base/physical_socket_server.cc
+@@ -113,6 +113,30 @@
+                              u_int cnt,
+                              int flags) __attribute__((weak_import));
+ #endif  // WEBRTC_USE_APPLE_SENDMSG_X
++
++#include <atomic>
++#include "rtc_base/time_utils.h"
++
++// Reactor bench stamps (0012, bench only). Microseconds; *_utc are wall clock
++// (the kernel's SO_TIMESTAMP is), the rest TimeMicros(). The last data channel
++// message received: 0 kernel arrival (utc), 1 DTLS read (utc), 2 DTLS read,
++// 3 SCTP read (decrypted), 4 message delivered. The last message sent: 5
++// SendData entry, 6 its first DTLS send, 7 its first datagram handed to the
++// kernel, 8 SendData return, 9 1 when 7 came from a batch flush.
++namespace reactor_bench {
++std::atomic<int64_t> g_stamps[16];
++thread_local int64_t g_cur[4];
++thread_local bool g_pend_dtls = false;
++thread_local bool g_pend_sock = false;
++}  // namespace reactor_bench
++
++extern "C" __attribute__((visibility("default"))) void reactor_bench_stamps(
++    int64_t* out,
++    int n) {
++  for (int i = 0; i < n && i < 16; ++i) {
++    out[i] = reactor_bench::g_stamps[i].load(std::memory_order_relaxed);
++  }
++}
+ 
+ namespace webrtc {
+ 
+@@ -377,6 +401,11 @@
+   }
+   send_batch_.clear();
+   send_batch_bytes_.clear();
++  if (reactor_bench::g_pend_sock) {
++    reactor_bench::g_pend_sock = false;
++    reactor_bench::g_stamps[7].store(TimeMicros(), std::memory_order_relaxed);
++    reactor_bench::g_stamps[9].store(1, std::memory_order_relaxed);
++  }
+ }
+ #else
+ ScopedUdpSendBatch::ScopedUdpSendBatch() = default;
+@@ -682,6 +711,11 @@
+                0,
+ #endif
+                reinterpret_cast<sockaddr*>(&saddr), static_cast<int>(len));
++  if (reactor_bench::g_pend_sock) {
++    reactor_bench::g_pend_sock = false;
++    reactor_bench::g_stamps[7].store(TimeMicros(), std::memory_order_relaxed);
++    reactor_bench::g_stamps[9].store(0, std::memory_order_relaxed);
++  }
+   UpdateLastError();
+   MaybeRemapSendError();
+   // We have seen minidumps where this may be false.
+--- a/media/sctp/dcsctp_transport.cc
++++ b/media/sctp/dcsctp_transport.cc
+@@ -57,6 +57,29 @@
+ #include "rtc_base/trace_event.h"
+ #include "system_wrappers/include/clock.h"
+ 
++#include <atomic>
++#include "rtc_base/time_utils.h"
++
++// Reactor bench stamps (0012, bench only): see physical_socket_server.cc.
++namespace reactor_bench {
++extern std::atomic<int64_t> g_stamps[16];
++extern thread_local int64_t g_cur[4];
++extern thread_local bool g_pend_dtls;
++extern thread_local bool g_pend_sock;
++}  // namespace reactor_bench
++
++namespace {
++// Stamps SendData's return (8), whichever path it returns by.
++struct ReactorBenchSendReturn {
++  ~ReactorBenchSendReturn() {
++    reactor_bench::g_pend_dtls = false;
++    reactor_bench::g_pend_sock = false;
++    reactor_bench::g_stamps[8].store(webrtc::TimeMicros(),
++                                     std::memory_order_relaxed);
++  }
++};
++}  // namespace
++
+ namespace webrtc {
+ 
+ namespace {
+@@ -313,6 +336,12 @@
+                                    const SendDataParams& params,
+                                    const CopyOnWriteBuffer& payload) {
+   RTC_DCHECK_RUN_ON(network_thread_);
++  reactor_bench::g_stamps[5].store(TimeMicros(), std::memory_order_relaxed);
++  reactor_bench::g_stamps[6].store(0, std::memory_order_relaxed);
++  reactor_bench::g_stamps[7].store(0, std::memory_order_relaxed);
++  reactor_bench::g_pend_dtls = true;
++  reactor_bench::g_pend_sock = true;
++  ReactorBenchSendReturn reactor_bench_send_return;
+   RTC_DLOG(LS_VERBOSE) << debug_name_ << "->SendData(sid=" << sid
+                        << ", type=" << static_cast<int>(params.type)
+                        << ", length=" << payload.size() << ").";
+@@ -526,6 +555,11 @@
+ 
+ void DcSctpTransport::OnMessageReceived(dcsctp::DcSctpMessage message) {
+   RTC_DCHECK_RUN_ON(network_thread_);
++  for (int i = 0; i < 4; ++i) {
++    reactor_bench::g_stamps[i].store(reactor_bench::g_cur[i],
++                                     std::memory_order_relaxed);
++  }
++  reactor_bench::g_stamps[4].store(TimeMicros(), std::memory_order_relaxed);
+   RTC_DLOG(LS_VERBOSE) << debug_name_ << "->OnMessageReceived(sid="
+                        << message.stream_id().value()
+                        << ", ppid=" << message.ppid().value()
+@@ -756,6 +790,7 @@
+     PacketTransportInternal* /* transport */,
+     const ReceivedIpPacket& packet) {
+   RTC_DCHECK_RUN_ON(network_thread_);
++  reactor_bench::g_cur[3] = TimeMicros();
+   // TODO: bugs.webrtc.org/517079993 - follow RFC 7983 design.
+   if (packet.decryption_info() != ReceivedIpPacket::kDtlsDecrypted) {
+     // We are only interested in SCTP packets.
+--- a/p2p/dtls/dtls_transport.cc
++++ b/p2p/dtls/dtls_transport.cc
+@@ -57,6 +57,17 @@
+ #include "system_wrappers/include/clock.h"
+ #include "system_wrappers/include/metrics.h"
+ 
++#include <atomic>
++#include "rtc_base/time_utils.h"
++
++// Reactor bench stamps (0012, bench only): see physical_socket_server.cc.
++namespace reactor_bench {
++extern std::atomic<int64_t> g_stamps[16];
++extern thread_local int64_t g_cur[4];
++extern thread_local bool g_pend_dtls;
++extern thread_local bool g_pend_sock;
++}  // namespace reactor_bench
++
+ namespace webrtc {
+ namespace {
+ 
+@@ -623,6 +634,10 @@
+     size_t size,
+     const AsyncSocketPacketOptions& options,
+     int flags) {
++  if (reactor_bench::g_pend_dtls) {
++    reactor_bench::g_pend_dtls = false;
++    reactor_bench::g_stamps[6].store(TimeMicros(), std::memory_order_relaxed);
++  }
+   if (!dtls_active_) {
+     // Not doing DTLS.
+     return ice_transport()->SendPacket(data, size, options);
+@@ -869,6 +884,10 @@
+                                              const ReceivedIpPacket& packet,
+                                              bool piggybacked) {
+   RTC_DCHECK_RUN_ON(&thread_checker_);
++  reactor_bench::g_cur[0] =
++      packet.arrival_time() ? packet.arrival_time()->us() : 0;
++  reactor_bench::g_cur[1] = TimeUTCMicros();
++  reactor_bench::g_cur[2] = TimeMicros();
+   RTC_DCHECK(transport == ice_transport());
+ 
+   if (!dtls_active_) {

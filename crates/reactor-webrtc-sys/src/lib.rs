@@ -1142,3 +1142,18 @@ extern "C" {
         context: *mut std::ffi::c_void,
     ) -> c_int;
 }
+
+// Bench only (libwebrtc patch 0012): the native data channel stamps, exported
+// so a process can read them through ctypes.
+extern "C" {
+    fn reactor_bench_stamps(out: *mut i64, n: c_int);
+}
+
+/// Copies up to `n` (at most 16) bench stamps into `out`.
+///
+/// # Safety
+/// `out` must be valid for `n` writes.
+#[no_mangle]
+pub unsafe extern "C" fn reactor_webrtc_bench_stamps(out: *mut i64, n: c_int) {
+    reactor_bench_stamps(out, n)
+}
