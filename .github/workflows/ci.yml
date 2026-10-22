@@ -54,6 +54,8 @@ jobs:
         run: python3 .github/scripts/test-mise-pin.py
 
       - name: Test review bootstrap
+        env:
+          MISE_REVIEW_TEST_BINARY: mise
         run: python3 .github/scripts/test-mise-review-bootstrap.py
 
       - run: hk validate   # the hk.pkl that drives local git hooks parses
