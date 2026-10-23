@@ -1010,6 +1010,53 @@ class PeerConnectionFactoryBuilder:
         peer nothing changes. `build()` raises when the values cannot work
         together."""
         ...
+    def with_dc_callbacks_on_network_thread(self, enabled: bool) -> None:
+        """Run the data channels' callbacks (`on_message`, `on_state_change`,
+        `on_open`, `on_close`, `on_buffered_amount_low`) on libwebrtc's network
+        thread, where the events happen, instead of posting each one to the
+        signaling thread first. Default disabled.
+
+        It saves a thread hop per message: on loopback a small message's round
+        trip is 30-40% shorter. The network thread carries every packet of the
+        factory, and each callback holds it while it runs, GIL wait included:
+
+        - Return quickly. Hand the work to your event loop
+          (`loop.call_soon_threadsafe`) or a queue.
+        - Don't call `PeerConnection` methods from the callbacks: they wait on
+          the signaling thread, which may be waiting on the network thread.
+          The channel's own methods are fine: a state change or
+          `on_buffered_amount_low` they raise from inside a callback runs once
+          that callback returns.
+        - Another Python thread holding the GIL holds up the network thread
+          for as long as it does."""
+        ...
+    def with_sctp_tuning(
+        self,
+        low_latency: bool = False,
+        initial_cwnd_mtus: int | None = None,
+        min_cwnd_mtus: int | None = None,
+        rto_initial_ms: int | None = None,
+        rto_min_ms: int | None = None,
+        delayed_ack_max_ms: int | None = None,
+        immediate_sack_under_cwnd_mtus: int | None = None,
+    ) -> None:
+        """dcsctp's congestion control and timers for every data channel of
+        the factory (libwebrtc patch 0011). Each value left `None` keeps
+        upstream's: a 10-packet initial window, a 4-packet floor after a loss,
+        a 400 ms minimum retransmission timeout, SACKs held up to 200 ms.
+
+        `low_latency=True` is the setting for commands on a long or lossy path:
+        a 200-packet initial window, a 100-packet floor after a loss, SACKs
+        held at most 20 ms and asked for at once. On an emulated 200 ms path
+        with 0.1% loss it cut a 100 KB command from ~600 to ~200 ms and 1 MB
+        from ~5.5 to ~1.8 s; after an idle second, 1 MB went from 1.4 s to one
+        round trip. Set it on both ends. The floor keeps sending ~120 KB per
+        round trip after a loss instead of backing off, which suits commands
+        more than bulk transfers over congested links.
+
+        Keywords override single values, with or without `low_latency`.
+        `build()` raises `RuntimeError` for a value of 0 or out of range."""
+        ...
     def with_send_playout_delay(self, min_s: float = 0.0, max_s: float = 0.0) -> None:
         """Stamp the playout-delay RTP header extension on every video frame
         the factory sends, asking each receiver to keep its playout delay

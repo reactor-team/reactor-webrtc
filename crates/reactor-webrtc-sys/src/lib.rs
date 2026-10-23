@@ -189,7 +189,38 @@ pub struct ReactorFactoryOptions {
     pub recv_playout_delay_set: c_int,
     pub recv_playout_delay_min_ms: c_int,
     pub recv_playout_delay_max_ms: c_int,
+    /// dcsctp congestion control and timers for every data channel of the
+    /// factory, through the `WebRTC-DcSctp-*` field trials of libwebrtc patch
+    /// 0011. Each positive value overrides upstream's default; 0 keeps it.
+    /// Initial congestion window, in MTUs (upstream 10).
+    pub sctp_initial_cwnd_mtus: c_int,
+    /// Floor of the window after a loss detected by SACK, in MTUs (upstream 4).
+    pub sctp_min_cwnd_mtus: c_int,
+    /// Retransmission timeout before the first RTT sample, ms (upstream 500).
+    pub sctp_rto_initial_ms: c_int,
+    /// Retransmission timeout floor, ms (upstream 400).
+    pub sctp_rto_min_ms: c_int,
+    /// Longest the receiver holds a SACK, ms (upstream 200).
+    pub sctp_delayed_ack_max_ms: c_int,
+    /// Below this window, in MTUs, DATA asks for an immediate SACK (upstream 10).
+    pub sctp_immediate_sack_under_cwnd_mtus: c_int,
 }
+
+// Pins the layout of `ReactorFactoryOptions` against the C struct in
+// glue/reactor_webrtc.cpp, which carries the same numbers. Both sides build
+// from one checkout, so no ABI version guards this struct; it only grows at
+// its end, behind `size`. The offsets catch a field added on one side only
+// within a run of `int`s, which the size alone would not place.
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert!(
+        core::mem::size_of::<ReactorFactoryOptions>() == 136,
+        "ReactorFactoryOptions changed size — update the C struct in \
+         glue/reactor_webrtc.cpp and both assertions"
+    );
+    assert!(core::mem::offset_of!(ReactorFactoryOptions, dtls_in_stun) == 80);
+    assert!(core::mem::offset_of!(ReactorFactoryOptions, sctp_initial_cwnd_mtus) == 112);
+};
 
 impl Default for ReactorFactoryOptions {
     fn default() -> Self {
@@ -213,6 +244,12 @@ impl Default for ReactorFactoryOptions {
             recv_playout_delay_set: 0,
             recv_playout_delay_min_ms: 0,
             recv_playout_delay_max_ms: 0,
+            sctp_initial_cwnd_mtus: 0,
+            sctp_min_cwnd_mtus: 0,
+            sctp_rto_initial_ms: 0,
+            sctp_rto_min_ms: 0,
+            sctp_delayed_ack_max_ms: 0,
+            sctp_immediate_sack_under_cwnd_mtus: 0,
         }
     }
 }
@@ -748,6 +785,9 @@ extern "C" {
     /// `on_buffered_amount_low` fires when buffered_amount drops at or below the
     /// threshold set by `reactor_webrtc_data_channel_set_low_threshold`. Any
     /// pointer may be null. Replaces any previously registered observer.
+    /// `on_network_thread` nonzero runs the callbacks on the network thread,
+    /// where the events happen; 0 runs them on the signaling thread, as
+    /// libwebrtc does by default.
     pub fn reactor_webrtc_data_channel_register_observer(
         data_channel: *mut DataChannel,
         userdata: *mut c_void,
@@ -759,7 +799,18 @@ extern "C" {
         ),
         on_state_change: extern "C" fn(userdata: *mut c_void, state: c_int),
         on_buffered_amount_low: extern "C" fn(userdata: *mut c_void),
+        on_network_thread: c_int,
     );
+    /// Send, then read the buffered amount, in one trip to the network
+    /// thread. Returns 1 on success, 0 on failure; `buffered_after` (may be
+    /// null) receives the amount after the send either way.
+    pub fn reactor_webrtc_data_channel_send_measured(
+        data_channel: *mut DataChannel,
+        data: *const u8,
+        len: usize,
+        binary: c_int,
+        buffered_after: *mut u64,
+    ) -> c_int;
     /// Number of bytes currently queued for sending on the data channel.
     pub fn reactor_webrtc_data_channel_buffered_amount(data_channel: *mut DataChannel) -> u64;
     /// Copy the channel's label into `out` (NUL-terminated, capped at `cap`).

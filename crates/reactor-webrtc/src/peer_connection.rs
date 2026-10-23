@@ -1,6 +1,7 @@
 //! The peer connection and its associated signaling/data types.
 
 use std::ffi::{c_void, CStr, CString};
+use std::mem::ManuallyDrop;
 use std::os::raw::{c_char, c_int};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender};
@@ -1331,8 +1332,27 @@ impl RawDc {
             ) == 1
         }
     }
+    /// Send, and the buffered amount after it, in one trip to the network
+    /// thread instead of two.
+    fn send_measured(self, data: &[u8], binary: bool) -> (bool, u64) {
+        let mut after = 0u64;
+        let ok = unsafe {
+            reactor_webrtc_sys::reactor_webrtc_data_channel_send_measured(
+                self.0,
+                data.as_ptr(),
+                data.len(),
+                binary as c_int,
+                &mut after,
+            ) == 1
+        };
+        (ok, after)
+    }
     fn close(self) {
         unsafe { reactor_webrtc_sys::reactor_webrtc_data_channel_close(self.0) }
+    }
+    /// Unregisters the native observer and frees the handle.
+    fn destroy(self) {
+        unsafe { reactor_webrtc_sys::reactor_webrtc_data_channel_destroy(self.0) }
     }
 }
 
@@ -1360,6 +1380,56 @@ struct Chunked {
     // belongs to the pump (the queue's low-water mark).
     user_low_threshold: AtomicU64,
     user_low_armed: AtomicBool,
+    // libwebrtc's buffered amount as of the pump's last send, or UNKNOWN. Only
+    // the pump writes it, under `pump`. It is never below the real amount by
+    // more than the pump's own last frame (the native buffer only grows through
+    // the pump's sends), so trusting it up to `trust_below` cannot push the
+    // buffer past the high-water mark; above that, the pump asks libwebrtc.
+    native_est: AtomicU64,
+    trust_below: u64,
+}
+
+const UNKNOWN: u64 = u64::MAX;
+
+/// An event for the caller's handlers that libwebrtc can raise from inside a
+/// channel method: `close` changes the state, and `send` can report the
+/// buffer draining, both inline when the callbacks run on the network thread.
+enum Notice {
+    State(DataChannelState),
+    BufferedAmountLow,
+}
+
+/// Notices waiting for a handler of their channel to return.
+#[derive(Default)]
+struct Notices {
+    queue: std::collections::VecDeque<Notice>,
+    delivering: bool,
+}
+
+thread_local! {
+    // How many data channel callbacks this thread is inside; see
+    // `DataChannel`'s `Drop`.
+    static IN_DC_CALLBACK: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Marks this thread as inside a data channel callback while it lives.
+struct CallbackScope;
+
+impl CallbackScope {
+    fn enter() -> Self {
+        IN_DC_CALLBACK.with(|depth| depth.set(depth.get() + 1));
+        Self
+    }
+
+    fn active() -> bool {
+        IN_DC_CALLBACK.with(|depth| depth.get() > 0)
+    }
+}
+
+impl Drop for CallbackScope {
+    fn drop(&mut self) {
+        IN_DC_CALLBACK.with(|depth| depth.set(depth.get() - 1));
+    }
 }
 
 /// Everything the native observer reaches through `userdata`.
@@ -1371,7 +1441,14 @@ struct ChannelCore {
     on_open: Slot<EventCb>,
     on_close: Slot<EventCb>,
     on_buffered_amount_low: Slot<EventCb>,
+    // A handler holds its own lock while it runs, so a notice raised from
+    // inside one (a `close` from `on_message` or `on_state_change`, a `send`
+    // from `on_buffered_amount_low`) waits here until it returns.
+    notices: Mutex<Notices>,
     registered: AtomicBool,
+    // Whether the native observer asks libwebrtc for the network thread; see
+    // `PeerConnectionFactoryBuilder::with_dc_callbacks_on_network_thread`.
+    on_network_thread: bool,
     // The owning connection's chunking negotiation, and this channel's
     // decision, made once it is open.
     negotiation: Option<Arc<crate::dc_chunking::DcNegotiation>>,
@@ -1413,6 +1490,8 @@ impl ChannelCore {
                         self.early_low_threshold.load(Ordering::SeqCst),
                     ),
                     user_low_armed: AtomicBool::new(false),
+                    native_est: AtomicU64::new(UNKNOWN),
+                    trust_below: settings.send_config(&remote).low_water,
                 })
             }
             _ => None,
@@ -1445,6 +1524,7 @@ impl ChannelCore {
                 dc_on_message,
                 dc_on_state_change,
                 dc_on_buffered_amount_low,
+                self.on_network_thread as c_int,
             );
         }
     }
@@ -1471,8 +1551,21 @@ impl ChannelCore {
             };
             while c.pump_again.swap(false, Ordering::SeqCst) {
                 loop {
+                    // Read before taking the queue's lock: off the network
+                    // thread it waits on that thread, whose callbacks may be
+                    // waiting on the lock.
                     let check_start = Instant::now();
-                    let buffered = self.raw.buffered_amount();
+                    // The last send's reading while it is well below the
+                    // high-water mark; otherwise ask libwebrtc, which waits on
+                    // the network thread.
+                    let est = c.native_est.load(Ordering::SeqCst);
+                    let buffered = if est <= c.trust_below {
+                        est
+                    } else {
+                        let n = self.raw.buffered_amount();
+                        c.native_est.store(n, Ordering::SeqCst);
+                        n
+                    };
                     let build_start = Instant::now();
                     let (frame, queued_left) = {
                         let mut queue = c.queue.lock().unwrap();
@@ -1488,7 +1581,8 @@ impl ChannelCore {
                         break;
                     };
                     let native_start = Instant::now();
-                    let sent = self.raw.send(&frame, true);
+                    let (sent, after) = self.raw.send_measured(&frame, true);
+                    c.native_est.store(after, Ordering::SeqCst);
                     let native_end = Instant::now();
                     let steps = FrameSteps {
                         check_start,
@@ -1521,8 +1615,73 @@ impl ChannelCore {
     fn maybe_fire_user_low(&self, c: &Chunked) {
         let threshold = c.user_low_threshold.load(Ordering::SeqCst);
         if self.buffered_amount() <= threshold && c.user_low_armed.swap(false, Ordering::SeqCst) {
-            if let Some(cb) = self.on_buffered_amount_low.get() {
-                (*cb.lock().unwrap())();
+            self.notify(Notice::BufferedAmountLow);
+        }
+    }
+
+    /// Run the caller's handlers for `notice`, or, when it was raised from
+    /// inside one of this channel's handlers, right after that one returns.
+    /// A channel's callbacks all run on one thread, so `delivering` is only
+    /// ever set further up this thread's stack.
+    fn notify(&self, notice: Notice) {
+        {
+            let mut notices = self.notices.lock().unwrap();
+            notices.queue.push_back(notice);
+            if notices.delivering {
+                return;
+            }
+            notices.delivering = true;
+        }
+        self.deliver_notices();
+    }
+
+    /// Run `handler`, an `on_message` call from the native callback, holding
+    /// back the notices it raises (a `close`, a `send`) until it returns, as
+    /// `notify` does for the other handlers.
+    fn run_message_handler(&self, handler: impl FnOnce()) {
+        {
+            let mut notices = self.notices.lock().unwrap();
+            if notices.delivering {
+                drop(notices);
+                return handler();
+            }
+            notices.delivering = true;
+        }
+        handler();
+        self.deliver_notices();
+    }
+
+    /// Deliver the queued notices, then clear `delivering`. Called by whoever
+    /// set it.
+    fn deliver_notices(&self) {
+        loop {
+            let notice = {
+                let mut notices = self.notices.lock().unwrap();
+                let Some(notice) = notices.queue.pop_front() else {
+                    notices.delivering = false;
+                    return;
+                };
+                notice
+            };
+            match notice {
+                Notice::State(state) => {
+                    if let Some(cb) = self.on_state_change.get() {
+                        (*cb.lock().unwrap())(state);
+                    }
+                    let event = match state {
+                        DataChannelState::Open => Some(&self.on_open),
+                        DataChannelState::Closed => Some(&self.on_close),
+                        _ => None,
+                    };
+                    if let Some(cb) = event.and_then(Slot::get) {
+                        (*cb.lock().unwrap())();
+                    }
+                }
+                Notice::BufferedAmountLow => {
+                    if let Some(cb) = self.on_buffered_amount_low.get() {
+                        (*cb.lock().unwrap())();
+                    }
+                }
             }
         }
     }
@@ -1551,11 +1710,12 @@ impl ChannelCore {
 }
 
 extern "C" fn dc_on_message(ud: *mut c_void, data: *const u8, len: usize, binary: c_int) {
+    let _scope = CallbackScope::enter();
     let core = unsafe { &*(ud as *const ChannelCore) };
     let bytes = unsafe { std::slice::from_raw_parts(data, len) };
     let Some(c) = core.chunked() else {
         if let Some(cb) = core.on_message.get() {
-            (*cb.lock().unwrap())(bytes, binary != 0);
+            core.run_message_handler(|| (*cb.lock().unwrap())(bytes, binary != 0));
         }
         return;
     };
@@ -1574,7 +1734,7 @@ extern "C" fn dc_on_message(ud: *mut c_void, data: *const u8, len: usize, binary
     }
     match delivery {
         Ok(reactor_webrtc_dc_chunking::Delivery::Message { data, binary }) => {
-            core.deliver(c, data, binary)
+            core.run_message_handler(|| core.deliver(c, data, binary))
         }
         Ok(reactor_webrtc_dc_chunking::Delivery::Pending) => {}
         // Larger than this side's limit: dropped without buffering, and the
@@ -1590,6 +1750,7 @@ extern "C" fn dc_on_message(ud: *mut c_void, data: *const u8, len: usize, binary
 }
 
 extern "C" fn dc_on_state_change(ud: *mut c_void, state: c_int) {
+    let _scope = CallbackScope::enter();
     let core = unsafe { &*(ud as *const ChannelCore) };
     let state = DataChannelState::from_raw(state);
     match state {
@@ -1609,33 +1770,21 @@ extern "C" fn dc_on_state_change(ud: *mut c_void, state: c_int) {
         }
         _ => {}
     }
-    if let Some(cb) = core.on_state_change.get() {
-        (*cb.lock().unwrap())(state);
-    }
-    let event = match state {
-        DataChannelState::Open => Some(&core.on_open),
-        DataChannelState::Closed => Some(&core.on_close),
-        _ => None,
-    };
-    if let Some(cb) = event.and_then(Slot::get) {
-        (*cb.lock().unwrap())();
-    }
+    core.notify(Notice::State(state));
 }
 
 extern "C" fn dc_on_buffered_amount_low(ud: *mut c_void) {
+    let _scope = CallbackScope::enter();
     let core = unsafe { &*(ud as *const ChannelCore) };
     match core.decided.get() {
-        // The caller's own threshold is checked here, from the native event,
-        // never from inside a send: like libwebrtc, `send` does not call back.
+        // The caller's own threshold is checked here, from the native event.
+        // With network-thread callbacks that event can come from inside a
+        // native send, and so from inside `send`.
         Some(Some(c)) => {
             core.pump(c);
             core.maybe_fire_user_low(c);
         }
-        _ => {
-            if let Some(cb) = core.on_buffered_amount_low.get() {
-                (*cb.lock().unwrap())();
-            }
-        }
+        _ => core.notify(Notice::BufferedAmountLow),
     }
 }
 
@@ -1651,8 +1800,9 @@ extern "C" fn dc_on_buffered_amount_low(ud: *mut c_void) {
 pub struct DataChannel {
     raw: *mut reactor_webrtc_sys::DataChannel,
     // Addressed by the native observer as `userdata`; boxed so its address
-    // is stable for as long as the observer is registered.
-    core: Box<ChannelCore>,
+    // is stable for as long as the observer is registered. Freed by `Drop`,
+    // which may have to hand it to another thread first.
+    core: ManuallyDrop<Box<ChannelCore>>,
     // Keeps the factory's signaling/network threads alive for as long as this
     // channel exists — a caller can detach it and outlive both the connection
     // that created it and the factory that ultimately owns those threads.
@@ -1672,18 +1822,20 @@ impl DataChannel {
     ) -> Self {
         Self {
             raw,
-            core: Box::new(ChannelCore {
+            core: ManuallyDrop::new(Box::new(ChannelCore {
                 raw: RawDc(raw),
                 on_message: Slot::empty(),
                 on_state_change: Slot::empty(),
                 on_open: Slot::empty(),
                 on_close: Slot::empty(),
                 on_buffered_amount_low: Slot::empty(),
+                notices: Mutex::new(Notices::default()),
                 registered: AtomicBool::new(false),
+                on_network_thread: factory.dc_callbacks_on_network_thread,
                 negotiation: None,
                 decided: std::sync::OnceLock::new(),
                 early_low_threshold: AtomicU64::new(0),
-            }),
+            })),
             _factory: factory,
         }
     }
@@ -1825,8 +1977,10 @@ impl DataChannel {
     /// own buffer is empty, or `timeout` passes. Returns whether it drained.
     ///
     /// Don't call it (or [`close`](Self::close) with a drain timeout) from
-    /// this channel's callbacks: they run on libwebrtc's network thread, which
-    /// is the thread that sends, so nothing drains until the timeout passes.
+    /// this channel's callbacks: it holds up the thread that runs them, and
+    /// with [network-thread callbacks](crate::PeerConnectionFactoryBuilder::with_dc_callbacks_on_network_thread)
+    /// that is the thread that sends, so nothing drains until the timeout
+    /// passes.
     pub fn drain(&self, timeout: std::time::Duration) -> bool {
         // A timeout too large to add to now never expires.
         let deadline = std::time::Instant::now().checked_add(timeout);
@@ -1858,7 +2012,9 @@ impl DataChannel {
     }
 
     /// Receive handler — fires on every incoming message. The closure runs on
-    /// a WebRTC network thread; return quickly or offload heavy work. On a
+    /// the factory's signaling thread, or on its network thread with
+    /// [`with_dc_callbacks_on_network_thread`](crate::PeerConnectionFactoryBuilder::with_dc_callbacks_on_network_thread);
+    /// return quickly or offload heavy work. On a
     /// chunked channel it fires once per whole message, including any that
     /// arrived before it was set.
     pub fn on_message(&self, cb: impl for<'a> FnMut(&'a [u8], bool) + Send + 'static) {
@@ -1911,8 +2067,11 @@ impl DataChannel {
     /// Flow-control handler — fires when `buffered_amount` drops at or below
     /// the threshold set by [`set_buffered_amount_low_threshold`](Self::set_buffered_amount_low_threshold).
     ///
-    /// Like libwebrtc's, it never fires from inside [`send`](Self::send), so
-    /// it may call `send` to refill. On a chunked channel it is checked when
+    /// It may call [`send`](Self::send) to refill: a `send` from inside it
+    /// never runs it again before it returns. With
+    /// [network-thread callbacks](crate::PeerConnectionFactoryBuilder::with_dc_callbacks_on_network_thread)
+    /// a `send` from elsewhere can run it before returning, as libwebrtc's
+    /// own send does there. On a chunked channel it is checked when
     /// libwebrtc's buffer falls to the queue's low-water mark.
     pub fn on_buffered_amount_low(&self, cb: impl FnMut() + Send + 'static) {
         self.core.on_buffered_amount_low.set(Box::new(cb));
@@ -1932,8 +2091,30 @@ impl DataChannel {
 
 impl Drop for DataChannel {
     fn drop(&mut self) {
-        // Unregisters the native observer before the core box is freed.
-        unsafe { reactor_webrtc_sys::reactor_webrtc_data_channel_destroy(self.raw) }
+        let raw = RawDc(self.raw);
+        let core = unsafe { ManuallyDrop::take(&mut self.core) };
+        // The native observer is unregistered before the core box is freed.
+        let release = move || {
+            raw.destroy();
+            drop(core);
+        };
+        if !CallbackScope::active() {
+            release();
+            return;
+        }
+        // Dropped from inside a data channel callback, as the last owner. The
+        // callback up the stack still reads the core, and libwebrtc forbids
+        // unregistering from the network thread. Another thread's unregister
+        // waits on the callbacks' thread, so it frees the core only once the
+        // callback has returned. The factory's threads stay up until then.
+        let factory = Arc::clone(&self._factory);
+        std::thread::Builder::new()
+            .name("reactor-dc-release".into())
+            .spawn(move || {
+                release();
+                drop(factory);
+            })
+            .expect("spawn the data channel release thread");
     }
 }
 

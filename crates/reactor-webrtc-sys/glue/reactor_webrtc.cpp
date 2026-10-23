@@ -25,6 +25,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <initializer_list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -715,15 +716,22 @@ class ReactorDcObserver : public webrtc::DataChannelObserver {
                     void (*on_message)(void*, const uint8_t*, size_t, int),
                     void (*on_state_change)(void*, int),
                     void (*on_buffered_amount_low)(void*),
-                    uint64_t low_threshold)
+                    uint64_t low_threshold, bool on_network_thread)
       : channel_(channel),
         userdata_(userdata),
         on_message_(on_message),
         on_state_change_(on_state_change),
         on_buffered_amount_low_(on_buffered_amount_low),
-        low_threshold_(low_threshold) {}
+        low_threshold_(low_threshold),
+        on_network_thread_(on_network_thread) {}
 
   void SetLowThreshold(uint64_t t) { low_threshold_ = t; }
+
+  // True: libwebrtc calls this observer on its network thread, where the
+  // event happens. False (upstream's default): it posts every event to the
+  // signaling thread first, one thread hop per message. Read once, when the
+  // observer is registered.
+  bool IsOkToCallOnTheNetworkThread() override { return on_network_thread_; }
 
   void OnStateChange() override {
     if (!on_state_change_) return;
@@ -756,6 +764,7 @@ class ReactorDcObserver : public webrtc::DataChannelObserver {
   void (*on_state_change_)(void*, int);
   void (*on_buffered_amount_low_)(void*);
   uint64_t low_threshold_;
+  bool on_network_thread_;
 };
 
 // A data-channel handle (the `DataChannel` in the Rust API): the channel plus
@@ -764,6 +773,10 @@ struct ReactorDataChannel {
   webrtc::scoped_refptr<webrtc::DataChannelInterface> channel;
   std::unique_ptr<ReactorDcObserver> observer;
   uint64_t low_threshold = 0;  // persisted across observer re-registrations
+  // The factory's network thread, where the channel's Send and
+  // buffered_amount run. Null when unknown; the measured send then takes the
+  // proxy's two hops instead of one.
+  webrtc::Thread* network_thread = nullptr;
 };
 
 // A transceiver handle (the `RtpTransceiver` in the Rust API).
@@ -792,6 +805,9 @@ class ReactorPcObserver : public webrtc::PeerConnectionObserver {
  public:
   explicit ReactorPcObserver(const ReactorPcCallbacks& cb) : cb_(cb) {}
 
+  // Set right after construction, before any callback can fire.
+  void SetNetworkThread(webrtc::Thread* t) { network_thread_ = t; }
+
   void OnSignalingChange(
       webrtc::PeerConnectionInterface::SignalingState new_state) override {
     if (cb_.on_signaling_change)
@@ -817,8 +833,9 @@ class ReactorPcObserver : public webrtc::PeerConnectionObserver {
   void OnDataChannel(
       webrtc::scoped_refptr<webrtc::DataChannelInterface> dc) override {
     if (!cb_.on_data_channel) return;
-    cb_.on_data_channel(cb_.userdata,
-                        new ReactorDataChannel{std::move(dc), nullptr});
+    auto* h = new ReactorDataChannel{std::move(dc), nullptr};
+    h->network_thread = network_thread_;
+    cb_.on_data_channel(cb_.userdata, h);
   }
   // Forward both the legacy and the spec-compliant negotiation signals.
   void OnRenegotiationNeeded() override { fire_renegotiation(); }
@@ -845,6 +862,7 @@ class ReactorPcObserver : public webrtc::PeerConnectionObserver {
     if (cb_.on_renegotiation_needed) cb_.on_renegotiation_needed(cb_.userdata);
   }
   ReactorPcCallbacks cb_;
+  webrtc::Thread* network_thread_ = nullptr;
 };
 
 // Holds the observer alongside the peer connection. The PC holds a raw pointer
@@ -1430,6 +1448,7 @@ void* reactor_webrtc_peer_connection_create(void* factory,
   ReactorPcCallbacks cb{};
   if (callbacks) cb = *callbacks;
   rpc->observer = std::make_unique<ReactorPcObserver>(cb);
+  rpc->observer->SetNetworkThread(rpc->network_thread);
 
   webrtc::PeerConnectionInterface::RTCConfiguration rtc_config;
   rtc_config.sdp_semantics = webrtc::SdpSemantics::kUnifiedPlan;
@@ -1617,7 +1636,9 @@ void* reactor_webrtc_peer_connection_create_data_channel(void* pc,
   webrtc::DataChannelInit init;
   auto result = rpc->pc->CreateDataChannelOrError(label ? label : "", &init);
   if (!result.ok()) return nullptr;
-  return new ReactorDataChannel{result.MoveValue(), nullptr};
+  auto* h = new ReactorDataChannel{result.MoveValue(), nullptr};
+  h->network_thread = rpc->network_thread;
+  return h;
 }
 
 // Send bytes over a data channel. Returns 1 on success, 0 on failure.
@@ -1629,6 +1650,34 @@ int reactor_webrtc_data_channel_send(void* data_channel, const uint8_t* data,
   return h->channel->Send(webrtc::DataBuffer(buffer, binary != 0)) ? 1 : 0;
 }
 
+// Send bytes and read the channel's buffered amount after the send, in one
+// trip to the network thread. Through the proxy each is its own blocking call;
+// called on the network thread, both run inline. Returns 1 on success, 0 on
+// failure; `buffered_after` (may be null) receives the amount either way.
+int reactor_webrtc_data_channel_send_measured(void* data_channel, const uint8_t* data,
+                                              size_t len, int binary,
+                                              uint64_t* buffered_after) {
+  auto* h = reinterpret_cast<ReactorDataChannel*>(data_channel);
+  if (!h || !h->channel) return 0;
+  webrtc::CopyOnWriteBuffer buffer(data, len);
+  bool ok = false;
+  uint64_t amount = 0;
+  auto send = [&] {
+    ok = h->channel->Send(webrtc::DataBuffer(buffer, binary != 0));
+    amount = h->channel->buffered_amount();
+  };
+  // Already on the network thread (the pump of a channel whose callbacks run
+  // there), run inline, as libwebrtc's own proxy does: a BlockingCall from a
+  // thread to itself trips IsInvokeToThreadAllowed in builds with DCHECKs.
+  if (h->network_thread && !h->network_thread->IsCurrent()) {
+    h->network_thread->BlockingCall(send);
+  } else {
+    send();
+  }
+  if (buffered_after) *buffered_after = amount;
+  return ok ? 1 : 0;
+}
+
 // Register callbacks for a data channel.
 // `on_message(userdata, data, len, binary)` fires per message.
 // `on_state_change(userdata, state)` fires on all state transitions;
@@ -1636,17 +1685,19 @@ int reactor_webrtc_data_channel_send(void* data_channel, const uint8_t* data,
 // `on_buffered_amount_low(userdata)` fires when buffered_amount drops at or
 //   below the threshold set by reactor_webrtc_data_channel_set_low_threshold.
 // Any pointer may be null. Replaces any previously registered observer.
+// `on_network_thread` nonzero: the callbacks run on the network thread, where
+// the events happen; 0: on the signaling thread, as upstream does by default.
 void reactor_webrtc_data_channel_register_observer(
     void* data_channel, void* userdata,
     void (*on_message)(void*, const uint8_t*, size_t, int),
     void (*on_state_change)(void*, int),
-    void (*on_buffered_amount_low)(void*)) {
+    void (*on_buffered_amount_low)(void*), int on_network_thread) {
   auto* h = reinterpret_cast<ReactorDataChannel*>(data_channel);
   if (!h || !h->channel) return;
   if (h->observer) h->channel->UnregisterObserver();
   h->observer = std::make_unique<ReactorDcObserver>(
       h->channel.get(), userdata, on_message, on_state_change,
-      on_buffered_amount_low, h->low_threshold);
+      on_buffered_amount_low, h->low_threshold, on_network_thread != 0);
   h->channel->RegisterObserver(h->observer.get());
 }
 
@@ -2453,8 +2504,29 @@ struct ReactorFactoryOptions {
   int                          recv_playout_delay_set;
   int                          recv_playout_delay_min_ms;
   int                          recv_playout_delay_max_ms;
+  // dcsctp congestion control and timers for every data channel of the
+  // factory, answered as the WebRTC-DcSctp-* field trials of patch 0011. Each
+  // > 0 overrides upstream's default; 0 keeps it.
+  int                          sctp_initial_cwnd_mtus;      // default 10
+  int                          sctp_min_cwnd_mtus;          // default 4
+  int                          sctp_rto_initial_ms;         // default 500
+  int                          sctp_rto_min_ms;             // default 400
+  int                          sctp_delayed_ack_max_ms;     // default 200
+  int                          sctp_immediate_sack_under_cwnd_mtus;  // default 10
 };
 }
+
+// Pins the layout against the repr(C) mirror in reactor-webrtc-sys/src/lib.rs,
+// which carries the same numbers. Both build from one checkout, so no ABI
+// version guards this struct; it only grows at its end, behind `size`. The
+// offsets catch a field added on one side only within a run of ints.
+static_assert(sizeof(void*) != 8 || sizeof(ReactorFactoryOptions) == 136,
+              "ReactorFactoryOptions changed size — update the repr(C) mirror "
+              "in reactor-webrtc-sys/src/lib.rs and both assertions");
+static_assert(sizeof(void*) != 8 ||
+              offsetof(ReactorFactoryOptions, dtls_in_stun) == 80);
+static_assert(sizeof(void*) != 8 ||
+              offsetof(ReactorFactoryOptions, sctp_initial_cwnd_mtus) == 112);
 
 struct ReactorEncoderState {
   reactor_video_encode_cb        cb;
@@ -2806,10 +2878,12 @@ class ReactorFieldTrials : public webrtc::FieldTrialsView {
     int sctp_max_burst = 0;
     std::string send_playout_delay;
     std::string recv_playout_delay;
+    // Patch 0011: WebRTC-DcSctp-<name> → value, only for the options set.
+    std::map<std::string, int> sctp_tuning;
 
     bool any() const {
       return dtls_in_stun || sctp_max_burst > 0 || !send_playout_delay.empty() ||
-             !recv_playout_delay.empty();
+             !recv_playout_delay.empty() || !sctp_tuning.empty();
     }
   };
 
@@ -2818,6 +2892,10 @@ class ReactorFieldTrials : public webrtc::FieldTrialsView {
   std::string Lookup(absl::string_view key) const override {
     // SPED: piggyback the DTLS handshake on the ICE binding requests.
     if (s_.dtls_in_stun && key == "WebRTC-IceHandshakeDtls") return "Enabled";
+    // Patch 0011: dcsctp congestion control and timers.
+    if (auto it = s_.sctp_tuning.find(std::string(key)); it != s_.sctp_tuning.end()) {
+      return std::to_string(it->second);
+    }
     // Patch 0005: dcsctp packets per Send() and per SACK.
     if (s_.sctp_max_burst > 0 && key == "WebRTC-DcSctp-MaxBurst") {
       return std::to_string(s_.sctp_max_burst);
@@ -2884,6 +2962,16 @@ void* reactor_webrtc_factory_create(const ReactorFactoryOptions* opts,
   ReactorFieldTrials::Settings trial_settings;
   trial_settings.dtls_in_stun = opts->dtls_in_stun != 0;
   trial_settings.sctp_max_burst = opts->sctp_max_burst;
+  for (const auto& [key, value] : std::initializer_list<std::pair<const char*, int>>{
+           {"WebRTC-DcSctp-InitialCwndMtus", opts->sctp_initial_cwnd_mtus},
+           {"WebRTC-DcSctp-MinCwndMtus", opts->sctp_min_cwnd_mtus},
+           {"WebRTC-DcSctp-RtoInitialMs", opts->sctp_rto_initial_ms},
+           {"WebRTC-DcSctp-RtoMinMs", opts->sctp_rto_min_ms},
+           {"WebRTC-DcSctp-DelayedAckMaxTimeoutMs", opts->sctp_delayed_ack_max_ms},
+           {"WebRTC-DcSctp-ImmediateSackUnderCwndMtus",
+            opts->sctp_immediate_sack_under_cwnd_mtus}}) {
+    if (value > 0) trial_settings.sctp_tuning[key] = value;
+  }
   if (opts->send_playout_delay_set) {
     trial_settings.send_playout_delay = ReactorFieldTrials::PlayoutDelay(
         opts->send_playout_delay_min_ms, opts->send_playout_delay_max_ms);

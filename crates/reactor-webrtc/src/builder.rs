@@ -1,7 +1,9 @@
 //! [`PeerConnectionFactoryBuilder`] — the composable entry point for every
 //! [`PeerConnectionFactory`].
 
-use crate::{AdmMode, ApmConfig, DcChunking, PeerConnectionFactory, PlayoutDelay, Result};
+use crate::{
+    AdmMode, ApmConfig, DcChunking, PeerConnectionFactory, PlayoutDelay, Result, SctpTuning,
+};
 
 /// Builds a [`PeerConnectionFactory`] knob by knob — the single entry point
 /// that replaced the old mutually-exclusive constructors (they could not
@@ -33,6 +35,8 @@ pub struct PeerConnectionFactoryBuilder {
     metadata: bool,
     dtls_in_stun: bool,
     dc_chunking: Option<DcChunking>,
+    dc_callbacks_on_network_thread: bool,
+    sctp_tuning: Option<SctpTuning>,
     send_playout_delay: Option<PlayoutDelay>,
     receive_playout_delay: Option<PlayoutDelay>,
     #[cfg(feature = "openh264")]
@@ -47,6 +51,8 @@ impl PeerConnectionFactoryBuilder {
             metadata: true,
             dtls_in_stun: false,
             dc_chunking: None,
+            dc_callbacks_on_network_thread: false,
+            sctp_tuning: None,
             send_playout_delay: None,
             receive_playout_delay: None,
             #[cfg(feature = "openh264")]
@@ -147,6 +153,55 @@ impl PeerConnectionFactoryBuilder {
         self
     }
 
+    /// Run the callbacks of this factory's data channels (`on_message`,
+    /// `on_state_change`, `on_open`, `on_close`, `on_buffered_amount_low`) on
+    /// libwebrtc's network thread, where the events happen. Off by default:
+    /// libwebrtc then posts every event to the signaling thread first.
+    ///
+    /// It saves that thread hop on every message and every buffer event. On
+    /// loopback a 64 B ping's round trip is 30–40% shorter, and a reply sent
+    /// from `on_message` leaves without waiting on another thread either. Large
+    /// messages, which spend their time on the wire, gain little.
+    ///
+    /// The price is that the callbacks now hold up the network thread, which
+    /// carries every packet of every connection of the factory:
+    ///
+    /// - Return quickly. Hand anything slow (decoding, I/O, a lock other
+    ///   threads hold for long) to another thread.
+    /// - Don't call [`PeerConnection`](crate::PeerConnection) methods from
+    ///   them: those wait on the signaling thread, which may itself be waiting
+    ///   on the network thread, and that deadlocks. The channel's own methods
+    ///   (`send`, `buffered_amount`, `state`, `close`, the handler setters) are
+    ///   fine; they run inline on the network thread. A state change or
+    ///   `on_buffered_amount_low` they raise from inside any of the channel's
+    ///   handlers, `on_message` included, reaches the handlers once that one
+    ///   returns, and dropping the channel's last handle there finishes its
+    ///   release on another thread. (Messages held until `on_message` is set
+    ///   run on the thread that sets it, outside this.)
+    /// - Don't block on a thread that is itself waiting on a data channel
+    ///   call, such as a `send` from another thread holding a lock the
+    ///   callback needs.
+    pub fn with_dc_callbacks_on_network_thread(mut self, enabled: bool) -> Self {
+        self.dc_callbacks_on_network_thread = enabled;
+        self
+    }
+
+    /// dcsctp's congestion control and timers for every data channel of the
+    /// factory (see [`SctpTuning`]): the window it starts with and falls back
+    /// to after a loss, and how quickly the receiver acknowledges. Off by
+    /// default, which keeps upstream's values, tuned for bulk transfers.
+    ///
+    /// [`SctpTuning::low_latency`] is the setting for commands on a long or
+    /// lossy path. Set it on both ends: the sender's window and the receiver's
+    /// acknowledgements decide each transfer together. A factory knob, like
+    /// [`with_dc_chunking`](Self::with_dc_chunking): libwebrtc reads it from
+    /// field trials in the factory's `Environment` (libwebrtc patch 0011).
+    /// [`build`](Self::build) fails on a value out of range.
+    pub fn with_sctp_tuning(mut self, tuning: SctpTuning) -> Self {
+        self.sctp_tuning = Some(tuning);
+        self
+    }
+
     /// Ask every receiver of this factory's video to hold its playout delay
     /// within `delay`, by stamping the playout-delay RTP header extension on
     /// every frame sent. Off by default: libwebrtc's own encoders never ask for
@@ -210,6 +265,9 @@ impl PeerConnectionFactoryBuilder {
         if let Some(chunking) = &self.dc_chunking {
             chunking.validate()?;
         }
+        if let Some(tuning) = &self.sctp_tuning {
+            tuning.validate()?;
+        }
         let send_playout = self.send_playout_delay.map(|d| d.validate()).transpose()?;
         let recv_playout = self
             .receive_playout_delay
@@ -248,6 +306,9 @@ impl PeerConnectionFactoryBuilder {
             openh264_lib_path: openh264_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
             ..Default::default()
         };
+        if let Some(tuning) = &self.sctp_tuning {
+            tuning.apply(&mut opts);
+        }
         registry.install_into(&mut opts);
         #[cfg(feature = "openh264")]
         let openh264_registered = self.openh264.is_some();
@@ -266,6 +327,7 @@ impl PeerConnectionFactoryBuilder {
             &opts,
             self.metadata,
             self.dc_chunking,
+            self.dc_callbacks_on_network_thread,
             registry.clone(),
             openh264_registered,
         )

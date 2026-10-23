@@ -1,0 +1,177 @@
+diff --git a/rtc_base/physical_socket_server.cc b/rtc_base/physical_socket_server.cc
+index e5b05ce..6fd888c 100644
+--- a/rtc_base/physical_socket_server.cc
++++ b/rtc_base/physical_socket_server.cc
+@@ -13,6 +13,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <atomic>
+ #include <cerrno>
+ #include <cstdint>
+ #include <cstring>
+@@ -93,6 +94,26 @@ typedef char* SockOptArg;
+ #endif  // !defined(EPOLLRDHUP)
+ #endif  // defined(WEBRTC_LINUX)
+ 
++#if defined(WEBRTC_USE_APPLE_SENDMSG_X)
++// Reactor (0010): from XNU's bsd/sys/socket_private.h, which the SDK does not
++// ship. Weak, so a macOS without it still loads and falls back to sendto();
++// an ENOSYS at runtime does the same.
++struct msghdr_x {
++  void* msg_name;
++  socklen_t msg_namelen;
++  struct iovec* msg_iov;
++  int msg_iovlen;
++  void* msg_control;
++  socklen_t msg_controllen;
++  int msg_flags;
++  size_t msg_datalen;
++};
++extern "C" ssize_t sendmsg_x(int s,
++                             const struct msghdr_x* msgp,
++                             u_int cnt,
++                             int flags) __attribute__((weak_import));
++#endif  // WEBRTC_USE_APPLE_SENDMSG_X
++
+ namespace webrtc {
+ 
+ namespace {
+@@ -215,6 +236,16 @@ UdpSendBatchState& ThreadUdpSendBatch() {
+ }
+ #endif  // WEBRTC_USE_UDP_SEND_BATCH
+ 
++#if defined(WEBRTC_USE_APPLE_SENDMSG_X)
++// Cleared for the process once sendmsg_x() reports ENOSYS.
++std::atomic<bool> g_sendmsg_x_works{true};
++
++bool SendmsgXAvailable() {
++  return sendmsg_x != nullptr &&
++         g_sendmsg_x_works.load(std::memory_order_relaxed);
++}
++#endif  // WEBRTC_USE_APPLE_SENDMSG_X
++
+ }  // namespace
+ 
+ #if defined(WEBRTC_USE_UDP_SEND_BATCH)
+@@ -265,21 +296,58 @@ void PhysicalSocket::FlushSendBatch() {
+   }
+   const size_t n = send_batch_.size();
+   RTC_DCHECK_LE(n, ScopedUdpSendBatch::kMaxUdpSendBatch);
++#if defined(WEBRTC_USE_APPLE_SENDMSG_X)
++  std::array<msghdr_x, ScopedUdpSendBatch::kMaxUdpSendBatch> msgs = {};
++#else
+   std::array<mmsghdr, ScopedUdpSendBatch::kMaxUdpSendBatch> msgs = {};
++#endif
+   std::array<iovec, ScopedUdpSendBatch::kMaxUdpSendBatch> iovs = {};
+   for (size_t i = 0; i < n; ++i) {
+     QueuedDatagram& datagram = send_batch_[i];
+     iovs[i].iov_base = send_batch_bytes_.data() + datagram.offset;
+     iovs[i].iov_len = datagram.length;
++#if defined(WEBRTC_USE_APPLE_SENDMSG_X)
++    msgs[i].msg_name = &datagram.addr;
++    msgs[i].msg_namelen = datagram.addr_len;
++    msgs[i].msg_iov = &iovs[i];
++    msgs[i].msg_iovlen = 1;
++#else
+     msgs[i].msg_hdr.msg_name = &datagram.addr;
+     msgs[i].msg_hdr.msg_namelen = datagram.addr_len;
+     msgs[i].msg_hdr.msg_iov = &iovs[i];
+     msgs[i].msg_hdr.msg_iovlen = 1;
++#endif
+   }
+   size_t done = 0;
+   while (done < n && s_ != INVALID_SOCKET) {
++#if defined(WEBRTC_USE_APPLE_SENDMSG_X)
++    // Reactor (0010): sendmsg_x() where available, else one sendto().
++    int sent;
++    if (SendmsgXAvailable()) {
++      sent = static_cast<int>(sendmsg_x(s_, msgs.data() + done,
++                                        static_cast<u_int>(n - done), 0));
++      if (sent < 0 && errno == ENOSYS) {
++        g_sendmsg_x_works.store(false, std::memory_order_relaxed);
++        continue;
++      }
++      if (sent == 0) {
++        // Nothing taken: treat it as a full buffer.
++        sent = -1;
++        errno = EWOULDBLOCK;
++      }
++    } else {
++      const QueuedDatagram& datagram = send_batch_[done];
++      sent = ::sendto(s_, send_batch_bytes_.data() + datagram.offset,
++                      datagram.length, 0,
++                      reinterpret_cast<const sockaddr*>(&datagram.addr),
++                      datagram.addr_len) < 0
++                 ? -1
++                 : 1;
++    }
++#else
+     int sent = ::sendmmsg(s_, msgs.data() + done, static_cast<unsigned>(n - done),
+                           MSG_NOSIGNAL);
++#endif
+     if (sent > 0) {
+       done += sent;
+       continue;
+@@ -292,7 +360,16 @@ void PhysicalSocket::FlushSendBatch() {
+     if (IsBlockingError(GetError())) {
+       // The rest are dropped, as a sendto() that would block drops its one.
+       EnableEvents(DE_WRITE);
++#if defined(WEBRTC_USE_APPLE_SENDMSG_X)
++      // Reactor (0010): except on macOS, where the error is often one
++      // destination's (ENOBUFS from a VPN or other interface's queue) and a
++      // read event's batch mixes ICE checks to many candidates: only the
++      // datagram that would block is dropped, as with separate sendto()s.
++      ++done;
++      continue;
++#else
+       break;
++#endif
+     }
+     // The datagram at `done` failed on its own (e.g. an ICMP error for its
+     // destination); the others still go out, as separate sendto()s would.
+@@ -1224,6 +1301,14 @@ void SocketDispatcher::OnEvent(uint32_t ff, int err) {
+   }
+   if ((ff & DE_READ) != 0) {
+     DisableEvents(DE_READ);
++#if defined(WEBRTC_USE_APPLE_SENDMSG_X)
++    // Reactor (0010): on macOS a read event's sends batch too: in a data
++    // channel transfer most packets leave when an incoming SACK frees the
++    // congestion window, so batching only tasks reached ~3% of them. Linux
++    // leaves events unbatched (see 0009); macOS showed no receiver drops with
++    // it, from 100 KB to 4 MB messages over loopback.
++    ScopedUdpSendBatch send_batch;
++#endif
+     NotifyReadEvent(this);
+   }
+   if ((ff & DE_WRITE) != 0) {
+diff --git a/rtc_base/physical_socket_server.h b/rtc_base/physical_socket_server.h
+index f95ba44..611c937 100644
+--- a/rtc_base/physical_socket_server.h
++++ b/rtc_base/physical_socket_server.h
+@@ -38,6 +38,16 @@
+ #include <poll.h>
+ 
+ #define WEBRTC_USE_POLL 1
++#if defined(WEBRTC_MAC) && !defined(WEBRTC_IOS) && \
++    !defined(WEBRTC_DISABLE_APPLE_SENDMSG_X)
++// Reactor (0010): flush the UDP send batch with sendmsg_x(), macOS's
++// counterpart of sendmmsg(). It is private API (XNU's socket_private.h), so
++// never on iOS, and a build that must not reference it defines
++// WEBRTC_DISABLE_APPLE_SENDMSG_X.
++#include <sys/types.h>
++#define WEBRTC_USE_UDP_SEND_BATCH 1
++#define WEBRTC_USE_APPLE_SENDMSG_X 1
++#endif
+ #else
+ // On other POSIX systems, use select by default.
+ #endif  // WEBRTC_LINUX, WEBRTC_FUCHSIA, WEBRTC_MAC
+@@ -79,7 +89,7 @@ class PhysicalSocket;
+ // like any UDP datagram, and a blocking error re-arms the write event as a
+ // failed sendto() would.
+ //
+-// Linux only (WEBRTC_USE_UDP_SEND_BATCH); elsewhere a scope does nothing.
++// Linux, and macOS with sendmsg_x() (0010); elsewhere a scope does nothing.
+ class RTC_EXPORT ScopedUdpSendBatch {
+  public:
+   static constexpr size_t kMaxUdpSendBatch = 16;

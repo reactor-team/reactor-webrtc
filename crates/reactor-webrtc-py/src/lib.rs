@@ -3243,6 +3243,63 @@ impl PeerConnectionFactoryBuilder {
         Ok(())
     }
 
+    /// Run the data channels' callbacks on libwebrtc's network thread instead
+    /// of posting each event to the signaling thread first. Default disabled.
+    /// Saves a thread hop per message; every callback then takes the GIL on
+    /// the network thread, so keep them short. See the stub for the rules.
+    fn with_dc_callbacks_on_network_thread(&mut self, enabled: bool) -> PyResult<()> {
+        let b = self
+            .pending
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("builder already consumed by build()"))?;
+        self.pending = Some(b.with_dc_callbacks_on_network_thread(enabled));
+        Ok(())
+    }
+
+    /// dcsctp's congestion control and timers for every data channel of the
+    /// factory. `low_latency=True` starts from the setting for commands on a
+    /// long or lossy path; each keyword given overrides one value. Set it on
+    /// both ends. `build()` raises on a value out of range.
+    #[pyo3(signature = (
+        low_latency = false,
+        initial_cwnd_mtus = None,
+        min_cwnd_mtus = None,
+        rto_initial_ms = None,
+        rto_min_ms = None,
+        delayed_ack_max_ms = None,
+        immediate_sack_under_cwnd_mtus = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn with_sctp_tuning(
+        &mut self,
+        low_latency: bool,
+        initial_cwnd_mtus: Option<u32>,
+        min_cwnd_mtus: Option<u32>,
+        rto_initial_ms: Option<u32>,
+        rto_min_ms: Option<u32>,
+        delayed_ack_max_ms: Option<u32>,
+        immediate_sack_under_cwnd_mtus: Option<u32>,
+    ) -> PyResult<()> {
+        let b = self
+            .pending
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("builder already consumed by build()"))?;
+        let mut t = if low_latency {
+            rw::SctpTuning::low_latency()
+        } else {
+            rw::SctpTuning::default()
+        };
+        t.initial_cwnd_mtus = initial_cwnd_mtus.or(t.initial_cwnd_mtus);
+        t.min_cwnd_mtus = min_cwnd_mtus.or(t.min_cwnd_mtus);
+        t.rto_initial_ms = rto_initial_ms.or(t.rto_initial_ms);
+        t.rto_min_ms = rto_min_ms.or(t.rto_min_ms);
+        t.delayed_ack_max_ms = delayed_ack_max_ms.or(t.delayed_ack_max_ms);
+        t.immediate_sack_under_cwnd_mtus =
+            immediate_sack_under_cwnd_mtus.or(t.immediate_sack_under_cwnd_mtus);
+        self.pending = Some(b.with_sctp_tuning(t));
+        Ok(())
+    }
+
     /// Stamp the playout-delay RTP header extension on every video frame the
     /// factory sends, asking each receiver to keep its playout delay between
     /// `min_s` and `max_s` seconds. The defaults (both 0) ask for immediate

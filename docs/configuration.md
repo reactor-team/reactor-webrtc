@@ -16,6 +16,8 @@ an existing `pc`.
 - [ICE timeouts](#ice-timeouts)
 - [Faster connection setup (WARP: SPED + SNAP)](#faster-connection-setup-warp-sped--snap)
 - [Large data-channel messages (max_burst and chunking)](#large-data-channel-messages-max_burst-and-chunking)
+- [Data-channel callbacks on the network thread](#data-channel-callbacks-on-the-network-thread)
+- [Data-channel latency on long paths (SCTP tuning)](#data-channel-latency-on-long-paths-sctp-tuning)
 - [Congestion-control bitrate limits](#congestion-control-bitrate-limits)
 - [Per-sender bitrate limits](#per-sender-bitrate-limits)
 
@@ -456,6 +458,127 @@ In Python, `DataChannel.handoff_stats()` returns a `MessageHandoffStats` with
 message (after its reassembly, on a chunked channel) until the `on_message`
 callback is called, which is the wait for the GIL and the copy into `bytes`.
 It counts from the last `on_message` call.
+
+## Data-channel callbacks on the network thread
+
+By default libwebrtc runs a data channel's callbacks (`on_message`,
+`on_state_change`, `on_open`, `on_close`, `on_buffered_amount_low`) on the
+signaling thread: each event happens on the network thread and is posted to
+the signaling thread, one thread hop per message. A reply sent from
+`on_message` then waits on the network thread again.
+
+`PeerConnectionFactoryBuilder::with_dc_callbacks_on_network_thread(true)` runs
+them on the network thread instead, for every data channel of the factory. On
+loopback it cuts a 64 B ping's round trip by 30–40% (macOS: 67 → 46 µs; Linux:
+123 → 78 µs), and a 100 KB message's by 14–18% on Linux. Large messages,
+which spend their time on the wire, gain little.
+
+The network thread carries every packet of every connection of the factory,
+and a callback holds it for as long as it runs:
+
+- Return quickly. Hand slow work to another thread.
+- Don't call `PeerConnection` methods from the callbacks. They wait on the
+  signaling thread, which may be waiting on the network thread: a deadlock.
+  The channel's own methods (`send`, `buffered_amount`, `state`, `close`, the
+  handler setters) are fine; they run inline. A state change or
+  `on_buffered_amount_low` they raise from inside a handler, `on_message`
+  included, reaches the handlers once that one returns, and dropping the
+  channel's last handle there finishes its release on another thread.
+- Don't wait on a thread that is itself in a data channel call (a `send` from
+  another thread, say) or holding a lock that such a thread needs.
+- Don't call `drain()` (or `close()` with a drain timeout) from them: the
+  network thread is the one that sends, so nothing drains until the timeout.
+
+In Python each callback takes the GIL on the network thread, so another thread
+holding the GIL holds up the network thread too. Hand the work to the event
+loop with `loop.call_soon_threadsafe`.
+
+<details>
+<summary>🦀 Example using Rust</summary>
+
+```rust
+let factory = PeerConnectionFactory::builder()
+    .with_dc_callbacks_on_network_thread(true)
+    .build()
+    .expect("factory");
+```
+
+</details>
+
+<details>
+<summary>🐍 Example using Python</summary>
+
+```python
+builder = rw.PeerConnectionFactoryBuilder()
+builder.with_dc_callbacks_on_network_thread(True)
+factory = builder.build()
+
+loop = asyncio.get_running_loop()
+dc.on_message(lambda data, binary: loop.call_soon_threadsafe(inbox.put_nowait, data))
+```
+
+</details>
+
+## Data-channel latency on long paths (SCTP tuning)
+
+On a long path, a data-channel command's latency is a count of round trips, and
+dcsctp's defaults, tuned for bulk transfers, add round trips in two places:
+
+- After a lost packet the sending window halves (to no less than 4 packets) and
+  grows back one packet per round trip. At 200 ms and 0.1% loss a 100 KB
+  command then takes two or three round trips, and 1 MB about five seconds.
+- The receiver holds each SACK for up to 200 ms. Over a 200 ms path that
+  reaches the retransmission timeout, which then fires for nothing and drops
+  the window to one packet: after an idle pause, the next large command starts
+  over from one packet.
+
+`PeerConnectionFactoryBuilder::with_sctp_tuning(SctpTuning::low_latency())`
+changes both for every data channel of the factory (libwebrtc patch 0011): the
+window starts at 200 packets and falls no lower than 100 after a loss, and SACKs
+are sent at once. Set it on both ends: the sender's window and the receiver's
+acknowledgements decide each transfer together. On an emulated 200 ms path:
+
+| Command | Upstream (median) | `low_latency()` (median) |
+|---|---|---|
+| 100 KB, 0.1% loss | 605 ms | 203 ms |
+| 1 MB, 0.1% loss | 5.5 s | 1.8 s |
+| 1 MB after a 1 s pause, no loss | 1.4 s | 214 ms |
+
+Pings and back-to-back commands on a clean path already take one round trip and
+do not change. The window floor is the aggressive part: after a loss the
+channel keeps sending about 120 KB per round trip instead of backing off as TCP
+would. That suits commands; a channel moving tens of megabytes over congested
+links may lose more with it. Every field of `SctpTuning` can be set on its own;
+`None` keeps upstream's value.
+
+<details>
+<summary>🦀 Example using Rust</summary>
+
+```rust
+use reactor_webrtc::{PeerConnectionFactory, SctpTuning};
+
+let factory = PeerConnectionFactory::builder()
+    .with_sctp_tuning(SctpTuning::low_latency())
+    .build()
+    .expect("factory");
+
+// Or one value at a time; the rest keep upstream's.
+let mut tuning = SctpTuning::default();
+tuning.delayed_ack_max_ms = Some(20);
+```
+
+</details>
+
+<details>
+<summary>🐍 Example using Python</summary>
+
+```python
+builder = rw.PeerConnectionFactoryBuilder()
+builder.with_sctp_tuning(low_latency=True)          # or e.g. min_cwnd_mtus=64
+factory = builder.build()
+```
+
+</details>
 
 ## Congestion-control bitrate limits
 
