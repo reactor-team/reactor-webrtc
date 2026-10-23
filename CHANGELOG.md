@@ -1,5 +1,58 @@
 # Changelog
 
+## 0.24.2 — data channel latency, and a factory on an x86_64 android emulator
+
+A data channel message spent most of its time in per-packet overhead and in
+round trips that dcsctp's bulk-transfer defaults add on a long path. This
+release cuts both, and fixes the crash that 0.24.1's `android-x64` prebuilt hit
+on every factory create.
+
+The prebuilt tag becomes `webrtc-7907-a5ddff60-p13`.
+
+### Added
+
+In Rust and Python:
+
+- **`with_sctp_tuning`** on the factory builder: `SctpTuning` in Rust,
+  `with_sctp_tuning(low_latency=..., **overrides)` in Python. It overrides six
+  dcsctp defaults: the initial window, the window floor after a loss, the
+  initial and minimum retransmission timeouts, how long a SACK is held, and
+  the window below which a SACK is sent at once. A value left unset keeps
+  upstream's. `SctpTuning::low_latency()` starts at 200 packets, keeps 100
+  after a loss, holds SACKs at most 20 ms and sends them at once below 1000
+  packets. On a 200 ms path with 0.1% loss it takes a 1 MB command from
+  5.5 s to 1.8 s median. A factory without it behaves as before.
+- **`with_dc_callbacks_on_network_thread`** on the factory builder: data
+  channel callbacks run on libwebrtc's network thread instead of hopping to
+  the signaling thread, which cuts a 64 B ping's loopback round trip by
+  30-40%. Off by default: the callbacks then hold up the network thread, so
+  they must return quickly and must not call `PeerConnection` methods.
+
+### Changed
+
+- **Less work per SCTP packet** (patches 0007-0010): SCTP and STUN packets
+  skip a no-op task on the worker thread, UDP sockets cache their IP overhead
+  instead of calling `getsockname()` per send, and on Linux the datagrams a
+  task sends go out in one `sendmmsg()` while reads take up to 16 datagrams
+  per event. On macOS this cut the CPU per 100 KB command from ~1.85 to
+  ~1.1 ms.
+- **A chunked frame takes one trip to the network thread**, not three: `Send`
+  and the buffered amount after it run in one blocking call. A ping between
+  the runtime and the SDK in one Linux container went from 469 to 406 us
+  median.
+
+### Fixed
+
+- **The android glue uses relative vtables on arm64 only**, as the prebuilt
+  does. It used them on every android target, so on x86_64 its classes'
+  vtables did not match the absolute ones libwebrtc reads, and the first call
+  from libwebrtc into the glue jumped to garbage. Archives now record their
+  vtable ABI in `lib/cxx_vtables`, and the glue follows it.
+- **Dropping the last `DataChannel` from inside one of its callbacks** no
+  longer unregisters the observer on the network thread or frees the channel
+  while the callback still reads it; the release waits for the callback to
+  return.
+
 ## 0.24.1 — the android x64 prebuilt
 
 An `x86_64-linux-android` build, the ABI an Android emulator on an x86_64 host
