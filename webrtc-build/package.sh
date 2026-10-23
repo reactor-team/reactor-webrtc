@@ -111,6 +111,20 @@ case "$OS" in
   linux-musl) echo musl > "$STAGE/lib/linux_libc" ;;
 esac
 
+# Record the C++ vtable ABI the archive was compiled with. Chromium picks it per
+# target (relative on arm64 Android, absolute elsewhere), and the consumer's glue
+# must match it: a mismatch links but crashes on the first virtual call from
+# libwebrtc into the glue. Read it from gn so build.rs never has to guess.
+if [ "$OS" = "android" ]; then
+  VT="$(cd "$SRC" && PATH="$HERE/depot_tools:$PATH" gn args "$OUT" --list=use_relative_vtables_abi --short)"
+  case "$VT" in
+    "use_relative_vtables_abi = true") echo relative > "$STAGE/lib/cxx_vtables" ;;
+    "use_relative_vtables_abi = false") echo absolute > "$STAGE/lib/cxx_vtables" ;;
+    *) echo "package.sh: unexpected use_relative_vtables_abi: '$VT'" >&2; exit 1 ;;
+  esac
+  echo "   vtables: $(cat "$STAGE/lib/cxx_vtables")"
+fi
+
 # ── Archive + checksum ────────────────────────────────────────────────────────
 mkdir -p "$DIST"
 ARCHIVE="$DIST/$NAME.tar.zst"
