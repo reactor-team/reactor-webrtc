@@ -1332,6 +1332,21 @@ impl RawDc {
             ) == 1
         }
     }
+    /// Send, and the buffered amount after it, in one trip to the network
+    /// thread instead of two.
+    fn send_measured(self, data: &[u8], binary: bool) -> (bool, u64) {
+        let mut after = 0u64;
+        let ok = unsafe {
+            reactor_webrtc_sys::reactor_webrtc_data_channel_send_measured(
+                self.0,
+                data.as_ptr(),
+                data.len(),
+                binary as c_int,
+                &mut after,
+            ) == 1
+        };
+        (ok, after)
+    }
     fn close(self) {
         unsafe { reactor_webrtc_sys::reactor_webrtc_data_channel_close(self.0) }
     }
@@ -1365,7 +1380,16 @@ struct Chunked {
     // belongs to the pump (the queue's low-water mark).
     user_low_threshold: AtomicU64,
     user_low_armed: AtomicBool,
+    // libwebrtc's buffered amount as of the pump's last send, or UNKNOWN. Only
+    // the pump writes it, under `pump`. It is never below the real amount by
+    // more than the pump's own last frame (the native buffer only grows through
+    // the pump's sends), so trusting it up to `trust_below` cannot push the
+    // buffer past the high-water mark; above that, the pump asks libwebrtc.
+    native_est: AtomicU64,
+    trust_below: u64,
 }
+
+const UNKNOWN: u64 = u64::MAX;
 
 /// An event for the caller's handlers that libwebrtc can raise from inside a
 /// channel method: `close` changes the state, and `send` can report the
@@ -1466,6 +1490,8 @@ impl ChannelCore {
                         self.early_low_threshold.load(Ordering::SeqCst),
                     ),
                     user_low_armed: AtomicBool::new(false),
+                    native_est: AtomicU64::new(UNKNOWN),
+                    trust_below: settings.send_config(&remote).low_water,
                 })
             }
             _ => None,
@@ -1529,7 +1555,17 @@ impl ChannelCore {
                     // thread it waits on that thread, whose callbacks may be
                     // waiting on the lock.
                     let check_start = Instant::now();
-                    let buffered = self.raw.buffered_amount();
+                    // The last send's reading while it is well below the
+                    // high-water mark; otherwise ask libwebrtc, which waits on
+                    // the network thread.
+                    let est = c.native_est.load(Ordering::SeqCst);
+                    let buffered = if est <= c.trust_below {
+                        est
+                    } else {
+                        let n = self.raw.buffered_amount();
+                        c.native_est.store(n, Ordering::SeqCst);
+                        n
+                    };
                     let build_start = Instant::now();
                     let (frame, queued_left) = {
                         let mut queue = c.queue.lock().unwrap();
@@ -1545,7 +1581,8 @@ impl ChannelCore {
                         break;
                     };
                     let native_start = Instant::now();
-                    let sent = self.raw.send(&frame, true);
+                    let (sent, after) = self.raw.send_measured(&frame, true);
+                    c.native_est.store(after, Ordering::SeqCst);
                     let native_end = Instant::now();
                     let steps = FrameSteps {
                         check_start,
