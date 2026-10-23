@@ -2,7 +2,7 @@
 mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{mpsc, Arc, Mutex};
+    use std::sync::{mpsc, Arc, Condvar, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -113,6 +113,33 @@ mod tests {
             _pc2: pc2,
             a,
             b,
+        }
+    }
+
+    /// A latch a callback can wait on until the test opens it.
+    #[derive(Default)]
+    struct Gate {
+        open: Mutex<bool>,
+        opened: Condvar,
+    }
+
+    impl Gate {
+        fn wait(&self) {
+            let open = self.open.lock().unwrap();
+            drop(self.opened.wait_while(open, |open| !*open).unwrap());
+        }
+
+        fn open(&self) {
+            *self.open.lock().unwrap() = true;
+            self.opened.notify_all();
+        }
+    }
+
+    struct OpenOnDrop(Arc<Gate>);
+
+    impl Drop for OpenOnDrop {
+        fn drop(&mut self) {
+            self.0.open();
         }
     }
 
@@ -401,12 +428,26 @@ mod tests {
         tight.max_message_size = 4 * MIB as u64;
         tight.send_buffer_limit = 4 * MIB as u64;
         let (f1, f2) = (factory(Some(tight)), chunking());
-        let mut p = connect(&f1, &f2);
-        let at_b = inbox(&mut p.b);
-        // Built once and sent back to back until the queue refuses one: how
-        // many fit depends on how fast loopback drains, so a fixed count
-        // would fill the queue on one machine and not on another. Copying
-        // 3 MiB into the queue is far faster than SCTP moves it.
+        let p = connect(&f1, &f2);
+        // The receiver holds its first message until the queue has refused
+        // one. With network-thread callbacks that stalls its network thread,
+        // so nothing is acknowledged and the queue fills however fast
+        // loopback drains: the sender pumps frames into libwebrtc itself, and
+        // a fast enough link took 1000 sends without filling it. With the
+        // default callbacks only the receiver's signaling thread waits.
+        let gate = Arc::new(Gate::default());
+        let (tx, at_b) = mpsc::channel();
+        p.b.on_message({
+            let gate = gate.clone();
+            move |data, binary| {
+                gate.wait();
+                let _ = tx.send((data.to_vec(), binary));
+            }
+        });
+        // Opened on every way out, so a failed assert does not leave the
+        // receiver's thread waiting through the teardown.
+        let _open = OpenOnDrop(gate.clone());
+        // Built once and sent back to back until the queue refuses one.
         let msg = pattern(7, 3 * MIB);
         let mut accepted = 0;
         let mut refused = false;
@@ -424,6 +465,7 @@ mod tests {
             assert!(p.a.buffered_amount() <= (8 + 4) * MIB as u64 + 64 * 1024);
         }
         assert!(refused, "a 4 MiB queue never filled in 1000 sends of 3 MiB");
+        gate.open();
         // The channel still takes a message once the queue has room.
         assert!(p.a.drain(Duration::from_secs(60)));
         p.a.send(&msg, true)
