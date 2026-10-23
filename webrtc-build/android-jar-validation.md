@@ -54,8 +54,10 @@ WebRTC. The passing bootstrap probe uses that arrangement.
 
 The arm64 Android archive uses Clang's relative C++ vtable ABI; the x64 one
 uses absolute vtables, because Chromium's `build/config/compiler` turns relative
-vtables on for arm64 Android only. `reactor-webrtc-sys` compiles its glue with
-`-fexperimental-relative-c++-abi-vtables` on arm64 Android only, to match.
+vtables on for arm64 Android only. `package.sh` records the archive's
+`use_relative_vtables_abi` in `lib/cxx_vtables`, and `reactor-webrtc-sys`
+compiles its glue with `-fexperimental-relative-c++-abi-vtables` when it says
+`relative` (archives without the marker: on arm64 only).
 A matching JAR alone is insufficient: either mismatch links successfully but
 crashes on the first virtual call from libwebrtc into the glue. With absolute
 vtables on arm64 that is `WebRtcVoiceEngine` invoking `AddRef` on the

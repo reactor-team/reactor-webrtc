@@ -143,7 +143,8 @@ fn link(root: &Path) {
         .ok()
         .map(|s| s.trim() == "debug")
         .unwrap_or(false); // no marker = old prebuilt without the file; treat as release
-    compile_glue(&include_dir, is_debug_prebuilt);
+    let relative_vtables = archive_uses_relative_vtables(&lib_dir);
+    compile_glue(&include_dir, is_debug_prebuilt, relative_vtables);
 
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
     // libwebrtc.a / libwebrtc.lib is a monolithic archive (gn complete_static_lib)
@@ -162,8 +163,33 @@ fn link(root: &Path) {
     println!("cargo:rustc-cfg=have_libwebrtc");
 }
 
+/// Whether the android archive was compiled with 32-bit relative vtable
+/// entries. Glue-created ADMs, observers, field trials and codec factories
+/// cross this ABI boundary, and either mismatch compiles and links but crashes
+/// on the first virtual call from libwebrtc. package.sh records the archive's
+/// `use_relative_vtables_abi` in `cxx_vtables`; archives packaged before that
+/// marker fall back to Chromium's own rule, relative on arm64 Android only.
+fn archive_uses_relative_vtables(lib_dir: &Path) -> bool {
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("android") {
+        return false;
+    }
+    let marker = lib_dir.join("cxx_vtables");
+    println!("cargo:rerun-if-changed={}", marker.display());
+    match std::fs::read_to_string(&marker) {
+        Ok(s) => match s.trim() {
+            "relative" => true,
+            "absolute" => false,
+            other => panic!(
+                "reactor-webrtc-sys: unknown vtable ABI {other:?} in {}",
+                marker.display()
+            ),
+        },
+        Err(_) => env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("aarch64"),
+    }
+}
+
 /// Compile `glue/*.cpp` against the WebRTC public headers (+ vendored abseil).
-fn compile_glue(include_dir: &Path, is_debug_prebuilt: bool) {
+fn compile_glue(include_dir: &Path, is_debug_prebuilt: bool, relative_vtables: bool) {
     println!("cargo:rerun-if-changed=glue/reactor_webrtc.cpp");
 
     let mut build = cc::Build::new();
@@ -211,14 +237,9 @@ fn compile_glue(include_dir: &Path, is_debug_prebuilt: bool) {
                 .define("WEBRTC_POSIX", None)
                 .define("WEBRTC_LINUX", None)
                 .define("WEBRTC_ANDROID", None);
-            // Chromium's arm64 Android archive uses 32-bit relative vtable
-            // entries, and its x64 one absolute ones: build/config/compiler
-            // turns relative vtables on for arm64 Android only. Glue-created
-            // ADMs, observers, field trials and codec factories cross this ABI
-            // boundary, and either mismatch compiles and links but crashes on
-            // the first virtual call from libwebrtc — on x64 that was
-            // EnvironmentFactory calling into the glue's field trials.
-            if env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("aarch64") {
+            // The glue's vtables must match the archive's: see
+            // archive_uses_relative_vtables.
+            if relative_vtables {
                 build.flag("-fexperimental-relative-c++-abi-vtables");
             }
         }
