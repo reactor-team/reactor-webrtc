@@ -1666,7 +1666,10 @@ int reactor_webrtc_data_channel_send_measured(void* data_channel, const uint8_t*
     ok = h->channel->Send(webrtc::DataBuffer(buffer, binary != 0));
     amount = h->channel->buffered_amount();
   };
-  if (h->network_thread) {
+  // Already on the network thread (the pump of a channel whose callbacks run
+  // there), run inline, as libwebrtc's own proxy does: a BlockingCall from a
+  // thread to itself trips IsInvokeToThreadAllowed in builds with DCHECKs.
+  if (h->network_thread && !h->network_thread->IsCurrent()) {
     h->network_thread->BlockingCall(send);
   } else {
     send();
