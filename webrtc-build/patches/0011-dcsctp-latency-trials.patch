@@ -1,0 +1,45 @@
+diff --git a/media/sctp/dcsctp_transport.cc b/media/sctp/dcsctp_transport.cc
+--- a/media/sctp/dcsctp_transport.cc
++++ b/media/sctp/dcsctp_transport.cc
+@@ -831,7 +831,41 @@
+           std::atoi(field_trials.Lookup("WebRTC-DcSctp-MaxBurst").c_str());
+       max_burst > 0) {
+     dcsctp_options.max_burst = max_burst;
++  }
++  // Reactor: congestion control and timers for a request/response data
++  // channel on long paths, each overriding upstream's default when its trial
++  // holds a positive number. See webrtc-build/patches/README.md (0011).
++  //  - InitialCwndMtus: the window a new association starts with (10). A
++  //    100 KB command needs ~85 packets, so it takes several RTTs to send.
++  //  - MinCwndMtus: the floor a loss detected by SACK halves the window to (4).
++  //  - RtoMinMs / RtoInitialMs: the retransmission timer's floor (400) and its
++  //    value before the first RTT sample (500).
++  //  - DelayedAckMaxTimeoutMs: how long the receiver may hold a SACK (200).
++  //    RTT plus this reaching the RTO fires a spurious T3-rtx, which drops the
++  //    window to one MTU.
++  //  - ImmediateSackUnderCwndMtus: below this window, DATA asks the peer for
++  //    an immediate SACK (10).
++  auto trial = [&field_trials](absl::string_view key) {
++    return std::atoi(field_trials.Lookup(key).c_str());
++  };
++  if (int v = trial("WebRTC-DcSctp-InitialCwndMtus"); v > 0) {
++    dcsctp_options.cwnd_mtus_initial = v;
+   }
++  if (int v = trial("WebRTC-DcSctp-MinCwndMtus"); v > 0) {
++    dcsctp_options.cwnd_mtus_min = v;
++  }
++  if (int v = trial("WebRTC-DcSctp-RtoMinMs"); v > 0) {
++    dcsctp_options.rto_min = dcsctp::DurationMs(v);
++  }
++  if (int v = trial("WebRTC-DcSctp-RtoInitialMs"); v > 0) {
++    dcsctp_options.rto_initial = dcsctp::DurationMs(v);
++  }
++  if (int v = trial("WebRTC-DcSctp-DelayedAckMaxTimeoutMs"); v > 0) {
++    dcsctp_options.delayed_ack_max_timeout = dcsctp::DurationMs(v);
++  }
++  if (int v = trial("WebRTC-DcSctp-ImmediateSackUnderCwndMtus"); v > 0) {
++    dcsctp_options.immediate_sack_under_cwnd_mtus = v;
++  }
+ 
+   return dcsctp_options;
+ }

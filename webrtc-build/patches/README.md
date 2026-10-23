@@ -420,6 +420,63 @@ load), and `sctp_snap` passes 10 of 10 on both.
 
 ---
 
+### 0011 — dcsctp congestion control and timers as field trials
+
+`0011-dcsctp-latency-trials.patch` · touches `media/sctp/dcsctp_transport.cc` (+34 lines)
+
+**What.** `DcSctpTransport::CreateDcSctpOptions` reads six more field trials
+after 0005's `WebRTC-DcSctp-MaxBurst`, each overriding a `DcSctpOptions` default
+when it holds a positive number:
+
+| Trial | Option | Upstream |
+|---|---|---|
+| `WebRTC-DcSctp-InitialCwndMtus` | `cwnd_mtus_initial` | 10 |
+| `WebRTC-DcSctp-MinCwndMtus` | `cwnd_mtus_min` | 4 |
+| `WebRTC-DcSctp-RtoInitialMs` | `rto_initial` | 500 ms |
+| `WebRTC-DcSctp-RtoMinMs` | `rto_min` | 400 ms |
+| `WebRTC-DcSctp-DelayedAckMaxTimeoutMs` | `delayed_ack_max_timeout` | 200 ms |
+| `WebRTC-DcSctp-ImmediateSackUnderCwndMtus` | `immediate_sack_under_cwnd_mtus` | 10 |
+
+The glue answers them from `ReactorFactoryOptions` (`SctpTuning` in the binding);
+a factory that sets none behaves exactly as before.
+
+**Why.** Upstream tunes dcsctp for bulk transfers that share a path fairly. A
+request/response channel on a long path pays for that in round trips, and on a
+200 ms path a round trip is the whole latency budget:
+
+- **After a loss the window halves, to no less than 4 packets, then grows one
+  packet per round trip.** At 200 ms and 0.1% loss it hovers near 2 Mbit/s: a
+  100 KB command takes two or three round trips and 1 MB about five seconds.
+- **The receiver holds a SACK for up to 200 ms.** On a 200 ms path the SACK for
+  the last packet of a message arrives at about RTT + 200 ms, the 400 ms
+  retransmission timeout. It fires spuriously and drops the window to one
+  packet, so after an idle pause the next large command starts from one packet.
+
+**Verify.** Two Linux containers (a runtime and an SDK client, both on this
+series), `tc netem` delay 100 ms each way on every egress, one session sending
+commands back to back, 2 rounds × 30 s per scenario. Median (P90) round trip:
+
+| 0.1% loss | upstream | `MinCwndMtus` 100 | immediate SACK¹ | all of `low_latency()`² |
+|---|---|---|---|---|
+| 100 KB | 605 (1,007) ms | 203 (208) ms | 407 (805) ms | 203 (403) ms |
+| 200 KB | 1,007 (1,610) ms | 406 (409) ms | 1,212 (1,619) ms | 405 (409) ms |
+| 1 MB | 5,546 (10,090) ms | 1,822 (2,227) ms | 4,431 (5,061) ms | 1,821 (1,833) ms |
+| 1 MB, 1 s pause before each | 5,356 (7,451) ms | 1,819 (2,019) ms | 5,951 (7,860) ms | 1,825 (2,032) ms |
+
+| no loss | upstream | `MinCwndMtus` 100 | immediate SACK¹ | all of `low_latency()`² |
+|---|---|---|---|---|
+| 1 MB, 1 s pause before each | 1,414 (3,230) ms | 816 (1,823) ms | 214 (217) ms | 214 (416) ms |
+
+¹ `DelayedAckMaxTimeoutMs` 20 and `ImmediateSackUnderCwndMtus` 1000.
+² Both, plus `InitialCwndMtus` 200.
+
+Pings, and back-to-back commands on the clean path, are one round trip
+(~203 ms) in every column. A 200-packet initial window alone and
+`RtoMinMs` 250 alone changed nothing measurable. No runtime counted a UDP
+receive-buffer drop. Applies cleanly on top of 0010 at the pinned commit.
+
+---
+
 ## Planned (not yet authored — need their target builds to validate)
 
 - **Symbol isolation** — keep WebRTC's C++ symbols from clashing when a consumer

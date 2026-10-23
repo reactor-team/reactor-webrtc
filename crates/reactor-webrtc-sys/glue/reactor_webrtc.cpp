@@ -25,6 +25,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <initializer_list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -1665,7 +1666,10 @@ int reactor_webrtc_data_channel_send_measured(void* data_channel, const uint8_t*
     ok = h->channel->Send(webrtc::DataBuffer(buffer, binary != 0));
     amount = h->channel->buffered_amount();
   };
-  if (h->network_thread) {
+  // Already on the network thread (the pump of a channel whose callbacks run
+  // there), run inline, as libwebrtc's own proxy does: a BlockingCall from a
+  // thread to itself trips IsInvokeToThreadAllowed in builds with DCHECKs.
+  if (h->network_thread && !h->network_thread->IsCurrent()) {
     h->network_thread->BlockingCall(send);
   } else {
     send();
@@ -2500,8 +2504,29 @@ struct ReactorFactoryOptions {
   int                          recv_playout_delay_set;
   int                          recv_playout_delay_min_ms;
   int                          recv_playout_delay_max_ms;
+  // dcsctp congestion control and timers for every data channel of the
+  // factory, answered as the WebRTC-DcSctp-* field trials of patch 0011. Each
+  // > 0 overrides upstream's default; 0 keeps it.
+  int                          sctp_initial_cwnd_mtus;      // default 10
+  int                          sctp_min_cwnd_mtus;          // default 4
+  int                          sctp_rto_initial_ms;         // default 500
+  int                          sctp_rto_min_ms;             // default 400
+  int                          sctp_delayed_ack_max_ms;     // default 200
+  int                          sctp_immediate_sack_under_cwnd_mtus;  // default 10
 };
 }
+
+// Pins the layout against the repr(C) mirror in reactor-webrtc-sys/src/lib.rs,
+// which carries the same numbers. Both build from one checkout, so no ABI
+// version guards this struct; it only grows at its end, behind `size`. The
+// offsets catch a field added on one side only within a run of ints.
+static_assert(sizeof(void*) != 8 || sizeof(ReactorFactoryOptions) == 136,
+              "ReactorFactoryOptions changed size — update the repr(C) mirror "
+              "in reactor-webrtc-sys/src/lib.rs and both assertions");
+static_assert(sizeof(void*) != 8 ||
+              offsetof(ReactorFactoryOptions, dtls_in_stun) == 80);
+static_assert(sizeof(void*) != 8 ||
+              offsetof(ReactorFactoryOptions, sctp_initial_cwnd_mtus) == 112);
 
 struct ReactorEncoderState {
   reactor_video_encode_cb        cb;
@@ -2853,10 +2878,12 @@ class ReactorFieldTrials : public webrtc::FieldTrialsView {
     int sctp_max_burst = 0;
     std::string send_playout_delay;
     std::string recv_playout_delay;
+    // Patch 0011: WebRTC-DcSctp-<name> → value, only for the options set.
+    std::map<std::string, int> sctp_tuning;
 
     bool any() const {
       return dtls_in_stun || sctp_max_burst > 0 || !send_playout_delay.empty() ||
-             !recv_playout_delay.empty();
+             !recv_playout_delay.empty() || !sctp_tuning.empty();
     }
   };
 
@@ -2865,6 +2892,10 @@ class ReactorFieldTrials : public webrtc::FieldTrialsView {
   std::string Lookup(absl::string_view key) const override {
     // SPED: piggyback the DTLS handshake on the ICE binding requests.
     if (s_.dtls_in_stun && key == "WebRTC-IceHandshakeDtls") return "Enabled";
+    // Patch 0011: dcsctp congestion control and timers.
+    if (auto it = s_.sctp_tuning.find(std::string(key)); it != s_.sctp_tuning.end()) {
+      return std::to_string(it->second);
+    }
     // Patch 0005: dcsctp packets per Send() and per SACK.
     if (s_.sctp_max_burst > 0 && key == "WebRTC-DcSctp-MaxBurst") {
       return std::to_string(s_.sctp_max_burst);
@@ -2931,6 +2962,16 @@ void* reactor_webrtc_factory_create(const ReactorFactoryOptions* opts,
   ReactorFieldTrials::Settings trial_settings;
   trial_settings.dtls_in_stun = opts->dtls_in_stun != 0;
   trial_settings.sctp_max_burst = opts->sctp_max_burst;
+  for (const auto& [key, value] : std::initializer_list<std::pair<const char*, int>>{
+           {"WebRTC-DcSctp-InitialCwndMtus", opts->sctp_initial_cwnd_mtus},
+           {"WebRTC-DcSctp-MinCwndMtus", opts->sctp_min_cwnd_mtus},
+           {"WebRTC-DcSctp-RtoInitialMs", opts->sctp_rto_initial_ms},
+           {"WebRTC-DcSctp-RtoMinMs", opts->sctp_rto_min_ms},
+           {"WebRTC-DcSctp-DelayedAckMaxTimeoutMs", opts->sctp_delayed_ack_max_ms},
+           {"WebRTC-DcSctp-ImmediateSackUnderCwndMtus",
+            opts->sctp_immediate_sack_under_cwnd_mtus}}) {
+    if (value > 0) trial_settings.sctp_tuning[key] = value;
+  }
   if (opts->send_playout_delay_set) {
     trial_settings.send_playout_delay = ReactorFieldTrials::PlayoutDelay(
         opts->send_playout_delay_min_ms, opts->send_playout_delay_max_ms);
