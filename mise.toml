@@ -32,7 +32,7 @@ config_roots = ["crates/reactor-webrtc-py", "webrtc-build"]
 # backend, which locks a per-platform URL+checksum (fully reproducible under
 # MISE_LOCKED) - faster and better-pinned than cargo:maturin + binstall.
 maturin = "1.14.1"
-uv = "0.11.31"
+uv = "0.13.4"
 ruff = "0.15.22"
 shellcheck = "0.11.0"
 # hk drives the git hooks (pre-commit/pre-push/post-checkout). It reads hk.pkl
