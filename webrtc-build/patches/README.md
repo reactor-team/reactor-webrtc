@@ -477,6 +477,47 @@ receive-buffer drop. Applies cleanly on top of 0010 at the pinned commit.
 
 ---
 
+### 0012 — never delete the sender transform queue on itself
+
+`0012-transformer-queue-not-deleted-on-itself.patch` · touches
+`modules/rtp_rtcp/source/rtp_sender_video_frame_transformer_delegate.{h,cc}` (+17 lines)
+
+**What.** `RTPSenderVideoFrameTransformerDelegate` gets a destructor: when it
+runs on the delegate's own `transformation_queue_`, it releases the queue and
+deletes it from a detached thread instead.
+
+**Why.** A video sender with a frame transformer (ours: the frame-metadata
+trailer) hands every transformed frame back through a task posted to
+`transformation_queue_`, a `TaskQueueStdlib` the delegate owns. That task holds
+a reference to the delegate. Close the sender while one is pending or still
+unwinding, and the task drops the last reference, so the delegate is destroyed
+on that queue's thread. Deleting a `TaskQueueStdlib` joins its thread, which is
+the current one: `pthread_join` returns `EDEADLK` and the process aborts with
+
+```
+# Fatal error in: ../../src/src/rtc_base/platform_thread.cc, line 181
+# Check failed: 0 == pthread_join(*handle_, nullptr) (0 vs. 35)
+```
+
+`TaskQueueStdlib::Delete()` only guards this with a `RTC_DCHECK`, so release
+builds abort instead. Linux only: on Apple platforms the queue is GCD-backed and
+`Delete()` does not join. Upstream `main` has the same code.
+
+**How it works.** The detached thread calls `Delete()`, which asks the queue to
+quit and joins its thread. That join returns once the current task, the one
+running this destructor, has returned.
+
+**Verify.** `crates/reactor-webrtc/tests/sender_transform_teardown.rs` closes
+connections mid-stream with metadata negotiated. The window is too narrow to hit
+on demand, so the check is a build with a 50 ms sleep added to the posted task
+after `SendVideo` (the delegate's reference held, as a preempted thread would):
+without this patch it aborts with the message above in 5 runs of 5, with it 5
+runs of 5 pass (100 connections each). The stack of the abort goes
+`TaskQueueStdlib` task → `RefCountedObject<RTPSenderVideoFrameTransformerDelegate>::Release`
+→ `TaskQueueStdlib::Delete` → `pthread_join`.
+
+---
+
 ## Planned (not yet authored — need their target builds to validate)
 
 - **Symbol isolation** — keep WebRTC's C++ symbols from clashing when a consumer
