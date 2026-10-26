@@ -1,0 +1,48 @@
+diff --git a/modules/rtp_rtcp/source/rtp_sender_video_frame_transformer_delegate.cc b/modules/rtp_rtcp/source/rtp_sender_video_frame_transformer_delegate.cc
+index c54f9f8..19a502d 100644
+--- a/modules/rtp_rtcp/source/rtp_sender_video_frame_transformer_delegate.cc
++++ b/modules/rtp_rtcp/source/rtp_sender_video_frame_transformer_delegate.cc
+@@ -16,6 +16,7 @@
+ #include <optional>
+ #include <span>
+ #include <string>
++#include <thread>
+ #include <utility>
+ #include <vector>
+ 
+@@ -174,6 +175,21 @@ RTPSenderVideoFrameTransformerDelegate::RTPSenderVideoFrameTransformerDelegate(
+           task_queue_factory->CreateTaskQueue("VideoFrameTransformerQueue",
+                                               transformation_queue_priority)) {}
+ 
++// Reactor: a task posted by OnTransformedFrame() holds a reference to this
++// delegate. When the sender is torn down while such a task is pending or still
++// unwinding, that task can drop the last reference, so this destructor runs on
++// `transformation_queue_` itself. Deleting a TaskQueueStdlib from its own thread
++// joins that thread: pthread_join fails with EDEADLK and PlatformThread aborts
++// ("Check failed: 0 == pthread_join(*handle_, nullptr) (0 vs. 35)"). Hand the
++// queue to another thread, which deletes (and joins) it once this task returns.
++RTPSenderVideoFrameTransformerDelegate::
++    ~RTPSenderVideoFrameTransformerDelegate() {
++  if (transformation_queue_ && transformation_queue_->IsCurrent()) {
++    TaskQueueBase* queue = transformation_queue_.release();
++    std::thread([queue] { queue->Delete(); }).detach();
++  }
++}
++
+ void RTPSenderVideoFrameTransformerDelegate::Init() {
+   frame_transformer_->RegisterTransformedFrameSinkCallback(
+       scoped_refptr<TransformedFrameCallback>(this), ssrc_);
+diff --git a/modules/rtp_rtcp/source/rtp_sender_video_frame_transformer_delegate.h b/modules/rtp_rtcp/source/rtp_sender_video_frame_transformer_delegate.h
+index ad799a0..bcc7988 100644
+--- a/modules/rtp_rtcp/source/rtp_sender_video_frame_transformer_delegate.h
++++ b/modules/rtp_rtcp/source/rtp_sender_video_frame_transformer_delegate.h
+@@ -110,7 +110,8 @@ class RTPSenderVideoFrameTransformerDelegate : public TransformedFrameCallback {
+   void Reset();
+ 
+  protected:
+-  ~RTPSenderVideoFrameTransformerDelegate() override = default;
++  // Reactor: not defaulted, see the definition.
++  ~RTPSenderVideoFrameTransformerDelegate() override;
+ 
+  private:
+   void EnsureEncoderQueueCreated();
