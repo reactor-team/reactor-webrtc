@@ -119,6 +119,10 @@ MAC_SDK_PATH=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk \
   ./webrtc-build/build.sh mac arm64 release
 ```
 
+Any SDK below 27 works: `ls /Library/Developer/CommandLineTools/SDKs/` lists
+the ones installed, and a Command Line Tools update can replace 26.5 with
+another. The variable only applies to mac builds.
+
 ### Verify the build actually links (real-link proof)
 
 `reactor-webrtc-sys` compiles a small C++ glue (`crates/reactor-webrtc-sys/glue/`)

@@ -73,6 +73,9 @@ fi
 
 # Resolved here, before the sync, so a relative or mistyped path fails now
 # rather than as a dangling SDK link that gn/ninja trip over much later.
+if [ -n "${MAC_SDK_PATH:-}" ] && [ "$GN_OS" != mac ]; then
+  echo "warning: MAC_SDK_PATH is only honoured for mac builds; ignoring it for $OS" >&2
+fi
 if [ "$GN_OS" = mac ] && [ -n "${MAC_SDK_PATH:-}" ]; then
   sdk="$(cd "$MAC_SDK_PATH" 2>/dev/null && pwd)" || { echo "MAC_SDK_PATH not found: $MAC_SDK_PATH" >&2; exit 2; }
   [ -f "$sdk/SDKSettings.json" ] || { echo "MAC_SDK_PATH is not a macOS SDK: $sdk" >&2; exit 2; }
@@ -115,8 +118,10 @@ gn_args() {
       if [ -n "${MAC_SDK_PATH:-}" ]; then
         local link
         link="$OUT/sdk/local_links/$(basename "$MAC_SDK_PATH")"
-        mkdir -p "$(dirname "$link")"
-        ln -sfn "$MAC_SDK_PATH" "$link"
+        # Returned, not left to set -e: this runs inside $(gn_args), where bash
+        # clears errexit, so a failure would otherwise hand gn a dangling link.
+        mkdir -p "$(dirname "$link")" || return 1
+        ln -sfn "$MAC_SDK_PATH" "$link" || return 1
         args+=("mac_sdk_path=\"$link\"")
       fi
       ;;
