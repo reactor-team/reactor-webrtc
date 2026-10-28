@@ -918,6 +918,98 @@ class TestFrameMetadata:
 
 
 
+class TestRgbFrames:
+    """RGB24 video: pushed and received without a BGRA step, channels in order."""
+
+    W, H = 320, 240
+
+    @pytest.mark.parametrize(
+        ("push", "receive"),
+        [("rgb", "rgb"), ("bgra", "rgb"), ("rgb", "bgra"), ("bgra", "bgra")],
+    )
+    async def test_a_red_frame_arrives_red_in_either_layout(self, factory, push, receive):
+        """A solid red frame, pushed as RGB24 or BGRA, reads red in either layout."""
+        w, h = self.W, self.H
+        recv_track_ref: list = []
+        received: list = []
+
+        def centre(data: bytes, width: int, height: int, bpp: int) -> tuple[int, int, int]:
+            i = ((height // 2) * width + width // 2) * bpp
+            if bpp == 3:
+                return data[i], data[i + 1], data[i + 2]
+            return data[i + 2], data[i + 1], data[i]
+
+        def on_track(kind, track):
+            if kind == rw.MediaKind.Video:
+                recv_track_ref.append(track)
+                if receive == "rgb":
+                    track.on_rgb_frame(
+                        lambda rgb, fw, fh, meta: received.append(
+                            (centre(rgb, fw, fh, 3), len(rgb), meta)
+                        )
+                    )
+                else:
+                    track.on_video_frame(
+                        lambda bgra, fw, fh, meta: received.append(
+                            (centre(bgra, fw, fh, 4), len(bgra), meta)
+                        )
+                    )
+
+        p1 = make_peer(factory)
+        p2 = make_peer(factory, on_track=on_track)
+        video = factory.create_video_track("rgb-video")
+        tx1 = p1.pc.add_transceiver(rw.MediaKind.Video, rw.TransceiverDirection.SendOnly)
+        await tx1.set_track(video)
+        assert await connect(p1, p2), "peers did not connect within timeout"
+
+        rgb = bytes([255, 0, 0]) * (w * h)
+        bgra = bytes([0, 0, 255, 255]) * (w * h)
+        for _ in range(150):
+            if received:
+                break
+            if push == "rgb":
+                video.push_rgb_frame(rgb, w, h, user_data=b"rgb-e2e")
+            else:
+                video.push_video_frame(bgra, w, h, user_data=b"rgb-e2e")
+            await asyncio.sleep(0.033)
+        assert await wait_for(lambda: len(received) > 0), "no frame received"
+
+        (r, g, b), size, meta = received[0]
+        # Through an encoder and back, red stays far from the other two channels.
+        assert r > 200 and g < 60 and b < 60, f"expected red, got {(r, g, b)}"
+        assert size == w * h * (3 if receive == "rgb" else 4)
+        assert meta is not None and bytes(meta.user_data) == b"rgb-e2e"
+
+    async def test_on_rgb_frame_is_counted_by_handoff_stats(self, factory):
+        """handoff_stats counts the frames handed to an on_rgb_frame callback."""
+        recv_track_ref: list = []
+        frames: list = []
+
+        def on_track(kind, track):
+            if kind == rw.MediaKind.Video:
+                recv_track_ref.append(track)
+                track.on_rgb_frame(lambda *_: frames.append(None))
+
+        p1 = make_peer(factory)
+        p2 = make_peer(factory, on_track=on_track)
+        video = factory.create_video_track("rgb-handoff")
+        tx1 = p1.pc.add_transceiver(rw.MediaKind.Video, rw.TransceiverDirection.SendOnly)
+        await tx1.set_track(video)
+        assert await connect(p1, p2), "peers did not connect within timeout"
+
+        rgb = bytes([40, 80, 120]) * (self.W * self.H)
+        for _ in range(150):
+            if len(frames) >= 5:
+                break
+            video.push_rgb_frame(rgb, self.W, self.H)
+            await asyncio.sleep(0.033)
+        assert len(frames) >= 5, "too few frames decoded"
+
+        stats = recv_track_ref[0].handoff_stats()
+        assert stats.frames >= len(frames)
+        assert stats.convert_s > 0
+
+
 class TestFrameMetadataNegotiation:
     """Declaring and reading the SDP capability, without any media."""
 

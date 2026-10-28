@@ -135,14 +135,14 @@ the frames that have left it:
 (Python) divides the first by the last — the per-frame wait, which is the
 number to compare before and after changing any of the above.
 
-After the decoder, a remote video track's sink converts each frame to BGRA and
-hands it to the `on_frame` closure. `VideoTrack::sink_timings()` (Rust) adds up
+After the decoder, a remote video track's sink converts each frame to BGRA (or
+RGB24, for a sink attached with `on_rgb_frame`) and hands it to the closure. `VideoTrack::sink_timings()` (Rust) adds up
 that conversion (`convert`) since the sink was attached, and can be read from
 inside the closure; `VideoTrack::on_frame_timed` hands the closure each frame's
 share of it, for a caller adding up its own totals. In Python,
 `Track.handoff_stats()` returns a `HandoffStats` with `convert_s`, `handoff_s`
 and `frames`: `handoff` adds the time from the closure to the `on_video_frame`
-callback being called, which is the wait for the GIL and the copy into `bytes`.
+(or `on_rgb_frame`) callback being called, which is the wait for the GIL and the copy into `bytes`.
 All three are added up together just before each call, so a reading's times
 and `frames` count the same frames. Both times are timed on monotonic clocks (`steady_clock` in the native sink, `Instant`
 in Rust) and added up in nanoseconds.

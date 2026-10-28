@@ -1560,7 +1560,8 @@ impl From<rw::FrameMetadata> for FrameMetadata {
 
 /// A media track — local (push frames) or remote (attach a sink).
 ///
-/// Video frames are delivered as BGRA bytes (`width * height * 4`).
+/// Video frames are delivered as BGRA bytes (`width * height * 4`), or as
+/// RGB24 bytes (`width * height * 3`, R,G,B) through `on_rgb_frame`.
 /// Audio frames are interleaved signed 16-bit little-endian PCM bytes.
 pub(crate) enum NativeTrack {
     Video(Arc<rw::VideoTrack>),
@@ -1599,14 +1600,15 @@ impl HandoffTotals {
 }
 
 /// How long a remote video track took to hand decoded frames to its
-/// `on_video_frame` callback, added up since the callback was set.
+/// `on_video_frame` or `on_rgb_frame` callback, added up since the callback
+/// was set.
 ///
 /// Divide a time by `frames` for a frame's mean.
 #[pyclass(get_all)]
 #[derive(Clone)]
 pub struct HandoffStats {
     /// From libwebrtc handing over a decoded frame, before its conversion to
-    /// BGRA, until the native closure has it.
+    /// BGRA or RGB24, until the native closure has it.
     pub convert_s: f64,
     /// From the native closure until the callback is called: the wait for the
     /// GIL and the copy into `bytes`.
@@ -1817,9 +1819,89 @@ impl Track {
         Ok(())
     }
 
+    /// Push a raw RGB24 video frame into a local video track:
+    /// `width * height * 3` bytes, R,G,B, row after row with no padding.
+    ///
+    /// It is converted to the encoder's I420 natively, so a caller holding
+    /// RGB pixels pushes them as they are, with no conversion to BGRA of its
+    /// own. `user_data` and `capture_time_us` work as they do in
+    /// `push_video_frame`. Raises `RuntimeError` when `rgb` is shorter than
+    /// `width * height * 3` or the size is zero.
+    #[pyo3(signature = (rgb, width, height, user_data=None, capture_time_us=None))]
+    fn push_rgb_frame(
+        &self,
+        py: Python,
+        rgb: &[u8],
+        width: u32,
+        height: u32,
+        user_data: Option<&[u8]>,
+        capture_time_us: Option<i64>,
+    ) -> PyResult<()> {
+        let expected = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|n| n.checked_mul(3))
+            .ok_or_else(|| {
+                PyRuntimeError::new_err(format!(
+                    "frame dimensions overflow: {width}×{height}×3 exceeds usize"
+                ))
+            })?;
+        if rgb.len() < expected {
+            return Err(PyRuntimeError::new_err(format!(
+                "rgb buffer too short: need {expected} bytes for {width}×{height}, got {}",
+                rgb.len()
+            )));
+        }
+        let native = Arc::clone(self.video()?);
+        let owned = rgb.to_vec();
+        let user_data = user_data.map(<[u8]>::to_vec);
+        py.allow_threads(|| {
+            let frame = rw::RgbFrame::new(&owned, width, height);
+            match (user_data, capture_time_us) {
+                (Some(ud), Some(us)) => native.push_rgb_frame_with_metadata_at(frame, &ud, us),
+                (Some(ud), None) => native.push_rgb_frame_with_metadata(frame, &ud),
+                (None, Some(us)) => native.push_rgb_frame_at(frame, us),
+                (None, None) => native.push_rgb_frame(frame),
+            }
+            .map_err(err)
+        })
+    }
+
+    /// Register a callback for decoded video frames from a remote track, as
+    /// RGB24: `width * height * 3` bytes, R,G,B, row after row with no padding.
+    ///
+    /// Signature: `callback(rgb: bytes, width: int, height: int, metadata: FrameMetadata | None)`
+    ///
+    /// The frames are converted from the decoder's output natively, in one
+    /// step. Replaces any callback set before, through this or
+    /// `on_video_frame`; `handoff_stats` counts from here.
+    fn on_rgb_frame(&mut self, py: Python, callback: PyObject) -> PyResult<()> {
+        let native = Arc::clone(self.video()?);
+        let handoff = Arc::new(HandoffTotals::default());
+        *self.handoff.lock().unwrap() = Arc::clone(&handoff);
+        // Same GIL release as `on_video_frame`: attaching dispatches to the
+        // worker thread, where other tracks' callbacks re-enter Python.
+        py.allow_threads(|| {
+            native.on_rgb_frame_timed(move |frame, convert| {
+                let handed_at = std::time::Instant::now();
+                Python::with_gil(|py| {
+                    let bytes = PyBytes::new_bound(py, frame.rgb);
+                    let meta = match frame.metadata {
+                        Some(m) => Py::new(py, FrameMetadata::from(m))
+                            .map(|p| p.into_any())
+                            .unwrap_or_else(|_| py.None()),
+                        None => py.None(),
+                    };
+                    handoff.add(convert, handed_at);
+                    let _ = callback.call1(py, (bytes, frame.width, frame.height, meta));
+                });
+            });
+        });
+        Ok(())
+    }
+
     /// How long this remote video track took to hand decoded frames to the
-    /// `on_video_frame` callback, added up since the callback was set. All
-    /// zero before a callback is set.
+    /// `on_video_frame` or `on_rgb_frame` callback, added up since the
+    /// callback was set. All zero before a callback is set.
     fn handoff_stats(&self) -> PyResult<HandoffStats> {
         self.video()?;
         let sums = self.handoff.lock().unwrap().sums();

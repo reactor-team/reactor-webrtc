@@ -327,6 +327,28 @@ class TestTrack:
         # 2×2 BGRA = 16 bytes — exactly the minimum.
         track.push_video_frame(b"\x00" * 16, 2, 2)
 
+    def test_push_rgb_frame_buffer_too_short(self, factory):
+        track = factory.create_video_track("v")
+        # 640×480 RGB24 needs 640*480*3 = 921 600 bytes; one fewer is refused.
+        with pytest.raises(RuntimeError, match="too short"):
+            track.push_rgb_frame(b"\x00" * (640 * 480 * 3 - 1), 640, 480)
+
+    def test_push_rgb_frame_dimension_overflow(self, factory):
+        track = factory.create_video_track("v")
+        # (2**32 - 1)**2 * 3 overflows usize on any platform.
+        with pytest.raises(RuntimeError, match="overflow"):
+            track.push_rgb_frame(b"\x00" * 3, 2**32 - 1, 2**32 - 1)
+
+    def test_push_rgb_frame_zero_size_refused(self, factory):
+        track = factory.create_video_track("v")
+        with pytest.raises(RuntimeError, match="needs a size"):
+            track.push_rgb_frame(b"", 0, 2)
+
+    def test_push_rgb_frame_exact_size_ok(self, factory):
+        track = factory.create_video_track("v")
+        # 2×2 RGB24 = 12 bytes — exactly the minimum.
+        track.push_rgb_frame(b"\x00" * 12, 2, 2)
+
 
 class TestPeerConnectionObserver:
     def test_all_callbacks_default_none(self):

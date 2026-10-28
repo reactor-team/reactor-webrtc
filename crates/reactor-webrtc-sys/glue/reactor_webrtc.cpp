@@ -601,15 +601,23 @@ class AudioFrameSink : public webrtc::AudioTrackSinkInterface {
   void (*on_audio_)(void*, const int16_t*, int, int, int);
 };
 
+// The pixel layouts a raw video frame crosses the C boundary in.
+// BGRA: width*height*4 bytes, B,G,R,A in memory (libyuv "ARGB").
+// RGB24: width*height*3 bytes, R,G,B in memory (libyuv "RAW"; libyuv's own
+// "RGB24" is B,G,R).
+constexpr int kPixelFormatBgra = 0;
+constexpr int kPixelFormatRgb24 = 1;
+
 // Bridges decoded frames from a (remote) video track to a C callback,
-// converting to BGRA (width*height*4) on the way out. The frame's SSRC and RTP
-// timestamp ride along so the binding can pair it with what the receive
-// transform saw.
+// converting to the sink's pixel format (BGRA or RGB24) on the way out. The
+// frame's SSRC and RTP timestamp ride along so the binding can pair it with
+// what the receive transform saw.
 class FrameSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
  public:
   FrameSink(void* userdata,
-            void (*on_frame)(void*, const uint8_t*, int, int, uint32_t, uint32_t, int64_t))
-      : userdata_(userdata), on_frame_(on_frame) {}
+            void (*on_frame)(void*, const uint8_t*, int, int, uint32_t, uint32_t, int64_t),
+            int pixel_format)
+      : userdata_(userdata), on_frame_(on_frame), pixel_format_(pixel_format) {}
   void OnFrame(const webrtc::VideoFrame& frame) override {
     if (!on_frame_) return;
     // Time this sink's own work, from libwebrtc handing the frame over to the
@@ -620,11 +628,19 @@ class FrameSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
         frame.video_frame_buffer()->ToI420();
     if (!i420) return;
     const int w = i420->width(), h = i420->height();
-    bgra_.resize(static_cast<size_t>(w) * h * 4);
-    // libyuv "ARGB" is B,G,R,A in memory == our BGRA byte order.
-    libyuv::I420ToARGB(i420->DataY(), i420->StrideY(), i420->DataU(),
-                       i420->StrideU(), i420->DataV(), i420->StrideV(),
-                       bgra_.data(), w * 4, w, h);
+    if (pixel_format_ == kPixelFormatRgb24) {
+      pixels_.resize(static_cast<size_t>(w) * h * 3);
+      // libyuv "RAW" is R,G,B in memory == our RGB24 byte order.
+      libyuv::I420ToRAW(i420->DataY(), i420->StrideY(), i420->DataU(),
+                        i420->StrideU(), i420->DataV(), i420->StrideV(),
+                        pixels_.data(), w * 3, w, h);
+    } else {
+      pixels_.resize(static_cast<size_t>(w) * h * 4);
+      // libyuv "ARGB" is B,G,R,A in memory == our BGRA byte order.
+      libyuv::I420ToARGB(i420->DataY(), i420->StrideY(), i420->DataU(),
+                         i420->StrideU(), i420->DataV(), i420->StrideV(),
+                         pixels_.data(), w * 4, w, h);
+    }
     // A received frame lists the RTP packets it was built from; they share one
     // SSRC. 0 when the list is empty (a frame that did not come off the wire).
     const webrtc::RtpPacketInfos& packets = frame.packet_infos();
@@ -632,13 +648,14 @@ class FrameSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
     const int64_t convert_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                    std::chrono::steady_clock::now() - received)
                                    .count();
-    on_frame_(userdata_, bgra_.data(), w, h, ssrc, frame.rtp_timestamp(), convert_ns);
+    on_frame_(userdata_, pixels_.data(), w, h, ssrc, frame.rtp_timestamp(), convert_ns);
   }
 
  private:
   void* userdata_;
   void (*on_frame_)(void*, const uint8_t*, int, int, uint32_t, uint32_t, int64_t);
-  std::vector<uint8_t> bgra_;
+  int pixel_format_;
+  std::vector<uint8_t> pixels_;
 };
 
 // A per-track audio source that bypasses the shared ADM.  Each instance
@@ -1796,24 +1813,52 @@ void* reactor_webrtc_video_track_create(void* factory, const char* id) {
 // by VideoFrame::set_timestamp_us and EncodedImage::CaptureTime().
 int64_t reactor_webrtc_time_micros() { return webrtc::TimeMicros(); }
 
-// Like reactor_webrtc_video_track_push_frame but uses a caller-supplied
-// capture timestamp so Rust can key per-frame metadata by that timestamp.
-void reactor_webrtc_video_track_push_frame_ts(void* track, const uint8_t* bgra,
-                                              int width, int height,
-                                              int64_t capture_time_us) {
+// Push a frame of `pixel_format` (0 = BGRA, width*height*4 bytes; 1 = RGB24,
+// width*height*3 bytes, R,G,B in memory) with a caller-supplied capture
+// timestamp, so Rust can key per-frame metadata by that timestamp. Converted
+// to I420 here; an unknown format pushes nothing.
+void reactor_webrtc_video_track_push_frame_format_ts(void* track,
+                                                     const uint8_t* pixels,
+                                                     int width, int height,
+                                                     int64_t capture_time_us,
+                                                     int pixel_format) {
   auto* h = reinterpret_cast<ReactorMediaStreamTrack*>(track);
-  if (!h || !h->source || !bgra || width <= 0 || height <= 0) return;
+  if (!h || !h->source || !pixels || width <= 0 || height <= 0) return;
+  if (pixel_format != kPixelFormatBgra && pixel_format != kPixelFormatRgb24)
+    return;
   webrtc::scoped_refptr<webrtc::I420Buffer> buffer =
       webrtc::I420Buffer::Create(width, height);
-  // libyuv "ARGB" is B,G,R,A in memory == our BGRA byte order.
-  libyuv::ARGBToI420(bgra, width * 4, buffer->MutableDataY(), buffer->StrideY(),
-                     buffer->MutableDataU(), buffer->StrideU(),
-                     buffer->MutableDataV(), buffer->StrideV(), width, height);
+  if (pixel_format == kPixelFormatRgb24) {
+    // libyuv "RAW" is R,G,B in memory == our RGB24 byte order. Expanded to
+    // BGRA first: the libyuv built into libwebrtc reads RAWToI420's input as
+    // B,G,R, which turns red into blue, while RAWToARGB reads it as R,G,B.
+    std::vector<uint8_t> bgra(static_cast<size_t>(width) * height * 4);
+    libyuv::RAWToARGB(pixels, width * 3, bgra.data(), width * 4, width, height);
+    libyuv::ARGBToI420(bgra.data(), width * 4, buffer->MutableDataY(),
+                       buffer->StrideY(), buffer->MutableDataU(),
+                       buffer->StrideU(), buffer->MutableDataV(),
+                       buffer->StrideV(), width, height);
+  } else {
+    // libyuv "ARGB" is B,G,R,A in memory == our BGRA byte order.
+    libyuv::ARGBToI420(pixels, width * 4, buffer->MutableDataY(),
+                       buffer->StrideY(), buffer->MutableDataU(),
+                       buffer->StrideU(), buffer->MutableDataV(),
+                       buffer->StrideV(), width, height);
+  }
   webrtc::VideoFrame frame = webrtc::VideoFrame::Builder()
                                  .set_video_frame_buffer(buffer)
                                  .set_timestamp_us(capture_time_us)
                                  .build();
   h->source->PushFrame(frame);
+}
+
+// Like reactor_webrtc_video_track_push_frame but uses a caller-supplied
+// capture timestamp so Rust can key per-frame metadata by that timestamp.
+void reactor_webrtc_video_track_push_frame_ts(void* track, const uint8_t* bgra,
+                                              int width, int height,
+                                              int64_t capture_time_us) {
+  reactor_webrtc_video_track_push_frame_format_ts(
+      track, bgra, width, height, capture_time_us, kPixelFormatBgra);
 }
 
 void reactor_webrtc_video_track_push_frame(void* track, const uint8_t* bgra,
@@ -1960,26 +2005,37 @@ void reactor_webrtc_audio_track_add_sink(
             static_cast<void*>(at), at->enabled(), static_cast<int>(at->state()));
 }
 
-// Attach a frame sink to a (video) track. `on_frame(userdata, bgra, width,
-// height, ssrc, rtp_timestamp, convert_ns)` fires per decoded frame;
-// `convert_ns` is how long the sink took from libwebrtc handing it the frame
-// to the call, its conversion to BGRA included, in nanoseconds. The sink
-// lives until the track handle is destroyed.
+// Attach a frame sink to a (video) track. `on_frame(userdata, pixels, width,
+// height, ssrc, rtp_timestamp, convert_ns)` fires per decoded frame, its
+// pixels in `pixel_format` (0 = BGRA, width*height*4 bytes; 1 = RGB24,
+// width*height*3 bytes, R,G,B in memory); `convert_ns` is how long the sink
+// took from libwebrtc handing it the frame to the call, its conversion to that
+// format included, in nanoseconds. The sink lives until the track handle is
+// destroyed.
 //
 // Same ordering requirement as the audio sink above: `AddOrUpdateSink` only
 // updates in place when the pointer already registered is the *same*
 // pointer; for a fresh `FrameSink` it is added alongside whatever is already
 // there. Detach the old one first, or replacing `h->sink` destroys a
 // `FrameSink` the broadcaster still holds and calls into.
-void reactor_webrtc_video_track_add_sink(
+void reactor_webrtc_video_track_add_sink_format(
     void* track, void* userdata,
-    void (*on_frame)(void*, const uint8_t*, int, int, uint32_t, uint32_t, int64_t)) {
+    void (*on_frame)(void*, const uint8_t*, int, int, uint32_t, uint32_t, int64_t),
+    int pixel_format) {
   auto* h = reinterpret_cast<ReactorMediaStreamTrack*>(track);
   if (!h || !h->track || h->track->kind() != "video") return;
   auto* vt = static_cast<webrtc::VideoTrackInterface*>(h->track.get());
   if (h->sink) vt->RemoveSink(h->sink.get());
-  h->sink = std::make_unique<FrameSink>(userdata, on_frame);
+  h->sink = std::make_unique<FrameSink>(userdata, on_frame, pixel_format);
   vt->AddOrUpdateSink(h->sink.get(), webrtc::VideoSinkWants());
+}
+
+// reactor_webrtc_video_track_add_sink_format with BGRA frames.
+void reactor_webrtc_video_track_add_sink(
+    void* track, void* userdata,
+    void (*on_frame)(void*, const uint8_t*, int, int, uint32_t, uint32_t, int64_t)) {
+  reactor_webrtc_video_track_add_sink_format(track, userdata, on_frame,
+                                             kPixelFormatBgra);
 }
 
 // Kind of a track handle: 0 = audio, 1 = video, -1 = unknown.
