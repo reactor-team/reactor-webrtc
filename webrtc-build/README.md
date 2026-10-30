@@ -110,6 +110,19 @@ brew install zstd
 
 The first `fetch` downloads tens of GB and the compile takes a while.
 
+With Xcode 27, the host tools (`protoc`, the protobuf plugins) fail to link:
+this milestone's lld can't read the MacOSX27.0 SDK's stubs, so every system
+symbol comes up undefined. Build against the Command Line Tools' SDK instead:
+
+```bash
+MAC_SDK_PATH=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk \
+  ./webrtc-build/build.sh mac arm64 release
+```
+
+Any SDK below 27 works: `ls /Library/Developer/CommandLineTools/SDKs/` lists
+the ones installed, and a Command Line Tools update can replace 26.5 with
+another. The variable only applies to mac builds.
+
 ### Verify the build actually links (real-link proof)
 
 `reactor-webrtc-sys` compiles a small C++ glue (`crates/reactor-webrtc-sys/glue/`)
