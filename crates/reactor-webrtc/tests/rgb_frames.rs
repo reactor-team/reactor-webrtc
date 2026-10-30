@@ -214,6 +214,10 @@ fn an_rgb_push_refuses_a_buffer_of_the_wrong_size() {
     let short = vec![0u8; (W * H * 3 - 1) as usize];
     assert!(video.push_rgb_frame(RgbFrame::new(&short, W, H)).is_err());
     assert!(video.push_rgb_frame(RgbFrame::new(&[], 0, H)).is_err());
+    // A size whose byte count overflows usize is an error, not a panic.
+    assert!(video
+        .push_rgb_frame(RgbFrame::new(&[], u32::MAX, u32::MAX))
+        .is_err());
     let exact = vec![0u8; 2 * 2 * 3];
     video
         .push_rgb_frame(RgbFrame::new(&exact, 2, 2))

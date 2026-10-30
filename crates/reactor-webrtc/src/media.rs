@@ -1144,7 +1144,17 @@ fn check_rgb(frame: &RgbFrame<'_>) -> Result<()> {
             frame.width, frame.height
         )));
     }
-    let needed = (frame.width as usize) * (frame.height as usize) * 3;
+    // Checked: two caller-supplied u32s times 3 can overflow usize, which
+    // would panic (debug) or wrap past the length check (release).
+    let needed = (frame.width as usize)
+        .checked_mul(frame.height as usize)
+        .and_then(|n| n.checked_mul(3))
+        .ok_or_else(|| {
+            Error::Webrtc(format!(
+                "an RGB24 frame of {}x{} is too large",
+                frame.width, frame.height
+            ))
+        })?;
     if frame.rgb.len() < needed {
         return Err(Error::Webrtc(format!(
             "an RGB24 frame of {}x{} is {needed} bytes, got {}",
