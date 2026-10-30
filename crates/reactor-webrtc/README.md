@@ -47,7 +47,7 @@ pc.set_local_description(&offer)?;
 | `PeerConnection` | Offer/answer, ICE, tracks, data channels, stats |
 | `PeerConnectionObserver` | Callbacks: state change, ICE candidate, track, data channel |
 | `DataChannel` | Reliable/unreliable messaging over SCTP |
-| `VideoTrack` / `AudioTrack` | Media-typed tracks (local or remote); `on_frame` receives decoded frames, `push_frame` family feeds a local track, both in BGRA; `on_rgb_frame` and the `push_rgb_frame` family do the same in RGB24 (`RgbFrame`); `Deref` to the untyped `Track` core used by transceivers |
+| `VideoTrack` / `AudioTrack` | Media-typed tracks (local or remote); `on_frame` receives decoded frames, `push_frame` family feeds a local track, both in BGRA; `on_frame_as` and `VideoFrame::with_format` do the same in RGB24 (`PixelFormat`); `Deref` to the untyped `Track` core used by transceivers |
 | `RemoteTrack` | `Video(VideoTrack) \| Audio(AudioTrack)` — what `on_track` delivers |
 | `LocalVideoTrack` | `Raw(VideoTrack) \| Encoded(EncodedVideoTrack)` — return of `create_video_track_with_options` |
 | `EncodedVideoTrack` | Push pre-encoded video frames (H.264, VP8, VP9, …); `on_encoder_feedback` surfaces BWE + keyframe requests |

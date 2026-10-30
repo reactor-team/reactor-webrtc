@@ -74,7 +74,7 @@ fn make_peer(
                 if let RemoteTrack::Video(v) = &track {
                     let s = s.clone();
                     v.on_frame(move |f| {
-                        if !f.bgra.is_empty() {
+                        if !f.pixels.is_empty() {
                             s.video_frames.fetch_add(1, Ordering::SeqCst);
                         }
                     });

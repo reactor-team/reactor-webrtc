@@ -78,7 +78,7 @@ mod imp {
                         v.on_frame(move |f| {
                             vw.lock()
                                 .unwrap()
-                                .write(f.bgra, f.width as usize, f.height as usize);
+                                .write(f.pixels, f.width as usize, f.height as usize);
                             frames.fetch_add(1, Ordering::SeqCst);
                         });
                     }

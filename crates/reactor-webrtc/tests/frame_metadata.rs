@@ -1286,7 +1286,7 @@ fn metadata_stays_paired_when_decoded_frames_are_dropped() {
                         let Some(meta) = frame.metadata else { return };
                         let center =
                             ((frame.height / 2 * frame.width + frame.width / 2) * 4) as usize;
-                        let level = frame.bgra[center + 1];
+                        let level = frame.pixels[center + 1];
                         out.lock().unwrap().push((level, meta.user_data[0]));
                     });
                     recv_setup = true;

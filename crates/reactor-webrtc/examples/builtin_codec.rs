@@ -81,13 +81,13 @@ fn run() {
                             // each decoded BGRA frame.
                             let s = s.clone();
                             video_track.on_frame(move |f| {
-                                // f.bgra is a Vec<u8>: width × height × 4 bytes.
+                                // f.pixels is a Vec<u8>: width × height × 4 bytes.
                                 // Feed it to your renderer (Metal, wgpu, SDL2, …).
                                 println!(
                                     "  [pc2 video] {}×{} frame — {} bytes BGRA",
                                     f.width,
                                     f.height,
-                                    f.bgra.len()
+                                    f.pixels.len()
                                 );
                                 s.video_frames.fetch_add(1, Ordering::SeqCst);
                             });

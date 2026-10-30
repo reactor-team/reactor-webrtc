@@ -1,6 +1,7 @@
 //! RGB24 video over a real loopback: a frame pushed as RGB24 arrives as RGB24
 //! with its channels in order, a BGRA frame arrives as RGB24 and an RGB24
-//! frame as BGRA, and an RGB24 push refuses a buffer of the wrong size.
+//! frame as BGRA, and a push refuses a buffer of the wrong size for its
+//! format.
 //!
 //! Gated on a native libwebrtc being linked (see build.rs).
 #![cfg(have_libwebrtc)]
@@ -13,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use reactor_webrtc::{
     IceCandidate, PeerConnection, PeerConnectionFactory, PeerConnectionObserver,
-    PeerConnectionState, RemoteTrack, RgbFrame, RtcConfiguration, VideoFrame, VideoTrack,
+    PeerConnectionState, PixelFormat, RemoteTrack, RtcConfiguration, VideoFrame, VideoTrack,
 };
 
 const W: u32 = 320;
@@ -79,16 +80,9 @@ fn wait_for(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
     done()
 }
 
-/// How a frame is pushed and how it is received.
-#[derive(Clone, Copy, Debug)]
-enum Format {
-    Bgra,
-    Rgb,
-}
-
 /// Push a solid red frame in `push`, receive it in `receive`, and return the
 /// centre pixel the receiver read, as (R, G, B), with the frame's byte length.
-fn red_frame_through(push: Format, receive: Format) -> ((u8, u8, u8), usize) {
+fn red_frame_through(push: PixelFormat, receive: PixelFormat) -> ((u8, u8, u8), usize) {
     let factory = PeerConnectionFactory::builder().build().expect("factory");
     let config = RtcConfiguration::default();
     let (pc1, s1) = make_peer(&factory, &config);
@@ -114,14 +108,14 @@ fn red_frame_through(push: Format, receive: Format) -> ((u8, u8, u8), usize) {
     // scope: a panic there waits for the pusher, which only `stop` ends.
     let outcome = thread::scope(|scope| {
         scope.spawn(|| {
-            let rgb: Vec<u8> = [255u8, 0, 0].repeat((W * H) as usize);
-            let bgra: Vec<u8> = [0u8, 0, 255, 255].repeat((W * H) as usize);
+            let red: Vec<u8> = match push {
+                PixelFormat::Rgb24 => [255u8, 0, 0].repeat((W * H) as usize),
+                PixelFormat::Bgra => [0u8, 0, 255, 255].repeat((W * H) as usize),
+            };
             while !stop.load(Ordering::SeqCst) {
-                match push {
-                    Format::Rgb => video.push_rgb_frame(RgbFrame::new(&rgb, W, H)),
-                    Format::Bgra => video.push_frame(VideoFrame::new(&bgra, W, H)),
-                }
-                .expect("push frame");
+                video
+                    .push_frame(VideoFrame::new(&red, W, H).with_format(push))
+                    .expect("push frame");
                 thread::sleep(Duration::from_millis(30));
             }
         });
@@ -143,24 +137,18 @@ fn red_frame_through(push: Format, receive: Format) -> ((u8, u8, u8), usize) {
             return outcome.map(|_| ());
         };
         let centre = |w: u32, h: u32| ((h / 2) * w + w / 2) as usize;
-        match receive {
-            Format::Rgb => remote.on_rgb_frame({
-                let received = received.clone();
-                move |f| {
-                    let i = centre(f.width, f.height) * 3;
-                    *received.lock().unwrap() =
-                        Some(((f.rgb[i], f.rgb[i + 1], f.rgb[i + 2]), f.rgb.len()));
-                }
-            }),
-            Format::Bgra => remote.on_frame({
-                let received = received.clone();
-                move |f| {
-                    let i = centre(f.width, f.height) * 4;
-                    *received.lock().unwrap() =
-                        Some(((f.bgra[i + 2], f.bgra[i + 1], f.bgra[i]), f.bgra.len()));
-                }
-            }),
-        }
+        remote.on_frame_as(receive, {
+            let received = received.clone();
+            move |f| {
+                let i = centre(f.width, f.height) * f.format.bytes_per_pixel();
+                let p = &f.pixels[i..];
+                let rgb = match f.format {
+                    PixelFormat::Rgb24 => (p[0], p[1], p[2]),
+                    PixelFormat::Bgra => (p[2], p[1], p[0]),
+                };
+                *received.lock().unwrap() = Some((rgb, f.pixels.len()));
+            }
+        });
         let got_frame = wait_for(Duration::from_secs(10), || {
             received.lock().unwrap().is_some()
         });
@@ -186,40 +174,45 @@ fn assert_red((r, g, b): (u8, u8, u8)) {
 
 #[test]
 fn an_rgb_frame_arrives_as_rgb_with_its_channels_in_order() {
-    let (pixel, len) = red_frame_through(Format::Rgb, Format::Rgb);
+    let (pixel, len) = red_frame_through(PixelFormat::Rgb24, PixelFormat::Rgb24);
     assert_red(pixel);
     assert_eq!(len, (W * H * 3) as usize);
 }
 
 #[test]
 fn a_bgra_frame_arrives_as_rgb() {
-    let (pixel, len) = red_frame_through(Format::Bgra, Format::Rgb);
+    let (pixel, len) = red_frame_through(PixelFormat::Bgra, PixelFormat::Rgb24);
     assert_red(pixel);
     assert_eq!(len, (W * H * 3) as usize);
 }
 
 #[test]
 fn an_rgb_frame_arrives_as_bgra() {
-    let (pixel, len) = red_frame_through(Format::Rgb, Format::Bgra);
+    let (pixel, len) = red_frame_through(PixelFormat::Rgb24, PixelFormat::Bgra);
     assert_red(pixel);
     assert_eq!(len, (W * H * 4) as usize);
 }
 
 #[test]
-fn an_rgb_push_refuses_a_buffer_of_the_wrong_size() {
+fn a_push_refuses_a_buffer_of_the_wrong_size_for_its_format() {
     let factory = PeerConnectionFactory::builder().build().expect("factory");
     let video = factory
         .create_video_track("rgb-video")
         .expect("video track");
+    let rgb = |px, w, h| VideoFrame::new(px, w, h).with_format(PixelFormat::Rgb24);
     let short = vec![0u8; (W * H * 3 - 1) as usize];
-    assert!(video.push_rgb_frame(RgbFrame::new(&short, W, H)).is_err());
-    assert!(video.push_rgb_frame(RgbFrame::new(&[], 0, H)).is_err());
+    assert!(video.push_frame(rgb(&short, W, H)).is_err());
+    assert!(video.push_frame(rgb(&[], 0, H)).is_err());
     // A size whose byte count overflows usize is an error, not a panic.
-    assert!(video
-        .push_rgb_frame(RgbFrame::new(&[], u32::MAX, u32::MAX))
-        .is_err());
+    assert!(video.push_frame(rgb(&[], u32::MAX, u32::MAX)).is_err());
     let exact = vec![0u8; 2 * 2 * 3];
     video
-        .push_rgb_frame(RgbFrame::new(&exact, 2, 2))
-        .expect("an exact buffer is accepted");
+        .push_frame(rgb(&exact, 2, 2))
+        .expect("an exact RGB24 buffer is accepted");
+    // The same RGB24-sized buffer is short as BGRA.
+    assert!(video.push_frame(VideoFrame::new(&exact, 2, 2)).is_err());
+    let bgra = vec![0u8; 2 * 2 * 4];
+    video
+        .push_frame(VideoFrame::new(&bgra, 2, 2))
+        .expect("an exact BGRA buffer is accepted");
 }

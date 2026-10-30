@@ -74,8 +74,8 @@ pub use reactor_webrtc_dc_chunking::SendError as DcSendError;
 /// Whether this build targets Apple (H.264 VideoToolbox backend exists).
 pub(crate) const HAVE_VIDEO_TOOLBOX: bool = cfg!(target_vendor = "apple");
 pub use media::{
-    AudioFrame, AudioTrack, AudioTrackOptions, AudioTrackSource, MediaKind, RemoteTrack, RgbFrame,
-    Track, VideoFrame, VideoSinkTimings, VideoTrack,
+    AudioFrame, AudioTrack, AudioTrackOptions, AudioTrackSource, MediaKind, PixelFormat,
+    RemoteTrack, Track, VideoFrame, VideoSinkTimings, VideoTrack,
 };
 pub use metadata::{
     FrameMetadata, FrameMetadataGate, FRAME_METADATA_ATTRIBUTE, FRAME_METADATA_VERSION,

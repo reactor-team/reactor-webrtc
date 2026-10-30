@@ -96,7 +96,7 @@ fn run() {
                                     "  [pc2 video/H264] {}×{} frame — {} bytes BGRA",
                                     f.width,
                                     f.height,
-                                    f.bgra.len()
+                                    f.pixels.len()
                                 );
                                 s.video_frames.fetch_add(1, Ordering::SeqCst);
                             });

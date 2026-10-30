@@ -141,7 +141,7 @@ fn concurrent_on_video_frame_attach_survives_live_frame_delivery() {
                     while Instant::now() < deadline {
                         let received = received.clone();
                         remote.on_frame(move |f| {
-                            if !f.bgra.is_empty() {
+                            if !f.pixels.is_empty() {
                                 received.fetch_add(1, Ordering::SeqCst);
                             }
                         });
