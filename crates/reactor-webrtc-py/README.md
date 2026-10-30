@@ -152,6 +152,16 @@ def on_track(kind, track):
 obs.on_track = on_track
 ```
 
+Video arrives as BGRA (`width * height * 4` bytes). A consumer that works in
+RGB takes it as RGB24 instead (`width * height * 3` bytes, R,G,B), converted
+natively from the decoder's output, and can push RGB24 the same way, by
+passing `format="rgb24"`:
+
+```python
+track.on_video_frame(lambda rgb, w, h, meta: model_input(rgb, w, h), format="rgb24")
+video.push_video_frame(rgb, 320, 240, format="rgb24")
+```
+
 ## Stats
 
 ```python
@@ -173,7 +183,7 @@ for pair in report.candidate_pairs:
 | `SessionDescription` | SDP offer or answer (`kind`, `sdp`, `ice_ufrags`, `with_ice_credentials`, `declares_frame_metadata`, `with_frame_metadata`) |
 | `FrameMetadata` | Per-frame `frame_id`, `timestamp`, `user_data` |
 | `FrameMetadataGate` | What the remote declared about per-frame metadata |
-| `Track` | Local (push frames) or remote (attach sink) media track; `push_video_frame` and `push_pcm` take an optional `capture_time_us` |
+| `Track` | Local (push frames) or remote (attach sink) media track; video goes in and out through `push_video_frame` and `on_video_frame`, as BGRA or, with `format="rgb24"`, RGB24; `push_video_frame` and `push_pcm` take an optional `capture_time_us` |
 | `EncodedVideoTrack` | Push pre-encoded video (H.264 Annex-B, VP8, VP9, …) |
 | `Transceiver` | RTP m-section: `mid`, `kind`, `set_track`, `set_direction`, `set_codec_preferences`, `set_sender_transform`, `set_receiver_transform` |
 | `DataChannel` | SCTP data channel: `send`, `on_message`, `on_open`, … |

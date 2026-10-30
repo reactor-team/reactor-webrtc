@@ -379,7 +379,7 @@ class HandoffStats:
     Divide a time by `frames` for a frame's mean.
     """
 
-    #: From libwebrtc handing over a decoded frame, before its conversion to BGRA, until the native closure has it.
+    #: From libwebrtc handing over a decoded frame, before its conversion to BGRA or RGB24, until the native closure has it.
     convert_s: float
     #: From the native closure until the callback is called: the wait for the GIL and the copy into `bytes`.
     handoff_s: float
@@ -590,13 +590,20 @@ class Track:
     def kind(self) -> MediaKind: ...
     def push_video_frame(
         self,
-        bgra: bytes,
+        pixels: bytes,
         width: int,
         height: int,
         user_data: Optional[bytes] = None,
         capture_time_us: Optional[int] = None,
+        format: str = "bgra",
     ) -> None:
-        """Push a raw BGRA video frame into a local video track.
+        """Push a raw video frame into a local video track: `width * height`
+        pixels of `format`, row after row with no padding — `"bgra"` (the
+        default, 4 bytes a pixel, B,G,R,A) or `"rgb24"` (3 bytes a pixel,
+        R,G,B), in any case. Either is converted to the encoder's I420
+        natively, so RGB pixels go in as they are. Raises `ValueError` for an
+        unknown format and `RuntimeError` when `pixels` is shorter than the
+        size needs or the size is zero.
 
         Pass `user_data` (bytes) to embed per-frame metadata in the encoded
         packet trailer. Nothing else has to be arranged: the trailer is appended
@@ -615,11 +622,17 @@ class Track:
             Callable[[bytes, int, int, Optional[FrameMetadata]], None],
             Callable[[bytes, int, int], None],
         ],
+        format: str = "bgra",
     ) -> None:
-        """Register a callback for decoded video frames from a remote track.
+        """Register a callback for decoded video frames from a remote track,
+        as `format`: `"bgra"` (the default, `width * height * 4` bytes,
+        B,G,R,A) or `"rgb24"` (`width * height * 3` bytes, R,G,B), in any
+        case, converted from the decoder's output natively, in one step.
+        Replaces any callback set before, of either format; `handoff_stats`
+        counts from here. Raises `ValueError` for an unknown format.
 
-        Preferred signature: `callback(bgra: bytes, width: int, height: int, metadata: FrameMetadata | None)`.
-        Legacy 3-arg signature `callback(bgra, width, height)` is also accepted.
+        Preferred signature: `callback(pixels: bytes, width: int, height: int, metadata: FrameMetadata | None)`.
+        Legacy 3-arg signature `callback(pixels, width, height)` is also accepted.
 
         `metadata` is `None` when no receiver transform is attached or when the
         sender did not include a trailer. When `metadata` is `None` and the
@@ -630,8 +643,7 @@ class Track:
         ...
     def handoff_stats(self) -> HandoffStats:
         """How long this remote video track took to hand decoded frames to the
-        `on_video_frame` callback, added up since the callback was set. All
-        zero before a callback is set."""
+        `on_video_frame` callback, added up since the callback was set. All zero before a callback is set."""
         ...
     def on_encoder_feedback(
         self,

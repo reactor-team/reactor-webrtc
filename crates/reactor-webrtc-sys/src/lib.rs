@@ -670,6 +670,13 @@ pub struct ReactorRtcConfig {
     pub sctp_snap: c_int,
 }
 
+/// `pixel_format` for raw video frames: `width * height * 4` bytes, B,G,R,A in
+/// memory.
+pub const PIXEL_FORMAT_BGRA: c_int = 0;
+/// `pixel_format` for raw video frames: `width * height * 3` bytes, R,G,B in
+/// memory.
+pub const PIXEL_FORMAT_RGB24: c_int = 1;
+
 extern "C" {
     /// ABI version of this native build. The safe crate asserts compatibility.
     pub fn reactor_webrtc_abi_version() -> u32;
@@ -868,6 +875,21 @@ extern "C" {
         height: c_int,
         capture_time_us: i64,
     );
+    /// Push a frame of `pixel_format` ([`PIXEL_FORMAT_BGRA`],
+    /// `width * height * 4` bytes, or [`PIXEL_FORMAT_RGB24`],
+    /// `width * height * 3` bytes, R,G,B in memory) into a local video track's
+    /// source, with a
+    /// caller-supplied capture timestamp (microseconds, same epoch as
+    /// `reactor_webrtc_time_micros`). Converted to I420 internally; an unknown
+    /// format pushes nothing.
+    pub fn reactor_webrtc_video_track_push_frame_format_ts(
+        track: *mut MediaStreamTrack,
+        pixels: *const u8,
+        width: c_int,
+        height: c_int,
+        capture_time_us: i64,
+        pixel_format: c_int,
+    );
     /// Add a local audio or video track to the peer connection (creates a
     /// sendrecv transceiver). Returns 1 on success, 0 on failure.
     pub fn reactor_webrtc_peer_connection_add_track(
@@ -893,6 +915,24 @@ extern "C" {
             rtp_timestamp: u32,
             convert_ns: i64,
         ),
+    );
+    /// [`reactor_webrtc_video_track_add_sink`] with each frame's pixels in
+    /// `pixel_format`: [`PIXEL_FORMAT_BGRA`] (`width*height*4` bytes) or
+    /// [`PIXEL_FORMAT_RGB24`] (`width*height*3` bytes, R,G,B in memory).
+    /// `convert_ns` includes the conversion to that format.
+    pub fn reactor_webrtc_video_track_add_sink_format(
+        track: *mut MediaStreamTrack,
+        userdata: *mut c_void,
+        on_frame: extern "C" fn(
+            userdata: *mut c_void,
+            pixels: *const u8,
+            width: c_int,
+            height: c_int,
+            ssrc: u32,
+            rtp_timestamp: u32,
+            convert_ns: i64,
+        ),
+        pixel_format: c_int,
     );
     /// Kind of a track handle: 0 = audio, 1 = video, -1 = unknown.
     pub fn reactor_webrtc_media_stream_track_kind(track: *mut MediaStreamTrack) -> c_int;

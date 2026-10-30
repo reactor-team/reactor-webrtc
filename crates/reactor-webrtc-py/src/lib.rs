@@ -73,6 +73,18 @@ mod exceptions {
 }
 use exceptions::{DataChannelMessageTooLarge, DataChannelQueueFull};
 
+/// Read a `format=` argument naming a pixel layout: `"bgra"` or `"rgb24"`,
+/// in any case.
+fn pixel_format(format: &str) -> PyResult<rw::PixelFormat> {
+    match format.to_ascii_lowercase().as_str() {
+        "bgra" => Ok(rw::PixelFormat::Bgra),
+        "rgb24" => Ok(rw::PixelFormat::Rgb24),
+        _ => Err(PyValueError::new_err(format!(
+            "unknown pixel format {format:?}: expected \"bgra\" or \"rgb24\""
+        ))),
+    }
+}
+
 fn err(e: rw::Error) -> PyErr {
     match &e {
         rw::Error::DataChannel(rw::DcSendError::QueueFull { .. }) => {
@@ -1560,7 +1572,8 @@ impl From<rw::FrameMetadata> for FrameMetadata {
 
 /// A media track — local (push frames) or remote (attach a sink).
 ///
-/// Video frames are delivered as BGRA bytes (`width * height * 4`).
+/// Video frames are delivered as BGRA bytes (`width * height * 4`), or as
+/// RGB24 bytes (`width * height * 3`, R,G,B) with `format="rgb24"`.
 /// Audio frames are interleaved signed 16-bit little-endian PCM bytes.
 pub(crate) enum NativeTrack {
     Video(Arc<rw::VideoTrack>),
@@ -1606,7 +1619,7 @@ impl HandoffTotals {
 #[derive(Clone)]
 pub struct HandoffStats {
     /// From libwebrtc handing over a decoded frame, before its conversion to
-    /// BGRA, until the native closure has it.
+    /// BGRA or RGB24, until the native closure has it.
     pub convert_s: f64,
     /// From the native closure until the callback is called: the wait for the
     /// GIL and the copy into `bytes`.
@@ -1691,7 +1704,13 @@ impl Track {
         }
     }
 
-    /// Push a raw BGRA video frame into a local video track.
+    /// Push a raw video frame into a local video track: `width * height`
+    /// pixels of `format`, row after row with no padding — `"bgra"` (the
+    /// default, 4 bytes a pixel, B,G,R,A) or `"rgb24"` (3 bytes a pixel,
+    /// R,G,B), in any case. Either is converted to the encoder's I420
+    /// natively, so a caller holding RGB pixels pushes them as they are.
+    /// Raises `ValueError` for an unknown format and `RuntimeError` when
+    /// `pixels` is shorter than the size needs or the size is zero.
     ///
     /// Pass `user_data` (bytes) to embed per-frame metadata in the encoded
     /// packet trailer. `frame_id` is computed automatically. Nothing else has to
@@ -1708,79 +1727,64 @@ impl Track {
     /// carrying that one stamp. Without it the frame is stamped from a
     /// `time_micros()` read taken here. Independent of `user_data`: a frame can
     /// carry either, both, or neither.
-    #[pyo3(signature = (bgra, width, height, user_data=None, capture_time_us=None))]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (pixels, width, height, user_data=None, capture_time_us=None, format="bgra"))]
     fn push_video_frame(
         &self,
         py: Python,
-        bgra: &[u8],
+        pixels: &[u8],
         width: u32,
         height: u32,
         user_data: Option<&[u8]>,
         capture_time_us: Option<i64>,
+        format: &str,
     ) -> PyResult<()> {
+        let format = pixel_format(format)?;
+        let bpp = format.bytes_per_pixel();
         let expected = (width as usize)
             .checked_mul(height as usize)
-            .and_then(|n| n.checked_mul(4))
+            .and_then(|n| n.checked_mul(bpp))
             .ok_or_else(|| {
                 PyRuntimeError::new_err(format!(
-                    "frame dimensions overflow: {width}×{height}×4 exceeds usize"
+                    "frame dimensions overflow: {width}×{height}×{bpp} exceeds usize"
                 ))
             })?;
-        if bgra.len() < expected {
+        if pixels.len() < expected {
             return Err(PyRuntimeError::new_err(format!(
-                "bgra buffer too short: need {expected} bytes for {width}×{height}, got {}",
-                bgra.len()
+                "pixel buffer too short: need {expected} bytes for {width}×{height}, got {}",
+                pixels.len()
             )));
         }
         let native = Arc::clone(self.video()?);
-        let owned = bgra.to_vec();
-        match (user_data, capture_time_us) {
-            (Some(ud), Some(us)) => {
-                let ud = ud.to_vec();
-                py.allow_threads(|| {
-                    native
-                        .push_frame_with_metadata_at(
-                            rw::VideoFrame::new(&owned, width, height),
-                            &ud,
-                            us,
-                        )
-                        .map_err(err)
-                })?;
+        let owned = pixels.to_vec();
+        let user_data = user_data.map(<[u8]>::to_vec);
+        py.allow_threads(|| {
+            let frame = rw::VideoFrame::new(&owned, width, height).with_format(format);
+            match (user_data, capture_time_us) {
+                (Some(ud), Some(us)) => native.push_frame_with_metadata_at(frame, &ud, us),
+                (Some(ud), None) => native.push_frame_with_metadata(frame, &ud),
+                (None, Some(us)) => native.push_frame_at(frame, us),
+                (None, None) => native.push_frame(frame),
             }
-            (Some(ud), None) => {
-                let ud = ud.to_vec();
-                py.allow_threads(|| {
-                    native
-                        .push_frame_with_metadata(rw::VideoFrame::new(&owned, width, height), &ud)
-                        .map_err(err)
-                })?;
-            }
-            (None, Some(us)) => {
-                py.allow_threads(|| {
-                    native
-                        .push_frame_at(rw::VideoFrame::new(&owned, width, height), us)
-                        .map_err(err)
-                })?;
-            }
-            (None, None) => {
-                py.allow_threads(|| {
-                    native
-                        .push_frame(rw::VideoFrame::new(&owned, width, height))
-                        .map_err(err)
-                })?;
-            }
-        }
-        Ok(())
+            .map_err(err)
+        })
     }
 
-    /// Register a callback for decoded video frames from a remote track.
+    /// Register a callback for decoded video frames from a remote track, as
+    /// `format`: `"bgra"` (the default, `width * height * 4` bytes, B,G,R,A)
+    /// or `"rgb24"` (`width * height * 3` bytes, R,G,B), in any case,
+    /// converted from the decoder's output natively, in one step. Replaces
+    /// any callback set before, of either format; `handoff_stats` counts from
+    /// here. Raises `ValueError` for an unknown format.
     ///
-    /// Signature: `callback(bgra: bytes, width: int, height: int, metadata: FrameMetadata | None)`
+    /// Signature: `callback(pixels: bytes, width: int, height: int, metadata: FrameMetadata | None)`
     ///
     /// For backward compatibility with 3-argument callbacks
-    /// `callback(bgra, width, height)`, the 4-argument call is retried as a
+    /// `callback(pixels, width, height)`, the 4-argument call is retried as a
     /// 3-argument call on `TypeError` when `metadata` is `None`.
-    fn on_video_frame(&mut self, py: Python, callback: PyObject) -> PyResult<()> {
+    #[pyo3(signature = (callback, format="bgra"))]
+    fn on_video_frame(&mut self, py: Python, callback: PyObject, format: &str) -> PyResult<()> {
+        let format = pixel_format(format)?;
         let native = Arc::clone(self.video()?);
         let handoff = Arc::new(HandoffTotals::default());
         *self.handoff.lock().unwrap() = Arc::clone(&handoff);
@@ -1788,10 +1792,10 @@ impl Track {
         // is also where another track's frame callback re-enters Python. The GIL
         // has to be free across the dispatch or the two deadlock.
         py.allow_threads(|| {
-            native.on_frame_timed(move |frame, convert| {
+            native.on_frame_as_timed(format, move |frame, convert| {
                 let handed_at = std::time::Instant::now();
                 Python::with_gil(|py| {
-                    let bytes = PyBytes::new_bound(py, frame.bgra);
+                    let bytes = PyBytes::new_bound(py, frame.pixels);
                     let meta = frame.metadata.map(|m| {
                         Py::new(py, FrameMetadata::from(m))
                             .map(|p| p.into_any())
@@ -1818,8 +1822,7 @@ impl Track {
     }
 
     /// How long this remote video track took to hand decoded frames to the
-    /// `on_video_frame` callback, added up since the callback was set. All
-    /// zero before a callback is set.
+    /// `on_video_frame` callback, added up since the callback was set. All zero before a callback is set.
     fn handoff_stats(&self) -> PyResult<HandoffStats> {
         self.video()?;
         let sums = self.handoff.lock().unwrap().sums();

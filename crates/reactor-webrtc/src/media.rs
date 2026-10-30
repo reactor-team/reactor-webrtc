@@ -35,12 +35,51 @@ impl MediaKind {
     }
 }
 
-/// A decoded video frame, borrowed for the duration of the callback. The buffer
-/// is BGRA (`width*height*4`, B-G-R-A); copy it if you need to keep it.
+/// The layout of a [`VideoFrame`]'s pixels: what a push hands over and what a
+/// sink attached with [`VideoTrack::on_frame_as`] receives. Either way the
+/// conversion to and from the codec's I420 happens natively, in one step.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum PixelFormat {
+    /// `width*height*4` bytes, B-G-R-A in memory.
+    #[default]
+    Bgra,
+    /// `width*height*3` bytes, R-G-B in memory, row after row with no padding.
+    Rgb24,
+}
+
+impl PixelFormat {
+    /// Bytes one pixel takes: 4 for BGRA, 3 for RGB24.
+    pub const fn bytes_per_pixel(self) -> usize {
+        match self {
+            Self::Bgra => 4,
+            Self::Rgb24 => 3,
+        }
+    }
+
+    pub(crate) const fn raw(self) -> c_int {
+        match self {
+            Self::Bgra => reactor_webrtc_sys::PIXEL_FORMAT_BGRA,
+            Self::Rgb24 => reactor_webrtc_sys::PIXEL_FORMAT_RGB24,
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Bgra => "BGRA",
+            Self::Rgb24 => "RGB24",
+        }
+    }
+}
+
+/// A video frame: `width*height` pixels of `format`, tightly packed. Borrowed
+/// for the duration of the callback on receive; copy it if you need to keep it.
 pub struct VideoFrame<'a> {
-    pub bgra: &'a [u8],
+    pub pixels: &'a [u8],
     pub width: u32,
     pub height: u32,
+    /// The layout of `pixels`. On receive, the format the sink was attached
+    /// with; on push, set with [`VideoFrame::with_format`] (BGRA by default).
+    pub format: PixelFormat,
     /// Metadata attached by the sender via
     /// [`Track::push_video_frame_with_metadata`], decoded from the packet trailer.
     ///
@@ -137,7 +176,18 @@ pub struct AudioTrackOptions {
     pub high_pass_filter: Option<bool>,
 }
 
-type VideoSinkCb = Box<dyn for<'a> FnMut(VideoFrame<'a>, std::time::Duration) + Send>;
+// Receives a frame's pixels in the sink's format, its size, its metadata and
+// its convert time; the public `on_*frame` wrappers shape it into a frame.
+type VideoSinkCb = Box<dyn for<'a> FnMut(RawSinkFrame<'a>, std::time::Duration) + Send>;
+
+/// What the native sink hands over for one frame, before the public wrappers
+/// shape it into a [`VideoFrame`].
+pub(crate) struct RawSinkFrame<'a> {
+    pub(crate) pixels: &'a [u8],
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) metadata: Option<crate::metadata::FrameMetadata>,
+}
 type AudioSinkCb = Box<dyn for<'a> FnMut(AudioFrame<'a>) + Send>;
 
 // sender: HashMap keyed by capture_time_ms (no-erase for simulcast), evicted
@@ -175,7 +225,8 @@ use crate::sender_meta::ReceiverMetaQueue;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VideoSinkTimings {
     /// From libwebrtc handing a decoded frame to the sink, before its conversion
-    /// to BGRA, until the frame reaches the `on_frame` closure.
+    /// to BGRA or RGB24, until the frame reaches the `on_frame` (or
+    /// `on_frame_as`) closure.
     pub convert: std::time::Duration,
     /// The frames the closure received.
     pub frames: u64,
@@ -189,6 +240,8 @@ struct SinkTimingTotals(Mutex<VideoSinkTimings>);
 // Heap-pinned sink state behind the C userdata pointer.
 struct VideoSinkState {
     cb: Mutex<VideoSinkCb>,
+    // 4 for BGRA, 3 for RGB24: the size of the pixels the native sink hands over.
+    bytes_per_pixel: usize,
     // Shared with Track::video_sink_timings, which sink_timings reads.
     timings: Arc<SinkTimingTotals>,
     // The track's inbound metadata queue, always present. It is simply empty when
@@ -202,7 +255,7 @@ struct AudioSinkState {
 
 extern "C" fn video_sink_tramp(
     ud: *mut c_void,
-    bgra: *const u8,
+    pixels: *const u8,
     width: c_int,
     height: c_int,
     ssrc: u32,
@@ -213,8 +266,8 @@ extern "C" fn video_sink_tramp(
     // the callback, on a clock as fine.
     let entered = std::time::Instant::now();
     let st = unsafe { &*(ud as *const VideoSinkState) };
-    let len = (width as usize) * (height as usize) * 4;
-    let slice = unsafe { std::slice::from_raw_parts(bgra, len) };
+    let len = (width as usize) * (height as usize) * st.bytes_per_pixel;
+    let slice = unsafe { std::slice::from_raw_parts(pixels, len) };
     let metadata = crate::sender_meta::take_receiver_meta(&st.receiver_meta, ssrc, rtp_timestamp);
     if let Ok(mut cb) = st.cb.lock() {
         let here_ns = u64::try_from(entered.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -226,8 +279,8 @@ extern "C" fn video_sink_tramp(
             totals.frames += 1;
         }
         cb(
-            VideoFrame {
-                bgra: slice,
+            RawSinkFrame {
+                pixels: slice,
                 width: width as u32,
                 height: height as u32,
                 metadata,
@@ -424,11 +477,12 @@ impl Track {
     /// pushed with one stamp deliver that one stamp.
     pub(crate) fn push_metadata_frame(
         &self,
-        bgra: &[u8],
+        pixels: &[u8],
         width: u32,
         height: u32,
         user_data: &[u8],
         capture_time_us: Option<i64>,
+        pixel_format: c_int,
     ) {
         if self.kind != MediaKind::Video {
             return;
@@ -449,7 +503,7 @@ impl Track {
             user_data: user_data.to_vec(),
         };
         self.insert_sender_meta(capture_us / 1000, meta);
-        self.push_video_frame_ts(bgra, width, height, capture_us);
+        self.push_pixels_ts(pixels, width, height, capture_us, pixel_format);
     }
 
     /// Return a strictly-increasing capture timestamp in microseconds for use
@@ -520,6 +574,32 @@ impl Track {
         }
     }
 
+    /// Push a frame of `pixel_format` (a `reactor_webrtc_sys::PIXEL_FORMAT_*`)
+    /// with an explicit WebRTC capture timestamp (µs). The caller has checked
+    /// the buffer holds `width * height` pixels of that format.
+    pub(crate) fn push_pixels_ts(
+        &self,
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        capture_us: i64,
+        pixel_format: c_int,
+    ) {
+        if self.kind != MediaKind::Video {
+            return;
+        }
+        unsafe {
+            reactor_webrtc_sys::reactor_webrtc_video_track_push_frame_format_ts(
+                self.raw,
+                pixels.as_ptr(),
+                width as c_int,
+                height as c_int,
+                capture_us,
+                pixel_format,
+            );
+        }
+    }
+
     /// Register a decoded-frame sink, replacing any previous one. Called by
     /// [`VideoTrack::on_frame`].
     ///
@@ -529,11 +609,14 @@ impl Track {
     /// negotiated. Nothing here has to be arranged for it.
     pub(crate) fn attach_video_sink(
         &self,
-        cb: impl for<'a> FnMut(VideoFrame<'a>, std::time::Duration) + Send + 'static,
+        format: PixelFormat,
+        cb: impl for<'a> FnMut(RawSinkFrame<'a>, std::time::Duration) + Send + 'static,
     ) {
         let timings = Arc::new(SinkTimingTotals::default());
+        let bytes_per_pixel = format.bytes_per_pixel();
         let state = Box::new(VideoSinkState {
             cb: Mutex::new(Box::new(cb)),
+            bytes_per_pixel,
             timings: Arc::clone(&timings),
             receiver_meta: self.receiver_meta.clone(),
         });
@@ -547,7 +630,12 @@ impl Track {
         // that always agree with each other.
         let mut guard = self.video_sink.lock().expect("video_sink mutex poisoned");
         unsafe {
-            reactor_webrtc_sys::reactor_webrtc_video_track_add_sink(self.raw, ud, video_sink_tramp);
+            reactor_webrtc_sys::reactor_webrtc_video_track_add_sink_format(
+                self.raw,
+                ud,
+                video_sink_tramp,
+                format.raw(),
+            );
         }
         // Drops the previous sink Box, if any, same as an `Option` field replace.
         *guard = Some(state);
@@ -662,10 +750,10 @@ impl VideoTrack {
         Self(track)
     }
 
-    /// Subscribe to decoded frames. Replaces any previous sink. The closure
-    /// runs on a WebRTC thread.
-    pub fn on_frame(&self, mut cb: impl for<'a> FnMut(VideoFrame<'a>) + Send + 'static) {
-        self.0.attach_video_sink(move |frame, _| cb(frame));
+    /// Subscribe to decoded frames as BGRA. Replaces any previous sink. The
+    /// closure runs on a WebRTC thread.
+    pub fn on_frame(&self, cb: impl for<'a> FnMut(VideoFrame<'a>) + Send + 'static) {
+        self.on_frame_as(PixelFormat::Bgra, cb);
     }
 
     /// [`on_frame`](Self::on_frame), with each frame's share of
@@ -676,7 +764,39 @@ impl VideoTrack {
         &self,
         cb: impl for<'a> FnMut(VideoFrame<'a>, std::time::Duration) + Send + 'static,
     ) {
-        self.0.attach_video_sink(cb);
+        self.on_frame_as_timed(PixelFormat::Bgra, cb);
+    }
+
+    /// Subscribe to decoded frames as `format`, converted from the decoder's
+    /// output natively, in one step. Replaces any previous sink, of any
+    /// format. The closure runs on a WebRTC thread.
+    pub fn on_frame_as(
+        &self,
+        format: PixelFormat,
+        mut cb: impl for<'a> FnMut(VideoFrame<'a>) + Send + 'static,
+    ) {
+        self.on_frame_as_timed(format, move |frame, _| cb(frame));
+    }
+
+    /// [`on_frame_as`](Self::on_frame_as), with each frame's share of
+    /// [`VideoSinkTimings::convert`], as [`on_frame_timed`](Self::on_frame_timed).
+    pub fn on_frame_as_timed(
+        &self,
+        format: PixelFormat,
+        mut cb: impl for<'a> FnMut(VideoFrame<'a>, std::time::Duration) + Send + 'static,
+    ) {
+        self.0.attach_video_sink(format, move |raw, convert| {
+            cb(
+                VideoFrame {
+                    pixels: raw.pixels,
+                    width: raw.width,
+                    height: raw.height,
+                    format,
+                    metadata: raw.metadata,
+                },
+                convert,
+            )
+        });
     }
 
     /// How long the sink took to hand decoded frames to the [`on_frame`](Self::on_frame)
@@ -694,19 +814,21 @@ impl VideoTrack {
         totals
     }
 
-    /// Push a BGRA frame (`width*height*4` bytes), captured now — on a local
-    /// track only (a remote track returns `Err`). What a
+    /// Push a frame, captured now — on a local track only. Its pixels are in
+    /// [`VideoFrame::format`] and converted to the encoder's I420 natively.
+    /// `Err` on a remote track, a zero size, or a buffer shorter than
+    /// `width*height` pixels of that format. What a
     /// [`TrackVideoEncoder::Inline`](crate::TrackVideoEncoder) callback sees on
     /// its slot comes straight from these pushes.
     pub fn push_frame(&self, frame: VideoFrame<'_>) -> Result<()> {
         self.guard_remote()?;
-        self.0
-            .push_video_frame_now(frame.bgra, frame.width, frame.height);
+        check_frame(&frame)?;
+        self.push_unmarked(&frame, None);
         Ok(())
     }
 
-    /// Push a BGRA frame captured at `capture_time_us` ([`time_micros`]'s
-    /// epoch) rather than whenever it reaches the encoder.
+    /// Push a frame captured at `capture_time_us` ([`time_micros`]'s epoch)
+    /// rather than whenever it reaches the encoder.
     ///
     /// A track's RTP timestamp otherwise counts only the samples handed to it,
     /// which says how much media exists but not when it was captured.
@@ -714,25 +836,16 @@ impl VideoTrack {
     /// alongside it is what lets the receiver play them together.
     pub fn push_frame_at(&self, frame: VideoFrame<'_>, capture_time_us: i64) -> Result<()> {
         self.guard_remote()?;
-        self.0
-            .push_video_frame_ts(frame.bgra, frame.width, frame.height, capture_time_us);
+        check_frame(&frame)?;
+        self.push_unmarked(&frame, Some(capture_time_us));
         Ok(())
     }
 
-    /// Push a BGRA frame with arbitrary `user_data` embedded as a protobuf
+    /// Push a frame with arbitrary `user_data` embedded as a protobuf
     /// trailer, captured now. `frame_id` (monotonic) and `capture_time_us`
     /// are filled in internally.
     pub fn push_frame_with_metadata(&self, frame: VideoFrame<'_>, user_data: &[u8]) -> Result<()> {
-        self.guard_remote()?;
-        if self.0.metadata_enabled() {
-            self.0
-                .push_metadata_frame(frame.bgra, frame.width, frame.height, user_data, None);
-        } else {
-            // user_data dropped by contract; the frame itself still flows.
-            self.0
-                .push_video_frame_now(frame.bgra, frame.width, frame.height);
-        }
-        Ok(())
+        self.push_with_metadata(frame, user_data, None)
     }
 
     /// Same as [`push_frame_with_metadata`](Self::push_frame_with_metadata)
@@ -745,21 +858,49 @@ impl VideoTrack {
         user_data: &[u8],
         capture_time_us: i64,
     ) -> Result<()> {
+        self.push_with_metadata(frame, user_data, Some(capture_time_us))
+    }
+
+    fn push_with_metadata(
+        &self,
+        frame: VideoFrame<'_>,
+        user_data: &[u8],
+        capture_time_us: Option<i64>,
+    ) -> Result<()> {
         self.guard_remote()?;
+        check_frame(&frame)?;
         if self.0.metadata_enabled() {
             self.0.push_metadata_frame(
-                frame.bgra,
+                frame.pixels,
                 frame.width,
                 frame.height,
                 user_data,
-                Some(capture_time_us),
+                capture_time_us,
+                frame.format.raw(),
             );
         } else {
-            // user_data dropped by contract; the frame still flows, stamped.
-            self.0
-                .push_video_frame_ts(frame.bgra, frame.width, frame.height, capture_time_us);
+            // user_data dropped by contract; the frame itself still flows.
+            self.push_unmarked(&frame, capture_time_us);
         }
         Ok(())
+    }
+
+    /// Push a checked frame with no trailer. BGRA keeps its own native entry
+    /// points, which stamp an unstamped frame natively; other formats go
+    /// through the format-aware one, which always takes a stamp.
+    fn push_unmarked(&self, frame: &VideoFrame<'_>, capture_time_us: Option<i64>) {
+        let (pixels, width, height) = (frame.pixels, frame.width, frame.height);
+        match (frame.format, capture_time_us) {
+            (PixelFormat::Bgra, None) => self.0.push_video_frame_now(pixels, width, height),
+            (PixelFormat::Bgra, Some(us)) => self.0.push_video_frame_ts(pixels, width, height, us),
+            (format, us) => self.0.push_pixels_ts(
+                pixels,
+                width,
+                height,
+                us.unwrap_or_else(crate::time_micros),
+                format.raw(),
+            ),
+        }
     }
 
     fn guard_remote(&self) -> Result<()> {
@@ -921,16 +1062,56 @@ impl RemoteTrack {
 impl VideoFrame<'_> {
     /// A push-side frame: BGRA pixels, no metadata (outgoing trailers go
     /// through [`VideoTrack::push_frame_with_metadata(_at)`] with `user_data`).
+    /// Pixels in another layout say so with [`with_format`](Self::with_format).
     /// The same struct `on_frame` delivers — relay use cases repack nothing.
     /// `metadata` is populated only on receive.
-    pub const fn new(bgra: &'_ [u8], width: u32, height: u32) -> VideoFrame<'_> {
+    pub const fn new(pixels: &'_ [u8], width: u32, height: u32) -> VideoFrame<'_> {
         VideoFrame {
-            bgra,
+            pixels,
             width,
             height,
+            format: PixelFormat::Bgra,
             metadata: None,
         }
     }
+
+    /// The same frame, its pixels read as `format`.
+    pub const fn with_format(mut self, format: PixelFormat) -> Self {
+        self.format = format;
+        self
+    }
+}
+
+/// Check a frame to push has a size and holds `width*height` pixels of its
+/// format.
+fn check_frame(frame: &VideoFrame<'_>) -> Result<()> {
+    let name = frame.format.name();
+    if frame.width == 0 || frame.height == 0 {
+        return Err(Error::Webrtc(format!(
+            "a {name} frame needs a size, got {}x{}",
+            frame.width, frame.height
+        )));
+    }
+    // Checked: two caller-supplied u32s times the pixel size can overflow
+    // usize, which would panic (debug) or wrap past the length check (release).
+    let needed = (frame.width as usize)
+        .checked_mul(frame.height as usize)
+        .and_then(|n| n.checked_mul(frame.format.bytes_per_pixel()))
+        .ok_or_else(|| {
+            Error::Webrtc(format!(
+                "a {name} frame of {}x{} is too large",
+                frame.width, frame.height
+            ))
+        })?;
+    if frame.pixels.len() < needed {
+        return Err(Error::Webrtc(format!(
+            "a {name} frame of {}x{} is {needed} bytes, got {}",
+            frame.width,
+            frame.height,
+            frame.pixels.len()
+        )));
+    }
+    Ok(())
 }
 
 impl AudioFrame<'_> {

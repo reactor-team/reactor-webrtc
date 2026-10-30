@@ -135,8 +135,10 @@ the frames that have left it:
 (Python) divides the first by the last — the per-frame wait, which is the
 number to compare before and after changing any of the above.
 
-After the decoder, a remote video track's sink converts each frame to BGRA and
-hands it to the `on_frame` closure. `VideoTrack::sink_timings()` (Rust) adds up
+After the decoder, a remote video track's sink converts each frame to BGRA (or
+RGB24, for a sink attached with `on_frame_as(PixelFormat::Rgb24, ..)`, or
+`on_video_frame(cb, format="rgb24")` in Python) and hands it to the closure.
+`VideoTrack::sink_timings()` (Rust) adds up
 that conversion (`convert`) since the sink was attached, and can be read from
 inside the closure; `VideoTrack::on_frame_timed` hands the closure each frame's
 share of it, for a caller adding up its own totals. In Python,
