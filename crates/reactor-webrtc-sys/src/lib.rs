@@ -435,6 +435,16 @@ pub struct ReactorStatEntry {
     /// Whether that implementation is the hardware one: -1 unknown, 0 no,
     /// 1 yes.
     pub power_efficient: i8,
+    /// Inbound audio (kind 0): samples played out, per channel, cumulative.
+    /// Zero for video.
+    pub total_samples_received: u64,
+    /// The part of `total_samples_received` the receiver made up because the
+    /// real samples were lost or late, cumulative.
+    pub concealed_samples: u64,
+    /// The part of `concealed_samples` that was silence anyway, cumulative.
+    pub silent_concealed_samples: u64,
+    /// Runs of concealed samples, cumulative: a burst of loss is one event.
+    pub concealment_events: u64,
 }
 
 // The other half of the layout guard in
@@ -448,7 +458,7 @@ pub struct ReactorStatEntry {
 // with their neighbours are pinned too, on both sides.
 const _: () = {
     assert!(
-        core::mem::size_of::<ReactorStatEntry>() == 624,
+        core::mem::size_of::<ReactorStatEntry>() == 656,
         "ReactorStatEntry changed size — update the C struct in \
          glue/reactor_webrtc.cpp and both assertions"
     );
@@ -524,6 +534,22 @@ const _: () = {
     assert!(
         core::mem::offset_of!(ReactorStatEntry, power_efficient) == 616,
         "the power-efficient flag moved — see above"
+    );
+    assert!(
+        core::mem::offset_of!(ReactorStatEntry, total_samples_received) == 624,
+        "the audio sample counters moved — see above"
+    );
+    assert!(
+        core::mem::offset_of!(ReactorStatEntry, concealed_samples) == 632,
+        "the audio sample counters moved — see above"
+    );
+    assert!(
+        core::mem::offset_of!(ReactorStatEntry, silent_concealed_samples) == 640,
+        "the audio sample counters moved — see above"
+    );
+    assert!(
+        core::mem::offset_of!(ReactorStatEntry, concealment_events) == 648,
+        "the audio sample counters moved — see above"
     );
 };
 

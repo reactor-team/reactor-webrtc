@@ -530,6 +530,11 @@ class TestStats:
         assert s.packets_received >= 0
         assert s.bytes_received >= 0
         assert s.jitter_s >= 0.0
+        # The audio sample counters nest: concealed samples are part of the
+        # played-out total, and silent ones part of the concealed.
+        assert s.concealed_samples <= s.total_samples_received
+        assert s.silent_concealed_samples <= s.concealed_samples
+        assert s.concealment_events <= s.concealed_samples
 
     async def test_video_stats_report_per_stage_latency(self, factory):
         """Video stats carry the per-stage totals and a timing frame."""

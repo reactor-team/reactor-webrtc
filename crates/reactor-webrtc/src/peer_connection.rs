@@ -1031,6 +1031,21 @@ pub struct InboundRtpStats {
     pub decoder_implementation: Option<String>,
     /// Whether that decoder is the hardware one; `None` when not reported.
     pub power_efficient_decoder: Option<bool>,
+    /// Audio samples played out since the stream started, per channel. `0`
+    /// for video. The denominator for the concealment counters below.
+    pub total_samples_received: u64,
+    /// The part of [`total_samples_received`](Self::total_samples_received)
+    /// the receiver made up because the real samples were lost or arrived
+    /// too late, since the stream started. The change in this over the
+    /// change in `total_samples_received` is the share of audio a listener
+    /// heard as concealment over that interval. `0` for video.
+    pub concealed_samples: u64,
+    /// The part of [`concealed_samples`](Self::concealed_samples) that was
+    /// silence anyway, so the concealment could not be heard. `0` for video.
+    pub silent_concealed_samples: u64,
+    /// Runs of concealed samples since the stream started: one burst of loss
+    /// is one event however long it lasts. `0` for video.
+    pub concealment_events: u64,
 }
 
 impl InboundRtpStats {
@@ -2243,6 +2258,10 @@ extern "C" fn stats_cb(ud: *mut c_void, entries: *const ReactorStatEntry, count:
                 }),
                 decoder_implementation: stat_str_prefix(&e.codec_implementation),
                 power_efficient_decoder: power_efficient(e.power_efficient),
+                total_samples_received: e.total_samples_received,
+                concealed_samples: e.concealed_samples,
+                silent_concealed_samples: e.silent_concealed_samples,
+                concealment_events: e.concealment_events,
             }),
             1 => report.outbound_rtp.push(OutboundRtpStats {
                 ssrc: e.ssrc,
