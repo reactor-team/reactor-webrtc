@@ -1,5 +1,70 @@
 # Changelog
 
+## 0.25.0 — RGB24 video, and audio concealment in stats
+
+Video crossed this library's boundary as BGRA only, so a caller with RGB
+pixels, as most model inputs and outputs are, converted every frame on its own
+side. A video track now takes and delivers RGB24 as well, in the same native
+step as the conversion to and from I420. A native client also could not tell
+how much of the audio it played was made up to cover loss; inbound stats now
+carry libwebrtc's sample counters for that.
+
+The prebuilt tag stays `webrtc-7907-a5ddff60-p13`.
+
+### Breaking
+
+- **Rust: `VideoFrame`'s pixel field is now `pixels`** (was `bgra`), and the
+  frame carries its `format`. Code that reads `frame.bgra` has to read
+  `frame.pixels`.
+- **Python: `push_video_frame`'s first argument is now called `pixels`.** A
+  call that passes it by keyword (`bgra=...`) has to use `pixels=...`; a
+  positional call is unchanged.
+- **Rust: `InboundRtpStats` gains four public fields** (below). Code that
+  builds one with a struct literal has to set them.
+
+### Added
+
+In Rust and Python:
+
+- **RGB24 video.** Tightly packed RGB24 (`width * height * 3` bytes, R,G,B,
+  rows with no padding) next to BGRA, as a parameter of the existing push and
+  receive methods. In Rust, a `PixelFormat` enum (`Bgra`, the default, or
+  `Rgb24`): `VideoFrame::with_format` on push, and `on_frame_as` /
+  `on_frame_as_timed` on receive; `on_frame` / `on_frame_timed` stay the BGRA
+  shorthand. In Python, `format="bgra" | "rgb24"` (any case) on
+  `push_video_frame` and `on_video_frame`; an unknown format raises
+  `ValueError`. Receive converts with libyuv's `I420ToRAW` in one step. Push
+  expands to BGRA with `RAWToARGB` and then runs `ARGBToI420`, one extra native
+  pass, because the libyuv in libwebrtc reads `RAWToI420`'s input as B,G,R.
+  `handoff_stats` and `sink_timings` count the RGB conversion as they count the
+  BGRA one. The sys crate adds `reactor_webrtc_video_track_add_sink_format` and
+  `reactor_webrtc_video_track_push_frame_format_ts`; the BGRA C entry points
+  are unchanged.
+- **Inbound audio concealment counters** on `InboundRtpStats`:
+  `total_samples_received`, `concealed_samples`, `silent_concealed_samples` and
+  `concealment_events`, from `RTCInboundRtpStreamStats`. All are cumulative
+  since the stream started and `0` on video. Between two reads, the change in
+  `concealed_samples` over the change in `total_samples_received` is the share
+  of the audio played that was concealed, and less the change in
+  `silent_concealed_samples`, the share a listener could hear.
+  `ReactorStatEntry` grows from 624 to 656 bytes, with the new fields at its
+  end.
+
+### Changed
+
+- **Every video push checks its size**, for either format. A buffer shorter
+  than `width * height` pixels, a zero size, or a size whose byte count
+  overflows `usize` returns `Err` (`RuntimeError` in Python). Before, a short
+  BGRA buffer went to the native side unchecked, and a zero-size BGRA push was
+  dropped without an error.
+- **The optional `openh264` feature requires patched CA trust** for its
+  download client: webpki-roots 1.0.10 and rustls-webpki 0.103.16, through
+  version floors on ureq and rustls that also update an existing lockfile.
+  Builds without the feature keep a TLS-free dependency graph.
+- **A local mac build of the prebuilt can pick its SDK** with `MAC_SDK_PATH`,
+  for Xcode 27, whose SDK the lld of this milestone cannot read. CI is
+  unaffected.
+
 ## 0.24.2 — data channel latency, and a factory on an x86_64 android emulator
 
 A data channel message spent most of its time in per-packet overhead and in
