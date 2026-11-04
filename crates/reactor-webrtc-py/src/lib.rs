@@ -1138,6 +1138,9 @@ pub struct OutboundRtpStats {
     pub fraction_lost: f64,
     /// Packets the receiver reports as lost. Signed, per RFC 3550.
     pub packets_lost: i32,
+    /// Jitter in seconds, as the receiver reports it about this stream; `0.0`
+    /// until it has sent a report.
+    pub jitter_s: f64,
     pub retransmitted_packets_sent: u64,
     /// Retransmissions the receiver asked for, where
     /// `retransmitted_packets_sent` is what was sent in answer. The two differ
@@ -1190,6 +1193,7 @@ impl From<rw::OutboundRtpStats> for OutboundRtpStats {
             total_round_trip_time_s: s.total_round_trip_time_s,
             fraction_lost: s.fraction_lost,
             packets_lost: s.packets_lost,
+            jitter_s: s.jitter_s,
             retransmitted_packets_sent: s.retransmitted_packets_sent,
             nack_count: s.nack_count,
             pli_count: s.pli_count,

@@ -745,6 +745,11 @@ until the first frame is encoded or decoded. An implementation name longer than
 127 bytes, such as the composed name of a simulcast adapter, is cut to its first
 127 bytes.
 
+On an outbound stream, `round_trip_time_s`, `fraction_lost`, `packets_lost`
+and `jitter_s` come from the far end's RTCP receiver report about the stream
+(`RTCRemoteInboundRtpStreamStats`): its view of what we send. They stay `0`
+until the first report arrives, so a zero there means "not reported yet".
+
 On an inbound audio stream, `total_samples_received` counts the samples played
 out, per channel, and `concealed_samples` the part of them the receiver made up
 because the real ones were lost or arrived too late. `silent_concealed_samples`
