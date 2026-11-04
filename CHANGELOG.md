@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.26.0 — the far end's jitter on outbound stats
+
+A send stream's round-trip time and loss already came from the far end's RTCP
+receiver report about it, but not its jitter, which the same report carries.
+So a native client could not report the jitter of what it sends, as the
+browser does.
+
+The prebuilt tag stays `webrtc-7907-a5ddff60-p13`.
+
+### Breaking
+
+- **Rust: `OutboundRtpStats` gains a public field** (below). Code that builds
+  one with a struct literal has to set it.
+
+### Added
+
+In Rust and Python:
+
+- **`OutboundRtpStats::jitter_s`**: the jitter, in seconds, that the far end
+  reports about this stream in its RTCP receiver report
+  (`RTCRemoteInboundRtpStreamStats`), next to the round-trip time and loss
+  from the same report. `0.0` until the first report arrives. The glue fills
+  the stat entry's existing `jitter` field, so the C ABI does not change.
+
 ## 0.25.0 — RGB24 video, and audio concealment in stats
 
 Video crossed this library's boundary as BGRA only, so a caller with RGB
