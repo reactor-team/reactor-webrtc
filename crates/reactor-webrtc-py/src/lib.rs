@@ -936,6 +936,16 @@ pub struct InboundRtpStats {
     pub decoder_implementation: Option<String>,
     /// Whether that decoder is the hardware one; `None` when not reported.
     pub power_efficient_decoder: Option<bool>,
+    /// Audio samples played out since the stream started, per channel; `0`
+    /// for video.
+    pub total_samples_received: u64,
+    /// The part of `total_samples_received` made up because the real samples
+    /// were lost or late, cumulative; `0` for video.
+    pub concealed_samples: u64,
+    /// The part of `concealed_samples` that was silence anyway, cumulative.
+    pub silent_concealed_samples: u64,
+    /// Runs of concealed samples, cumulative: a burst of loss is one event.
+    pub concealment_events: u64,
 }
 
 /// One frame libwebrtc stamped at each stage of its trip, as the receiver
@@ -1090,6 +1100,10 @@ impl From<rw::InboundRtpStats> for InboundRtpStats {
             timing_frame: s.timing_frame.map(TimingFrameInfo::from),
             decoder_implementation: s.decoder_implementation,
             power_efficient_decoder: s.power_efficient_decoder,
+            total_samples_received: s.total_samples_received,
+            concealed_samples: s.concealed_samples,
+            silent_concealed_samples: s.silent_concealed_samples,
+            concealment_events: s.concealment_events,
         }
     }
 }

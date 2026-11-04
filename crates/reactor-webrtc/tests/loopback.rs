@@ -247,6 +247,37 @@ fn safe_loopback_exchanges_media() {
     assert_eq!(audio_in.frames_decoded, 0);
     assert_eq!(audio_in.frame_width, 0);
 
+    // The audio sample counters. Played-out samples are what a listener heard,
+    // so audio reaching the sink must have counted some; the concealment
+    // counters are parts of that total (and of each other), so they can never
+    // exceed it. A loopback loses nothing, so how many were concealed is not
+    // asserted — only that the numbers nest. Video plays no samples.
+    assert!(
+        audio_in.total_samples_received > 0,
+        "the audio stream reported no samples played out despite {a} frames \
+         arriving at the sink"
+    );
+    assert!(
+        audio_in.concealed_samples <= audio_in.total_samples_received,
+        "more samples concealed ({}) than played out ({})",
+        audio_in.concealed_samples,
+        audio_in.total_samples_received
+    );
+    assert!(
+        audio_in.silent_concealed_samples <= audio_in.concealed_samples,
+        "more silent concealed samples ({}) than concealed ones ({})",
+        audio_in.silent_concealed_samples,
+        audio_in.concealed_samples
+    );
+    assert!(
+        audio_in.concealment_events <= audio_in.concealed_samples,
+        "more concealment events ({}) than concealed samples ({})",
+        audio_in.concealment_events,
+        audio_in.concealed_samples
+    );
+    assert_eq!(video_in.total_samples_received, 0);
+    assert_eq!(video_in.concealed_samples, 0);
+
     // Which transceiver, and which codec. A reader with several tracks of one
     // kind can only tell them apart by `mid`, so each stream's has to name a
     // transceiver of its own kind on its own peer — and its codec has to be one
@@ -319,7 +350,7 @@ fn safe_loopback_exchanges_media() {
     println!(
         "per-stream stats ✅\n  \
          inbound  video: {}x{} @{:.1}fps  frames={} dropped={} jitter={:.1}ms\n  \
-         inbound  audio: jitter={:.1}ms packets={}\n  \
+         inbound  audio: jitter={:.1}ms packets={} samples={} concealed={} events={}\n  \
          inbound  codecs: video={:?} (mid {:?}) audio={:?} (mid {:?})\n  \
          outbound rtt={:.3}ms fraction_lost={:.4}",
         video_in.frame_width,
@@ -330,6 +361,9 @@ fn safe_loopback_exchanges_media() {
         video_in.jitter_s * 1000.0,
         audio_in.jitter_s * 1000.0,
         audio_in.packets_received,
+        audio_in.total_samples_received,
+        audio_in.concealed_samples,
+        audio_in.concealment_events,
         video_in.codec_mime_type,
         video_in.mid,
         audio_in.codec_mime_type,

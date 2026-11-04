@@ -745,6 +745,18 @@ until the first frame is encoded or decoded. An implementation name longer than
 127 bytes, such as the composed name of a simulcast adapter, is cut to its first
 127 bytes.
 
+On an inbound audio stream, `total_samples_received` counts the samples played
+out, per channel, and `concealed_samples` the part of them the receiver made up
+because the real ones were lost or arrived too late. `silent_concealed_samples`
+is the part of those that was silence anyway, and `concealment_events` counts
+runs of concealed samples, so one burst of loss is one event. All four are
+cumulative since the stream started. Between two reads, the change in
+`concealed_samples` over the change in `total_samples_received` is the share of
+the audio played in that interval that was concealed. The share a listener could
+hear subtracts the silent part: the change in `concealed_samples` less the change
+in `silent_concealed_samples`, over the change in `total_samples_received`. They
+are `0` on a video stream.
+
 A data channel's message is one `send` or one delivered message, however many
 SCTP chunks carried it. On a chunked channel libwebrtc sees each frame as a
 message, so its counts there are frames.

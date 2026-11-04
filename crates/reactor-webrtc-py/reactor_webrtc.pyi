@@ -257,6 +257,19 @@ class InboundRtpStats:
     decoder_implementation: Optional[str]
     #: Whether that decoder is the hardware one; None when not reported.
     power_efficient_decoder: Optional[bool]
+    #: Audio samples played out since the stream started, per channel; 0 for
+    #: video. The denominator for the concealment counters below.
+    total_samples_received: int
+    #: The part of total_samples_received the receiver made up because the real
+    #: samples were lost or late, cumulative. Its change over the change in
+    #: total_samples_received is the share of the audio played that was
+    #: concealed; less the change in silent_concealed_samples, it is the share
+    #: a listener could hear.
+    concealed_samples: int
+    #: The part of concealed_samples that was silence anyway, cumulative.
+    silent_concealed_samples: int
+    #: Runs of concealed samples, cumulative: a burst of loss is one event.
+    concealment_events: int
     @property
     def average_jitter_buffer_delay_s(self) -> Optional[float]:
         """Average seconds a frame spent in the jitter buffer; None before the

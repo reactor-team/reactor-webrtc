@@ -265,7 +265,20 @@ struct ReactorStatEntry {
   // power_efficient_decoder / power_efficient_encoder: whether that
   // implementation is the hardware one. -1 unknown, 0 no, 1 yes.
   int8_t   power_efficient;
-  // Seven bytes of padding, so the size stays a multiple of 8.
+  // Seven bytes of padding, so the audio sample counters start 8-byte aligned.
+  //
+  // Inbound audio (kind 0): RTCInboundRtpStreamStats' sample counters, all
+  // cumulative since the stream started. total_samples_received counts samples
+  // the receiver played out, per channel; concealed_samples is the part of
+  // them it had to make up because the real ones were lost or late, and
+  // silent_concealed_samples the part of those that were silence anyway.
+  // concealment_events counts the runs of concealed samples, so a burst of
+  // loss is one event however long it lasts. Zero for video, and before the
+  // first sample.
+  uint64_t total_samples_received;
+  uint64_t concealed_samples;
+  uint64_t silent_concealed_samples;
+  uint64_t concealment_events;
 };
 
 // The layout guard, and the reason it is a size and not a comment: this struct
@@ -277,7 +290,7 @@ struct ReactorStatEntry {
 //
 // The Rust side carries the same assertion against the same number. If you are
 // here because one of them failed: you changed the struct on one side only.
-static_assert(sizeof(struct ReactorStatEntry) == 624,
+static_assert(sizeof(struct ReactorStatEntry) == 656,
               "ReactorStatEntry changed size — update the repr(C) mirror in "
               "reactor-webrtc-sys/src/lib.rs and both assertions");
 static_assert(offsetof(struct ReactorStatEntry, bytes_received) == 72,
@@ -325,6 +338,16 @@ static_assert(offsetof(struct ReactorStatEntry, codec_implementation) == 488,
               "the codec implementation moved — see above");
 static_assert(offsetof(struct ReactorStatEntry, power_efficient) == 616,
               "the power-efficient flag moved — see above");
+// The four audio sample counters share a width, and a swap would report loss
+// as playout.
+static_assert(offsetof(struct ReactorStatEntry, total_samples_received) == 624,
+              "the audio sample counters moved — see above");
+static_assert(offsetof(struct ReactorStatEntry, concealed_samples) == 632,
+              "the audio sample counters moved — see above");
+static_assert(offsetof(struct ReactorStatEntry, silent_concealed_samples) == 640,
+              "the audio sample counters moved — see above");
+static_assert(offsetof(struct ReactorStatEntry, concealment_events) == 648,
+              "the audio sample counters moved — see above");
 
 // The SCTP association's metrics, as dcsctp tracks them (patch 0006). Handed
 // to the callback of reactor_webrtc_peer_connection_sctp_metrics; mirrored by `repr(C) struct
@@ -1244,6 +1267,10 @@ class StatsCallback : public webrtc::RTCStatsCollectorCallback {
           e.jitter_buffer_minimum_delay = stat_val(s.jitter_buffer_minimum_delay);
           e.jitter_buffer_emitted_count = stat_val(s.jitter_buffer_emitted_count);
           e.total_processing_delay      = stat_val(s.total_processing_delay);
+          e.total_samples_received      = stat_val(s.total_samples_received);
+          e.concealed_samples           = stat_val(s.concealed_samples);
+          e.silent_concealed_samples    = stat_val(s.silent_concealed_samples);
+          e.concealment_events          = stat_val(s.concealment_events);
           stat_str_prefix(s.decoder_implementation, e.codec_implementation);
           e.power_efficient = s.power_efficient_decoder
                                   ? (*s.power_efficient_decoder ? 1 : 0)
