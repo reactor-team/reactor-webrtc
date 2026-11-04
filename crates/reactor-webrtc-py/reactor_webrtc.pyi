@@ -262,7 +262,9 @@ class InboundRtpStats:
     total_samples_received: int
     #: The part of total_samples_received the receiver made up because the real
     #: samples were lost or late, cumulative. Its change over the change in
-    #: total_samples_received is the share of audio heard as concealment.
+    #: total_samples_received is the share of the audio played that was
+    #: concealed; less the change in silent_concealed_samples, it is the share
+    #: a listener could hear.
     concealed_samples: int
     #: The part of concealed_samples that was silence anyway, cumulative.
     silent_concealed_samples: int

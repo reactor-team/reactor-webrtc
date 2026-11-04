@@ -1037,8 +1037,10 @@ pub struct InboundRtpStats {
     /// The part of [`total_samples_received`](Self::total_samples_received)
     /// the receiver made up because the real samples were lost or arrived
     /// too late, since the stream started. The change in this over the
-    /// change in `total_samples_received` is the share of audio a listener
-    /// heard as concealment over that interval. `0` for video.
+    /// change in `total_samples_received` is the share of the audio played
+    /// over that interval that was concealed; less the change in
+    /// [`silent_concealed_samples`](Self::silent_concealed_samples), it is the
+    /// share a listener could hear. `0` for video.
     pub concealed_samples: u64,
     /// The part of [`concealed_samples`](Self::concealed_samples) that was
     /// silence anyway, so the concealment could not be heard. `0` for video.

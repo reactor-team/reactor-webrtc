@@ -523,13 +523,24 @@ class TestStats:
 
         await wait_for(lambda: received_audio.is_set(), timeout=10.0)
 
+        # The stats collector can lag the frames at the sink, so poll until
+        # the played-out samples show up rather than reading one snapshot.
         report = await p2.pc.get_stats()
+        deadline = time.monotonic() + 5.0
+        while (
+            not report.inbound_rtp or report.inbound_rtp[0].total_samples_received == 0
+        ) and time.monotonic() < deadline:
+            await asyncio.sleep(0.1)
+            report = await p2.pc.get_stats()
         assert len(report.inbound_rtp) > 0, "expected inbound RTP stats after receiving audio"
         s = report.inbound_rtp[0]
         assert s.ssrc > 0
         assert s.packets_received >= 0
         assert s.bytes_received >= 0
         assert s.jitter_s >= 0.0
+        # Audio reached the sink, so the binding must carry played-out
+        # samples: a binding that never copied the field would leave it 0.
+        assert s.total_samples_received > 0
         # The audio sample counters nest: concealed samples are part of the
         # played-out total, and silent ones part of the concealed.
         assert s.concealed_samples <= s.total_samples_received
