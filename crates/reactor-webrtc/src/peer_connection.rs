@@ -1156,6 +1156,10 @@ pub struct OutboundRtpStats {
     pub fraction_lost: f64,
     /// Packets the receiver reports as lost. Signed, per RFC 3550.
     pub packets_lost: i32,
+    /// Jitter in seconds, as the receiver reports it about this stream, from
+    /// the same report as [`OutboundRtpStats::round_trip_time_s`]; `0.0` until
+    /// the far end has sent one.
+    pub jitter_s: f64,
     /// 64-bit for the same reason as [`OutboundRtpStats::packets_sent`].
     pub retransmitted_packets_sent: u64,
     /// Retransmissions the receiver asked this endpoint for.
@@ -2277,6 +2281,7 @@ extern "C" fn stats_cb(ud: *mut c_void, entries: *const ReactorStatEntry, count:
                 total_round_trip_time_s: e.total_round_trip_time,
                 fraction_lost: e.fraction_lost,
                 packets_lost: e.packets_lost,
+                jitter_s: e.jitter,
                 retransmitted_packets_sent: e.retransmitted_packets_sent,
                 nack_count: e.nack_count,
                 pli_count: e.pli_count,

@@ -176,7 +176,10 @@ struct ReactorStatEntry {
   uint64_t packets_sent;
   uint64_t retransmitted_packets_sent;
   uint64_t pair_packets_received;
-  double   jitter;                  // seconds
+  // Seconds. Kind 0: our own receive jitter. Kind 1: the jitter the far end
+  // reports in its RTCP receiver report about us, which stays 0 until one
+  // arrives.
+  double   jitter;
   double   total_decode_time;       // seconds
   double   target_bitrate;          // bps
   // Send-path RTT, seconds, 0 if not measured. Reached from the outbound
@@ -1324,9 +1327,11 @@ class StatsCallback : public webrtc::RTCStatsCollectorCallback {
               e.round_trip_time       = stat_val(r.round_trip_time);
               e.total_round_trip_time = stat_val(r.total_round_trip_time);
               e.fraction_lost         = stat_val(r.fraction_lost);
-              // The receiver's own loss count, which is the send path's. The
-              // inbound branch above fills the same field from our side.
+              // The receiver's own loss count and jitter, which are the send
+              // path's. The inbound branch above fills the same fields from
+              // our side.
               e.packets_lost          = stat_val(r.packets_lost);
+              e.jitter                = stat_val(r.jitter);
             }
           }
           entries.push_back(e);

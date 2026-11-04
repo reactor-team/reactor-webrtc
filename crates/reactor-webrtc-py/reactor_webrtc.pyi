@@ -327,6 +327,9 @@ class OutboundRtpStats:
     total_round_trip_time_s: float
     fraction_lost: float
     packets_lost: int
+    #: Jitter in seconds, as the receiver reports it about this stream; 0.0
+    #: until it has sent a report.
+    jitter_s: float
     retransmitted_packets_sent: int
     #: Retransmissions the receiver asked for, against
     #: retransmitted_packets_sent, which is what was sent in answer.

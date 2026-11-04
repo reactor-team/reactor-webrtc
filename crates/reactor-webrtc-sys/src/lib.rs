@@ -345,7 +345,8 @@ pub struct ReactorStatEntry {
     pub retransmitted_packets_sent: u64,
     /// Candidate pair (kind 2) only — see `packets_received`.
     pub pair_packets_received: u64,
-    /// jitter in seconds (inbound RTP)
+    /// Jitter in seconds: our own on an inbound stream (kind 0), the far end's
+    /// report about us on an outbound one (kind 1).
     pub jitter: f64,
     /// total decode time in seconds (inbound RTP)
     pub total_decode_time: f64,

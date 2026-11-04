@@ -590,6 +590,8 @@ class TestStats:
         assert inbound is not None and outbound is not None, "no video stream stats"
         assert outbound.frames_encoded > 0
         assert outbound.total_encode_time_s > 0.0
+        # The far end's jitter is on the binding; 0.0 until its first report.
+        assert outbound.jitter_s >= 0.0
         assert math.isfinite(outbound.total_packet_send_delay_s)
         assert inbound.jitter_buffer_emitted_count > 0
         assert inbound.jitter_buffer_delay_s > 0.0
