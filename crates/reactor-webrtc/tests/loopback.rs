@@ -346,17 +346,30 @@ fn safe_loopback_exchanges_media() {
         "no send stream reported a round-trip time; the remote_id lookup in \
          OnStatsDelivered matched nothing"
     );
-    // The far end's jitter comes from the same report, so a send stream that
-    // has its round-trip time has its jitter too. The receiver measures some
-    // on a loopback (its own inbound jitter above is not zero), so a zero on
-    // every send stream means the field was never copied.
-    let remote_jitter_ms = outbound
-        .iter()
-        .map(|s| s.jitter_s * 1000.0)
-        .fold(0.0, f64::max);
+    // The far end's jitter comes from the same report as the round-trip time.
+    // One report can carry a jitter of exactly zero, for example the first
+    // one, sent after a packet or two, so this polls the later reports rather
+    // than reading one. The receiver measures some jitter on this loopback
+    // (its own inbound jitter above is not zero), and each later report
+    // carries it, so a zero on every send stream for the whole wait means the
+    // field was never copied.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let remote_jitter_ms = loop {
+        let jitter_ms = pc1
+            .get_stats()
+            .expect("pc1 get_stats")
+            .outbound_rtp
+            .iter()
+            .map(|s| s.jitter_s * 1000.0)
+            .fold(0.0, f64::max);
+        if jitter_ms > 0.0 || Instant::now() >= deadline {
+            break jitter_ms;
+        }
+        thread::sleep(Duration::from_millis(100));
+    };
     assert!(
         remote_jitter_ms > 0.0,
-        "no send stream reported the far end's jitter despite a round-trip time"
+        "no send stream reported the far end's jitter within 5 s of a round-trip time"
     );
 
     println!(
