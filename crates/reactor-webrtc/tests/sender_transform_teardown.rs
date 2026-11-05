@@ -9,9 +9,13 @@
 //! thread it is running on, and on Linux the process aborts with
 //! `Check failed: 0 == pthread_join(*handle_, nullptr) (0 vs. 35)`.
 //!
-//! This test closes many connections mid-stream, with large frames pushed as
-//! fast as possible so tasks pile up on that queue. A crash aborts the test
-//! binary. `TEARDOWN_ITERATIONS` and `TEARDOWN_WORKERS` scale the run.
+//! Left alone, that needs a task to be preempted at the wrong moment, which
+//! hundreds of closes do not reliably hit. So the factory turns on the
+//! test-only hold of patch 0012: each transformed frame keeps the delegate
+//! alive `HOLD` longer on its queue. Closing the sender mid-stream then always
+//! leaves the last reference to that queue, and waiting past `HOLD` lets it
+//! drop there. Without the fix in patch 0012 this aborts the test binary on
+//! every iteration; `TEARDOWN_ITERATIONS` scales the run.
 //!
 //! ```sh
 //! REACTOR_WEBRTC_LIB_DIR=webrtc-build/out/linux-x64-release/dist \
@@ -32,6 +36,8 @@ use reactor_webrtc::{
 
 const W: u32 = 1280;
 const H: u32 = 720;
+/// How long each transformed frame keeps the delegate alive on its queue.
+const HOLD: Duration = Duration::from_millis(200);
 
 #[derive(Default)]
 struct Ice {
@@ -77,8 +83,7 @@ fn negotiate(pc1: &PeerConnection, pc2: &PeerConnection) {
     pc1.set_remote_description(&answer).expect("pc1 remote");
 }
 
-/// Noise frames: incompressible, so every encoded frame is large and the
-/// sender spends real time packetizing it on the transform queue.
+/// Noise frames: incompressible, so every frame is encoded and sent.
 fn noise_frames(count: usize) -> Vec<Vec<u8>> {
     let mut state = 0x9E37_79B9_7F4A_7C15u64;
     (0..count)
@@ -102,7 +107,8 @@ fn env_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-/// One connection: stream until frames arrive, then close the sender mid-stream.
+/// One connection: stream until frames arrive, close the sender mid-stream,
+/// then wait out `HOLD` so the delegate's last reference drops on its queue.
 /// Returns whether the receiver saw frames before the close.
 fn stream_then_close(factory: &PeerConnectionFactory, frames: &[Vec<u8>]) -> bool {
     let config = RtcConfiguration::default();
@@ -160,7 +166,8 @@ fn stream_then_close(factory: &PeerConnectionFactory, frames: &[Vec<u8>]) -> boo
             thread::sleep(Duration::from_millis(10));
         };
 
-        // Close the sender while frames are still being pushed and transformed.
+        // Close the sender while frames are still being pushed and transformed:
+        // the held tasks now own the delegate.
         drop(pc1.take());
         thread::sleep(Duration::from_millis(20));
         stop.store(true, Ordering::SeqCst);
@@ -168,46 +175,33 @@ fn stream_then_close(factory: &PeerConnectionFactory, frames: &[Vec<u8>]) -> boo
     });
 
     drop(pc2);
+    // The last held task fires `HOLD` after its frame and destroys the delegate
+    // on the delegate's own queue. Without the fix, the process aborts here.
+    thread::sleep(HOLD * 3);
     saw_frames
 }
 
 #[test]
 fn closing_a_sender_with_transformed_frames_in_flight_does_not_abort() {
-    let iterations = env_usize("TEARDOWN_ITERATIONS", 20);
-    let workers = env_usize("TEARDOWN_WORKERS", 2);
+    let iterations = env_usize("TEARDOWN_ITERATIONS", 3);
 
-    // One factory for the process, the way the runtime uses it.
-    let factory = Arc::new(PeerConnectionFactory::builder().build().expect("factory"));
-    let frames = Arc::new(noise_frames(4));
-    let streamed = Arc::new(AtomicUsize::new(0));
-    let done = Arc::new(AtomicUsize::new(0));
+    let factory = PeerConnectionFactory::builder()
+        .with_sender_transform_hold_for_testing(HOLD)
+        .build()
+        .expect("factory");
+    let frames = noise_frames(2);
 
-    let handles: Vec<_> = (0..workers)
-        .map(|_| {
-            let (factory, frames, streamed, done) = (
-                factory.clone(),
-                frames.clone(),
-                streamed.clone(),
-                done.clone(),
-            );
-            thread::spawn(move || {
-                while done.fetch_add(1, Ordering::SeqCst) < iterations {
-                    if stream_then_close(&factory, &frames) {
-                        streamed.fetch_add(1, Ordering::SeqCst);
-                    }
-                }
-            })
-        })
-        .collect();
-    for h in handles {
-        h.join().expect("worker panicked");
+    let mut streamed = 0;
+    for _ in 0..iterations {
+        if stream_then_close(&factory, &frames) {
+            streamed += 1;
+        }
     }
 
-    let streamed = streamed.load(Ordering::SeqCst);
     println!("closed {iterations} connections mid-stream ({streamed} had frames flowing)");
-    assert!(
-        streamed * 2 >= iterations,
-        "too few connections streamed before the close ({streamed}/{iterations}); \
-         the teardown race was not exercised"
+    assert_eq!(
+        streamed, iterations,
+        "a connection closed before frames flowed, so its sender had no held \
+         tasks and the teardown was not exercised"
     );
 }

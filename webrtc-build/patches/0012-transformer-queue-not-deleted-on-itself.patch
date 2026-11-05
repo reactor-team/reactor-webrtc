@@ -1,16 +1,51 @@
+diff --git a/modules/rtp_rtcp/BUILD.gn b/modules/rtp_rtcp/BUILD.gn
+index 6876cbe9c9..b31baee3cc 100644
+--- a/modules/rtp_rtcp/BUILD.gn
++++ b/modules/rtp_rtcp/BUILD.gn
+@@ -330,6 +330,7 @@ rtc_library("rtp_rtcp") {
+     "../../rtc_base:macromagic",
+     "../../rtc_base:mod_ops",
+     "../../rtc_base:one_time_event",
++    "../../rtc_base:platform_thread",
+     "../../rtc_base:race_checker",
+     "../../rtc_base:random",
+     "../../rtc_base:rate_limiter",
+diff --git a/modules/rtp_rtcp/source/rtp_sender_video.cc b/modules/rtp_rtcp/source/rtp_sender_video.cc
+index d5d2fa0f73..0a3ef79b42 100644
+--- a/modules/rtp_rtcp/source/rtp_sender_video.cc
++++ b/modules/rtp_rtcp/source/rtp_sender_video.cc
+@@ -217,8 +217,17 @@ RTPSenderVideo::RTPSenderVideo(const Config& config)
+                         ? TaskQueueFactory::Priority::kVideo
+                         : TaskQueueFactory::Priority::kNormal)
+               : nullptr) {
+-  if (frame_transformer_delegate_)
++  if (frame_transformer_delegate_) {
++    // Reactor: test-only, see SetTaskHoldForTesting().
++    if (int hold_ms = std::atoi(
++            config.field_trials->Lookup("Reactor-SenderTransformHoldMs")
++                .c_str());
++        hold_ms > 0) {
++      frame_transformer_delegate_->SetTaskHoldForTesting(
++          TimeDelta::Millis(hold_ms));
++    }
+     frame_transformer_delegate_->Init();
++  }
+ }
+ 
+ RTPSenderVideo::~RTPSenderVideo() {
 diff --git a/modules/rtp_rtcp/source/rtp_sender_video_frame_transformer_delegate.cc b/modules/rtp_rtcp/source/rtp_sender_video_frame_transformer_delegate.cc
-index c54f9f8..19a502d 100644
+index c54f9f8991..dac541ab70 100644
 --- a/modules/rtp_rtcp/source/rtp_sender_video_frame_transformer_delegate.cc
 +++ b/modules/rtp_rtcp/source/rtp_sender_video_frame_transformer_delegate.cc
-@@ -16,6 +16,7 @@
- #include <optional>
- #include <span>
- #include <string>
-+#include <thread>
- #include <utility>
- #include <vector>
+@@ -34,6 +34,7 @@
+ #include "api/video_codecs/video_codec.h"
+ #include "modules/rtp_rtcp/source/rtp_video_header.h"
+ #include "rtc_base/checks.h"
++#include "rtc_base/platform_thread.h"
+ #include "rtc_base/synchronization/mutex.h"
  
-@@ -174,6 +175,21 @@ RTPSenderVideoFrameTransformerDelegate::RTPSenderVideoFrameTransformerDelegate(
+ namespace webrtc {
+@@ -174,6 +175,27 @@ RTPSenderVideoFrameTransformerDelegate::RTPSenderVideoFrameTransformerDelegate(
            task_queue_factory->CreateTaskQueue("VideoFrameTransformerQueue",
                                                transformation_queue_priority)) {}
  
@@ -25,20 +60,51 @@ index c54f9f8..19a502d 100644
 +    ~RTPSenderVideoFrameTransformerDelegate() {
 +  if (transformation_queue_ && transformation_queue_->IsCurrent()) {
 +    TaskQueueBase* queue = transformation_queue_.release();
-+    std::thread([queue] { queue->Delete(); }).detach();
++    PlatformThread::SpawnDetached([queue] { queue->Delete(); },
++                                  "VideoFrameTransformerQueueDelete");
 +  }
++}
++
++void RTPSenderVideoFrameTransformerDelegate::SetTaskHoldForTesting(
++    TimeDelta hold) {
++  task_hold_ = hold;
 +}
 +
  void RTPSenderVideoFrameTransformerDelegate::Init() {
    frame_transformer_->RegisterTransformedFrameSinkCallback(
        scoped_refptr<TransformedFrameCallback>(this), ssrc_);
+@@ -212,9 +234,15 @@ void RTPSenderVideoFrameTransformerDelegate::OnTransformedFrame(
+   }
+   scoped_refptr<RTPSenderVideoFrameTransformerDelegate> delegate(this);
+   transformation_queue_->PostTask(
+-      [delegate = std::move(delegate), frame = std::move(frame)]() mutable {
++      [delegate = std::move(delegate), frame = std::move(frame),
++       hold = task_hold_]() mutable {
+         RTC_DCHECK_RUN_ON(delegate->transformation_queue_.get());
+         delegate->SendVideo(std::move(frame));
++        // Reactor: test-only, see SetTaskHoldForTesting().
++        if (hold > TimeDelta::Zero()) {
++          TaskQueueBase* queue = delegate->transformation_queue_.get();
++          queue->PostDelayedTask([delegate = std::move(delegate)] {}, hold);
++        }
+       });
+ }
+ 
 diff --git a/modules/rtp_rtcp/source/rtp_sender_video_frame_transformer_delegate.h b/modules/rtp_rtcp/source/rtp_sender_video_frame_transformer_delegate.h
-index ad799a0..bcc7988 100644
+index ad799a0408..559f4716ee 100644
 --- a/modules/rtp_rtcp/source/rtp_sender_video_frame_transformer_delegate.h
 +++ b/modules/rtp_rtcp/source/rtp_sender_video_frame_transformer_delegate.h
-@@ -110,7 +110,8 @@ class RTPSenderVideoFrameTransformerDelegate : public TransformedFrameCallback {
+@@ -109,8 +109,16 @@ class RTPSenderVideoFrameTransformerDelegate : public TransformedFrameCallback {
+   // `sender_` to dangle.
    void Reset();
  
++  // Reactor: test-only, set from the Reactor-SenderTransformHoldMs field trial
++  // before Init(). Each transformed-frame task keeps its reference to this
++  // delegate for `hold` longer, on `transformation_queue_`, so closing the
++  // sender reliably leaves the last reference to that queue. See the
++  // destructor.
++  void SetTaskHoldForTesting(TimeDelta hold);
++
   protected:
 -  ~RTPSenderVideoFrameTransformerDelegate() override = default;
 +  // Reactor: not defaulted, see the definition.
@@ -46,3 +112,13 @@ index ad799a0..bcc7988 100644
  
   private:
    void EnsureEncoderQueueCreated();
+@@ -124,6 +132,9 @@ class RTPSenderVideoFrameTransformerDelegate : public TransformedFrameCallback {
+   // happen if a hardware encoder was used.
+   std::unique_ptr<TaskQueueBase, TaskQueueDeleter> transformation_queue_;
+   bool short_circuit_ RTC_GUARDED_BY(sender_lock_) = false;
++  // Reactor: see SetTaskHoldForTesting(). Written before Init(), then only
++  // read.
++  TimeDelta task_hold_ = TimeDelta::Zero();
+ };
+ 
+ // Method to support cloning a Sender frame from another frame

@@ -480,11 +480,16 @@ receive-buffer drop. Applies cleanly on top of 0010 at the pinned commit.
 ### 0012 — never delete the sender transform queue on itself
 
 `0012-transformer-queue-not-deleted-on-itself.patch` · touches
-`modules/rtp_rtcp/source/rtp_sender_video_frame_transformer_delegate.{h,cc}` (+17 lines)
+`modules/rtp_rtcp/source/rtp_sender_video_frame_transformer_delegate.{h,cc}`,
+`modules/rtp_rtcp/source/rtp_sender_video.cc`, `modules/rtp_rtcp/BUILD.gn`
+(+52 lines)
 
 **What.** `RTPSenderVideoFrameTransformerDelegate` gets a destructor: when it
 runs on the delegate's own `transformation_queue_`, it releases the queue and
-deletes it from a detached thread instead.
+deletes it from a detached thread (`PlatformThread::SpawnDetached`) instead.
+For tests, the `Reactor-SenderTransformHoldMs` field trial makes each
+transformed-frame task keep its reference to the delegate that many ms longer,
+through a delayed no-op task on the same queue. Unset, nothing changes.
 
 **Why.** A video sender with a frame transformer (ours: the frame-metadata
 trailer) hands every transformed frame back through a task posted to
@@ -500,19 +505,22 @@ the current one: `pthread_join` returns `EDEADLK` and the process aborts with
 ```
 
 `TaskQueueStdlib::Delete()` only guards this with a `RTC_DCHECK`, so release
-builds abort instead. Linux only: on Apple platforms the queue is GCD-backed and
+builds abort instead. Affects Linux and Android (`TaskQueueStdlib`) and Windows,
+whose `Delete()` also joins. On Apple platforms the queue is GCD-backed and
 `Delete()` does not join. Upstream `main` has the same code.
 
 **How it works.** The detached thread calls `Delete()`, which asks the queue to
 quit and joins its thread. That join returns once the current task, the one
 running this destructor, has returned.
 
-**Verify.** `crates/reactor-webrtc/tests/sender_transform_teardown.rs` closes
-connections mid-stream with metadata negotiated. The window is too narrow to hit
-on demand, so the check is a build with a 50 ms sleep added to the posted task
-after `SendVideo` (the delegate's reference held, as a preempted thread would):
-without this patch it aborts with the message above in 5 runs of 5, with it 5
-runs of 5 pass (100 connections each). The stack of the abort goes
+**Verify.** Without help, the abort needs a task preempted at the wrong moment,
+which hundreds of closes do not reliably hit. The field trial removes the luck:
+`crates/reactor-webrtc/tests/sender_transform_teardown.rs` builds its factory
+with a 200 ms hold (`with_sender_transform_hold_for_testing`), closes
+connections mid-stream with metadata negotiated, and waits past the hold, so
+the last reference always drops on the queue. With the field trial but without
+the destructor, the test aborts with the message above in 5 runs of 5; with
+both, 5 runs of 5 pass. The stack of the abort goes
 `TaskQueueStdlib` task → `RefCountedObject<RTPSenderVideoFrameTransformerDelegate>::Release`
 → `TaskQueueStdlib::Delete` → `pthread_join`.
 

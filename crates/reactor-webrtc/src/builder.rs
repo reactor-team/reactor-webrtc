@@ -39,6 +39,7 @@ pub struct PeerConnectionFactoryBuilder {
     sctp_tuning: Option<SctpTuning>,
     send_playout_delay: Option<PlayoutDelay>,
     receive_playout_delay: Option<PlayoutDelay>,
+    sender_transform_hold: Option<std::time::Duration>,
     #[cfg(feature = "openh264")]
     openh264: Option<std::path::PathBuf>,
 }
@@ -55,6 +56,7 @@ impl PeerConnectionFactoryBuilder {
             sctp_tuning: None,
             send_playout_delay: None,
             receive_playout_delay: None,
+            sender_transform_hold: None,
             #[cfg(feature = "openh264")]
             openh264: None,
         }
@@ -135,6 +137,17 @@ impl PeerConnectionFactoryBuilder {
     /// [`RtcConfiguration::sctp_snap`](crate::RtcConfiguration::sctp_snap).
     pub fn with_dtls_in_stun(mut self, enabled: bool) -> Self {
         self.dtls_in_stun = enabled;
+        self
+    }
+
+    /// Tests only. Each transformed video frame keeps the sender's transform
+    /// delegate alive `hold` longer on that delegate's own task queue, so
+    /// closing a sender while frames flow drops the delegate's last reference
+    /// on that queue. That is the teardown libwebrtc patch 0012 makes safe;
+    /// `tests/sender_transform_teardown.rs` uses this to hit it every time.
+    #[doc(hidden)]
+    pub fn with_sender_transform_hold_for_testing(mut self, hold: std::time::Duration) -> Self {
+        self.sender_transform_hold = Some(hold);
         self
     }
 
@@ -302,6 +315,9 @@ impl PeerConnectionFactoryBuilder {
             recv_playout_delay_set: recv_playout.is_some() as std::os::raw::c_int,
             recv_playout_delay_min_ms: recv_playout.map_or(0, |(min, _)| min),
             recv_playout_delay_max_ms: recv_playout.map_or(0, |(_, max)| max),
+            sender_transform_hold_ms: self.sender_transform_hold.map_or(0, |d| {
+                d.as_millis().min(std::os::raw::c_int::MAX as u128) as std::os::raw::c_int
+            }),
             #[cfg(feature = "openh264")]
             openh264_lib_path: openh264_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
             ..Default::default()
