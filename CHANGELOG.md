@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.27.0 — no abort when a video sender closes mid-frame
+
+With frame metadata negotiated, every outgoing video frame goes through a frame
+transformer, and libwebrtc hands each transformed frame back to the sender on a
+task queue it creates for that. Closing the sender while one of those frames was
+still on the queue could destroy the queue from its own thread. On Linux,
+Android and Windows that aborts the process with
+`Check failed: 0 == pthread_join(*handle_, nullptr) (0 vs. 35)`.
+
+The prebuilt tag becomes `webrtc-7907-a5ddff60-p14`.
+
+### Breaking
+
+- **Rust: `reactor_webrtc_sys::ReactorFactoryOptions` gains a public field**,
+  `sender_transform_hold_ms`. Code that builds one with a struct literal has to
+  set it or use `..Default::default()`. The struct only grows at its end, behind
+  `size`.
+
+### Fixed
+
+- **Closing a video sender no longer aborts the process** (patch 0012). When
+  the sender's transform delegate is destroyed on its own queue, the queue is
+  deleted from a separate thread instead of joining itself. Every other
+  teardown is unchanged.
+
+### Added
+
+- **`with_sender_transform_hold_for_testing`** on the factory builder (Rust,
+  hidden from docs): each transformed frame keeps the delegate alive that much
+  longer on its queue, so a test can close a sender and hit the teardown above
+  every time. Off unless set.
+
 ## 0.26.0 — the far end's jitter on outbound stats
 
 A send stream's round-trip time and loss already came from the far end's RTCP
