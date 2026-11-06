@@ -2601,6 +2601,10 @@ struct ReactorFactoryOptions {
   int                          sctp_rto_min_ms;             // default 400
   int                          sctp_delayed_ack_max_ms;     // default 200
   int                          sctp_immediate_sack_under_cwnd_mtus;  // default 10
+  // Tests only. > 0: each transformed video frame keeps the sender's transform
+  // delegate alive this many ms longer on its queue, answered as the
+  // Reactor-SenderTransformHoldMs field trial (patch 0012).
+  int                          sender_transform_hold_ms;
 };
 }
 
@@ -2608,13 +2612,15 @@ struct ReactorFactoryOptions {
 // which carries the same numbers. Both build from one checkout, so no ABI
 // version guards this struct; it only grows at its end, behind `size`. The
 // offsets catch a field added on one side only within a run of ints.
-static_assert(sizeof(void*) != 8 || sizeof(ReactorFactoryOptions) == 136,
+static_assert(sizeof(void*) != 8 || sizeof(ReactorFactoryOptions) == 144,
               "ReactorFactoryOptions changed size — update the repr(C) mirror "
               "in reactor-webrtc-sys/src/lib.rs and both assertions");
 static_assert(sizeof(void*) != 8 ||
               offsetof(ReactorFactoryOptions, dtls_in_stun) == 80);
 static_assert(sizeof(void*) != 8 ||
               offsetof(ReactorFactoryOptions, sctp_initial_cwnd_mtus) == 112);
+static_assert(sizeof(void*) != 8 ||
+              offsetof(ReactorFactoryOptions, sender_transform_hold_ms) == 136);
 
 struct ReactorEncoderState {
   reactor_video_encode_cb        cb;
@@ -2968,10 +2974,13 @@ class ReactorFieldTrials : public webrtc::FieldTrialsView {
     std::string recv_playout_delay;
     // Patch 0011: WebRTC-DcSctp-<name> → value, only for the options set.
     std::map<std::string, int> sctp_tuning;
+    // Patch 0012, tests only: Reactor-SenderTransformHoldMs.
+    int sender_transform_hold_ms = 0;
 
     bool any() const {
       return dtls_in_stun || sctp_max_burst > 0 || !send_playout_delay.empty() ||
-             !recv_playout_delay.empty() || !sctp_tuning.empty();
+             !recv_playout_delay.empty() || !sctp_tuning.empty() ||
+             sender_transform_hold_ms > 0;
     }
   };
 
@@ -2987,6 +2996,10 @@ class ReactorFieldTrials : public webrtc::FieldTrialsView {
     // Patch 0005: dcsctp packets per Send() and per SACK.
     if (s_.sctp_max_burst > 0 && key == "WebRTC-DcSctp-MaxBurst") {
       return std::to_string(s_.sctp_max_burst);
+    }
+    // Patch 0012, tests only: hold the sender transform delegate on its queue.
+    if (s_.sender_transform_hold_ms > 0 && key == "Reactor-SenderTransformHoldMs") {
+      return std::to_string(s_.sender_transform_hold_ms);
     }
     // RTPSenderVideo stamps these limits on every frame it sends, in place of
     // whatever the encoder asked for (which, for libwebrtc's own encoders, is
@@ -3050,6 +3063,7 @@ void* reactor_webrtc_factory_create(const ReactorFactoryOptions* opts,
   ReactorFieldTrials::Settings trial_settings;
   trial_settings.dtls_in_stun = opts->dtls_in_stun != 0;
   trial_settings.sctp_max_burst = opts->sctp_max_burst;
+  trial_settings.sender_transform_hold_ms = opts->sender_transform_hold_ms;
   for (const auto& [key, value] : std::initializer_list<std::pair<const char*, int>>{
            {"WebRTC-DcSctp-InitialCwndMtus", opts->sctp_initial_cwnd_mtus},
            {"WebRTC-DcSctp-MinCwndMtus", opts->sctp_min_cwnd_mtus},

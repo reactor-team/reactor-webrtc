@@ -204,6 +204,11 @@ pub struct ReactorFactoryOptions {
     pub sctp_delayed_ack_max_ms: c_int,
     /// Below this window, in MTUs, DATA asks for an immediate SACK (upstream 10).
     pub sctp_immediate_sack_under_cwnd_mtus: c_int,
+    /// Tests only. When positive, each transformed video frame keeps the
+    /// sender's transform delegate alive this many ms longer on its queue,
+    /// through the `Reactor-SenderTransformHoldMs` field trial (libwebrtc patch
+    /// 0012), so closing the sender drops the delegate's last reference there.
+    pub sender_transform_hold_ms: c_int,
 }
 
 // Pins the layout of `ReactorFactoryOptions` against the C struct in
@@ -214,12 +219,13 @@ pub struct ReactorFactoryOptions {
 #[cfg(target_pointer_width = "64")]
 const _: () = {
     assert!(
-        core::mem::size_of::<ReactorFactoryOptions>() == 136,
+        core::mem::size_of::<ReactorFactoryOptions>() == 144,
         "ReactorFactoryOptions changed size — update the C struct in \
          glue/reactor_webrtc.cpp and both assertions"
     );
     assert!(core::mem::offset_of!(ReactorFactoryOptions, dtls_in_stun) == 80);
     assert!(core::mem::offset_of!(ReactorFactoryOptions, sctp_initial_cwnd_mtus) == 112);
+    assert!(core::mem::offset_of!(ReactorFactoryOptions, sender_transform_hold_ms) == 136);
 };
 
 impl Default for ReactorFactoryOptions {
@@ -250,6 +256,7 @@ impl Default for ReactorFactoryOptions {
             sctp_rto_min_ms: 0,
             sctp_delayed_ack_max_ms: 0,
             sctp_immediate_sack_under_cwnd_mtus: 0,
+            sender_transform_hold_ms: 0,
         }
     }
 }
