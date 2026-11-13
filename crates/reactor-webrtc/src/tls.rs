@@ -12,6 +12,7 @@
 //! A verifier decides only whether the chain leads to a trusted root for TLS
 //! server use. libwebrtc checks the host name itself afterwards.
 
+use std::any::Any;
 use std::borrow::Cow;
 use std::fmt;
 use std::os::raw::{c_int, c_void};
@@ -62,21 +63,26 @@ impl WebPkiVerifier {
 
     /// Trust the given DER root certificates, for example the platform store
     /// from `rustls-native-certs`.
+    ///
+    /// A certificate that cannot be a trust anchor is skipped, as rustls's
+    /// `RootCertStore::add_parsable_certificates` does: platform stores often
+    /// hold a few legacy roots that webpki refuses. It fails only when no root
+    /// remains.
     pub fn from_der_roots<I, C>(roots: I) -> Result<Self>
     where
         I: IntoIterator<Item = C>,
         C: AsRef<[u8]>,
     {
-        let roots = roots
+        let roots: Vec<TrustAnchor<'static>> = roots
             .into_iter()
-            .map(|der| {
+            .filter_map(|der| {
                 webpki::anchor_from_trusted_cert(&CertificateDer::from(der.as_ref()))
+                    .ok()
                     .map(|anchor| anchor.to_owned())
-                    .map_err(|e| Error::Webrtc(format!("TLS root certificate: {e}")))
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect();
         if roots.is_empty() {
-            return Err(Error::Webrtc("no TLS root certificate".into()));
+            return Err(Error::Webrtc("no usable TLS root certificate".into()));
         }
         Ok(Self {
             roots: Cow::Owned(roots),
@@ -130,20 +136,38 @@ pub(crate) extern "C" fn tls_verify(
         return 0;
     }
     // SAFETY: `userdata` comes from `into_userdata` and stays alive until the
-    // glue calls `tls_release`. The glue passes `count` valid pointers and
-    // lengths that it keeps alive for this call.
+    // glue calls `tls_release`.
     let verifier = unsafe { &*userdata.cast::<Shared>() };
-    let chain: Vec<&[u8]> = (0..count)
-        .map(|i| unsafe { std::slice::from_raw_parts(*certs.add(i), *lens.add(i)) })
-        .collect();
-    // A panic must not cross into C++: treat it as a refusal. Leak the payload,
-    // because its own drop can panic too.
+    let mut chain: Vec<&[u8]> = Vec::with_capacity(count);
+    for i in 0..count {
+        // SAFETY: the glue passes `count` pointers and lengths that stay alive
+        // for this call. A null or empty entry is refused below.
+        let (ptr, len) = unsafe { (*certs.add(i), *lens.add(i)) };
+        if ptr.is_null() || len == 0 {
+            return 0;
+        }
+        // SAFETY: `ptr` is not null and points to `len` readable bytes.
+        chain.push(unsafe { std::slice::from_raw_parts(ptr, len) });
+    }
+    // A panic must not cross into C++: treat it as a refusal.
     match catch_unwind(AssertUnwindSafe(|| verifier.verify_chain(&chain))) {
         Ok(accepted) => accepted as c_int,
         Err(payload) => {
-            std::mem::forget(payload);
+            drop_payload(payload);
             0
         }
+    }
+}
+
+/// Drop a panic payload without unwinding into C++.
+///
+/// Unwinding has finished when `catch_unwind` returns, so the payload can be
+/// dropped under a second `catch_unwind`. Only a payload whose own `Drop`
+/// panics is leaked, with the second payload: leaking every payload would grow
+/// memory with each handshake that makes a verifier panic.
+fn drop_payload(payload: Box<dyn Any + Send>) {
+    if let Err(second) = catch_unwind(AssertUnwindSafe(move || drop(payload))) {
+        std::mem::forget(second);
     }
 }
 
@@ -159,7 +183,7 @@ pub(crate) extern "C" fn tls_release(userdata: *mut c_void) {
     // SAFETY: the glue calls this exactly once per `into_userdata`.
     let shared = unsafe { Box::from_raw(userdata.cast::<Shared>()) };
     if let Err(payload) = catch_unwind(AssertUnwindSafe(move || drop(shared))) {
-        std::mem::forget(payload);
+        drop_payload(payload);
     }
 }
 
@@ -233,6 +257,15 @@ mod tests {
         assert!(WebPkiVerifier::from_der_roots(Vec::<Vec<u8>>::new()).is_err());
     }
 
+    #[test]
+    fn unusable_roots_are_skipped() {
+        let garbage: &[u8] = b"not a certificate";
+        let mixed = WebPkiVerifier::from_der_roots([garbage, ROOT_YR]).expect("one usable root");
+        assert_eq!(mixed.verify_at(&[LEAF, YR1], valid_time()), Ok(()));
+
+        assert!(WebPkiVerifier::from_der_roots([garbage]).is_err());
+    }
+
     #[derive(Debug)]
     struct Counting {
         answer: bool,
@@ -300,6 +333,70 @@ mod tests {
         // is the last one. Without the guard, the panic in Drop aborts the
         // test process.
         let userdata = into_userdata(&(Arc::new(PanicsOnDrop) as Shared));
+        tls_release(userdata);
+    }
+
+    /// A panic payload that counts its drops.
+    struct CountedPayload(Arc<AtomicUsize>);
+
+    impl Drop for CountedPayload {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Debug)]
+    struct PanicsWithPayload(Arc<AtomicUsize>);
+
+    impl TlsCertVerifier for PanicsWithPayload {
+        fn verify_chain(&self, _chain: &[&[u8]]) -> bool {
+            std::panic::panic_any(CountedPayload(self.0.clone()));
+        }
+    }
+
+    impl Drop for PanicsWithPayload {
+        fn drop(&mut self) {
+            std::panic::panic_any(CountedPayload(self.0.clone()));
+        }
+    }
+
+    #[test]
+    fn panic_payloads_are_dropped_not_leaked() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let userdata = into_userdata(&(Arc::new(PanicsWithPayload(drops.clone())) as Shared));
+        let certs = [LEAF.as_ptr()];
+        let lens = [LEAF.len()];
+        for _ in 0..3 {
+            assert_eq!(tls_verify(userdata, certs.as_ptr(), lens.as_ptr(), 1), 0);
+        }
+        assert_eq!(drops.load(Ordering::SeqCst), 3, "a verify payload leaked");
+
+        // The last release runs the verifier's Drop, which panics too.
+        tls_release(userdata);
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            4,
+            "the release payload leaked"
+        );
+    }
+
+    #[test]
+    fn a_null_or_empty_certificate_refuses_the_chain() {
+        let counting = Arc::new(Counting {
+            answer: true,
+            calls: AtomicUsize::new(0),
+            leaf_len: AtomicUsize::new(0),
+        });
+        let userdata = into_userdata(&(counting.clone() as Shared));
+
+        let null = [LEAF.as_ptr(), std::ptr::null()];
+        let lens = [LEAF.len(), 0];
+        assert_eq!(tls_verify(userdata, null.as_ptr(), lens.as_ptr(), 2), 0);
+
+        let empty = [LEAF.as_ptr(), YR1.as_ptr()];
+        assert_eq!(tls_verify(userdata, empty.as_ptr(), lens.as_ptr(), 2), 0);
+
+        assert_eq!(counting.calls.load(Ordering::SeqCst), 0);
         tls_release(userdata);
     }
 

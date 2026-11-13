@@ -78,8 +78,10 @@ the server sent, and it can ask more than once in one handshake.
 The default, `WebPkiVerifier::mozilla()`, checks the chain with `rustls-webpki`
 against the Mozilla root store of the `webpki-roots` crate, which is what a
 browser trusts. `WebPkiVerifier::from_der_roots` trusts other roots, for
-example the platform store from `rustls-native-certs`, and a type of your own
-can implement `TlsCertVerifier`. `None` keeps the built-in roots only. In every
+example the platform store from `rustls-native-certs`. It skips a certificate
+that cannot be a trust anchor, because platform stores often hold a few legacy
+roots, and fails only when no root remains. A type of your own can implement
+`TlsCertVerifier`. `None` keeps the built-in roots only. In every
 case libwebrtc checks the host name itself, and a chain the built-in roots
 accept never reaches the verifier.
 

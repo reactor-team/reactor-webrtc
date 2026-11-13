@@ -1021,6 +1021,8 @@ class ReactorTlsCertVerifier : public webrtc::SSLCertificateVerifier {
   bool Verify(const webrtc::SSLCertificate& certificate) override {
     webrtc::Buffer der;
     certificate.ToDER(&der);
+    // ToDER leaves the buffer empty when the encoding fails.
+    if (der.empty()) return false;
     const uint8_t* data = der.data();
     const size_t len = der.size();
     return verify_(userdata_, &data, &len, 1) != 0;
@@ -1034,6 +1036,8 @@ class ReactorTlsCertVerifier : public webrtc::SSLCertificateVerifier {
     std::vector<size_t> lens(count);
     for (size_t i = 0; i < count; ++i) {
       chain.Get(i).ToDER(&ders[i]);
+      // ToDER leaves the buffer empty when the encoding fails.
+      if (ders[i].empty()) return false;
       data[i] = ders[i].data();
       lens[i] = ders[i].size();
     }
