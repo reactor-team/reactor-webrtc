@@ -90,7 +90,9 @@
 #include "modules/video_coding/include/video_error_codes.h"
 #include "pc/sctp_transport.h"
 #include "pc/video_track_source.h"
+#include "rtc_base/buffer.h"
 #include "rtc_base/copy_on_write_buffer.h"
+#include "rtc_base/ssl_certificate.h"
 #include "rtc_base/thread.h"
 #include "rtc_base/time_utils.h"
 #include "third_party/libyuv/include/libyuv/convert.h"
@@ -426,6 +428,20 @@ struct ReactorRtcConfig {
   int                     tcp_candidate_policy;
   // SNAP (draft-hancke-tsvwg-snap): 0 = off (libwebrtc default).
   int                     sctp_snap;
+  // Certificate check for TURN over TLS (turns: URLs). libwebrtc first checks
+  // the server chain against the roots compiled into it (rtc_base/ssl_roots.h).
+  // When that fails, it calls `tls_verify` on its network thread with the chain
+  // as DER: `certs[i]` holds `lens[i]` bytes, leaf first. Nonzero accepts the
+  // chain. libwebrtc checks the host name itself afterwards. A null
+  // `tls_verify` keeps the built-in roots only.
+  //
+  // The glue owns `tls_userdata`: it calls `tls_release(tls_userdata)` exactly
+  // once, when libwebrtc drops the verifier, or before
+  // reactor_webrtc_peer_connection_create returns when no verifier was built.
+  int  (*tls_verify)(void* userdata, const uint8_t* const* certs,
+                     const size_t* lens, size_t count);
+  void (*tls_release)(void* userdata);
+  void*                   tls_userdata;
 };
 }  // extern "C"
 
@@ -985,6 +1001,68 @@ class SetRemoteDescObserver
 // Copy a borrowed C string, mapping null to empty.
 std::string str_or_empty(const char* s) { return s ? std::string(s) : std::string(); }
 
+// Checks the chain of a TURN-over-TLS server with the caller's `tls_verify`
+// (see ReactorRtcConfig). libwebrtc owns it through
+// PeerConnectionDependencies::tls_cert_verifier and calls it on the network
+// thread when its built-in roots do not verify the chain.
+class ReactorTlsCertVerifier : public webrtc::SSLCertificateVerifier {
+ public:
+  ReactorTlsCertVerifier(int (*verify)(void*, const uint8_t* const*,
+                                       const size_t*, size_t),
+                         void (*release)(void*), void* userdata)
+      : verify_(verify), release_(release), userdata_(userdata) {}
+  ~ReactorTlsCertVerifier() override {
+    if (release_) release_(userdata_);
+  }
+  ReactorTlsCertVerifier(const ReactorTlsCertVerifier&) = delete;
+  ReactorTlsCertVerifier& operator=(const ReactorTlsCertVerifier&) = delete;
+
+  bool Verify(const webrtc::SSLCertificate& certificate) override {
+    webrtc::Buffer der;
+    certificate.ToDER(&der);
+    const uint8_t* data = der.data();
+    const size_t len = der.size();
+    return verify_(userdata_, &data, &len, 1) != 0;
+  }
+
+  bool VerifyChain(const webrtc::SSLCertChain& chain) override {
+    const size_t count = chain.GetSize();
+    if (count == 0) return false;
+    std::vector<webrtc::Buffer> ders(count);
+    std::vector<const uint8_t*> data(count);
+    std::vector<size_t> lens(count);
+    for (size_t i = 0; i < count; ++i) {
+      chain.Get(i).ToDER(&ders[i]);
+      data[i] = ders[i].data();
+      lens[i] = ders[i].size();
+    }
+    return verify_(userdata_, data.data(), lens.data(), count) != 0;
+  }
+
+ private:
+  int (*verify_)(void*, const uint8_t* const*, const size_t*, size_t);
+  void (*release_)(void*);
+  void* userdata_;
+};
+
+// Give the caller's TURN-over-TLS verifier to `deps`, or release its userdata
+// when there is none to build (see ReactorRtcConfig::tls_release).
+void attach_tls_verifier(const ReactorRtcConfig* in,
+                         webrtc::PeerConnectionDependencies& deps) {
+  if (!in) return;
+  if (in->tls_verify) {
+    deps.tls_cert_verifier = std::make_unique<ReactorTlsCertVerifier>(
+        in->tls_verify, in->tls_release, in->tls_userdata);
+  } else if (in->tls_release) {
+    in->tls_release(in->tls_userdata);
+  }
+}
+
+// Release the userdata of a TURN-over-TLS verifier that was never built.
+void release_tls_verifier(const ReactorRtcConfig* in) {
+  if (in && in->tls_release) in->tls_release(in->tls_userdata);
+}
+
 // Apply the caller's configuration to a libwebrtc RTCConfiguration. A null
 // `in` keeps the libwebrtc defaults. Credentials travel per server entry, so a
 // turn:/turns: URL reaches ice_server_parsing.cc with its username and
@@ -1487,6 +1565,7 @@ void* reactor_webrtc_peer_connection_create(void* factory,
                                             char* err, int err_cap) {
   auto* rf = reinterpret_cast<ReactorFactory*>(factory);
   if (!rf || !rf->factory) {
+    release_tls_verifier(config);
     write_error(err, err_cap, "invalid peer connection factory");
     return nullptr;
   }
@@ -1504,6 +1583,9 @@ void* reactor_webrtc_peer_connection_create(void* factory,
   apply_rtc_config(config, rtc_config);
 
   webrtc::PeerConnectionDependencies deps(rpc->observer.get());
+  // From here libwebrtc owns the verifier, and drops it with `deps` when the
+  // create call fails.
+  attach_tls_verifier(config, deps);
   auto result =
       rf->factory->CreatePeerConnectionOrError(rtc_config, std::move(deps));
   if (!result.ok()) {

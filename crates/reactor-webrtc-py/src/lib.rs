@@ -432,6 +432,9 @@ impl From<&RtcConfiguration> for rw::RtcConfiguration {
             frame_metadata: c.frame_metadata,
             sctp_snap: c.sctp_snap,
             dc_chunking: c.dc_chunking,
+            // Python has no verifier setting: the Mozilla roots of the Rust
+            // default check TURN-over-TLS servers.
+            ..rw::RtcConfiguration::default()
         }
     }
 }
