@@ -8,6 +8,7 @@ is self-contained (imports included) except where noted that it assumes
 an existing `pc`.
 
 - [ICE servers](#ice-servers)
+- [TURN over TLS certificates](#turn-over-tls-certificates)
 - [ICE transport policy](#ice-transport-policy)
 - [Continual gathering policy](#continual-gathering-policy)
 - [Port range](#port-range)
@@ -63,6 +64,53 @@ config = rw.RtcConfiguration(ice_servers=[
 </details>
 
 Default: empty (no STUN/TURN — only host candidates are gathered).
+
+## TURN over TLS certificates
+
+For a `turns:` server, libwebrtc checks the certificate chain against a root
+list compiled into it (`rtc_base/ssl_roots.h`). That list comes from Google's
+small `pki.goog/roots.pem` of May 2023 and has no ISRG root, so on its own it
+refuses every Let's Encrypt certificate. When that check fails, libwebrtc asks
+the connection's `tls_cert_verifier`. It passes the chain its TLS stack built
+from the server's certificates, leaf first, which is not always the exact list
+the server sent, and it can ask more than once in one handshake.
+
+The default, `WebPkiVerifier::mozilla()`, checks the chain with `rustls-webpki`
+against the Mozilla root store of the `webpki-roots` crate, which is what a
+browser trusts. It refuses a leaf with no DNS name in its subjectAltName:
+libwebrtc's host check falls back to the Common Name for such a leaf, and name
+constraints do not cover the Common Name. `WebPkiVerifier::from_der_roots` trusts other roots, for
+example the platform store from `rustls-native-certs`. It skips a certificate
+that cannot be a trust anchor, because platform stores often hold a few legacy
+roots, and fails only when no root remains. A type of your own can implement
+`TlsCertVerifier`. `None` keeps the built-in roots only. In every
+case libwebrtc checks the host name itself, and a chain the built-in roots
+accept never reaches the verifier.
+
+The verifier runs on libwebrtc's network thread during the TLS handshake, so it
+must not block.
+
+<details>
+<summary>🦀 Example using Rust</summary>
+
+```rust
+use std::sync::Arc;
+
+use reactor_webrtc::{RtcConfiguration, WebPkiVerifier};
+
+// Trust the platform root store instead of the Mozilla roots.
+let roots = rustls_native_certs::load_native_certs().certs;
+let config = RtcConfiguration {
+    tls_cert_verifier: Some(Arc::new(WebPkiVerifier::from_der_roots(&roots)?)),
+    ..Default::default()
+};
+```
+
+</details>
+
+Python uses the default and has no setting.
+
+Default: `Some(WebPkiVerifier::mozilla())`.
 
 ## ICE transport policy
 

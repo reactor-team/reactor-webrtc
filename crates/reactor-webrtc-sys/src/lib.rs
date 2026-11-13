@@ -702,6 +702,28 @@ pub struct ReactorRtcConfig {
     /// nonzero puts the SCTP INIT parameters in the SDP. 0 = off (libwebrtc
     /// default).
     pub sctp_snap: c_int,
+    /// Certificate check for TURN over TLS (`turns:` URLs). libwebrtc first
+    /// checks the server chain against the roots compiled into it
+    /// (`rtc_base/ssl_roots.h`). When that fails, it calls `tls_verify` on its
+    /// network thread with the chain its TLS stack built from the server's
+    /// certificates, as DER: `certs[i]` holds `lens[i]` bytes, leaf first. It
+    /// can call it more than once in one handshake. Nonzero accepts the chain.
+    /// libwebrtc checks the host name itself afterwards. `None` keeps the
+    /// built-in roots only.
+    pub tls_verify: Option<
+        extern "C" fn(
+            userdata: *mut c_void,
+            certs: *const *const u8,
+            lens: *const usize,
+            count: usize,
+        ) -> c_int,
+    >,
+    /// Releases `tls_userdata`. The glue owns `tls_userdata` and calls this
+    /// exactly once: when libwebrtc drops the verifier, or before
+    /// [`reactor_webrtc_peer_connection_create`] returns when no verifier was
+    /// built.
+    pub tls_release: Option<extern "C" fn(userdata: *mut c_void)>,
+    pub tls_userdata: *mut c_void,
 }
 
 /// `pixel_format` for raw video frames: `width * height * 4` bytes, B,G,R,A in
