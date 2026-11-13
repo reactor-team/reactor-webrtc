@@ -230,6 +230,20 @@ fn gather(
     seen
 }
 
+/// Whether the glue let go of its reference to `verifier`, so that only the test
+/// holds it. libwebrtc can destroy a peer connection a moment after its handle
+/// is dropped, so poll for up to 5 s.
+fn released(verifier: &Arc<Recorder>) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Arc::strong_count(verifier) > 1 {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    true
+}
+
 /// Every case runs on one factory: libwebrtc starts process-global threads on
 /// factory creation, so repeated factory churn in one process is unsafe.
 #[test]
@@ -251,12 +265,42 @@ fn turns_asks_the_connection_verifier() {
         Some(pki.leaf.as_ref()),
         "the verifier did not get the server leaf first"
     );
+    assert!(
+        released(&trusting),
+        "the glue kept the verifier after the peer connection closed"
+    );
 
     // A verifier that refuses.
     let refusing = Arc::new(Recorder::default());
     let seen = gather(&factory, &pki, Some(refusing.clone())).expect("a TLS connection");
     assert!(!seen.handshake_ok, "a refused chain finished the handshake");
     assert!(refusing.calls.load(Ordering::SeqCst) > 0);
+    assert!(
+        released(&refusing),
+        "the glue kept the verifier after the peer connection closed"
+    );
+
+    // A configuration libwebrtc rejects: a TURN URL with an empty password. The
+    // glue gives the verifier to libwebrtc before the create call fails, so the
+    // failed call must release it too.
+    let rejected = Arc::new(Recorder::default());
+    let config = RtcConfiguration {
+        ice_servers: vec![IceServer {
+            urls: vec!["turns:localhost:443?transport=tcp".into()],
+            username: "user".into(),
+            password: String::new(),
+        }],
+        tls_cert_verifier: Some(rejected.clone()),
+        ..Default::default()
+    };
+    assert!(
+        factory
+            .create_peer_connection(&config, PeerConnectionObserver::new())
+            .is_err(),
+        "libwebrtc accepted a TURN URL with an empty password"
+    );
+    drop(config);
+    assert!(released(&rejected), "a failed create kept the verifier");
 
     // No verifier: the built-in roots do not know the test CA.
     let seen = gather(&factory, &pki, None).expect("a TLS connection");
