@@ -23,3 +23,13 @@ openh264 = ["reactor-webrtc-sys/openh264"]
 reactor-webrtc-sys = { workspace = true }
 reactor-webrtc-dc-chunking = { workspace = true }
 prost = "0.13"
+# TURN over TLS: verify the server chain against the Mozilla roots, because
+# libwebrtc's built-in roots have no ISRG root (see src/tls.rs).
+rustls-pki-types = { version = "1", features = ["std"] }
+rustls-webpki = { version = "0.103", default-features = false, features = ["std", "ring"] }
+webpki-roots = "1"
+
+[dev-dependencies]
+# tests/turn_tls.rs: a local TLS server with a certificate from a test CA.
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

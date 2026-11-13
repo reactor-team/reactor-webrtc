@@ -2,9 +2,11 @@
 
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int};
+use std::sync::Arc;
 
 use reactor_webrtc_sys::{ReactorIceServer, ReactorRtcConfig};
 
+use crate::tls::{self, TlsCertVerifier, WebPkiVerifier};
 use crate::{Error, Result};
 
 /// A single ICE (STUN/TURN) server.
@@ -185,6 +187,17 @@ pub struct RtcConfiguration {
     /// to keep one connection of a chunking factory on plain data channels.
     /// The factory's `max_burst` still applies to it.
     pub dc_chunking: bool,
+    /// Which TURN-over-TLS (`turns:`) servers this connection trusts.
+    ///
+    /// libwebrtc checks the server chain against its built-in roots first.
+    /// Those come from 2023 and have no ISRG root, so they refuse Let's Encrypt
+    /// certificates. When they fail, libwebrtc asks this verifier. The default,
+    /// [`WebPkiVerifier::mozilla`], trusts the Mozilla root store. Set a
+    /// [`WebPkiVerifier::from_der_roots`] to trust other roots, for example the
+    /// platform store. `None` keeps the built-in roots only.
+    ///
+    /// libwebrtc checks the host name in every case.
+    pub tls_cert_verifier: Option<Arc<dyn TlsCertVerifier>>,
 }
 
 impl Default for RtcConfiguration {
@@ -213,6 +226,9 @@ impl Default for RtcConfiguration {
             sctp_snap: false,
             // Only an opt-out: the factory decides whether chunking is offered.
             dc_chunking: true,
+            // The built-in roots refuse Let's Encrypt, which most TURN servers
+            // use. Mozilla's roots are what a browser trusts.
+            tls_cert_verifier: Some(Arc::new(WebPkiVerifier::mozilla())),
         }
     }
 }
@@ -249,6 +265,7 @@ pub(crate) struct NativeConfig {
     ice_check_interval_strong_connectivity_ms: c_int,
     tcp_candidate_policy: c_int,
     sctp_snap: c_int,
+    tls_cert_verifier: Option<Arc<dyn TlsCertVerifier>>,
 }
 
 impl NativeConfig {
@@ -318,10 +335,26 @@ impl NativeConfig {
                 .unwrap_or(-1),
             tcp_candidate_policy: config.tcp_candidate_policy.to_wire(),
             sctp_snap: config.sctp_snap as c_int,
+            tls_cert_verifier: config.tls_cert_verifier.clone(),
         })
     }
 
-    /// The struct to pass to the glue. Valid while `self` is alive.
+    /// The struct to pass to `reactor_webrtc_peer_connection_create`, with the
+    /// TURN-over-TLS verifier attached. The glue takes one reference to the
+    /// verifier and releases it, so call this once per create call. Valid while
+    /// `self` is alive.
+    pub(crate) fn create_config(&self) -> ReactorRtcConfig {
+        let mut config = self.config();
+        if let Some(verifier) = &self.tls_cert_verifier {
+            config.tls_verify = Some(tls::tls_verify);
+            config.tls_release = Some(tls::tls_release);
+            config.tls_userdata = tls::into_userdata(verifier);
+        }
+        config
+    }
+
+    /// The struct to pass to the glue, without a TURN-over-TLS verifier. Valid
+    /// while `self` is alive.
     pub(crate) fn config(&self) -> ReactorRtcConfig {
         ReactorRtcConfig {
             servers: self.servers.as_ptr(),
@@ -336,6 +369,9 @@ impl NativeConfig {
                 .ice_check_interval_strong_connectivity_ms,
             tcp_candidate_policy: self.tcp_candidate_policy,
             sctp_snap: self.sctp_snap,
+            tls_verify: None,
+            tls_release: None,
+            tls_userdata: std::ptr::null_mut(),
         }
     }
 }

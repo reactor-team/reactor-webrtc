@@ -48,6 +48,7 @@ pub mod platform;
 mod playout;
 mod sctp_tuning;
 mod sender_meta;
+mod tls;
 
 use std::ffi::CString;
 use std::os::raw::c_int;
@@ -95,6 +96,7 @@ pub use playout::PlayoutDelay;
 #[cfg(feature = "openh264")]
 pub use reactor_webrtc_sys::openh264;
 pub use sctp_tuning::SctpTuning;
+pub use tls::{TlsCertVerifier, WebPkiVerifier};
 
 /// The ABI version of the linked native build. Used to assert that the safe
 /// crate and the prebuilt `libwebrtc` agree.
@@ -334,7 +336,7 @@ impl PeerConnectionFactory {
         let raw = unsafe {
             reactor_webrtc_sys::reactor_webrtc_peer_connection_create(
                 self.handle.raw(),
-                &native.config(),
+                &native.create_config(),
                 &callbacks,
                 err.as_mut_ptr(),
                 err.len() as c_int,
