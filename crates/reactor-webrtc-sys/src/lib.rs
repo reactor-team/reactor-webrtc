@@ -705,9 +705,11 @@ pub struct ReactorRtcConfig {
     /// Certificate check for TURN over TLS (`turns:` URLs). libwebrtc first
     /// checks the server chain against the roots compiled into it
     /// (`rtc_base/ssl_roots.h`). When that fails, it calls `tls_verify` on its
-    /// network thread with the chain as DER: `certs[i]` holds `lens[i]` bytes,
-    /// leaf first. Nonzero accepts the chain. libwebrtc checks the host name
-    /// itself afterwards. `None` keeps the built-in roots only.
+    /// network thread with the chain its TLS stack built from the server's
+    /// certificates, as DER: `certs[i]` holds `lens[i]` bytes, leaf first. It
+    /// can call it more than once in one handshake. Nonzero accepts the chain.
+    /// libwebrtc checks the host name itself afterwards. `None` keeps the
+    /// built-in roots only.
     pub tls_verify: Option<
         extern "C" fn(
             userdata: *mut c_void,

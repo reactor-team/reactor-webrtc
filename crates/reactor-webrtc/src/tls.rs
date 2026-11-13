@@ -29,9 +29,12 @@ use crate::{Error, Result};
 /// must not block. It runs only when libwebrtc's built-in roots do not verify
 /// the chain.
 pub trait TlsCertVerifier: fmt::Debug + Send + Sync {
-    /// `chain` holds DER certificates as the server sent them: the leaf first,
-    /// then the intermediates. Return `true` when the chain leads to a trusted
-    /// root and the leaf may serve TLS.
+    /// `chain` holds DER certificates, the leaf first. It is the chain that
+    /// libwebrtc's TLS stack built from the server's certificates, not always
+    /// the exact list the server sent: it can miss a certificate the server
+    /// sent, or hold one from the built-in roots. libwebrtc can call this more
+    /// than once in one handshake. Return `true` when the chain leads to a
+    /// trusted root and the leaf may serve TLS.
     fn verify_chain(&self, chain: &[&[u8]]) -> bool;
 }
 
@@ -133,15 +136,30 @@ pub(crate) extern "C" fn tls_verify(
     let chain: Vec<&[u8]> = (0..count)
         .map(|i| unsafe { std::slice::from_raw_parts(*certs.add(i), *lens.add(i)) })
         .collect();
-    // A panic must not cross into C++: treat it as a refusal.
-    catch_unwind(AssertUnwindSafe(|| verifier.verify_chain(&chain))).unwrap_or(false) as c_int
+    // A panic must not cross into C++: treat it as a refusal. Leak the payload,
+    // because its own drop can panic too.
+    match catch_unwind(AssertUnwindSafe(|| verifier.verify_chain(&chain))) {
+        Ok(accepted) => accepted as c_int,
+        Err(payload) => {
+            std::mem::forget(payload);
+            0
+        }
+    }
 }
 
 /// The glue's `tls_release`: drop the reference from `into_userdata`.
+///
+/// libwebrtc can drop the verifier after the configuration and the caller let
+/// go of theirs, so this can drop the last reference and run the verifier's
+/// `Drop`. A panic there must not cross into C++ either.
 pub(crate) extern "C" fn tls_release(userdata: *mut c_void) {
-    if !userdata.is_null() {
-        // SAFETY: the glue calls this exactly once per `into_userdata`.
-        drop(unsafe { Box::from_raw(userdata.cast::<Shared>()) });
+    if userdata.is_null() {
+        return;
+    }
+    // SAFETY: the glue calls this exactly once per `into_userdata`.
+    let shared = unsafe { Box::from_raw(userdata.cast::<Shared>()) };
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(move || drop(shared))) {
+        std::mem::forget(payload);
     }
 }
 
@@ -259,6 +277,30 @@ mod tests {
         fn verify_chain(&self, _chain: &[&[u8]]) -> bool {
             panic!("verifier bug");
         }
+    }
+
+    #[derive(Debug)]
+    struct PanicsOnDrop;
+
+    impl TlsCertVerifier for PanicsOnDrop {
+        fn verify_chain(&self, _chain: &[&[u8]]) -> bool {
+            true
+        }
+    }
+
+    impl Drop for PanicsOnDrop {
+        fn drop(&mut self) {
+            panic!("verifier drop bug");
+        }
+    }
+
+    #[test]
+    fn the_last_release_contains_a_panicking_drop() {
+        // The temporary Arc is gone after this line, so the glue's reference
+        // is the last one. Without the guard, the panic in Drop aborts the
+        // test process.
+        let userdata = into_userdata(&(Arc::new(PanicsOnDrop) as Shared));
+        tls_release(userdata);
     }
 
     #[test]

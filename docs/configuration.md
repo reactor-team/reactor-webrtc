@@ -71,7 +71,9 @@ For a `turns:` server, libwebrtc checks the certificate chain against a root
 list compiled into it (`rtc_base/ssl_roots.h`). That list comes from Google's
 small `pki.goog/roots.pem` of May 2023 and has no ISRG root, so on its own it
 refuses every Let's Encrypt certificate. When that check fails, libwebrtc asks
-the connection's `tls_cert_verifier` with the chain the server sent.
+the connection's `tls_cert_verifier`. It passes the chain its TLS stack built
+from the server's certificates, leaf first, which is not always the exact list
+the server sent, and it can ask more than once in one handshake.
 
 The default, `WebPkiVerifier::mozilla()`, checks the chain with `rustls-webpki`
 against the Mozilla root store of the `webpki-roots` crate, which is what a
