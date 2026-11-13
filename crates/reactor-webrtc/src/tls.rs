@@ -40,6 +40,10 @@ pub trait TlsCertVerifier: fmt::Debug + Send + Sync {
 }
 
 /// A [`TlsCertVerifier`] that checks the chain with `rustls-webpki`.
+///
+/// It also refuses a leaf with no DNS name in its subjectAltName. libwebrtc's
+/// host check falls back to the Common Name for such a leaf, and name
+/// constraints do not cover the Common Name.
 #[derive(Clone)]
 pub struct WebPkiVerifier {
     roots: Cow<'static, [TrustAnchor<'static>]>,
@@ -90,14 +94,15 @@ impl WebPkiVerifier {
     }
 
     /// Verify `chain` at `time` for TLS server use.
-    fn verify_at(&self, chain: &[&[u8]], time: UnixTime) -> std::result::Result<(), webpki::Error> {
+    fn verify_at(&self, chain: &[&[u8]], time: UnixTime) -> std::result::Result<(), Refusal> {
         let Some((leaf, rest)) = chain.split_first() else {
-            return Err(webpki::Error::BadDer);
+            return Err(webpki::Error::BadDer.into());
         };
         let leaf = CertificateDer::from(*leaf);
         let intermediates: Vec<CertificateDer<'_>> =
             rest.iter().map(|der| CertificateDer::from(*der)).collect();
-        EndEntityCert::try_from(&leaf)?.verify_for_usage(
+        let end_entity = EndEntityCert::try_from(&leaf)?;
+        end_entity.verify_for_usage(
             ALL_VERIFICATION_ALGS,
             &self.roots,
             &intermediates,
@@ -106,7 +111,31 @@ impl WebPkiVerifier {
             None,
             None,
         )?;
+        // libwebrtc checks the host name with X509_check_host, which falls back
+        // to the subject Common Name when the leaf has no DNS name in its
+        // subjectAltName. webpki applies name constraints to the
+        // subjectAltName only, so through the Common Name a constrained issuer
+        // could certify a name outside its constraints. BoringSSL refuses that
+        // leaf, and this verifier must not accept what it refused.
+        if end_entity.valid_dns_names().next().is_none() {
+            return Err(Refusal::NoDnsName);
+        }
         Ok(())
+    }
+}
+
+/// Why [`WebPkiVerifier`] refused a chain.
+#[derive(Debug, PartialEq)]
+enum Refusal {
+    /// webpki refused the chain.
+    Chain(webpki::Error),
+    /// The leaf has no DNS name in its subjectAltName.
+    NoDnsName,
+}
+
+impl From<webpki::Error> for Refusal {
+    fn from(error: webpki::Error) -> Self {
+        Self::Chain(error)
     }
 }
 
@@ -255,6 +284,84 @@ mod tests {
     #[test]
     fn no_roots_is_an_error() {
         assert!(WebPkiVerifier::from_der_roots(Vec::<Vec<u8>>::new()).is_err());
+    }
+
+    /// A root, an intermediate it limits to names under `allowed.test`, and a
+    /// leaf from that intermediate, as `(root, intermediate, leaf)` DER.
+    fn constrained_chain(dns_names: &[&str], common_name: &str) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        use rcgen::{
+            BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, GeneralSubtree,
+            IsCa, KeyPair, NameConstraints,
+        };
+
+        let mut root = CertificateParams::new(Vec::<String>::new()).expect("root params");
+        root.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        root.distinguished_name
+            .push(DnType::CommonName, "test root");
+        let root_key = KeyPair::generate().expect("root key");
+        let root = root.self_signed(&root_key).expect("root");
+
+        let mut intermediate =
+            CertificateParams::new(Vec::<String>::new()).expect("intermediate params");
+        intermediate.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        intermediate
+            .distinguished_name
+            .push(DnType::CommonName, "constrained intermediate");
+        intermediate.name_constraints = Some(NameConstraints {
+            permitted_subtrees: vec![GeneralSubtree::DnsName("allowed.test".into())],
+            excluded_subtrees: Vec::new(),
+        });
+        let intermediate_key = KeyPair::generate().expect("intermediate key");
+        let intermediate = intermediate
+            .signed_by(&intermediate_key, &root, &root_key)
+            .expect("intermediate");
+
+        let names: Vec<String> = dns_names.iter().map(|name| name.to_string()).collect();
+        let mut leaf = CertificateParams::new(names).expect("leaf params");
+        leaf.distinguished_name
+            .push(DnType::CommonName, common_name);
+        leaf.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let leaf_key = KeyPair::generate().expect("leaf key");
+        let leaf = leaf
+            .signed_by(&leaf_key, &intermediate, &intermediate_key)
+            .expect("leaf");
+
+        (
+            root.der().to_vec(),
+            intermediate.der().to_vec(),
+            leaf.der().to_vec(),
+        )
+    }
+
+    #[test]
+    fn a_leaf_without_a_dns_name_is_refused() {
+        // The Common Name is outside the intermediate's constraint. libwebrtc's
+        // host check would fall back to it, because the leaf has no DNS name.
+        let (root, intermediate, leaf) = constrained_chain(&[], "turn.victim.test");
+        let verifier = WebPkiVerifier::from_der_roots([&root]).expect("root");
+        assert_eq!(
+            verifier.verify_at(&[&leaf, &intermediate], UnixTime::now()),
+            Err(Refusal::NoDnsName)
+        );
+    }
+
+    #[test]
+    fn name_constraints_apply_to_the_dns_names() {
+        let (root, intermediate, inside) =
+            constrained_chain(&["turn.allowed.test"], "turn.allowed.test");
+        let verifier = WebPkiVerifier::from_der_roots([&root]).expect("root");
+        assert_eq!(
+            verifier.verify_at(&[&inside, &intermediate], UnixTime::now()),
+            Ok(())
+        );
+
+        let (root, intermediate, outside) =
+            constrained_chain(&["turn.victim.test"], "turn.victim.test");
+        let verifier = WebPkiVerifier::from_der_roots([&root]).expect("root");
+        assert!(matches!(
+            verifier.verify_at(&[&outside, &intermediate], UnixTime::now()),
+            Err(Refusal::Chain(_))
+        ));
     }
 
     #[test]
