@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.29.0 — standalone video encoders and decoders
+
+libwebrtc's H.264, VP8, VP9 and AV1 encoders and decoders now run without a
+peer connection: raw frames in, one encoded frame out per call, and back. An
+application can then carry an encoded video stream over a channel of its own,
+such as a data channel, with the same codec stack as its media tracks.
+
+The prebuilt stays `webrtc-7907-a5ddff60-p14`: the codecs are in the glue,
+which is built from source.
+
+### Added
+
+- **`reactor_webrtc::codec`** (Rust). `VideoCodecs` collects the backends this
+  process can run; `capabilities()` lists them per codec and direction,
+  hardware first, and leaves out what the build cannot run.
+  `VideoCodecs::encoder` and `VideoCodecs::decoder` take the codec as a
+  parameter, and `Backend` restricts one to hardware or software.
+  - The encoder takes RGB or another `PixelFormat` with a timestamp and returns
+    that frame's encoded output before it returns. It is rate-controlled
+    (`bitrate_bps` and `framerate`, changed with `set_rates`), makes no
+    B-frames, marks each key frame, and makes one for its first frame, a new
+    frame size, the frame after an error and the frame after
+    `request_key_frame()`.
+  - The decoder keeps its references between calls. After `reset()`, or
+    before its first frame, it answers `CodecError::NeedKeyFrame` until it gets
+    a key frame.
+  - One encoded frame is one Annex B access unit for H.264, one frame for VP8
+    and VP9, and one temporal unit of OBUs for AV1.
+  - H.264 uses VideoToolbox on Apple and OpenH264 (the `openh264` feature) in
+    software. VP8 and VP9 run on libvpx, AV1 on libaom to encode and dav1d to
+    decode.
+- **`reactor_webrtc_sys`: the C functions and structs behind the codecs**
+  (`reactor_webrtc_codec_context_*`, `reactor_webrtc_video_encoder_*`,
+  `reactor_webrtc_video_decoder_*`).
+- **Python: `VideoCodecs`, `VideoEncoder`, `VideoDecoder`,
+  `CodecCapabilities`.** Frames are numpy `uint8` arrays of shape `(H, W, 3)`;
+  numpy comes with the new `numpy` extra
+  (`pip install 'reactor-webrtc[numpy]'`) and the rest of the module does not
+  need it. Encode and decode release the GIL. `CodecUnsupported` and
+  `CodecNeedsKeyFrame` report a codec with no backend here and a decoder
+  waiting for a key frame. See "Standalone video codecs" in the package README
+  and the stub for the full contract.
+
 ## 0.28.0 — TURN over TLS with Let's Encrypt certificates
 
 libwebrtc checks a `turns:` server's certificate against a list of roots
