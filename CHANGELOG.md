@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.28.0 — TURN over TLS with Let's Encrypt certificates
+
+libwebrtc checks a `turns:` server's certificate against a list of roots
+compiled into it in 2023. That list has no ISRG root, so a TURN server with a
+Let's Encrypt certificate, which is most of them, failed the TLS handshake. On
+a network that allows only TCP 443, the connection then failed. Browsers are
+not affected: they use their own trust store.
+
+The prebuilt stays `webrtc-7907-a5ddff60-p14`.
+
+### Breaking
+
+- **Rust: `RtcConfiguration` gains `tls_cert_verifier`.** Code that builds one
+  with a struct literal has to set it or use `..Default::default()`.
+- **Rust: `reactor_webrtc_sys::ReactorRtcConfig` gains `tls_verify`,
+  `tls_release` and `tls_userdata`.** It has no `Default`: set the first two to
+  `None` and `tls_userdata` to null.
+
+### Fixed
+
+- **TURN over TLS accepts Let's Encrypt chains.** When libwebrtc's built-in
+  roots refuse a chain, it now goes to a verifier. The default,
+  `WebPkiVerifier::mozilla()`, checks it with `rustls-webpki` against the
+  Mozilla roots from `webpki-roots`. libwebrtc still checks the host name
+  afterwards. Python uses this default and has no new setting.
+
+### Added
+
+- **`TlsCertVerifier` and `WebPkiVerifier`** (Rust).
+  `WebPkiVerifier::from_der_roots` takes other roots, for example the platform
+  store, and `tls_cert_verifier: None` keeps the built-in roots only. See
+  "TURN over TLS certificates" in `docs/configuration.md`.
+
 ## 0.27.0 — no abort when a video sender closes mid-frame
 
 With frame metadata negotiated, every outgoing video frame goes through a frame
