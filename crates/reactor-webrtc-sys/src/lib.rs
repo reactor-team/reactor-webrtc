@@ -1340,8 +1340,9 @@ extern "C" {
     );
 
     // ── Standalone video codecs ──────────────────────────────────────────────
-    /// Collect the codec backends this process can run: VideoToolbox on Apple,
-    /// and OpenH264 from `openh264_lib_path` when it is not null. Returns null,
+    /// Collect the codec backends this process can run: for H264 VideoToolbox
+    /// on Apple and OpenH264 from `openh264_lib_path` when it is not null; for
+    /// VP8, VP9 and AV1 libwebrtc's builtin software codecs. Returns null,
     /// with the reason in `err`, when that library does not load or the build
     /// has no OpenH264 support. Free with
     /// [`reactor_webrtc_codec_context_destroy`]; encoders and decoders keep

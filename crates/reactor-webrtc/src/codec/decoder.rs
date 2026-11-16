@@ -85,7 +85,7 @@ impl VideoDecoder {
         self.codec
     }
 
-    /// The backend this decoder runs on, e.g. `"VideoToolbox"`.
+    /// The backend this decoder runs on, e.g. `"VideoToolbox"` or `"dav1d"`.
     pub fn implementation(&self) -> &str {
         &self.implementation
     }

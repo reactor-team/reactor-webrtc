@@ -3,8 +3,10 @@
 //!
 //! [`VideoCodecs`] collects the backends this process can run, and creates a
 //! [`VideoEncoder`] or a [`VideoDecoder`] for a [`VideoCodec`]. The codec is a
-//! parameter, not a separate API. Today only [`VideoCodec::H264`] is
-//! supported; [`VideoCodecs::capabilities`] lists what this process can run.
+//! parameter, not a separate API: [`VideoCodec::H264`], [`VideoCodec::Vp8`],
+//! [`VideoCodec::Vp9`] and [`VideoCodec::Av1`] run standalone, and
+//! [`VideoCodecs::capabilities`] lists which of them this process can run in
+//! each direction.
 //!
 //! ```rust,ignore
 //! use reactor_webrtc::codec::{VideoCodecs, VideoEncoderConfig};
@@ -23,6 +25,14 @@
 //! | Codec | Hardware | Software |
 //! |-------|----------|----------|
 //! | H.264 | VideoToolbox (macOS, iOS) | OpenH264, with the `openh264` feature ([`VideoCodecs::with_openh264`]) |
+//! | VP8 | — | libvpx |
+//! | VP9 | — | libvpx (profile 0) |
+//! | AV1 | — | libaom to encode, dav1d to decode (main profile) |
+//!
+//! The software VP8, VP9 and AV1 codecs are the ones built into libwebrtc. A
+//! build without one of them (an AV1 encoder, say) leaves it out of
+//! [`VideoCodecs::capabilities`] in that direction, and creating it fails
+//! with [`CodecError::Unsupported`].
 //!
 //! A codec is created on the first backend its [`Backend`] allows that
 //! accepts it, hardware first. Each encoder and decoder reports the backend it
@@ -36,6 +46,9 @@
 //! | Codec | One encoded frame |
 //! |-------|-------------------|
 //! | H.264 | one access unit, Annex B (start codes), constrained baseline; a key frame carries its SPS and PPS |
+//! | VP8 | one frame, as the encoder emits it (RFC 6386) |
+//! | VP9 | one frame, as the encoder emits it; one spatial layer, so no superframe |
+//! | AV1 | one temporal unit of OBUs, each with its size field (low-overhead format); a key frame carries the sequence header |
 //!
 //! # Key frames
 //!
@@ -220,23 +233,135 @@ impl VideoCodecs {
 }
 
 /// Whether `codec` is one the standalone codecs run at all, on any platform.
+/// Whether this process has a backend for it is
+/// [`VideoCodecs::capabilities`]'s answer.
 fn check_codec(codec: VideoCodec) -> Result<(), CodecError> {
     match codec {
-        VideoCodec::H264 => Ok(()),
+        VideoCodec::H264 | VideoCodec::Vp8 | VideoCodec::Vp9 | VideoCodec::Av1 => Ok(()),
         other => Err(CodecError::Unsupported(format!(
-            "{} is not available as a standalone codec yet",
+            "{} is not available as a standalone codec",
             other.name()
         ))),
     }
 }
 
-/// Whether `data` holds a frame a decoder can start from. For H.264, an Annex B
-/// access unit with an IDR slice.
+/// Whether `data` holds a frame a decoder can start from, in the bitstream
+/// format of the [module docs](self#bitstream-format).
 pub(crate) fn is_key_frame(codec: VideoCodec, data: &[u8]) -> bool {
     match codec {
         VideoCodec::H264 => h264_nal_types(data).any(|t| t == 5),
-        _ => false,
+        VideoCodec::Vp8 => vp8_is_key_frame(data),
+        VideoCodec::Vp9 => vp9_is_key_frame(data),
+        VideoCodec::Av1 => av1_is_key_frame(data),
+        VideoCodec::H265 => false,
     }
+}
+
+/// A VP8 key frame: the frame tag's type bit is 0 and the start code
+/// `9d 01 2a` follows the three-byte tag (RFC 6386, 9.1).
+fn vp8_is_key_frame(data: &[u8]) -> bool {
+    data.len() >= 10 && data[0] & 1 == 0 && data[3..6] == [0x9d, 0x01, 0x2a]
+}
+
+/// A VP9 key frame: the uncompressed header's `frame_type` is `KEY_FRAME` and
+/// the frame is not a `show_existing_frame` (VP9 spec, 6.2). A superframe
+/// starts with its first frame, so the same bits are read.
+fn vp9_is_key_frame(data: &[u8]) -> bool {
+    let Some(&first) = data.first() else {
+        return false;
+    };
+    let mut bits = (0..8).rev().map(|i| (first >> i) & 1);
+    let mut next = || bits.next().unwrap_or(1);
+    // frame_marker
+    if (next(), next()) != (1, 0) {
+        return false;
+    }
+    let profile = next() | (next() << 1);
+    if profile == 3 && next() != 0 {
+        return false; // reserved_zero
+    }
+    let show_existing_frame = next();
+    let frame_type = next();
+    show_existing_frame == 0 && frame_type == 0
+}
+
+const AV1_OBU_SEQUENCE_HEADER: u8 = 1;
+const AV1_OBU_FRAME_HEADER: u8 = 3;
+const AV1_OBU_FRAME: u8 = 6;
+
+/// An AV1 temporal unit a decoder can start from: it carries a sequence
+/// header, and its first frame header is a shown `KEY_FRAME` (AV1 spec, 5.9.2).
+fn av1_is_key_frame(data: &[u8]) -> bool {
+    // Set by the sequence header: whether frame headers are reduced, which
+    // makes every frame a key frame.
+    let mut reduced_still_picture = None;
+    for (obu_type, payload) in av1_obus(data) {
+        match obu_type {
+            AV1_OBU_SEQUENCE_HEADER => {
+                // seq_profile (3 bits), still_picture (1),
+                // reduced_still_picture_header (1).
+                let Some(&b) = payload.first() else {
+                    return false;
+                };
+                reduced_still_picture = Some(b & 0x08 != 0);
+            }
+            AV1_OBU_FRAME_HEADER | AV1_OBU_FRAME => {
+                let Some(reduced) = reduced_still_picture else {
+                    return false;
+                };
+                if reduced {
+                    return true;
+                }
+                // show_existing_frame (1 bit), frame_type (2 bits).
+                let Some(&b) = payload.first() else {
+                    return false;
+                };
+                return b & 0x80 == 0 && (b >> 5) & 0x03 == 0;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// The `(obu_type, payload)` of each OBU in a temporal unit in the
+/// low-overhead format. Stops at the first malformed OBU. An OBU without a
+/// size field runs to the end of the buffer.
+fn av1_obus(mut data: &[u8]) -> impl Iterator<Item = (u8, &[u8])> {
+    std::iter::from_fn(move || {
+        let (&header, rest) = data.split_first()?;
+        if header & 0x80 != 0 {
+            data = &[];
+            return None; // obu_forbidden_bit
+        }
+        let obu_type = (header >> 3) & 0x0f;
+        let has_extension = header & 0x04 != 0;
+        let has_size = header & 0x02 != 0;
+        let rest = if has_extension { rest.get(1..)? } else { rest };
+        let (size, rest) = if has_size {
+            leb128(rest)?
+        } else {
+            (rest.len(), rest)
+        };
+        let Some(payload) = rest.get(..size) else {
+            data = &[];
+            return None;
+        };
+        data = &rest[size..];
+        Some((obu_type, payload))
+    })
+}
+
+/// An AV1 `leb128()` value and the bytes after it.
+fn leb128(data: &[u8]) -> Option<(usize, &[u8])> {
+    let mut value: u64 = 0;
+    for (i, &b) in data.iter().take(8).enumerate() {
+        value |= u64::from(b & 0x7f) << (7 * i);
+        if b & 0x80 == 0 {
+            return Some((usize::try_from(value).ok()?, &data[i + 1..]));
+        }
+    }
+    None
 }
 
 /// The `nal_unit_type` of each NAL unit in an Annex B buffer.
@@ -305,18 +430,114 @@ mod tests {
     }
 
     #[test]
+    fn finds_a_vp8_key_frame_by_its_tag_and_start_code() {
+        let key = [0x50, 0x2a, 0x00, 0x9d, 0x01, 0x2a, 0x80, 0x02, 0x68, 0x01];
+        assert!(is_key_frame(VideoCodec::Vp8, &key));
+        let mut delta = key;
+        delta[0] |= 1;
+        assert!(!is_key_frame(VideoCodec::Vp8, &delta));
+        // A key frame tag without the start code is not one.
+        assert!(!is_key_frame(
+            VideoCodec::Vp8,
+            &[0x50, 0x2a, 0x00, 0, 0, 0, 0, 0, 0, 0]
+        ));
+        assert!(!is_key_frame(VideoCodec::Vp8, &key[..9]));
+    }
+
+    #[test]
+    fn finds_a_vp9_key_frame_in_the_uncompressed_header() {
+        // Profile 0: marker 10, profile 00, show_existing 0, frame_type 0.
+        assert!(is_key_frame(VideoCodec::Vp9, &[0x82, 0x49, 0x83, 0x42]));
+        // frame_type 1: an inter frame.
+        assert!(!is_key_frame(VideoCodec::Vp9, &[0x86, 0x00]));
+        // show_existing_frame.
+        assert!(!is_key_frame(VideoCodec::Vp9, &[0x88]));
+        // Profile 3 has a reserved bit before show_existing_frame.
+        assert!(is_key_frame(VideoCodec::Vp9, &[0xb0]));
+        assert!(!is_key_frame(VideoCodec::Vp9, &[0xb2]));
+        // A bad frame marker.
+        assert!(!is_key_frame(VideoCodec::Vp9, &[0x02]));
+        assert!(!is_key_frame(VideoCodec::Vp9, &[]));
+    }
+
+    /// An OBU of `obu_type` with a size field.
+    fn obu(obu_type: u8, payload: &[u8]) -> Vec<u8> {
+        let mut v = vec![(obu_type << 3) | 0x02, payload.len() as u8];
+        v.extend_from_slice(payload);
+        v
+    }
+
+    #[test]
+    fn finds_an_av1_key_frame_after_a_sequence_header() {
+        let td = obu(2, &[]);
+        let seq = obu(AV1_OBU_SEQUENCE_HEADER, &[0x00, 0x00, 0x00]);
+        // show_existing_frame 0, frame_type KEY_FRAME, show_frame 1.
+        let key_frame = obu(AV1_OBU_FRAME, &[0x10, 0xaa]);
+        // frame_type INTER_FRAME.
+        let inter_frame = obu(AV1_OBU_FRAME, &[0x30, 0xaa]);
+
+        let key = [td.clone(), seq.clone(), key_frame.clone()].concat();
+        assert!(is_key_frame(VideoCodec::Av1, &key));
+        // The same, through a FRAME_HEADER OBU.
+        let header = obu(AV1_OBU_FRAME_HEADER, &[0x10]);
+        assert!(is_key_frame(
+            VideoCodec::Av1,
+            &[td.clone(), seq.clone(), header].concat()
+        ));
+        // Without the sequence header a decoder cannot start there.
+        assert!(!is_key_frame(
+            VideoCodec::Av1,
+            &[td.clone(), key_frame].concat()
+        ));
+        assert!(!is_key_frame(
+            VideoCodec::Av1,
+            &[td.clone(), seq.clone(), inter_frame].concat()
+        ));
+        // show_existing_frame.
+        let existing = obu(AV1_OBU_FRAME_HEADER, &[0x80]);
+        assert!(!is_key_frame(
+            VideoCodec::Av1,
+            &[td.clone(), seq, existing].concat()
+        ));
+        // Reduced still picture headers make every frame a key frame.
+        let still = obu(AV1_OBU_SEQUENCE_HEADER, &[0x18]);
+        assert!(is_key_frame(
+            VideoCodec::Av1,
+            &[still, obu(AV1_OBU_FRAME, &[0xff])].concat()
+        ));
+        // Truncated or malformed buffers are not key frames, and do not panic.
+        for n in 0..key.len() {
+            assert!(!is_key_frame(VideoCodec::Av1, &key[..n]), "{n} bytes");
+        }
+        assert!(!is_key_frame(VideoCodec::Av1, &[0x80, 0x00]));
+        assert!(!is_key_frame(VideoCodec::Av1, &[0x0a, 0xff, 0xff]));
+    }
+
+    #[test]
+    fn reads_multi_byte_obu_sizes() {
+        let payload = vec![0u8; 200];
+        let mut long = vec![(5 << 3) | 0x02, 0xc8, 0x01];
+        long.extend_from_slice(&payload);
+        let seq = obu(AV1_OBU_SEQUENCE_HEADER, &[0x00]);
+        let frame = obu(AV1_OBU_FRAME, &[0x10]);
+        assert!(is_key_frame(VideoCodec::Av1, &[long, seq, frame].concat()));
+        assert_eq!(leb128(&[0xc8, 0x01, 0x07]), Some((200, &[0x07][..])));
+        assert_eq!(leb128(&[0x80]), None);
+    }
+
+    #[test]
     fn refuses_codecs_it_does_not_run() {
-        assert!(check_codec(VideoCodec::H264).is_ok());
         for codec in [
+            VideoCodec::H264,
             VideoCodec::Vp8,
             VideoCodec::Vp9,
             VideoCodec::Av1,
-            VideoCodec::H265,
         ] {
-            assert!(matches!(
-                check_codec(codec),
-                Err(CodecError::Unsupported(_))
-            ));
+            assert!(check_codec(codec).is_ok(), "{codec:?}");
         }
+        assert!(matches!(
+            check_codec(VideoCodec::H265),
+            Err(CodecError::Unsupported(_))
+        ));
     }
 }

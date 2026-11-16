@@ -308,8 +308,9 @@ Two more ways to get real H.264, available on any platform:
 
 ## Standalone video codecs
 
-`reactor_webrtc::codec` runs the same H.264 backends without a peer
-connection: raw frames in, one encoded frame out per call, and back. Each
+`reactor_webrtc::codec` runs the same H.264, VP8, VP9 and AV1 backends
+without a peer connection: raw frames in, one encoded frame out per call, and
+back. Each
 call returns its own frame's output before it returns, so the encoded stream
 can travel over any reliable channel.
 
@@ -325,7 +326,8 @@ let mut decoder = codecs.decoder(VideoCodec::H264)?;
 
 let encoded = encoder.encode(&rgb, 1280, 720, PixelFormat::Rgb24, timestamp_us)?;
 if let Some(frame) = encoded {
-    // frame.data: one Annex B access unit; frame.key_frame says if a decoder can start here.
+    // frame.data: one Annex B access unit (H.264), one frame (VP8, VP9) or one
+    // temporal unit of OBUs (AV1); frame.key_frame says if a decoder can start here.
     let picture = decoder.decode(&frame.data, frame.timestamp_us, PixelFormat::Rgb24)?;
 }
 encoder.request_key_frame(); // the next frame is a key frame
@@ -337,9 +339,11 @@ The encoder is rate-controlled (`bitrate_bps` / `framerate`, changed with
 new frame size, the frame after an error and the frame after
 `request_key_frame`. The decoder keeps its references between calls and
 answers `CodecError::NeedKeyFrame` to an inter frame until it has had a key
-frame. Hardware comes first (VideoToolbox on Apple), OpenH264 with the
-`openh264` feature is the software backend, and `Backend` restricts a codec to
-either. H.264 only for now. The `codec` module docs hold the full contract.
+frame. For H.264, hardware comes first (VideoToolbox on Apple), OpenH264 with
+the `openh264` feature is the software backend, and `Backend` restricts a
+codec to either. VP8 and VP9 run on libvpx and AV1 on libaom (encode) and
+dav1d (decode), all software. `capabilities()` leaves out what this build
+cannot run. The `codec` module docs hold the full contract.
 
 ## Target support
 
