@@ -112,8 +112,12 @@ description = "[Testing] reactor-webrtc tests via nextest + doctests (requires a
 # nextest runs the unit/integration tests (fast, per-test process isolation) but
 # does NOT run doctests, so `cargo test --doc` covers reactor-webrtc's doc
 # examples. reactor-webrtc-py has no Rust tests (it is covered by pytest).
+# The standalone codecs run again with `openh264`, so the runners Cisco ships
+# OpenH264 for (Linux, Windows) cover the software H.264 path too; it is
+# downloaded on first use.
 run = [
   "cargo nextest run -p reactor-webrtc --no-tests=pass",
+  "cargo nextest run -p reactor-webrtc --features openh264 --test video_codec",
   "cargo test -p reactor-webrtc --doc",
 ]
 

@@ -31,12 +31,16 @@
 //! the crate owns libwebrtc's single transformer slot per sender/receiver and runs
 //! both, so encoded-frame access and per-frame metadata work on one transceiver.
 //!
+//! [`codec`] runs libwebrtc's video encoders and decoders on their own, without a
+//! peer connection: raw frames in, one encoded frame out per call, and back.
+//!
 //! Building a real binary or test requires a native `libwebrtc`; set
 //! `REACTOR_WEBRTC_LIB_DIR` or `REACTOR_WEBRTC_PREBUILT_URL`. `cargo check`
 //! works without one.
 
 mod builder;
 mod chunking_times;
+pub mod codec;
 mod config;
 mod dc_chunking;
 mod encoded;

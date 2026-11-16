@@ -268,7 +268,7 @@ pub enum VideoCodec {
 }
 
 impl VideoCodec {
-    fn from_u32(v: u32) -> Option<Self> {
+    pub(crate) fn from_u32(v: u32) -> Option<Self> {
         match v {
             1 => Some(Self::Vp8),
             2 => Some(Self::Vp9),

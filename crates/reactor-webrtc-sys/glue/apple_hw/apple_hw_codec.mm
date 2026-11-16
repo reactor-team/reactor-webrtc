@@ -87,4 +87,10 @@ std::unique_ptr<webrtc::VideoDecoderFactory> CreateAppleHwVideoDecoderFactory() 
       webrtc::ObjCToNativeVideoDecoderFactory(objc_factory));
 }
 
+void RunInAutoreleasePool(const std::function<void()>& fn) {
+  @autoreleasepool {
+    fn();
+  }
+}
+
 }  // namespace reactor
