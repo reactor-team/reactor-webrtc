@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from typing import Awaitable, Callable, Optional, Union, final
 
+import numpy as np
+from numpy.typing import NDArray
+
 # ── Config ────────────────────────────────────────────────────────────────────
 
 class IceServer:
@@ -1180,3 +1183,219 @@ class PeerConnectionFactory:
         track_id: str, width: int, height: int
     ) -> tuple[PeerConnectionFactory, EncodedVideoTrack]: ...
     def set_adm_playout_enabled(self, enabled: bool) -> None: ...
+
+# ── Standalone video codecs ───────────────────────────────────────────────────
+#
+# libwebrtc's video encoders and decoders without a peer connection: RGB frames
+# in, one encoded frame out per call, and back. Frames are numpy uint8 arrays
+# of shape (H, W, 3); numpy is imported on first use (`reactor-webrtc[numpy]`).
+#
+# Bitstream format of one encoded frame (`EncodedVideoFrame.data`, and what
+# `VideoDecoder.decode` takes):
+#
+#   H.264  one access unit, Annex B (start codes), constrained baseline; a key
+#          frame carries its SPS and PPS
+#   VP8    one frame, as the encoder emits it
+#   VP9    one frame, as the encoder emits it; one spatial layer, no superframe
+#   AV1    one temporal unit of OBUs, each with its size field (low-overhead
+#          format); a key frame carries the sequence header
+#
+# Threading: every call blocks until its own frame is done and returns that
+# frame's output, never a later one's. Encode and decode run with the GIL
+# released, so different encoders and decoders run in parallel from Python
+# threads. Calls on one encoder or decoder from several threads take turns.
+
+class CodecError(RuntimeError):
+    """A standalone codec call failed in the backend. An encoder makes its next
+    frame a key frame; a decoder waits for a key frame."""
+
+class CodecUnsupported(CodecError):
+    """No backend in this process runs this codec with these settings.
+    `VideoCodecs.capabilities()` lists the ones that do."""
+
+class CodecNeedsKeyFrame(CodecError):
+    """The decoder needs a key frame and was given another frame. Nothing was
+    decoded, and the decoder still waits for a key frame."""
+
+class CodecBackend:
+    """Which backends a codec may be created on."""
+
+    Auto: CodecBackend
+    """Hardware when a hardware backend accepts the settings, software otherwise."""
+    Hardware: CodecBackend
+    """Hardware only: creation raises `CodecUnsupported` without one."""
+    Software: CodecBackend
+    """Software only."""
+
+@final
+class CodecSupport:
+    """One backend for one codec."""
+
+    @property
+    def codec(self) -> VideoCodec: ...
+    @property
+    def hardware(self) -> bool:
+        """Whether the backend is the platform's hardware codec (VideoToolbox
+        counts as hardware, as libwebrtc reports it)."""
+        ...
+    @property
+    def implementation(self) -> str:
+        """`"VideoToolbox"` or `"OpenH264"` for H.264, `"libvpx"` for VP8 and
+        VP9, `"libaom"` (encode) or `"dav1d"` (decode) for AV1."""
+        ...
+
+@final
+class CodecCapabilities:
+    """The codecs this process can encode and decode, one entry per backend,
+    hardware first within each codec. A codec missing from a list cannot be
+    created in that direction here."""
+
+    @property
+    def encoders(self) -> list[CodecSupport]: ...
+    @property
+    def decoders(self) -> list[CodecSupport]: ...
+    def can_encode(self, codec: VideoCodec) -> bool: ...
+    def can_decode(self, codec: VideoCodec) -> bool: ...
+
+@final
+class VideoCodecs:
+    """The video codec backends this process can run, and the place to create
+    standalone encoders and decoders on them. H.264 runs on VideoToolbox on
+    macOS and iOS, and on OpenH264 in a wheel built with the `openh264`
+    feature (`with_openh264`); VP8 and VP9 on libvpx; AV1 on libaom (encode)
+    and dav1d (decode)."""
+
+    def __init__(self) -> None: ...
+    @staticmethod
+    def with_openh264(lib_path: str) -> VideoCodecs:
+        """Add Cisco's OpenH264 loaded from `lib_path` as the software H.264
+        backend; its binary license requires attribution in your app. Only in
+        wheels built with the `openh264` feature. Raises when the library does
+        not load."""
+        ...
+    def capabilities(self) -> CodecCapabilities: ...
+    def encoder(
+        self,
+        codec: VideoCodec,
+        width: int,
+        height: int,
+        *,
+        bitrate_bps: int = 2_000_000,
+        framerate: float = 30.0,
+        backend: CodecBackend = CodecBackend.Auto,
+    ) -> VideoEncoder:
+        """An encoder for `codec`, starting at `width` x `height` (both even).
+
+        libwebrtc's encoders are real-time and rate-controlled: they aim at
+        `bitrate_bps` over a second of frames at `framerate`, whatever
+        timestamps the frames carry. Raises `CodecUnsupported` when no backend
+        `backend` allows accepts it, `ValueError` for a bad size or rate."""
+        ...
+    def decoder(
+        self, codec: VideoCodec, *, backend: CodecBackend = CodecBackend.Auto
+    ) -> VideoDecoder:
+        """A decoder for `codec`. Raises `CodecUnsupported` when no backend
+        `backend` allows has one."""
+        ...
+
+@final
+class EncodedVideoFrame:
+    """One encoded frame, in its codec's bitstream format."""
+
+    @property
+    def data(self) -> bytes: ...
+    @property
+    def key_frame(self) -> bool:
+        """Whether a decoder can start from this frame."""
+        ...
+    @property
+    def width(self) -> int: ...
+    @property
+    def height(self) -> int: ...
+    @property
+    def timestamp_us(self) -> int:
+        """The timestamp given to `encode`, unchanged."""
+        ...
+
+@final
+class VideoEncoder:
+    """A video encoder that runs outside a peer connection.
+
+    Key frames: the first frame, the first frame of a new size, the frame after
+    a failed call, and the frame after `request_key_frame()`. A backend may add
+    key frames of its own, so read `EncodedVideoFrame.key_frame` rather than
+    predicting it. Every other frame references the one before it: no
+    B-frames, and frames come out in the order they went in."""
+
+    @property
+    def codec(self) -> VideoCodec: ...
+    @property
+    def implementation(self) -> str:
+        """The backend this encoder runs on, e.g. `"VideoToolbox"` or `"libvpx"`."""
+        ...
+    @property
+    def is_hardware(self) -> bool: ...
+    @property
+    def bitrate_bps(self) -> int: ...
+    @property
+    def framerate(self) -> float: ...
+    def request_key_frame(self) -> None:
+        """Make the next frame a key frame. Asking again before it is encoded
+        changes nothing."""
+        ...
+    def set_rates(self, bitrate_bps: int, framerate: float) -> None:
+        """Change the target bitrate and the frame rate it is spread over, from
+        the next frame on. Raises `ValueError` for 0 or a non-positive rate."""
+        ...
+    def encode(
+        self, frame: NDArray[np.uint8], timestamp_us: int = 0
+    ) -> Optional[EncodedVideoFrame]:
+        """Encode one RGB frame, a uint8 array of shape (H, W, 3) with both
+        sides even, and return its encoded frame carrying `timestamp_us` back.
+        Blocks, with the GIL released, until the backend is done with it.
+
+        `None` means the backend dropped the frame; the next one still
+        references the last frame that came out. Raises `TypeError` or
+        `ValueError` for a frame of the wrong type, dtype or shape, and
+        `CodecError` when the backend fails (the next frame is then a key
+        frame)."""
+        ...
+
+@final
+class VideoDecoder:
+    """A video decoder that runs outside a peer connection. It keeps its
+    reference frames between calls, so it takes one stream's frames in the
+    order they were encoded.
+
+    It needs a key frame first: after it is created, after `reset()`, and
+    after a failed call. Until then it refuses every other frame with
+    `CodecNeedsKeyFrame` and leaves its state untouched."""
+
+    @property
+    def codec(self) -> VideoCodec: ...
+    @property
+    def implementation(self) -> str:
+        """The backend this decoder runs on, e.g. `"VideoToolbox"` or `"dav1d"`."""
+        ...
+    @property
+    def is_hardware(self) -> bool: ...
+    @property
+    def needs_key_frame(self) -> bool:
+        """Whether the next frame must be a key frame."""
+        ...
+    def reset(self) -> None:
+        """Forget every frame decoded so far, as when a stream starts over: the
+        next frame must be a key frame. On `CodecError` the decoder is unusable
+        until a later `reset()` succeeds."""
+        ...
+    def decode(self, data: bytes) -> Optional[NDArray[np.uint8]]:
+        """Decode one encoded frame and return its picture as a writable uint8
+        array of shape (H, W, 3), RGB. Blocks, with the GIL released, until the
+        backend is done with it.
+
+        `None` means the frame gave no picture, which a whole frame from
+        `VideoEncoder` does not. Raises `CodecNeedsKeyFrame` for anything but
+        a key frame while `needs_key_frame`, `ValueError` for empty data, and
+        `CodecError` when the backend fails (the decoder then waits for a key
+        frame)."""
+        ...

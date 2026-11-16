@@ -21,7 +21,7 @@ VENV="$REPO_ROOT/target/py-test-venv"
 uv venv --python 3.12 --allow-existing "$VENV"
 # --reinstall: a venv left over from a previous run already has some version of
 # the wheel, and uv would keep it when the version string has not changed.
-VIRTUAL_ENV="$VENV" uv pip install --reinstall pytest pytest-asyncio "$WHEEL"
+VIRTUAL_ENV="$VENV" uv pip install --reinstall pytest pytest-asyncio numpy "$WHEEL"
 # One pytest process per test file: PeerConnectionFactory is a process-wide
 # singleton (one factory per process), and test_loopback.py and
 # test_encoded_track.py each create their own session-scoped factory.
