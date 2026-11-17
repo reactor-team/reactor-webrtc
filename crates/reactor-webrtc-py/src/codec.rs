@@ -8,7 +8,7 @@
 //! same one take turns instead of failing.
 
 use ::reactor_webrtc as rw;
-use pyo3::exceptions::{PyImportError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyImportError, PyOverflowError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyByteArray, PyBytes};
 use rw::codec as rc;
@@ -190,6 +190,23 @@ impl CodecCapabilities {
     }
 }
 
+/// A `u32` setting from Python: a size or a bitrate. An `int` out of range,
+/// such as a negative one, is a bad setting and raises `ValueError`, as the
+/// codec does for one it refuses. pyo3 alone raises `OverflowError` for it.
+struct Setting(u32);
+
+impl<'py> FromPyObject<'py> for Setting {
+    fn extract_bound(ob: &Bound<'py, PyAny>) -> PyResult<Self> {
+        ob.extract::<u32>().map(Self).map_err(|e| {
+            if e.is_instance_of::<PyOverflowError>(ob.py()) {
+                PyValueError::new_err(format!("{ob} is not between 0 and {}", u32::MAX))
+            } else {
+                e
+            }
+        })
+    }
+}
+
 /// The video codec backends this process can run, and the place to create
 /// standalone encoders and decoders on them.
 #[pyclass(frozen)]
@@ -231,20 +248,23 @@ impl VideoCodecs {
     /// Create an encoder for `codec`, starting at `width` x `height` (both
     /// even). Raises `CodecUnsupported` when no backend `backend` allows
     /// accepts it, `ValueError` for a bad size or rate.
-    #[pyo3(signature = (codec, width, height, *, bitrate_bps = 2_000_000, framerate = 30.0, backend = CodecBackend::Auto))]
+    #[pyo3(
+        signature = (codec, width, height, *, bitrate_bps = Setting(2_000_000), framerate = 30.0, backend = CodecBackend::Auto),
+        text_signature = "($self, codec, width, height, *, bitrate_bps=2000000, framerate=30.0, backend=...)"
+    )]
     #[allow(clippy::too_many_arguments)]
     fn encoder(
         &self,
         py: Python<'_>,
         codec: VideoCodec,
-        width: u32,
-        height: u32,
-        bitrate_bps: u32,
+        width: Setting,
+        height: Setting,
+        bitrate_bps: Setting,
         framerate: f64,
         backend: CodecBackend,
     ) -> PyResult<VideoEncoder> {
-        let mut config = rc::VideoEncoderConfig::new(codec.into(), width, height);
-        config.bitrate_bps = bitrate_bps;
+        let mut config = rc::VideoEncoderConfig::new(codec.into(), width.0, height.0);
+        config.bitrate_bps = bitrate_bps.0;
         config.framerate = framerate;
         config.backend = backend.into();
         let inner = py
@@ -388,8 +408,8 @@ impl VideoEncoder {
 
     /// Change the target bitrate and the frame rate it is spread over, from
     /// the next frame on. Raises `ValueError` for 0 or a non-positive rate.
-    fn set_rates(&self, py: Python<'_>, bitrate_bps: u32, framerate: f64) -> PyResult<()> {
-        with_codec(py, &self.inner, |e| e.set_rates(bitrate_bps, framerate)).map_err(codec_err)
+    fn set_rates(&self, py: Python<'_>, bitrate_bps: Setting, framerate: f64) -> PyResult<()> {
+        with_codec(py, &self.inner, |e| e.set_rates(bitrate_bps.0, framerate)).map_err(codec_err)
     }
 
     /// Encode one RGB frame and return its encoded frame, or `None` when the

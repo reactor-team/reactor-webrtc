@@ -100,6 +100,22 @@ def test_bad_encoder_settings_raise_value_error(codecs: rw.VideoCodecs) -> None:
         encoder.set_rates(0, 30.0)
 
 
+@pytest.mark.parametrize("value", [-1, -W, 2**32])
+def test_out_of_range_settings_raise_value_error(codecs: rw.VideoCodecs, value: int) -> None:
+    # Not OverflowError: a negative or too large size or bitrate is a bad
+    # setting like any other.
+    _require(codecs, rw.VideoCodec.Vp8)
+    with pytest.raises(ValueError):
+        codecs.encoder(rw.VideoCodec.Vp8, value, H)
+    with pytest.raises(ValueError):
+        codecs.encoder(rw.VideoCodec.Vp8, W, value)
+    with pytest.raises(ValueError):
+        codecs.encoder(rw.VideoCodec.Vp8, W, H, bitrate_bps=value)
+    encoder = codecs.encoder(rw.VideoCodec.Vp8, W, H)
+    with pytest.raises(ValueError):
+        encoder.set_rates(value, 30.0)
+
+
 def test_encode_checks_the_frame(codecs: rw.VideoCodecs) -> None:
     _require(codecs, rw.VideoCodec.Vp8)
     encoder = codecs.encoder(rw.VideoCodec.Vp8, W, H)
