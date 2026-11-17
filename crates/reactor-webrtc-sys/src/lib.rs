@@ -726,6 +726,97 @@ pub struct ReactorRtcConfig {
     pub tls_userdata: *mut c_void,
 }
 
+/// Opaque handle to the codec backends of the standalone video codecs, from
+/// [`reactor_webrtc_codec_context_create`].
+#[repr(C)]
+pub struct CodecContext {
+    _private: [u8; 0],
+}
+/// Opaque standalone video encoder, from [`reactor_webrtc_video_encoder_create`].
+#[repr(C)]
+pub struct StandaloneVideoEncoder {
+    _private: [u8; 0],
+}
+/// Opaque standalone video decoder, from [`reactor_webrtc_video_decoder_create`].
+#[repr(C)]
+pub struct StandaloneVideoDecoder {
+    _private: [u8; 0],
+}
+
+/// One codec backend, as [`reactor_webrtc_codec_context_capabilities`] lists
+/// it. Layout must match `ReactorCodecSupport` in the glue.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ReactorCodecSupport {
+    /// 0 = encode, 1 = decode.
+    pub direction: i32,
+    /// `webrtc::VideoCodecType`: VP8=1, VP9=2, AV1=3, H264=4, H265=5.
+    pub codec: i32,
+    /// 1 when the backend is hardware.
+    pub hardware: i32,
+    /// The backend's name, NUL-terminated.
+    pub implementation: [c_char; 64],
+}
+
+/// `backend` of [`ReactorVideoEncoderConfig`] and
+/// [`reactor_webrtc_video_decoder_create`]: hardware first, software after.
+pub const CODEC_BACKEND_AUTO: c_int = 0;
+/// Hardware backends only.
+pub const CODEC_BACKEND_HARDWARE: c_int = 1;
+/// Software backends only.
+pub const CODEC_BACKEND_SOFTWARE: c_int = 2;
+
+/// Settings for [`reactor_webrtc_video_encoder_create`]. `size` must be
+/// `size_of::<ReactorVideoEncoderConfig>()`. Layout must match
+/// `ReactorVideoEncoderConfig` in the glue.
+#[repr(C)]
+pub struct ReactorVideoEncoderConfig {
+    pub size: u32,
+    /// `webrtc::VideoCodecType`, as in [`ReactorCodecSupport::codec`].
+    pub codec: i32,
+    pub width: i32,
+    pub height: i32,
+    pub bitrate_bps: u32,
+    pub framerate: f64,
+    /// One of the `CODEC_BACKEND_*` values.
+    pub backend: i32,
+}
+
+/// The output of [`reactor_webrtc_video_encoder_encode`]. `data` points into
+/// the encoder and stays valid until its next call. Layout must match
+/// `ReactorCodecEncodedFrame` in the glue.
+#[repr(C)]
+pub struct ReactorCodecEncodedFrame {
+    pub data: *const u8,
+    pub len: usize,
+    pub is_key_frame: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+/// The output of [`reactor_webrtc_video_decoder_decode`]. `pixels` points into
+/// the decoder and stays valid until its next call. Layout must match
+/// `ReactorCodecDecodedFrame` in the glue.
+#[repr(C)]
+pub struct ReactorCodecDecodedFrame {
+    pub pixels: *const u8,
+    pub len: usize,
+    pub width: i32,
+    pub height: i32,
+}
+
+// The other half of the static_asserts next to these structs in the glue.
+const _: () = {
+    assert!(core::mem::size_of::<ReactorCodecSupport>() == 76);
+    assert!(core::mem::size_of::<ReactorVideoEncoderConfig>() == 40);
+    assert!(core::mem::offset_of!(ReactorVideoEncoderConfig, framerate) == 24);
+};
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert!(core::mem::size_of::<ReactorCodecEncodedFrame>() == 32);
+    assert!(core::mem::size_of::<ReactorCodecDecodedFrame>() == 24);
+};
+
 /// `pixel_format` for raw video frames: `width * height * 4` bytes, B,G,R,A in
 /// memory.
 pub const PIXEL_FORMAT_BGRA: c_int = 0;
@@ -1247,6 +1338,99 @@ extern "C" {
             ok: c_int,
         ),
     );
+
+    // ── Standalone video codecs ──────────────────────────────────────────────
+    /// Collect the codec backends this process can run: VideoToolbox on Apple,
+    /// and OpenH264 from `openh264_lib_path` when it is not null. Returns null,
+    /// with the reason in `err`, when that library does not load or the build
+    /// has no OpenH264 support. Free with
+    /// [`reactor_webrtc_codec_context_destroy`]; encoders and decoders keep
+    /// what they use alive past it.
+    pub fn reactor_webrtc_codec_context_create(
+        openh264_lib_path: *const c_char,
+        err: *mut c_char,
+        err_cap: c_int,
+    ) -> *mut CodecContext;
+    pub fn reactor_webrtc_codec_context_destroy(ctx: *mut CodecContext);
+    /// Write up to `cap` backends into `out` (may be null); returns how many
+    /// there are in all, encoders first, each list hardware first.
+    pub fn reactor_webrtc_codec_context_capabilities(
+        ctx: *mut CodecContext,
+        out: *mut ReactorCodecSupport,
+        cap: c_int,
+    ) -> c_int;
+
+    /// Create and initialise an encoder on the first backend `config` allows
+    /// that accepts it. Null, with the reason in `err`, when none does.
+    pub fn reactor_webrtc_video_encoder_create(
+        ctx: *mut CodecContext,
+        config: *const ReactorVideoEncoderConfig,
+        err: *mut c_char,
+        err_cap: c_int,
+    ) -> *mut StandaloneVideoEncoder;
+    pub fn reactor_webrtc_video_encoder_destroy(encoder: *mut StandaloneVideoEncoder);
+    /// Copy the backend's name into `name` (NUL-terminated, capped at `cap`);
+    /// returns 1 when it is hardware, 0 when not.
+    pub fn reactor_webrtc_video_encoder_info(
+        encoder: *mut StandaloneVideoEncoder,
+        name: *mut c_char,
+        cap: c_int,
+    ) -> c_int;
+    /// Change the target bitrate and frame rate, from the next frame on.
+    pub fn reactor_webrtc_video_encoder_set_rates(
+        encoder: *mut StandaloneVideoEncoder,
+        bitrate_bps: u32,
+        framerate: f64,
+    );
+    /// Encode one frame of `pixel_format` and wait for its output. Returns 1
+    /// with the frame in `out`, 0 when the backend dropped it, -1 on error
+    /// (reason in `err`). A size other than the last one re-initialises the
+    /// encoder and yields a key frame.
+    pub fn reactor_webrtc_video_encoder_encode(
+        encoder: *mut StandaloneVideoEncoder,
+        pixels: *const u8,
+        width: c_int,
+        height: c_int,
+        pixel_format: c_int,
+        key_frame: c_int,
+        out: *mut ReactorCodecEncodedFrame,
+        err: *mut c_char,
+        err_cap: c_int,
+    ) -> c_int;
+
+    /// Create a decoder for `codec` on the first backend `backend` (a
+    /// `CODEC_BACKEND_*` value) allows that configures. Null, with the reason
+    /// in `err`, when none does.
+    pub fn reactor_webrtc_video_decoder_create(
+        ctx: *mut CodecContext,
+        codec: c_int,
+        backend: c_int,
+        err: *mut c_char,
+        err_cap: c_int,
+    ) -> *mut StandaloneVideoDecoder;
+    pub fn reactor_webrtc_video_decoder_destroy(decoder: *mut StandaloneVideoDecoder);
+    /// As [`reactor_webrtc_video_encoder_info`].
+    pub fn reactor_webrtc_video_decoder_info(
+        decoder: *mut StandaloneVideoDecoder,
+        name: *mut c_char,
+        cap: c_int,
+    ) -> c_int;
+    /// Drop the decoder's references and configure it again. Returns 1 on
+    /// success, 0 when the backend refused.
+    pub fn reactor_webrtc_video_decoder_reset(decoder: *mut StandaloneVideoDecoder) -> c_int;
+    /// Decode one encoded frame and wait for its picture, converted to
+    /// `pixel_format`. Returns 1 with the picture in `out`, 0 when the input
+    /// gave none, -1 on error (reason in `err`).
+    pub fn reactor_webrtc_video_decoder_decode(
+        decoder: *mut StandaloneVideoDecoder,
+        data: *const u8,
+        len: usize,
+        key_frame: c_int,
+        pixel_format: c_int,
+        out: *mut ReactorCodecDecodedFrame,
+        err: *mut c_char,
+        err_cap: c_int,
+    ) -> c_int;
 
     // ── Platform bootstrap ───────────────────────────────────────────────────
     /// Android: hand the JavaVM to libwebrtc (call from JNI_OnLoad).

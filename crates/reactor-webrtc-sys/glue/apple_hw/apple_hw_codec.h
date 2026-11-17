@@ -9,6 +9,7 @@
 // Objective-C++ bridging code.
 #pragma once
 
+#include <functional>
 #include <memory>
 
 #include "api/video_codecs/video_decoder_factory.h"
@@ -21,5 +22,11 @@ namespace reactor {
 // glue/openh264/openh264_codec.{h,cc} and glue/android_hw/android_hw_codec.{h,cc}.
 std::unique_ptr<webrtc::VideoEncoderFactory> CreateAppleHwVideoEncoderFactory();
 std::unique_ptr<webrtc::VideoDecoderFactory> CreateAppleHwVideoDecoderFactory();
+
+// Runs `fn` inside an Objective-C autorelease pool. The VideoToolbox codecs
+// autorelease objects on every frame; libwebrtc's own threads drain a pool per
+// task, but the standalone codecs run on the caller's thread, which may have
+// none, so those objects would pile up until the thread exits.
+void RunInAutoreleasePool(const std::function<void()>& fn);
 
 }  // namespace reactor

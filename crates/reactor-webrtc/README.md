@@ -63,6 +63,7 @@ pc.set_local_description(&offer)?;
 | `RtcConfiguration` | ICE servers/policy, port range, bundle policy, TCP candidates, ICE timeouts, faster setup (`sctp_snap`) — see [`docs/configuration.md`](../../docs/configuration.md) |
 | `AdmMode` | `Synthetic` (push PCM) or `Platform` (real mic/speaker) |
 | `ApmConfig` | AEC3, noise suppression, AGC, high-pass filter |
+| `codec::VideoCodecs` | Standalone video encoders and decoders, without a peer connection — see [Standalone video codecs](#standalone-video-codecs) |
 
 `PeerConnection::set_bitrate` sets congestion-control bitrate limits after
 the connection is created — also covered in
@@ -304,6 +305,41 @@ Two more ways to get real H.264, available on any platform:
   runtime and `dlopen`s it — the same approach Firefox and Chrome use. See
   `reactor-webrtc-sys`'s `openh264` module docs for the exact platforms
   covered (Linux/Windows x64/arm64).
+
+## Standalone video codecs
+
+`reactor_webrtc::codec` runs the same H.264 backends without a peer
+connection: raw frames in, one encoded frame out per call, and back. Each
+call returns its own frame's output before it returns, so the encoded stream
+can travel over any reliable channel.
+
+```rust
+use reactor_webrtc::codec::{VideoCodecs, VideoEncoderConfig};
+use reactor_webrtc::{PixelFormat, VideoCodec};
+
+let codecs = VideoCodecs::new()?; // or VideoCodecs::with_openh264(&path)
+println!("{:?}", codecs.capabilities()); // codecs and backends, hardware first
+
+let mut encoder = codecs.encoder(&VideoEncoderConfig::new(VideoCodec::H264, 1280, 720))?;
+let mut decoder = codecs.decoder(VideoCodec::H264)?;
+
+let encoded = encoder.encode(&rgb, 1280, 720, PixelFormat::Rgb24, timestamp_us)?;
+if let Some(frame) = encoded {
+    // frame.data: one Annex B access unit; frame.key_frame says if a decoder can start here.
+    let picture = decoder.decode(&frame.data, frame.timestamp_us, PixelFormat::Rgb24)?;
+}
+encoder.request_key_frame(); // the next frame is a key frame
+decoder.reset()?;            // the decoder now refuses anything but a key frame
+```
+
+The encoder is rate-controlled (`bitrate_bps` / `framerate`, changed with
+`set_rates`), makes no B-frames, and makes a key frame for its first frame, a
+new frame size, the frame after an error and the frame after
+`request_key_frame`. The decoder keeps its references between calls and
+answers `CodecError::NeedKeyFrame` to an inter frame until it has had a key
+frame. Hardware comes first (VideoToolbox on Apple), OpenH264 with the
+`openh264` feature is the software backend, and `Backend` restricts a codec to
+either. H.264 only for now. The `codec` module docs hold the full contract.
 
 ## Target support
 
