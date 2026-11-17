@@ -3598,9 +3598,22 @@ constexpr int kCodecBackendAuto = 0;
 constexpr int kCodecBackendHardware = 1;
 constexpr int kCodecBackendSoftware = 2;
 
+// The frame rates an encoder takes. The frame interval is turned into whole
+// RTP ticks and microseconds, and the rate into a whole maxFramerate; inside
+// this range every one of those conversions fits its integer type. Keep in
+// step with the range in reactor-webrtc's codec/encoder.rs.
+constexpr double kMinFramerate = 0.01;
+constexpr double kMaxFramerate = 1000.0;
+
+// False for NaN and infinities as well.
+bool FramerateInRange(double fps) {
+  return fps >= kMinFramerate && fps <= kMaxFramerate;
+}
+
 // How long a call waits for a backend that delivers on its own thread. Far
 // above any real frame's encode or decode time; reaching it means the backend
-// dropped the frame without saying so.
+// dropped the frame without saying so. Backends that deliver within Encode()
+// never wait for it.
 constexpr auto kCodecWait = std::chrono::seconds(3);
 
 void InAutoreleasePool(const std::function<void()>& fn) {
@@ -3657,6 +3670,9 @@ webrtc::scoped_refptr<webrtc::I420Buffer> PixelsToI420(const uint8_t* pixels,
 struct StandaloneBackend {
   std::string name;
   bool hardware = false;
+  // Its encoder delivers a frame, if at all, before Encode() returns: no
+  // callback by then means the frame was dropped.
+  bool synchronous = false;
   std::unique_ptr<webrtc::VideoEncoderFactory> encoders;
   std::unique_ptr<webrtc::VideoDecoderFactory> decoders;
 };
@@ -3720,6 +3736,7 @@ class StandaloneVideoEncoder : public webrtc::EncodedImageCallback {
       if (Init(width_, height_)) {
         name_ = b->name;
         hardware_ = b->hardware;
+        synchronous_ = b->synchronous;
         return true;
       }
       *why += b->name + ": InitEncode failed; ";
@@ -3729,7 +3746,9 @@ class StandaloneVideoEncoder : public webrtc::EncodedImageCallback {
     return false;
   }
 
+  // Ignores a frame rate outside [kMinFramerate, kMaxFramerate].
   void SetRates(uint32_t bitrate_bps, double framerate) {
+    if (!FramerateInRange(framerate)) return;
     bitrate_bps_ = bitrate_bps;
     framerate_ = framerate;
     ApplyRates();
@@ -3750,6 +3769,10 @@ class StandaloneVideoEncoder : public webrtc::EncodedImageCallback {
       InAutoreleasePool([&] { rc = encoder_->Release(); });
       (void)rc;
       if (!Init(width, height)) {
+        // The old session is released too: force a re-init on the next
+        // call, whatever its size.
+        width_ = 0;
+        height_ = 0;
         *why = "InitEncode failed for the new frame size";
         return -1;
       }
@@ -3765,7 +3788,7 @@ class StandaloneVideoEncoder : public webrtc::EncodedImageCallback {
     }
     // Timestamps of our own, evenly spaced at the configured rate: backends
     // pace their rate control by them, and VideoToolbox wants them to grow.
-    const double fps = framerate_ > 0 ? framerate_ : 30.0;
+    const double fps = FramerateInRange(framerate_) ? framerate_ : 30.0;
     const uint32_t rtp = next_rtp_;
     next_rtp_ += std::max<uint32_t>(1, static_cast<uint32_t>(90000.0 / fps));
     const int64_t ts_us = next_ts_us_;
@@ -3789,10 +3812,21 @@ class StandaloneVideoEncoder : public webrtc::EncodedImageCallback {
     int32_t rc = 0;
     InAutoreleasePool([&] { rc = encoder_->Encode(frame, &types); });
     std::unique_lock<std::mutex> lock(mu_);
+    if (rc == WEBRTC_VIDEO_CODEC_NO_OUTPUT && !done_) {
+      // The backend skipped the frame.
+      waiting_ = false;
+      return 0;
+    }
     if (rc != WEBRTC_VIDEO_CODEC_OK) {
       waiting_ = false;
       *why = "Encode returned " + std::to_string(rc);
       return -1;
+    }
+    if (synchronous_ && !done_) {
+      // Nothing came out of a backend that delivers within Encode(): it
+      // skipped the frame without a callback.
+      waiting_ = false;
+      return 0;
     }
     const bool finished = cv_.wait_for(lock, kCodecWait, [&] { return done_; });
     waiting_ = false;
@@ -3886,6 +3920,7 @@ class StandaloneVideoEncoder : public webrtc::EncodedImageCallback {
   std::unique_ptr<webrtc::VideoEncoder> encoder_;
   std::string name_;
   bool hardware_ = false;
+  bool synchronous_ = false;
   int width_ = 0;
   int height_ = 0;
   uint32_t bitrate_bps_ = 0;
@@ -4113,6 +4148,7 @@ void* reactor_webrtc_codec_context_create(const char* openh264_lib_path,
     StandaloneBackend oh;
     oh.name = "OpenH264";
     oh.hardware = false;
+    oh.synchronous = true;
     oh.encoders = reactor::CreateOpenH264VideoEncoderFactory(lib);
     oh.decoders = reactor::CreateOpenH264VideoDecoderFactory(lib);
     ctx->h264.push_back(std::move(oh));
@@ -4168,6 +4204,10 @@ void* reactor_webrtc_video_encoder_create(void* ctx,
   if (cfg->width <= 0 || cfg->height <= 0 || cfg->width > 65535 ||
       cfg->height > 65535) {
     write_error(err, err_cap, "frame size out of range");
+    return nullptr;
+  }
+  if (!FramerateInRange(cfg->framerate)) {
+    write_error(err, err_cap, "framerate out of range");
     return nullptr;
   }
   auto candidates = h->ctx->Candidates(cfg->codec, cfg->backend);

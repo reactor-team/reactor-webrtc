@@ -19,7 +19,8 @@ pub struct VideoEncoderConfig {
     pub height: u32,
     /// Target bitrate, in bits per second. Default 2 Mbps.
     pub bitrate_bps: u32,
-    /// The frame rate the bitrate is spread over. Default 30.
+    /// The frame rate the bitrate is spread over, from 0.01 to 1000.
+    /// Default 30.
     pub framerate: f64,
     /// Which backends the encoder may run on. Default [`Backend::Auto`].
     pub backend: Backend,
@@ -85,12 +86,7 @@ impl VideoEncoder {
         if config.bitrate_bps == 0 {
             return Err(CodecError::InvalidInput("bitrate_bps is 0".into()));
         }
-        if !(config.framerate.is_finite() && config.framerate > 0.0) {
-            return Err(CodecError::InvalidInput(format!(
-                "framerate {} is not a positive number",
-                config.framerate
-            )));
-        }
+        check_framerate(config.framerate)?;
         let native = reactor_webrtc_sys::ReactorVideoEncoderConfig {
             size: std::mem::size_of::<reactor_webrtc_sys::ReactorVideoEncoderConfig>() as u32,
             codec: config.codec as i32,
@@ -154,13 +150,15 @@ impl VideoEncoder {
     }
 
     /// Change the target bitrate (bits per second) and the frame rate it is
-    /// spread over, from the next frame on. Refuses 0 and non-positive rates.
+    /// spread over, from the next frame on. Refuses a bitrate of 0 and a frame
+    /// rate outside 0.01 to 1000.
     pub fn set_rates(&mut self, bitrate_bps: u32, framerate: f64) -> Result<(), CodecError> {
-        if bitrate_bps == 0 || !(framerate.is_finite() && framerate > 0.0) {
+        if bitrate_bps == 0 {
             return Err(CodecError::InvalidInput(format!(
                 "rates {bitrate_bps} bps at {framerate} fps"
             )));
         }
+        check_framerate(framerate)?;
         self.bitrate_bps = bitrate_bps;
         self.framerate = framerate;
         unsafe {
@@ -263,6 +261,23 @@ impl Drop for VideoEncoder {
     }
 }
 
+/// The lowest and highest frame rates an encoder takes. The glue turns the
+/// frame interval into whole RTP ticks and microseconds; inside this range
+/// those conversions fit their integer types. Keep in step with the glue.
+const MIN_FRAMERATE: f64 = 0.01;
+const MAX_FRAMERATE: f64 = 1000.0;
+
+fn check_framerate(framerate: f64) -> Result<(), CodecError> {
+    // Also false for NaN.
+    if (MIN_FRAMERATE..=MAX_FRAMERATE).contains(&framerate) {
+        Ok(())
+    } else {
+        Err(CodecError::InvalidInput(format!(
+            "framerate {framerate} is outside {MIN_FRAMERATE} to {MAX_FRAMERATE}"
+        )))
+    }
+}
+
 /// The frame sizes every backend takes: positive, even, and within 16 bits.
 fn check_size(width: u32, height: u32) -> Result<(), CodecError> {
     if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
@@ -276,4 +291,32 @@ fn check_size(width: u32, height: u32) -> Result<(), CodecError> {
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refuses_frame_rates_the_glue_cannot_convert() {
+        for ok in [MIN_FRAMERATE, 1.0, 29.97, 30.0, 240.0, MAX_FRAMERATE] {
+            assert!(check_framerate(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            0.0,
+            -1.0,
+            1e-300,
+            f64::MIN_POSITIVE,
+            0.009,
+            1000.5,
+            1e300,
+            f64::INFINITY,
+            f64::NAN,
+        ] {
+            assert!(
+                matches!(check_framerate(bad), Err(CodecError::InvalidInput(_))),
+                "{bad}"
+            );
+        }
+    }
 }

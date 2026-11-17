@@ -278,6 +278,41 @@ fn a_new_frame_size_starts_with_a_key_frame() {
 }
 
 #[test]
+fn an_encoder_recovers_from_a_frame_size_it_refused() {
+    let codecs = codecs();
+    for backend in h264_backends(&codecs) {
+        let (mut encoder, _) = open(&codecs, backend);
+        encode(&mut encoder, 0);
+        // Above every level the backends are set up for: VideoToolbox refuses
+        // it at re-init, after releasing the session for the old size.
+        let (w, h) = (4352, 4352);
+        let big = encoder.encode(
+            &vec![128u8; (w * h * 3) as usize],
+            w,
+            h,
+            PixelFormat::Rgb24,
+            FRAME_US,
+        );
+        if big.is_ok() {
+            eprintln!(
+                "{}: took {w}x{h}; the failed re-init is not exercised",
+                encoder.implementation()
+            );
+        }
+        // Back to the old size, the encoder works again from a key frame.
+        let encoded = encoder
+            .encode(&frame(2), W, H, PixelFormat::Rgb24, 2 * FRAME_US)
+            .unwrap_or_else(|e| panic!("{backend:?}: back to {W}x{H}: {e}"))
+            .expect("the backend dropped a frame");
+        assert!(
+            encoded.key_frame,
+            "{backend:?}: no key frame after the size change"
+        );
+        assert_eq!((encoded.width, encoded.height), (W, H));
+    }
+}
+
+#[test]
 fn capabilities_list_h264_where_a_backend_exists() {
     let codecs = codecs();
     let caps = codecs.capabilities();
@@ -360,6 +395,13 @@ fn bad_input_is_refused_before_the_codec() {
         Err(CodecError::InvalidInput(_))
     ));
     assert!(encoder.set_rates(0, 30.0).is_err());
+    assert!(encoder.set_rates(1_000_000, 1e-300).is_err());
+    let mut slow = VideoEncoderConfig::new(VideoCodec::H264, W, H);
+    slow.framerate = 1e-300;
+    assert!(matches!(
+        codecs.encoder(&slow),
+        Err(CodecError::InvalidInput(_))
+    ));
     encoder.set_rates(1_000_000, 15.0).expect("set_rates");
     assert!(encode(&mut encoder, 0).key_frame);
 }
