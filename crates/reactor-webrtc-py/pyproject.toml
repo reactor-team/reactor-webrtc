@@ -22,6 +22,11 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 
+[project.optional-dependencies]
+# The standalone video codecs (VideoCodecs, VideoEncoder, VideoDecoder) take and
+# return numpy arrays; the rest of the module does not need numpy.
+numpy = ["numpy>=1.21"]
+
 [project.urls]
 Homepage = "https://github.com/reactor-team/reactor-webrtc"
 Repository = "https://github.com/reactor-team/reactor-webrtc"

@@ -138,6 +138,40 @@ transceiver's own sender actually encode with whichever preferred codec was
 negotiated, once negotiation completes — not just list it first in the SDP.
 No further call needed.
 
+## Standalone video codecs
+
+`VideoCodecs` runs libwebrtc's H.264, VP8, VP9 and AV1 encoders and decoders
+without a peer connection: RGB frames in, one encoded frame out per call, and
+back. Frames are numpy `uint8` arrays of shape `(H, W, 3)`
+(`pip install 'reactor-webrtc[numpy]'`).
+
+```python
+import reactor_webrtc as rw
+
+codecs = rw.VideoCodecs()
+caps = codecs.capabilities()            # what this process can run, hardware first
+assert caps.can_encode(rw.VideoCodec.Vp9)
+
+encoder = codecs.encoder(rw.VideoCodec.Vp9, 1280, 720, bitrate_bps=2_000_000)
+decoder = codecs.decoder(rw.VideoCodec.Vp9)
+
+encoded = encoder.encode(rgb, timestamp_us)   # EncodedVideoFrame, or None if dropped
+if encoded is not None:
+    # encoded.data: one Annex B access unit (H.264), one frame (VP8, VP9) or one
+    # temporal unit of OBUs (AV1); encoded.key_frame says if a decoder can start here.
+    picture = decoder.decode(encoded.data)    # (720, 1280, 3) uint8
+encoder.request_key_frame()   # the next frame is a key frame
+decoder.reset()               # now raises CodecNeedsKeyFrame until a key frame
+```
+
+The encoder is rate-controlled (`bitrate_bps` over a second at `framerate`,
+changed with `set_rates`), makes no B-frames, and makes a key frame for its
+first frame, a new frame size, the frame after an error and the frame after
+`request_key_frame()`. The decoder keeps its references between calls. Encode
+and decode release the GIL, and each call returns its own frame's output.
+`CodecUnsupported` means no backend here runs the codec; `capabilities()` says
+which do. The stub (`reactor_webrtc.pyi`) states the full contract.
+
 ## Receiving media
 
 ```python
@@ -188,6 +222,7 @@ for pair in report.candidate_pairs:
 | `Transceiver` | RTP m-section: `mid`, `kind`, `set_track`, `set_direction`, `set_codec_preferences`, `set_sender_transform`, `set_receiver_transform` |
 | `DataChannel` | SCTP data channel: `send`, `on_message`, `on_open`, … |
 | `StatsReport` | `inbound_rtp`, `outbound_rtp`, `candidate_pairs` |
+| `VideoCodecs`, `VideoEncoder`, `VideoDecoder`, `CodecCapabilities` | Standalone video encoders and decoders, without a peer connection — see [Standalone video codecs](#standalone-video-codecs) |
 | `FrameMetadata`, `FrameAction`, `EncodedFrame`, `FrameTransform` | Per-frame metadata trailers and custom encoded-frame transforms — see [`docs/frame-metadata.md`](../../docs/frame-metadata.md) |
 
 | Function | Description |

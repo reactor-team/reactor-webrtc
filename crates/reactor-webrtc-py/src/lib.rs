@@ -23,6 +23,8 @@
 // function named `reactor_webrtc` that this file also defines.
 use ::reactor_webrtc as rw;
 
+mod codec;
+
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyTuple};
@@ -3835,6 +3837,7 @@ fn reactor_webrtc(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<KeyFrameRequest>()?;
     m.add_class::<RateUpdate>()?;
     m.add_class::<RawVideoFrameInfo>()?;
+    codec::register(m)?;
 
     m.add_function(wrap_pyfunction!(time_micros, m)?)?;
 
