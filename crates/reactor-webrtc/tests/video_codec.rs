@@ -293,8 +293,13 @@ fn a_new_frame_size_starts_with_a_key_frame() {
 #[test]
 fn an_encoder_recovers_from_a_frame_size_it_refused() {
     let codecs = codecs();
-    for backend in h264_backends(&codecs) {
-        let (mut encoder, _) = open(&codecs, backend);
+    // H.264 only: VideoToolbox is the backend that refuses a size at re-init,
+    // and a frame this large is slow on the software VP9/AV1 encoders.
+    for (codec, backend) in cases(&codecs)
+        .into_iter()
+        .filter(|(codec, _)| *codec == VideoCodec::H264)
+    {
+        let (mut encoder, _) = open(&codecs, codec, backend);
         encode(&mut encoder, 0);
         // Above every level the backends are set up for: VideoToolbox refuses
         // it at re-init, after releasing the session for the old size.
