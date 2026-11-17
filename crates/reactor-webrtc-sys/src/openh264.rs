@@ -195,13 +195,47 @@ pub fn ensure_available(cache_dir: Option<&Path>) -> Result<PathBuf, OpenH264Err
     verify_sha1(&compressed, target.sha1)?;
     let decompressed = decompress_bz2(&compressed)?;
 
-    fs::write(&lib_path, &decompressed)?;
-    // Best-effort: a noexec-mounted cache dir would otherwise block dlopen.
-    // Not fatal on its own — if dlopen still fails the C++ side reports that.
-    let _ = mark_executable(&lib_path);
-    fs::write(&sentinel, b"ok")?;
+    // Several processes can miss the cache at once (parallel test runners,
+    // two apps starting together), and one of them may already have the
+    // library mapped. Rewriting the file in place would truncate the mapping
+    // under it (SIGBUS); each one writes its own copy and renames it over.
+    replace_atomically(&lib_path, &decompressed, true)?;
+    replace_atomically(&sentinel, b"ok", false)?;
 
     Ok(lib_path)
+}
+
+/// Write `bytes` to `path` without ever exposing a partial file: they go to
+/// a temporary sibling first, which is then renamed over `path`. A process
+/// that mapped the previous file keeps its inode intact.
+fn replace_atomically(path: &Path, bytes: &[u8], executable: bool) -> io::Result<()> {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    let tmp = path.with_file_name(format!(".{name}.{}.{nanos}.tmp", std::process::id()));
+    let written = fs::write(&tmp, bytes).and_then(|()| {
+        if executable {
+            // Best-effort: a noexec-mounted cache dir would otherwise block
+            // dlopen. Not fatal on its own — if dlopen still fails the C++
+            // side reports that.
+            let _ = mark_executable(&tmp);
+        }
+        fs::rename(&tmp, path)
+    });
+    if let Err(error) = written {
+        let _ = fs::remove_file(&tmp);
+        // Windows refuses to replace a library another process has loaded;
+        // that process put the same verified bytes there already.
+        if path.is_file() && fs::read(path).is_ok_and(|on_disk| on_disk == bytes) {
+            return Ok(());
+        }
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn download(url: &str) -> Result<Vec<u8>, OpenH264Error> {
@@ -289,6 +323,33 @@ mod tests {
                 Err(OpenH264Error::UnsupportedPlatform { .. })
             ));
         }
+    }
+
+    #[test]
+    fn a_replaced_library_keeps_the_open_one_whole_and_leaves_no_temp_file() {
+        let dir = std::env::temp_dir().join(format!("openh264-replace-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("libopenh264.so");
+        replace_atomically(&path, b"first copy", true).unwrap();
+        // A reader that opened the first file before the second write still
+        // reads it whole: the rename swaps the name, not the bytes under it.
+        let mut held = fs::File::open(&path).unwrap();
+        replace_atomically(&path, b"second", true).unwrap();
+        let mut read = String::new();
+        held.read_to_string(&mut read).unwrap();
+        assert_eq!(read, "first copy");
+        assert_eq!(fs::read(&path).unwrap(), b"second");
+        let names: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names, ["libopenh264.so"]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_ne!(fs::metadata(&path).unwrap().permissions().mode() & 0o111, 0);
+        }
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
