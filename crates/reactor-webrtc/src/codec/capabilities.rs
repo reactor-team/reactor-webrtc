@@ -11,13 +11,16 @@ pub struct CodecSupport {
     /// counts as hardware, as libwebrtc reports it; on a Mac with no
     /// hardware encoder (a virtual machine) it runs Apple's software one.
     pub hardware: bool,
-    /// The backend's name, e.g. `"VideoToolbox"` or `"OpenH264"`.
+    /// The backend's name: `"VideoToolbox"` or `"OpenH264"` for H.264,
+    /// `"libvpx"` for VP8 and VP9, `"libaom"` (encode) or `"dav1d"` (decode)
+    /// for AV1.
     pub implementation: String,
 }
 
 /// The codecs a process can encode and decode, one entry per backend, hardware
 /// first within each codec. A codec missing from a list cannot be created in
-/// that direction here.
+/// that direction here: the platform has no backend for it, or this build of
+/// libwebrtc left it out.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CodecCapabilities {
     pub encoders: Vec<CodecSupport>,

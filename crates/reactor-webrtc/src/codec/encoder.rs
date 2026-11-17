@@ -133,7 +133,7 @@ impl VideoEncoder {
         self.codec
     }
 
-    /// The backend this encoder runs on, e.g. `"VideoToolbox"`.
+    /// The backend this encoder runs on, e.g. `"VideoToolbox"` or `"libvpx"`.
     pub fn implementation(&self) -> &str {
         &self.implementation
     }

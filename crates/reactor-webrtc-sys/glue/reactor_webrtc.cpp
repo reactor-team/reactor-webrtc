@@ -78,7 +78,9 @@
 #include "api/video/video_source_interface.h"
 #include "api/video_codecs/builtin_video_decoder_factory.h"
 #include "api/video_codecs/builtin_video_encoder_factory.h"
+#include "api/video_codecs/scalability_mode.h"
 #include "api/video_codecs/sdp_video_format.h"
+#include "api/video_codecs/simulcast_stream.h"
 #include "api/video_codecs/video_codec.h"
 #include "api/video_codecs/video_decoder.h"
 #include "api/video_codecs/video_decoder_factory.h"
@@ -3539,8 +3541,10 @@ void reactor_webrtc_peer_connection_sctp_metrics(
 // ── Standalone video codecs ───────────────────────────────────────────────────
 // libwebrtc's video encoders and decoders, driven directly instead of through a
 // PeerConnection: one frame in, its output back before the call returns. The
-// backends are the ones the PeerConnectionFactory routes H264 to (VideoToolbox
-// on Apple, a loaded OpenH264 elsewhere), listed hardware first.
+// backends are the ones the PeerConnectionFactory routes each codec to: for
+// H264 VideoToolbox on Apple and a loaded OpenH264; for VP8, VP9 and AV1
+// libwebrtc's builtin software codecs (libvpx, libaom, dav1d). Each codec's
+// backends are listed hardware first.
 //
 // Each encoder or decoder is driven by one thread at a time (the Rust wrapper
 // takes `&mut self`). Backends that call back on a thread of their own
@@ -3639,6 +3643,21 @@ webrtc::SdpVideoFormat StandaloneH264Format() {
                                          {"profile-level-id", "42e034"}});
 }
 
+// The SDP format the backends of `codec` (a webrtc::VideoCodecType) are
+// created with. VP9 and AV1 use profile 0: 8-bit 4:2:0, what I420 carries.
+webrtc::SdpVideoFormat StandaloneFormat(int codec) {
+  switch (codec) {
+    case webrtc::kVideoCodecVP8:
+      return webrtc::SdpVideoFormat::VP8();
+    case webrtc::kVideoCodecVP9:
+      return webrtc::SdpVideoFormat::VP9Profile0();
+    case webrtc::kVideoCodecAV1:
+      return webrtc::SdpVideoFormat::AV1Profile0();
+    default:
+      return StandaloneH264Format();
+  }
+}
+
 // Converts `pixels` (kPixelFormatBgra or kPixelFormatRgb24) to a fresh I420
 // buffer; null on an unknown format.
 webrtc::scoped_refptr<webrtc::I420Buffer> PixelsToI420(const uint8_t* pixels,
@@ -3666,34 +3685,53 @@ webrtc::scoped_refptr<webrtc::I420Buffer> PixelsToI420(const uint8_t* pixels,
   return buffer;
 }
 
-// One way to run a codec: a factory pair and what it is.
+// One way to run one codec: a factory pair and what it is. A factory is null
+// in a direction it cannot run the codec in (libwebrtc built without an AV1
+// encoder, say). Factories may be shared between the entries of several
+// codecs.
 struct StandaloneBackend {
-  std::string name;
+  int codec = webrtc::kVideoCodecH264;  // webrtc::VideoCodecType
+  std::string encoder_name;
+  std::string decoder_name;
   bool hardware = false;
   // Its encoder delivers a frame, if at all, before Encode() returns: no
   // callback by then means the frame was dropped.
   bool synchronous = false;
-  std::unique_ptr<webrtc::VideoEncoderFactory> encoders;
-  std::unique_ptr<webrtc::VideoDecoderFactory> decoders;
+  std::shared_ptr<webrtc::VideoEncoderFactory> encoders;
+  std::shared_ptr<webrtc::VideoDecoderFactory> decoders;
 };
+
+constexpr int kCodecEncode = 0;
+constexpr int kCodecDecode = 1;
+
+// Whether `formats` lists `codec`'s standalone format.
+bool ListsCodec(const std::vector<webrtc::SdpVideoFormat>& formats,
+                int codec) {
+  const webrtc::SdpVideoFormat want = StandaloneFormat(codec);
+  for (const auto& f : formats)
+    if (f.IsSameCodec(want)) return true;
+  return false;
+}
 
 // What `reactor_webrtc_codec_context_create` returns, behind a shared_ptr so
 // every encoder and decoder keeps the backends (and a loaded OpenH264) alive.
 struct StandaloneCodecContext {
   StandaloneCodecContext() : env(webrtc::CreateEnvironment()) {}
   webrtc::Environment env;
-  // H264 backends, hardware first.
-  std::vector<StandaloneBackend> h264;
+  // Every codec's backends, grouped by codec, hardware first within each.
+  std::vector<StandaloneBackend> backends;
   // Factory Create() calls are serialised: nothing promises they are
   // thread-safe, and encoders are created far less often than they encode.
   std::mutex create_mu;
 
-  // The backends `backend` (kCodecBackend*) allows for `codec`, in the order
-  // to try them.
-  std::vector<StandaloneBackend*> Candidates(int codec, int backend) {
+  // The backends `backend` (kCodecBackend*) allows for `codec` in
+  // `direction` (kCodecEncode or kCodecDecode), in the order to try them.
+  std::vector<StandaloneBackend*> Candidates(int codec, int backend,
+                                             int direction) {
     std::vector<StandaloneBackend*> out;
-    if (codec != webrtc::kVideoCodecH264) return out;
-    for (auto& b : h264) {
+    for (auto& b : backends) {
+      if (b.codec != codec) continue;
+      if (direction == kCodecEncode ? !b.encoders : !b.decoders) continue;
       if (backend == kCodecBackendHardware && !b.hardware) continue;
       if (backend == kCodecBackendSoftware && b.hardware) continue;
       out.push_back(&b);
@@ -3716,6 +3754,7 @@ class StandaloneVideoEncoder : public webrtc::EncodedImageCallback {
             const std::vector<StandaloneBackend*>& candidates,
             const ReactorVideoEncoderConfig& cfg, std::string* why) {
     ctx_ = std::move(ctx);
+    codec_ = cfg.codec;
     width_ = cfg.width;
     height_ = cfg.height;
     bitrate_bps_ = cfg.bitrate_bps;
@@ -3725,21 +3764,21 @@ class StandaloneVideoEncoder : public webrtc::EncodedImageCallback {
       {
         std::lock_guard<std::mutex> lock(ctx_->create_mu);
         InAutoreleasePool([&] {
-          enc = b->encoders->Create(ctx_->env, StandaloneH264Format());
+          enc = b->encoders->Create(ctx_->env, StandaloneFormat(codec_));
         });
       }
       if (!enc) {
-        *why += b->name + ": no encoder; ";
+        *why += b->encoder_name + ": no encoder; ";
         continue;
       }
       encoder_ = std::move(enc);
       if (Init(width_, height_)) {
-        name_ = b->name;
+        name_ = b->encoder_name;
         hardware_ = b->hardware;
         synchronous_ = b->synchronous;
         return true;
       }
-      *why += b->name + ": InitEncode failed; ";
+      *why += b->encoder_name + ": InitEncode failed; ";
       Close();
     }
     if (why->empty()) *why = "no backend for this codec";
@@ -3872,7 +3911,7 @@ class StandaloneVideoEncoder : public webrtc::EncodedImageCallback {
  private:
   bool Init(int width, int height) {
     webrtc::VideoCodec codec;
-    codec.codecType = webrtc::kVideoCodecH264;
+    codec.codecType = static_cast<webrtc::VideoCodecType>(codec_);
     codec.width = static_cast<uint16_t>(width);
     codec.height = static_cast<uint16_t>(height);
     const unsigned kbps = std::max(1u, bitrate_bps_ / 1000);
@@ -3881,11 +3920,67 @@ class StandaloneVideoEncoder : public webrtc::EncodedImageCallback {
     codec.minBitrate = std::min(30u, kbps);
     codec.maxFramerate = static_cast<uint32_t>(
         std::max(1.0, framerate_ > 0 ? std::ceil(framerate_) : 30.0));
-    codec.qpMax = 51;
     codec.mode = webrtc::VideoCodecMode::kRealtimeVideo;
     codec.numberOfSimulcastStreams = 1;
-    *codec.H264() = webrtc::VideoEncoder::GetDefaultH264Settings();
-    codec.H264()->numberOfTemporalLayers = 1;
+    // One spatial and one temporal layer, every frame referencing the one
+    // before it. The rate is held by quantisation, never by dropping frames.
+    codec.SetFrameDropEnabled(false);
+    switch (codec_) {
+      case webrtc::kVideoCodecVP8:
+        codec.qpMax = 56;
+        codec.SetScalabilityMode(webrtc::ScalabilityMode::kL1T1);
+        *codec.VP8() = webrtc::VideoEncoder::GetDefaultVp8Settings();
+        codec.VP8()->numberOfTemporalLayers = 1;
+        codec.VP8()->automaticResizeOn = false;
+        codec.VP8()->denoisingOn = false;
+        break;
+      case webrtc::kVideoCodecVP9:
+        codec.qpMax = 56;
+        codec.SetScalabilityMode(webrtc::ScalabilityMode::kL1T1);
+        *codec.VP9() = webrtc::VideoEncoder::GetDefaultVp9Settings();
+        codec.VP9()->numberOfTemporalLayers = 1;
+        codec.VP9()->numberOfSpatialLayers = 1;
+        codec.VP9()->flexibleMode = false;
+        codec.VP9()->automaticResizeOn = false;
+        codec.VP9()->denoisingOn = false;
+        codec.VP9()->interLayerPred = webrtc::InterLayerPredMode::kOff;
+        // The single spatial layer, as a peer connection configures it.
+        codec.spatialLayers[0].width = width;
+        codec.spatialLayers[0].height = height;
+        codec.spatialLayers[0].maxFramerate =
+            static_cast<float>(codec.maxFramerate);
+        codec.spatialLayers[0].numberOfTemporalLayers = 1;
+        codec.spatialLayers[0].minBitrate = codec.minBitrate;
+        codec.spatialLayers[0].targetBitrate = kbps;
+        codec.spatialLayers[0].maxBitrate = kbps;
+        codec.spatialLayers[0].qpMax = codec.qpMax;
+        codec.spatialLayers[0].active = true;
+        break;
+      case webrtc::kVideoCodecAV1:
+        codec.qpMax = 56;
+        codec.SetScalabilityMode(webrtc::ScalabilityMode::kL1T1);
+        codec.AV1()->automatic_resize_on = false;
+        break;
+      default:
+        codec.qpMax = 51;
+        *codec.H264() = webrtc::VideoEncoder::GetDefaultH264Settings();
+        codec.H264()->numberOfTemporalLayers = 1;
+        break;
+    }
+    if (codec_ != webrtc::kVideoCodecH264) {
+      // The single stream, as a peer connection configures it for libvpx
+      // and libaom.
+      webrtc::SimulcastStream& stream = codec.simulcastStream[0];
+      stream.width = width;
+      stream.height = height;
+      stream.maxFramerate = static_cast<float>(codec.maxFramerate);
+      stream.numberOfTemporalLayers = 1;
+      stream.minBitrate = codec.minBitrate;
+      stream.targetBitrate = kbps;
+      stream.maxBitrate = kbps;
+      stream.qpMax = codec.qpMax;
+      stream.active = true;
+    }
     const webrtc::VideoEncoder::Settings settings(
         webrtc::VideoEncoder::Capabilities(/*loss_notification=*/false),
         CodecCores(), /*max_payload_size=*/1200);
@@ -3920,6 +4015,7 @@ class StandaloneVideoEncoder : public webrtc::EncodedImageCallback {
   std::unique_ptr<webrtc::VideoEncoder> encoder_;
   std::string name_;
   bool hardware_ = false;
+  int codec_ = webrtc::kVideoCodecH264;
   bool synchronous_ = false;
   int width_ = 0;
   int height_ = 0;
@@ -3954,20 +4050,20 @@ class StandaloneVideoDecoder : public webrtc::DecodedImageCallback {
       {
         std::lock_guard<std::mutex> lock(ctx_->create_mu);
         InAutoreleasePool([&] {
-          dec = b->decoders->Create(ctx_->env, StandaloneH264Format());
+          dec = b->decoders->Create(ctx_->env, StandaloneFormat(codec_));
         });
       }
       if (!dec) {
-        *why += b->name + ": no decoder; ";
+        *why += b->decoder_name + ": no decoder; ";
         continue;
       }
       decoder_ = std::move(dec);
       if (Configure()) {
-        name_ = b->name;
+        name_ = b->decoder_name;
         hardware_ = b->hardware;
         return true;
       }
-      *why += b->name + ": Configure failed; ";
+      *why += b->decoder_name + ": Configure failed; ";
       Close();
     }
     if (why->empty()) *why = "no backend for this codec";
@@ -4120,20 +4216,23 @@ extern "C" {
 
 // Collects the codec backends this process can run. `openh264_lib_path`
 // (may be null) is loaded as the software H264 backend; a path that does not
-// load, or one given to a build without OpenH264, fails the create.
+// load, or one given to a build without OpenH264, fails the create. VP8, VP9
+// and AV1 run on libwebrtc's builtin software codecs, in each direction the
+// library was built with.
 void* reactor_webrtc_codec_context_create(const char* openh264_lib_path,
                                           char* err, int err_cap) {
   auto ctx = std::make_shared<StandaloneCodecContext>();
 #if defined(WEBRTC_MAC)
   {
     StandaloneBackend vt;
-    vt.name = "VideoToolbox";
+    vt.codec = webrtc::kVideoCodecH264;
+    vt.encoder_name = vt.decoder_name = "VideoToolbox";
     vt.hardware = true;
     InAutoreleasePool([&] {
       vt.encoders = reactor::CreateAppleHwVideoEncoderFactory();
       vt.decoders = reactor::CreateAppleHwVideoDecoderFactory();
     });
-    ctx->h264.push_back(std::move(vt));
+    ctx->backends.push_back(std::move(vt));
   }
 #endif
   if (openh264_lib_path) {
@@ -4146,17 +4245,47 @@ void* reactor_webrtc_codec_context_create(const char* openh264_lib_path,
       return nullptr;
     }
     StandaloneBackend oh;
-    oh.name = "OpenH264";
+    oh.codec = webrtc::kVideoCodecH264;
+    oh.encoder_name = oh.decoder_name = "OpenH264";
     oh.hardware = false;
     oh.synchronous = true;
     oh.encoders = reactor::CreateOpenH264VideoEncoderFactory(lib);
     oh.decoders = reactor::CreateOpenH264VideoDecoderFactory(lib);
-    ctx->h264.push_back(std::move(oh));
+    ctx->backends.push_back(std::move(oh));
 #else
     write_error(err, err_cap,
                 "openh264_lib_path set but this build lacks OpenH264 support");
     return nullptr;
 #endif
+  }
+  {
+    std::shared_ptr<webrtc::VideoEncoderFactory> encoders =
+        webrtc::CreateBuiltinVideoEncoderFactory();
+    std::shared_ptr<webrtc::VideoDecoderFactory> decoders =
+        webrtc::CreateBuiltinVideoDecoderFactory();
+    const std::vector<webrtc::SdpVideoFormat> encode_formats =
+        encoders->GetSupportedFormats();
+    const std::vector<webrtc::SdpVideoFormat> decode_formats =
+        decoders->GetSupportedFormats();
+    struct Builtin {
+      int codec;
+      const char* encoder_name;
+      const char* decoder_name;
+    };
+    for (const Builtin& c : {Builtin{webrtc::kVideoCodecVP8, "libvpx", "libvpx"},
+                             Builtin{webrtc::kVideoCodecVP9, "libvpx", "libvpx"},
+                             Builtin{webrtc::kVideoCodecAV1, "libaom", "dav1d"}}) {
+      StandaloneBackend b;
+      b.codec = c.codec;
+      b.encoder_name = c.encoder_name;
+      b.decoder_name = c.decoder_name;
+      b.hardware = false;
+      // A direction the library was built without is left out, so the
+      // capabilities report it as unsupported.
+      if (ListsCodec(encode_formats, c.codec)) b.encoders = encoders;
+      if (ListsCodec(decode_formats, c.codec)) b.decoders = decoders;
+      if (b.encoders || b.decoders) ctx->backends.push_back(std::move(b));
+    }
   }
   return new StandaloneContextHandle{std::move(ctx)};
 }
@@ -4172,23 +4301,24 @@ int reactor_webrtc_codec_context_capabilities(void* ctx,
   auto* h = reinterpret_cast<StandaloneContextHandle*>(ctx);
   if (!h) return 0;
   int n = 0;
-  auto add = [&](int direction, const StandaloneBackend& b) {
+  auto add = [&](int direction, const StandaloneBackend& b,
+                 const std::string& name) {
     if (out && n < cap) {
       ReactorCodecSupport& s = out[n];
       std::memset(&s, 0, sizeof(s));
       s.direction = direction;
-      s.codec = webrtc::kVideoCodecH264;
+      s.codec = b.codec;
       s.hardware = b.hardware ? 1 : 0;
       std::snprintf(s.implementation, sizeof(s.implementation), "%s",
-                    b.name.c_str());
+                    name.c_str());
     }
     ++n;
   };
-  for (const auto& b : h->ctx->h264) {
-    if (b.encoders) add(0, b);
+  for (const auto& b : h->ctx->backends) {
+    if (b.encoders) add(kCodecEncode, b, b.encoder_name);
   }
-  for (const auto& b : h->ctx->h264) {
-    if (b.decoders) add(1, b);
+  for (const auto& b : h->ctx->backends) {
+    if (b.decoders) add(kCodecDecode, b, b.decoder_name);
   }
   return n;
 }
@@ -4210,7 +4340,7 @@ void* reactor_webrtc_video_encoder_create(void* ctx,
     write_error(err, err_cap, "framerate out of range");
     return nullptr;
   }
-  auto candidates = h->ctx->Candidates(cfg->codec, cfg->backend);
+    auto candidates = h->ctx->Candidates(cfg->codec, cfg->backend, kCodecEncode);
   if (candidates.empty()) {
     write_error(err, err_cap, "no encoder backend for this codec and backend");
     return nullptr;
@@ -4268,7 +4398,7 @@ void* reactor_webrtc_video_decoder_create(void* ctx, int codec, int backend,
     write_error(err, err_cap, "null codec context");
     return nullptr;
   }
-  auto candidates = h->ctx->Candidates(codec, backend);
+  auto candidates = h->ctx->Candidates(codec, backend, kCodecDecode);
   if (candidates.empty()) {
     write_error(err, err_cap, "no decoder backend for this codec and backend");
     return nullptr;

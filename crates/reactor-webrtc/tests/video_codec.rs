@@ -1,17 +1,19 @@
 //! The standalone video codecs: a sequence encoded and decoded back matches
 //! within tolerance, a key frame comes out when asked mid-stream, and a reset
-//! decoder starts again only at a key frame — on every backend this machine
-//! has, hardware and software.
+//! decoder starts again only at a key frame — for every codec, on every
+//! backend this machine has, hardware and software.
 //!
 //! The software H.264 backend is OpenH264, so it runs only with the `openh264`
 //! feature on a platform Cisco ships it for (Linux, Windows); the library is
-//! downloaded on first use. VideoToolbox covers the hardware path on Apple.
+//! downloaded on first use. VideoToolbox covers the hardware H.264 path on
+//! Apple. VP8, VP9 and AV1 run on libwebrtc's own software codecs everywhere.
 //!
 //! Gated on a native libwebrtc being linked (see build.rs).
 #![cfg(have_libwebrtc)]
 
 use reactor_webrtc::codec::{
-    Backend, CodecError, EncodedFrame, VideoCodecs, VideoDecoder, VideoEncoder, VideoEncoderConfig,
+    Backend, CodecError, CodecSupport, EncodedFrame, VideoCodecs, VideoDecoder, VideoEncoder,
+    VideoEncoderConfig,
 };
 use reactor_webrtc::{PixelFormat, VideoCodec};
 
@@ -24,6 +26,14 @@ const FRAME_US: i64 = 33_333;
 /// edges (VideoToolbox lands at 32-42 dB); a broken conversion (swapped
 /// channels, a wrong stride) lands far below.
 const MIN_PSNR_DB: f64 = 28.0;
+
+/// Every codec the standalone API runs.
+const CODECS: [VideoCodec; 4] = [
+    VideoCodec::H264,
+    VideoCodec::Vp8,
+    VideoCodec::Vp9,
+    VideoCodec::Av1,
+];
 
 /// The codecs with every backend this platform can load.
 fn codecs() -> VideoCodecs {
@@ -39,33 +49,37 @@ fn codecs() -> VideoCodecs {
     VideoCodecs::new().expect("codecs")
 }
 
-/// The H.264 backends to run each test on: the ones that both encode and
-/// decode here.
-fn h264_backends(codecs: &VideoCodecs) -> Vec<Backend> {
+/// The (codec, backend) pairs to run each test on: every codec, on each kind
+/// of backend that both encodes and decodes it here.
+fn cases(codecs: &VideoCodecs) -> Vec<(VideoCodec, Backend)> {
     let caps = codecs.capabilities();
     let mut out = Vec::new();
-    for (backend, hardware) in [(Backend::Hardware, true), (Backend::Software, false)] {
-        let has = |list: &[reactor_webrtc::codec::CodecSupport]| {
-            list.iter()
-                .any(|s| s.codec == VideoCodec::H264 && s.hardware == hardware)
-        };
-        if has(&caps.encoders) && has(&caps.decoders) {
-            out.push(backend);
+    for codec in CODECS {
+        let mut found = false;
+        for (backend, hardware) in [(Backend::Hardware, true), (Backend::Software, false)] {
+            let has = |list: &[CodecSupport]| {
+                list.iter()
+                    .any(|s| s.codec == codec && s.hardware == hardware)
+            };
+            if has(&caps.encoders) && has(&caps.decoders) {
+                out.push((codec, backend));
+                found = true;
+            }
         }
-    }
-    if out.is_empty() {
-        eprintln!("no H.264 backend on this machine; nothing to run");
+        if !found {
+            eprintln!("no {codec:?} backend on this machine; skipping it");
+        }
     }
     out
 }
 
-fn open(codecs: &VideoCodecs, backend: Backend) -> (VideoEncoder, VideoDecoder) {
-    let mut config = VideoEncoderConfig::new(VideoCodec::H264, W, H);
+fn open(codecs: &VideoCodecs, codec: VideoCodec, backend: Backend) -> (VideoEncoder, VideoDecoder) {
+    let mut config = VideoEncoderConfig::new(codec, W, H);
     config.backend = backend;
     let encoder = codecs.encoder(&config).expect("encoder");
-    let decoder = codecs
-        .decoder_on(VideoCodec::H264, backend)
-        .expect("decoder");
+    let decoder = codecs.decoder_on(codec, backend).expect("decoder");
+    assert_eq!(encoder.codec(), codec);
+    assert_eq!(decoder.codec(), codec);
     assert_eq!(encoder.is_hardware(), backend == Backend::Hardware);
     assert_eq!(decoder.is_hardware(), backend == Backend::Hardware);
     (encoder, decoder)
@@ -129,7 +143,8 @@ fn decode_and_compare(decoder: &mut VideoDecoder, encoded: &EncodedFrame, i: u32
     let quality = psnr(&decoded.data, &frame(i));
     assert!(
         quality >= MIN_PSNR_DB,
-        "{}: frame {i} decoded at {quality:.1} dB",
+        "{:?} on {}: frame {i} decoded at {quality:.1} dB",
+        decoder.codec(),
         decoder.implementation()
     );
 }
@@ -137,8 +152,8 @@ fn decode_and_compare(decoder: &mut VideoDecoder, encoded: &EncodedFrame, i: u32
 #[test]
 fn a_sequence_round_trips_within_tolerance() {
     let codecs = codecs();
-    for backend in h264_backends(&codecs) {
-        let (mut encoder, mut decoder) = open(&codecs, backend);
+    for (codec, backend) in cases(&codecs) {
+        let (mut encoder, mut decoder) = open(&codecs, codec, backend);
         let mut deltas = 0;
         for i in 0..30 {
             let encoded = encode(&mut encoder, i);
@@ -147,7 +162,7 @@ fn a_sequence_round_trips_within_tolerance() {
             if i == 0 {
                 assert!(
                     encoded.key_frame,
-                    "{backend:?}: the first frame is not a key frame"
+                    "{codec:?} {backend:?}: the first frame is not a key frame"
                 );
             } else if !encoded.key_frame {
                 deltas += 1;
@@ -157,7 +172,7 @@ fn a_sequence_round_trips_within_tolerance() {
         // Inter frames, not a stream of key frames.
         assert!(
             deltas >= 25,
-            "{}: only {deltas} of 29 frames were inter frames",
+            "{codec:?} on {}: only {deltas} of 29 frames were inter frames",
             encoder.implementation()
         );
     }
@@ -166,8 +181,8 @@ fn a_sequence_round_trips_within_tolerance() {
 #[test]
 fn a_key_frame_comes_out_on_demand_mid_stream() {
     let codecs = codecs();
-    for backend in h264_backends(&codecs) {
-        let (mut encoder, mut decoder) = open(&codecs, backend);
+    for (codec, backend) in cases(&codecs) {
+        let (mut encoder, mut decoder) = open(&codecs, codec, backend);
         for i in 0..10 {
             let encoded = encode(&mut encoder, i);
             decode_and_compare(&mut decoder, &encoded, i);
@@ -176,21 +191,19 @@ fn a_key_frame_comes_out_on_demand_mid_stream() {
         let key = encode(&mut encoder, 10);
         assert!(
             key.key_frame,
-            "{backend:?}: no key frame after request_key_frame"
+            "{codec:?} {backend:?}: no key frame after request_key_frame"
         );
         let next = encode(&mut encoder, 11);
         assert!(
             !next.key_frame,
-            "{backend:?}: the request outlived its frame"
+            "{codec:?} {backend:?}: the request outlived its frame"
         );
 
         // The stream so far decodes through the key frame…
         decode_and_compare(&mut decoder, &key, 10);
         decode_and_compare(&mut decoder, &next, 11);
         // …and a decoder that joins at it needs nothing before it.
-        let mut late = codecs
-            .decoder_on(VideoCodec::H264, backend)
-            .expect("decoder");
+        let mut late = codecs.decoder_on(codec, backend).expect("decoder");
         decode_and_compare(&mut late, &key, 10);
         decode_and_compare(&mut late, &next, 11);
     }
@@ -199,19 +212,21 @@ fn a_key_frame_comes_out_on_demand_mid_stream() {
 #[test]
 fn a_reset_decoder_starts_again_only_at_a_key_frame() {
     let codecs = codecs();
-    for backend in h264_backends(&codecs) {
-        let (mut encoder, mut decoder) = open(&codecs, backend);
+    for (codec, backend) in cases(&codecs) {
+        let (mut encoder, mut decoder) = open(&codecs, codec, backend);
         let stream: Vec<EncodedFrame> = (0..6).map(|i| encode(&mut encoder, i)).collect();
-        assert!(stream[0].key_frame);
-        assert!(stream[1..].iter().all(|f| !f.key_frame));
+        assert!(stream[0].key_frame, "{codec:?} {backend:?}");
+        assert!(
+            stream[1..].iter().all(|f| !f.key_frame),
+            "{codec:?} {backend:?}"
+        );
 
         // A new decoder refuses an inter frame without touching its state.
-        let mut fresh = codecs
-            .decoder_on(VideoCodec::H264, backend)
-            .expect("decoder");
+        let mut fresh = codecs.decoder_on(codec, backend).expect("decoder");
         assert_eq!(
             fresh.decode(&stream[1].data, 0, PixelFormat::Rgb24),
-            Err(CodecError::NeedKeyFrame)
+            Err(CodecError::NeedKeyFrame),
+            "{codec:?} {backend:?}"
         );
         assert!(fresh.needs_key_frame());
 
@@ -225,14 +240,14 @@ fn a_reset_decoder_starts_again_only_at_a_key_frame() {
             assert_eq!(
                 decoder.decode(&f.data, f.timestamp_us, PixelFormat::Rgb24),
                 Err(CodecError::NeedKeyFrame),
-                "{backend:?}: a reset decoder took an inter frame"
+                "{codec:?} {backend:?}: a reset decoder took an inter frame"
             );
         }
 
         // The encoder's next key frame brings it back.
         encoder.request_key_frame();
         let key = encode(&mut encoder, 6);
-        assert!(key.key_frame);
+        assert!(key.key_frame, "{codec:?} {backend:?}");
         decode_and_compare(&mut decoder, &key, 6);
         assert!(!decoder.needs_key_frame());
         let next = encode(&mut encoder, 7);
@@ -243,14 +258,14 @@ fn a_reset_decoder_starts_again_only_at_a_key_frame() {
 #[test]
 fn a_new_frame_size_starts_with_a_key_frame() {
     let codecs = codecs();
-    for backend in h264_backends(&codecs) {
-        let (mut encoder, _) = open(&codecs, backend);
+    for (codec, backend) in cases(&codecs) {
+        let (mut encoder, _) = open(&codecs, codec, backend);
         encode(&mut encoder, 0);
-        assert!(!encode(&mut encoder, 1).key_frame);
-        // Larger than the level in the SDP format the backends are created
-        // with: the encoder must not hold the stream to it.
+        assert!(!encode(&mut encoder, 1).key_frame, "{codec:?} {backend:?}");
+        // Larger than the level in the SDP format the H.264 backends are
+        // created with: the encoder must not hold the stream to it.
         let (w, h) = (1920, 1080);
-        let small = encoder
+        let large = encoder
             .encode(
                 &vec![128u8; (w * h * 3) as usize],
                 w,
@@ -261,15 +276,13 @@ fn a_new_frame_size_starts_with_a_key_frame() {
             .expect("encode")
             .expect("frame");
         assert!(
-            small.key_frame,
-            "{backend:?}: a new size without a key frame"
+            large.key_frame,
+            "{codec:?} {backend:?}: a new size without a key frame"
         );
-        assert_eq!((small.width, small.height), (w, h));
-        let mut decoder = codecs
-            .decoder_on(VideoCodec::H264, backend)
-            .expect("decoder");
+        assert_eq!((large.width, large.height), (w, h));
+        let mut decoder = codecs.decoder_on(codec, backend).expect("decoder");
         let decoded = decoder
-            .decode(&small.data, 0, PixelFormat::Bgra)
+            .decode(&large.data, 0, PixelFormat::Bgra)
             .expect("decode")
             .expect("picture");
         assert_eq!((decoded.width, decoded.height), (w, h));
@@ -280,8 +293,13 @@ fn a_new_frame_size_starts_with_a_key_frame() {
 #[test]
 fn an_encoder_recovers_from_a_frame_size_it_refused() {
     let codecs = codecs();
-    for backend in h264_backends(&codecs) {
-        let (mut encoder, _) = open(&codecs, backend);
+    // H.264 only: VideoToolbox is the backend that refuses a size at re-init,
+    // and a frame this large is slow on the software VP9/AV1 encoders.
+    for (codec, backend) in cases(&codecs)
+        .into_iter()
+        .filter(|(codec, _)| *codec == VideoCodec::H264)
+    {
+        let (mut encoder, _) = open(&codecs, codec, backend);
         encode(&mut encoder, 0);
         // Above every level the backends are set up for: VideoToolbox refuses
         // it at re-init, after releasing the session for the old size.
@@ -341,13 +359,6 @@ fn capabilities_list_h264_where_a_backend_exists() {
                 "{what}: {caps:?}"
             );
         }
-        // Hardware is listed first.
-        if let (Some(h), Some(s)) = (
-            list.iter().position(|s| s.hardware),
-            list.iter().position(|s| !s.hardware),
-        ) {
-            assert!(h < s, "{what}: software listed before hardware: {caps:?}");
-        }
     }
     assert_eq!(
         caps.can_encode(VideoCodec::H264),
@@ -355,53 +366,135 @@ fn capabilities_list_h264_where_a_backend_exists() {
     );
     if !caps.can_encode(VideoCodec::H264) {
         assert!(!expect_hardware && !expect_software);
-        let config = VideoEncoderConfig::new(VideoCodec::H264, W, H);
-        assert!(matches!(
-            codecs.encoder(&config),
-            Err(CodecError::Unsupported(_))
-        ));
     }
-    // Only H.264 runs standalone so far.
-    assert!(caps
-        .encoders
-        .iter()
-        .chain(&caps.decoders)
-        .all(|s| s.codec == VideoCodec::H264));
+}
+
+#[test]
+fn capabilities_list_the_builtin_software_codecs() {
+    let caps = codecs().capabilities();
+    // libvpx is part of every libwebrtc build this crate links.
+    for codec in [VideoCodec::Vp8, VideoCodec::Vp9] {
+        for (list, what) in [(&caps.encoders, "encoders"), (&caps.decoders, "decoders")] {
+            let entry = list.iter().find(|s| s.codec == codec);
+            assert_eq!(
+                entry.map(|s| (s.implementation.as_str(), s.hardware)),
+                Some(("libvpx", false)),
+                "{codec:?} {what}: {caps:?}"
+            );
+        }
+    }
+    // AV1 is listed in each direction the build has, under its library.
+    if let Some(s) = caps.encoders.iter().find(|s| s.codec == VideoCodec::Av1) {
+        assert_eq!((s.implementation.as_str(), s.hardware), ("libaom", false));
+    }
+    if let Some(s) = caps.decoders.iter().find(|s| s.codec == VideoCodec::Av1) {
+        assert_eq!((s.implementation.as_str(), s.hardware), ("dav1d", false));
+    }
+}
+
+#[test]
+fn capabilities_group_codecs_hardware_first() {
+    let caps = codecs().capabilities();
+    for (list, what) in [(&caps.encoders, "encoders"), (&caps.decoders, "decoders")] {
+        for codec in CODECS {
+            let of_codec: Vec<&CodecSupport> = list.iter().filter(|s| s.codec == codec).collect();
+            if let (Some(h), Some(s)) = (
+                of_codec.iter().position(|s| s.hardware),
+                of_codec.iter().position(|s| !s.hardware),
+            ) {
+                assert!(
+                    h < s,
+                    "{what}: {codec:?} software listed before hardware: {caps:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_codec_missing_from_the_capabilities_is_refused_without_a_panic() {
+    let codecs = codecs();
+    let caps = codecs.capabilities();
+    // H.265 never runs standalone.
+    assert!(!caps.can_encode(VideoCodec::H265));
+    assert!(!caps.can_decode(VideoCodec::H265));
+    for codec in CODECS.into_iter().chain([VideoCodec::H265]) {
+        if !caps.can_encode(codec) {
+            let config = VideoEncoderConfig::new(codec, W, H);
+            assert!(
+                matches!(codecs.encoder(&config), Err(CodecError::Unsupported(_))),
+                "{codec:?} encoder: {caps:?}"
+            );
+        }
+        if !caps.can_decode(codec) {
+            assert!(
+                matches!(codecs.decoder(codec), Err(CodecError::Unsupported(_))),
+                "{codec:?} decoder: {caps:?}"
+            );
+        }
+        // A backend kind the codec lacks here is refused the same way.
+        for (backend, hardware) in [(Backend::Hardware, true), (Backend::Software, false)] {
+            if !caps
+                .encoders
+                .iter()
+                .any(|s| s.codec == codec && s.hardware == hardware)
+            {
+                let mut config = VideoEncoderConfig::new(codec, W, H);
+                config.backend = backend;
+                assert!(
+                    matches!(codecs.encoder(&config), Err(CodecError::Unsupported(_))),
+                    "{codec:?} {backend:?} encoder: {caps:?}"
+                );
+            }
+            if !caps
+                .decoders
+                .iter()
+                .any(|s| s.codec == codec && s.hardware == hardware)
+            {
+                assert!(
+                    matches!(
+                        codecs.decoder_on(codec, backend),
+                        Err(CodecError::Unsupported(_))
+                    ),
+                    "{codec:?} {backend:?} decoder: {caps:?}"
+                );
+            }
+        }
+    }
 }
 
 #[test]
 fn bad_input_is_refused_before_the_codec() {
     let codecs = codecs();
-    let vp8 = VideoEncoderConfig::new(VideoCodec::Vp8, W, H);
+    let h265 = VideoEncoderConfig::new(VideoCodec::H265, W, H);
     assert!(matches!(
-        codecs.encoder(&vp8),
+        codecs.encoder(&h265),
         Err(CodecError::Unsupported(_))
     ));
-    let odd = VideoEncoderConfig::new(VideoCodec::H264, 641, H);
-    assert!(matches!(
-        codecs.encoder(&odd),
-        Err(CodecError::InvalidInput(_))
-    ));
-    let Some(backend) = h264_backends(&codecs).into_iter().next() else {
-        return;
-    };
-    let (mut encoder, mut decoder) = open(&codecs, backend);
-    assert!(matches!(
-        encoder.encode(&[0u8; 10], W, H, PixelFormat::Rgb24, 0),
-        Err(CodecError::InvalidInput(_))
-    ));
-    assert!(matches!(
-        decoder.decode(&[], 0, PixelFormat::Rgb24),
-        Err(CodecError::InvalidInput(_))
-    ));
-    assert!(encoder.set_rates(0, 30.0).is_err());
-    assert!(encoder.set_rates(1_000_000, 1e-300).is_err());
-    let mut slow = VideoEncoderConfig::new(VideoCodec::H264, W, H);
-    slow.framerate = 1e-300;
-    assert!(matches!(
-        codecs.encoder(&slow),
-        Err(CodecError::InvalidInput(_))
-    ));
-    encoder.set_rates(1_000_000, 15.0).expect("set_rates");
-    assert!(encode(&mut encoder, 0).key_frame);
+    for (codec, backend) in cases(&codecs) {
+        let odd = VideoEncoderConfig::new(codec, 641, H);
+        assert!(matches!(
+            codecs.encoder(&odd),
+            Err(CodecError::InvalidInput(_))
+        ));
+        let (mut encoder, mut decoder) = open(&codecs, codec, backend);
+        assert!(matches!(
+            encoder.encode(&[0u8; 10], W, H, PixelFormat::Rgb24, 0),
+            Err(CodecError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            decoder.decode(&[], 0, PixelFormat::Rgb24),
+            Err(CodecError::InvalidInput(_))
+        ));
+        assert!(encoder.set_rates(0, 30.0).is_err());
+        assert!(encoder.set_rates(1_000_000, 1e-300).is_err());
+        let mut slow = VideoEncoderConfig::new(codec, W, H);
+        slow.framerate = 1e-300;
+        assert!(matches!(
+            codecs.encoder(&slow),
+            Err(CodecError::InvalidInput(_))
+        ));
+        encoder.set_rates(1_000_000, 15.0).expect("set_rates");
+        assert!(encode(&mut encoder, 0).key_frame, "{codec:?} {backend:?}");
+    }
 }
