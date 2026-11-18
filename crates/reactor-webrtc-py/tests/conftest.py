@@ -19,4 +19,7 @@ def factory() -> rw.PeerConnectionFactory:
     PeerConnectionFactory.with_encoded_video_track) — doing so would result in
     two concurrent factory instances, which is equally unsafe.
     """
-    return rw.PeerConnectionFactory()
+    builder = rw.PeerConnectionFactoryBuilder()
+    # NVDEC decodes H.264 where an NVIDIA GPU does (a no-op elsewhere).
+    builder.with_nvdec()
+    return builder.build()

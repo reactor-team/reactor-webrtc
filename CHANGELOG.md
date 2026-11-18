@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **H.264 decode on NVIDIA GPUs with NVDEC** (Linux, opt-in). It is the
+  hardware H.264 decoder of the factory
+  (`PeerConnectionFactoryBuilder::with_nvdec`, `with_nvdec()` in Python) and
+  of the standalone codecs (`VideoCodecs::builder().nvdec()`,
+  `VideoCodecs(nvdec=True)` in Python), ahead of the software decoders. The
+  CUDA driver and NVDEC are loaded from the NVIDIA driver at run time through
+  the vendored, MIT-licensed `nv-codec-headers` loader, so nothing is linked
+  and no NVIDIA toolkit is needed to build. On a machine without an NVIDIA
+  GPU, a driver or H.264 decode, or on another platform, the backend is left
+  out and H.264 decodes as before. The standalone codecs list it as the
+  `NVDEC` hardware decoder. `CUDA_VISIBLE_DEVICES` picks the GPU. It decodes
+  8-bit 4:2:0 H.264, which is what WebRTC carries; it does not encode.
+
 ## 0.29.0 — standalone video encoders and decoders
 
 libwebrtc's H.264, VP8, VP9 and AV1 encoders and decoders now run without a
