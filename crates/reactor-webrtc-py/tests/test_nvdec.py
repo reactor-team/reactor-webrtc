@@ -8,9 +8,12 @@ they decode comes from the process's own encoder (OpenH264 on Linux).
 
 from __future__ import annotations
 
+import asyncio
+
 import numpy as np
 import pytest
 import reactor_webrtc as rw
+from test_loopback import connect, make_peer
 from test_video_codec import FRAME_US, MIN_PSNR_DB, frame, psnr
 
 W, H = 320, 180
@@ -99,3 +102,35 @@ def test_a_new_size_mid_stream_decodes_at_the_new_size(nvdec: rw.VideoCodecs) ->
 
         assert picture is not None and picture.shape == (height, width, 3)
 
+
+
+async def test_a_peer_connection_decodes_h264_on_nvdec(factory, nvdec: rw.VideoCodecs) -> None:
+    # The session factory asks for NVDEC, as an application would: a received
+    # H.264 stream decodes on it.
+    received: list = []  # keeps the Track alive: dropping it removes the sink
+
+    def on_track(kind, track):
+        if kind == rw.MediaKind.Video:
+            received.append(track)
+            track.on_video_frame(lambda *_: None)
+
+    sender = make_peer(factory)
+    receiver = make_peer(factory, on_track=on_track)
+    video = factory.create_video_track("nvdec-video")
+    transceiver = sender.pc.add_transceiver(rw.MediaKind.Video, rw.TransceiverDirection.SendOnly)
+    await transceiver.set_codec_preferences([rw.VideoCodec.H264])
+    await transceiver.set_track(video)
+    assert await connect(sender, receiver), "peers did not connect within timeout"
+
+    inbound = None
+    for i in range(300):
+        video.push_video_frame(bytes([(i * 7) % 256]) * (320 * 240 * 4), 320, 240)
+        await asyncio.sleep(0.033)
+        if i % 15 == 0:
+            stats = await receiver.pc.get_stats()
+            inbound = next((s for s in stats.inbound_rtp if s.kind == rw.StreamKind.Video), None)
+            if inbound is not None and inbound.frames_decoded >= 30:
+                break
+
+    assert inbound is not None and inbound.frames_decoded >= 30, "no H.264 frames decoded"
+    assert inbound.decoder_implementation == "NVDEC", inbound.decoder_implementation
