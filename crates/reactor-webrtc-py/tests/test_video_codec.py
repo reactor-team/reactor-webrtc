@@ -4,8 +4,9 @@ For every codec this process can both encode and decode: a sequence encoded and
 decoded back matches its source within tolerance, a key frame comes out when
 asked mid-stream and is marked as one, and a reset decoder starts again only at
 a key frame. Frames go in and come out as numpy uint8 arrays of shape
-(H, W, 3). A codec with no backend here (H.264 on Linux without OpenH264, say)
-is skipped, not failed.
+(H, W, 3). H.264 runs on VideoToolbox on macOS and on Cisco's OpenH264
+elsewhere (conftest's `openh264_path`); a codec with no backend here is
+skipped, not failed.
 
 None of this touches a PeerConnectionFactory, so it sits beside the session
 factory in conftest without creating another.
@@ -30,7 +31,9 @@ CODECS = [rw.VideoCodec.H264, rw.VideoCodec.Vp8, rw.VideoCodec.Vp9, rw.VideoCode
 
 
 @pytest.fixture(scope="module")
-def codecs() -> rw.VideoCodecs:
+def codecs(openh264_path: str | None) -> rw.VideoCodecs:
+    if openh264_path is not None:
+        return rw.VideoCodecs.with_openh264(openh264_path)
     return rw.VideoCodecs()
 
 

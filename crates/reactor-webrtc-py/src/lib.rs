@@ -3768,6 +3768,27 @@ impl PeerConnectionFactory {
 /// `Track.push_pcm` are expressed in. Read it once per unit of produced media
 /// and stamp every track with that one value: audio and video are synchronised
 /// by sharing a capture time, not by reaching the encoder at the same moment.
+/// ensure_openh264(cache_dir=None) -> str
+///
+/// Download Cisco's prebuilt OpenH264 for this platform on first use, verify
+/// it against the hash pinned in this build, cache it, and return its path,
+/// for `PeerConnectionFactoryBuilder.with_openh264` and
+/// `VideoCodecs.with_openh264`. Later calls find it in the cache and touch no
+/// network. `cache_dir` overrides the default cache directory.
+///
+/// Raises `RuntimeError` on a platform Cisco ships no binary for (macOS, where
+/// H.264 is VideoToolbox), a failed download, or a hash mismatch. Cisco's
+/// binary license requires `OPENH264_ATTRIBUTION` to be shown wherever the
+/// application shows its licensing notices.
+#[cfg(feature = "openh264")]
+#[pyfunction]
+#[pyo3(signature = (cache_dir=None))]
+fn ensure_openh264(py: Python<'_>, cache_dir: Option<std::path::PathBuf>) -> PyResult<String> {
+    py.allow_threads(|| rw::openh264::ensure_available(cache_dir.as_deref()))
+        .map(|path| path.to_string_lossy().into_owned())
+        .map_err(|error| PyRuntimeError::new_err(format!("OpenH264 is not available: {error}")))
+}
+
 #[pyfunction]
 fn time_micros() -> i64 {
     rw::time_micros()
@@ -3840,6 +3861,11 @@ fn reactor_webrtc(m: &Bound<'_, PyModule>) -> PyResult<()> {
     codec::register(m)?;
 
     m.add_function(wrap_pyfunction!(time_micros, m)?)?;
+    #[cfg(feature = "openh264")]
+    {
+        m.add_function(wrap_pyfunction!(ensure_openh264, m)?)?;
+        m.add("OPENH264_ATTRIBUTION", rw::openh264::OPENH264_ATTRIBUTION)?;
+    }
 
     // The SDP attribute peers declare frame-metadata support with, and the trailer
     // version this wheel speaks. Exposed so that a caller inspecting or building SDP
