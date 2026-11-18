@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **The Python wheels ship OpenH264 support.** They are built with the
+  `openh264` feature, so `PeerConnectionFactoryBuilder.with_openh264`,
+  `VideoCodecs.with_openh264` and `H264Backend.OpenH264` exist in every wheel.
+  Before, no published wheel had them, and on Linux a process negotiated no
+  H.264 at all. A peer that offered only H.264 for a video section got that
+  section rejected (`m=video 0`).
+
+### Added
+
+- **`reactor_webrtc.ensure_openh264(cache_dir=None)`** (Python). It downloads
+  Cisco's prebuilt OpenH264 for the platform on first use, verifies it against
+  the hash pinned in the build, caches it, and returns its path for
+  `with_openh264`. Later calls read the cache and use no network. It raises
+  `RuntimeError` where Cisco ships no binary (macOS, where H.264 is
+  VideoToolbox), on a failed download and on a hash mismatch.
+- **`reactor_webrtc.OPENH264_ATTRIBUTION`** (Python). Cisco's binary license
+  requires an application that uses OpenH264 to show this notice wherever it
+  shows its licensing notices.
+
 ## 0.29.0 — standalone video encoders and decoders
 
 libwebrtc's H.264, VP8, VP9 and AV1 encoders and decoders now run without a
