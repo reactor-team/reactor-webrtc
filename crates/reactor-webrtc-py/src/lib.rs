@@ -3357,6 +3357,19 @@ impl PeerConnectionFactoryBuilder {
         Ok(())
     }
 
+    /// Decode H.264 on the first visible NVIDIA GPU with NVDEC, ahead of the
+    /// software decoders (Linux; `CUDA_VISIBLE_DEVICES` picks the GPU). Never
+    /// fails the factory: without a GPU, driver or H.264 decode, H.264
+    /// decodes as it would without it.
+    fn with_nvdec(&mut self) -> PyResult<()> {
+        let b = self
+            .pending
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("builder already consumed by build()"))?;
+        self.pending = Some(b.with_nvdec());
+        Ok(())
+    }
+
     /// Register the OpenH264 backend from a downloaded library path (see the
     /// `openh264` module: attribution requirements apply). A failed load
     /// degrades to "no OpenH264 backend"; it never fails the factory.

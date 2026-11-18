@@ -247,6 +247,15 @@ fn compile_glue(include_dir: &Path, is_debug_prebuilt: bool, relative_vtables: b
             build
                 .define("WEBRTC_POSIX", None)
                 .define("WEBRTC_LINUX", None);
+            // H.264 decode on NVIDIA GPUs (glue/nvdec). Always compiled: the
+            // CUDA driver and nvcuvid are dlopen'd at run time and nothing is
+            // linked, so a machine without an NVIDIA driver just doesn't get the
+            // backend. REACTOR_WEBRTC_NVDEC gates its use in reactor_webrtc.cpp.
+            println!("cargo:rerun-if-changed=glue/nvdec/nvdec_codec.cc");
+            println!("cargo:rerun-if-changed=glue/nvdec/nvdec_codec.h");
+            build
+                .file("glue/nvdec/nvdec_codec.cc")
+                .define("REACTOR_WEBRTC_NVDEC", None);
         }
         "windows" => {
             build.define("WEBRTC_WIN", None);

@@ -1103,6 +1103,12 @@ class PeerConnectionFactoryBuilder:
         dropping the ~10 ms of render smoothing a default receiver adds. Same
         validation as `with_send_playout_delay`."""
         ...
+    def with_nvdec(self) -> None:
+        """Decode H.264 on the first visible NVIDIA GPU with NVDEC, ahead of the
+        software decoders (Linux; `CUDA_VISIBLE_DEVICES` picks the GPU). Never
+        fails the factory: without a GPU, a driver or H.264 decode on it, H.264
+        decodes as it would without this."""
+        ...
     def with_openh264(self, lib_path: str) -> None:
         """Register the OpenH264 backend from a downloaded library path
         (attribution requirements apply; a failed load degrades to "no backend").
@@ -1261,17 +1267,23 @@ class CodecCapabilities:
 class VideoCodecs:
     """The video codec backends this process can run, and the place to create
     standalone encoders and decoders on them. H.264 runs on VideoToolbox on
-    macOS and iOS, and on OpenH264 in a wheel built with the `openh264`
-    feature (`with_openh264`); VP8 and VP9 on libvpx; AV1 on libaom (encode)
-    and dav1d (decode)."""
+    macOS and iOS, decodes on NVDEC on NVIDIA GPUs when asked (`nvdec=True`,
+    Linux), and runs on OpenH264 in a wheel built with the `openh264` feature
+    (`with_openh264`); VP8 and VP9 on libvpx; AV1 on libaom (encode) and
+    dav1d (decode)."""
 
-    def __init__(self) -> None: ...
+    def __init__(self, nvdec: bool = False) -> None:
+        """`nvdec` adds NVDEC as the hardware H.264 decoder where the first
+        visible NVIDIA GPU decodes H.264 (Linux; `CUDA_VISIBLE_DEVICES` picks
+        it). Without one it is left out: `capabilities()` shows whether it is
+        there, as an `NVDEC` hardware decoder."""
+        ...
     @staticmethod
-    def with_openh264(lib_path: str) -> VideoCodecs:
+    def with_openh264(lib_path: str, nvdec: bool = False) -> VideoCodecs:
         """Add Cisco's OpenH264 loaded from `lib_path` as the software H.264
         backend; its binary license requires attribution in your app. Only in
         wheels built with the `openh264` feature. Raises when the library does
-        not load."""
+        not load. `nvdec` as for the constructor."""
         ...
     def capabilities(self) -> CodecCapabilities: ...
     def encoder(

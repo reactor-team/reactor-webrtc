@@ -217,9 +217,17 @@ pub struct VideoCodecs {
 #[pymethods]
 impl VideoCodecs {
     /// The platform's own codecs plus the software ones built into libwebrtc.
+    /// `nvdec` adds NVDEC as the hardware H.264 decoder where the first
+    /// visible NVIDIA GPU decodes H.264 (Linux); `capabilities()` shows
+    /// whether it is there.
     #[new]
-    fn new(py: Python<'_>) -> PyResult<Self> {
-        let inner = py.allow_threads(rc::VideoCodecs::new).map_err(codec_err)?;
+    #[pyo3(signature = (nvdec=false))]
+    fn new(py: Python<'_>, nvdec: bool) -> PyResult<Self> {
+        let mut builder = rc::VideoCodecs::builder();
+        if nvdec {
+            builder = builder.nvdec();
+        }
+        let inner = py.allow_threads(|| builder.build()).map_err(codec_err)?;
         Ok(Self { inner })
     }
 
@@ -228,11 +236,14 @@ impl VideoCodecs {
     /// library does not load.
     #[cfg(feature = "openh264")]
     #[staticmethod]
-    fn with_openh264(py: Python<'_>, lib_path: &str) -> PyResult<Self> {
+    #[pyo3(signature = (lib_path, nvdec=false))]
+    fn with_openh264(py: Python<'_>, lib_path: &str, nvdec: bool) -> PyResult<Self> {
         let path = std::path::PathBuf::from(lib_path);
-        let inner = py
-            .allow_threads(|| rc::VideoCodecs::with_openh264(&path))
-            .map_err(codec_err)?;
+        let mut builder = rc::VideoCodecs::builder().openh264(&path);
+        if nvdec {
+            builder = builder.nvdec();
+        }
+        let inner = py.allow_threads(|| builder.build()).map_err(codec_err)?;
         Ok(Self { inner })
     }
 
