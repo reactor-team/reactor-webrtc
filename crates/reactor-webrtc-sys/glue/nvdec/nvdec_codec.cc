@@ -8,6 +8,7 @@
 #include "api/video/nv12_buffer.h"
 #include "api/video/video_frame.h"
 #include "api/video_codecs/sdp_video_format.h"
+#include "api/video_codecs/video_codec.h"
 #include "api/video_codecs/video_decoder.h"
 #include "modules/video_coding/include/video_error_codes.h"
 
@@ -32,6 +33,11 @@ class NvdecLibrary {
   CuvidFunctions* cuvid = nullptr;
   CUdevice device = 0;
   CUcontext context = nullptr;
+  // Which codecs the GPU decodes, asked once at open.
+  bool h264 = false;
+  bool vp8 = false;
+  bool vp9 = false;
+  bool av1 = false;
 };
 
 namespace {
@@ -60,33 +66,71 @@ void SetWhy(std::string* why, std::string reason) {
   if (why) *why = std::move(reason);
 }
 
-// The H.264 profiles NVDEC decodes, at level 3.1, the level libwebrtc lists
-// its own H.264 at. A decoder accepts any level its profile allows.
-std::vector<webrtc::SdpVideoFormat> NvdecFormats() {
-  std::vector<webrtc::SdpVideoFormat> formats;
-  for (const char* profile_level_id : {"42e01f",   // constrained baseline
-                                       "42001f",   // baseline
-                                       "4d001f",   // main
-                                       "64001f"}) {  // high
-    formats.emplace_back("H264",
-                         webrtc::CodecParameterMap{{"level-asymmetry-allowed", "1"},
-                                                   {"packetization-mode", "1"},
-                                                   {"profile-level-id", profile_level_id}});
+// The nvcuvid codec of a libwebrtc one; cudaVideoCodec_NumCodecs for one
+// NVDEC is not used for.
+cudaVideoCodec CuvidCodec(webrtc::VideoCodecType codec) {
+  switch (codec) {
+    case webrtc::kVideoCodecH264:
+      return cudaVideoCodec_H264;
+    case webrtc::kVideoCodecVP8:
+      return cudaVideoCodec_VP8;
+    case webrtc::kVideoCodecVP9:
+      return cudaVideoCodec_VP9;
+    case webrtc::kVideoCodecAV1:
+      return cudaVideoCodec_AV1;
+    default:
+      return cudaVideoCodec_NumCodecs;
   }
+}
+
+// The formats NVDEC decodes on `lib`'s GPU. H.264 in the profiles it decodes,
+// at level 3.1, the level libwebrtc lists its own H.264 at (a decoder accepts
+// any level its profile allows); VP9 profile 0 and AV1 main, the 8-bit 4:2:0
+// ones.
+std::vector<webrtc::SdpVideoFormat> NvdecFormats(const NvdecLibrary& lib) {
+  std::vector<webrtc::SdpVideoFormat> formats;
+  if (lib.h264) {
+    for (const char* profile_level_id : {"42e01f",   // constrained baseline
+                                         "42001f",   // baseline
+                                         "4d001f",   // main
+                                         "64001f"}) {  // high
+      formats.emplace_back(
+          "H264", webrtc::CodecParameterMap{{"level-asymmetry-allowed", "1"},
+                                            {"packetization-mode", "1"},
+                                            {"profile-level-id", profile_level_id}});
+    }
+  }
+  if (lib.vp8) formats.push_back(webrtc::SdpVideoFormat::VP8());
+  if (lib.vp9) formats.push_back(webrtc::SdpVideoFormat::VP9Profile0());
+  if (lib.av1) formats.push_back(webrtc::SdpVideoFormat::AV1Profile0());
   return formats;
 }
 
-// One H.264 stream. libwebrtc hands Decode() one access unit at a time; with no
+// Whether `lib`'s GPU decodes `codec` at 8-bit 4:2:0. Its context must be
+// current.
+bool AskDecodes(const NvdecLibrary& lib, cudaVideoCodec codec) {
+  CUVIDDECODECAPS caps;
+  memset(&caps, 0, sizeof(caps));
+  caps.eCodecType = codec;
+  caps.eChromaFormat = cudaVideoChromaFormat_420;
+  caps.nBitDepthMinus8 = 0;
+  return lib.cuvid->cuvidGetDecoderCaps(&caps) == CUDA_SUCCESS &&
+         caps.bIsSupported;
+}
+
+// One stream of one codec. libwebrtc hands Decode() one frame at a time (an
+// H.264 access unit, a VP8 or VP9 frame, an AV1 temporal unit); with no
 // display delay the parser decodes it and maps the picture before
 // cuvidParseVideoData returns, so a frame comes out of the Decode() call that
-// put its access unit in, as the software decoders do. The picture is copied
-// from the GPU as NV12; consumers that want I420 or RGB convert from there.
-class NvdecH264Decoder : public webrtc::VideoDecoder {
+// put it in, as the software decoders do. A frame that is not shown (a hidden
+// VP9 or AV1 frame) gives no picture. The picture is copied from the GPU as
+// NV12; consumers that want I420 or RGB convert from there.
+class NvdecVideoDecoder : public webrtc::VideoDecoder {
  public:
-  explicit NvdecH264Decoder(std::shared_ptr<NvdecLibrary> lib)
-      : lib_(std::move(lib)) {}
+  NvdecVideoDecoder(std::shared_ptr<NvdecLibrary> lib, cudaVideoCodec codec)
+      : lib_(std::move(lib)), codec_(codec) {}
 
-  ~NvdecH264Decoder() override { Release(); }
+  ~NvdecVideoDecoder() override { Release(); }
 
   bool Configure(const Settings&) override {
     Release();
@@ -127,7 +171,7 @@ class NvdecH264Decoder : public webrtc::VideoDecoder {
     memset(&packet, 0, sizeof(packet));
     packet.payload = input.data();
     packet.payload_size = static_cast<unsigned long>(input.size());
-    // One access unit: the parser decodes it now rather than waiting for the
+    // One whole frame: the parser decodes it now rather than waiting for the
     // start of the next one to know it ended.
     packet.flags = CUVID_PKT_TIMESTAMP | CUVID_PKT_ENDOFPICTURE;
     packet.timestamp = input.RtpTimestamp();
@@ -151,19 +195,19 @@ class NvdecH264Decoder : public webrtc::VideoDecoder {
 
  private:
   static int CUDAAPI OnSequence(void* self, CUVIDEOFORMAT* format) {
-    return static_cast<NvdecH264Decoder*>(self)->HandleSequence(format);
+    return static_cast<NvdecVideoDecoder*>(self)->HandleSequence(format);
   }
   static int CUDAAPI OnDecode(void* self, CUVIDPICPARAMS* picture) {
-    return static_cast<NvdecH264Decoder*>(self)->HandleDecode(picture);
+    return static_cast<NvdecVideoDecoder*>(self)->HandleDecode(picture);
   }
   static int CUDAAPI OnDisplay(void* self, CUVIDPARSERDISPINFO* display) {
-    return static_cast<NvdecH264Decoder*>(self)->HandleDisplay(display);
+    return static_cast<NvdecVideoDecoder*>(self)->HandleDisplay(display);
   }
 
   bool CreateParser() {
     CUVIDPARSERPARAMS params;
     memset(&params, 0, sizeof(params));
-    params.CodecType = cudaVideoCodec_H264;
+    params.CodecType = codec_;
     // Raised by the sequence callback's return value once the stream says how
     // many it needs.
     params.ulMaxNumDecodeSurfaces = 1;
@@ -196,7 +240,7 @@ class NvdecH264Decoder : public webrtc::VideoDecoder {
   // Returns the number of decode surfaces the parser should cycle through,
   // 0 to fail.
   int HandleSequence(CUVIDEOFORMAT* format) {
-    if (format->codec != cudaVideoCodec_H264 ||
+    if (format->codec != codec_ ||
         format->chroma_format != cudaVideoChromaFormat_420 ||
         format->bit_depth_luma_minus8 != 0) {
       failed_ = true;  // 4:2:2, 4:4:4 or high bit depth: not 8-bit NV12.
@@ -224,7 +268,7 @@ class NvdecH264Decoder : public webrtc::VideoDecoder {
     info.ulMaxWidth = format->coded_width;
     info.ulMaxHeight = format->coded_height;
     info.ulNumDecodeSurfaces = surfaces;
-    info.CodecType = cudaVideoCodec_H264;
+    info.CodecType = codec_;
     info.ChromaFormat = cudaVideoChromaFormat_420;
     info.bitDepthMinus8 = 0;
     info.ulCreationFlags = cudaVideoCreate_PreferCUVID;
@@ -338,6 +382,7 @@ class NvdecH264Decoder : public webrtc::VideoDecoder {
   }
 
   std::shared_ptr<NvdecLibrary> lib_;
+  const cudaVideoCodec codec_;
   CUvideoctxlock lock_ = nullptr;
   CUvideoparser parser_ = nullptr;
   CUvideodecoder decoder_ = nullptr;
@@ -359,14 +404,21 @@ class NvdecVideoDecoderFactory : public webrtc::VideoDecoderFactory {
       : lib_(std::move(lib)) {}
 
   std::vector<webrtc::SdpVideoFormat> GetSupportedFormats() const override {
-    return NvdecFormats();
+    return NvdecFormats(*lib_);
   }
 
   std::unique_ptr<webrtc::VideoDecoder> Create(
       const webrtc::Environment& /*env*/,
       const webrtc::SdpVideoFormat& format) override {
-    if (format.name != "H264") return nullptr;
-    return std::make_unique<NvdecH264Decoder>(lib_);
+    // Only a format listed: VP9 profile 2 or 10-bit AV1 stay in software.
+    bool listed = false;
+    for (const auto& f : NvdecFormats(*lib_))
+      if (f.IsSameCodec(format)) listed = true;
+    if (!listed) return nullptr;
+    const cudaVideoCodec codec =
+        CuvidCodec(webrtc::PayloadStringToCodecType(format.name));
+    if (codec == cudaVideoCodec_NumCodecs) return nullptr;
+    return std::make_unique<NvdecVideoDecoder>(lib_, codec);
   }
 
  private:
@@ -404,21 +456,39 @@ std::shared_ptr<NvdecLibrary> OpenNvdec(int device, std::string* why) {
     return nullptr;
   }
 
-  CUVIDDECODECAPS caps;
-  memset(&caps, 0, sizeof(caps));
-  caps.eCodecType = cudaVideoCodec_H264;
-  caps.eChromaFormat = cudaVideoChromaFormat_420;
-  caps.nBitDepthMinus8 = 0;
   {
     ScopedContext scope(*lib);
-    if (!scope.ok() ||
-        lib->cuvid->cuvidGetDecoderCaps(&caps) != CUDA_SUCCESS ||
-        !caps.bIsSupported) {
-      SetWhy(why, "GPU " + std::to_string(device) + " does not decode H.264");
+    if (!scope.ok()) {
+      SetWhy(why, "could not make GPU " + std::to_string(device) +
+                      "'s context current");
       return nullptr;
     }
+    lib->h264 = AskDecodes(*lib, cudaVideoCodec_H264);
+    lib->vp8 = AskDecodes(*lib, cudaVideoCodec_VP8);
+    lib->vp9 = AskDecodes(*lib, cudaVideoCodec_VP9);
+    lib->av1 = AskDecodes(*lib, cudaVideoCodec_AV1);
+  }
+  if (!lib->h264 && !lib->vp8 && !lib->vp9 && !lib->av1) {
+    SetWhy(why, "GPU " + std::to_string(device) +
+                    " decodes none of H.264, VP8, VP9 and AV1");
+    return nullptr;
   }
   return lib;
+}
+
+bool NvdecDecodes(const NvdecLibrary& lib, webrtc::VideoCodecType codec) {
+  switch (codec) {
+    case webrtc::kVideoCodecH264:
+      return lib.h264;
+    case webrtc::kVideoCodecVP8:
+      return lib.vp8;
+    case webrtc::kVideoCodecVP9:
+      return lib.vp9;
+    case webrtc::kVideoCodecAV1:
+      return lib.av1;
+    default:
+      return false;
+  }
 }
 
 std::unique_ptr<webrtc::VideoDecoderFactory> CreateNvdecVideoDecoderFactory(

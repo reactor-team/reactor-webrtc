@@ -217,9 +217,9 @@ pub struct VideoCodecs {
 #[pymethods]
 impl VideoCodecs {
     /// The platform's own codecs plus the software ones built into libwebrtc.
-    /// `nvdec` adds NVDEC as the hardware H.264 decoder where the first
-    /// visible NVIDIA GPU decodes H.264 (Linux); `capabilities()` shows
-    /// whether it is there.
+    /// `nvdec` adds NVDEC as the hardware decoder of each of H.264, VP8, VP9
+    /// and AV1 the first visible NVIDIA GPU decodes (Linux); `capabilities()`
+    /// shows which.
     #[new]
     #[pyo3(signature = (nvdec=false))]
     fn new(py: Python<'_>, nvdec: bool) -> PyResult<Self> {

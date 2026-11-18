@@ -2707,9 +2707,9 @@ struct ReactorFactoryOptions {
   // delegate alive this many ms longer on its queue, answered as the
   // Reactor-SenderTransformHoldMs field trial (patch 0012).
   int                          sender_transform_hold_ms;
-  // Nonzero: decode H.264 on the first visible NVIDIA GPU with NVDEC, ahead
-  // of the software decoders (Linux). Without a GPU, driver or H.264 decode,
-  // H.264 decodes as it would without it.
+  // Nonzero: decode video on the first visible NVIDIA GPU with NVDEC, ahead
+  // of the software decoders, for each of H.264, VP8, VP9 and AV1 it decodes
+  // (Linux). Otherwise video decodes as it would without it.
   int                          use_nvdec;
 };
 }
@@ -3055,13 +3055,13 @@ class ReactorCompositeVideoDecoderFactory : public webrtc::VideoDecoderFactory {
   std::unique_ptr<webrtc::VideoDecoder> Create(
       const webrtc::Environment& env,
       const webrtc::SdpVideoFormat& format) override {
+    // Hardware first: NVDEC where the factory was asked for it and its GPU
+    // decodes the format (it lists only those), then the other decoders.
+    if (nvdec_ && HasFormat(nvdec_->GetSupportedFormats(), format)) {
+      if (auto decoder = nvdec_->Create(env, format)) return decoder;
+    }
     if (IsBuiltinCodec(format)) return builtin_->Create(env, format);
     if (format.name == "H264") {
-      // Hardware first: NVDEC where the factory was asked for it and a GPU
-      // decodes H.264, then the software decoder.
-      if (nvdec_) {
-        if (auto decoder = nvdec_->Create(env, format)) return decoder;
-      }
       if (openh264_) return openh264_->Create(env, format);
       if (apple_h264_) return apple_h264_->Create(env, format);
     }
@@ -3238,7 +3238,7 @@ void* reactor_webrtc_factory_create(const ReactorFactoryOptions* opts,
     if (auto lib = reactor::OpenNvdec(/*device=*/0, &why)) {
       nvdec_dec = reactor::CreateNvdecVideoDecoderFactory(std::move(lib));
     } else {
-      RTC_LOG(LS_INFO) << "NVDEC is not available, H.264 decodes in software: "
+      RTC_LOG(LS_INFO) << "NVDEC is not available, video decodes in software: "
                        << why;
     }
   }
@@ -4250,9 +4250,9 @@ extern "C" {
 // Collects the codec backends this process can run. `openh264_lib_path`
 // (may be null) is loaded as the software H264 backend; a path that does not
 // load, or one given to a build without OpenH264, fails the create. Nonzero
-// `use_nvdec` adds NVDEC as the hardware H264 decoder where the first visible
-// NVIDIA GPU decodes H.264 (Linux); without one it is left out, which the
-// capabilities show. VP8, VP9 and AV1 run on libwebrtc's builtin software
+// `use_nvdec` adds NVDEC as the hardware decoder of each of H264, VP8, VP9
+// and AV1 the first visible NVIDIA GPU decodes (Linux); a codec it does not
+// decode is left out, which the capabilities show. VP8, VP9 and AV1 run on libwebrtc's builtin software
 // codecs, in each direction the library was built with.
 void* reactor_webrtc_codec_context_create(const char* openh264_lib_path,
                                           int use_nvdec, char* err,
@@ -4261,12 +4261,21 @@ void* reactor_webrtc_codec_context_create(const char* openh264_lib_path,
 #ifdef REACTOR_WEBRTC_NVDEC
   if (use_nvdec) {
     if (auto lib = reactor::OpenNvdec(/*device=*/0, nullptr)) {
-      StandaloneBackend nv;
-      nv.codec = webrtc::kVideoCodecH264;
-      nv.decoder_name = "NVDEC";
-      nv.hardware = true;
-      nv.decoders = reactor::CreateNvdecVideoDecoderFactory(std::move(lib));
-      ctx->backends.push_back(std::move(nv));
+      // One factory, an entry per codec the GPU decodes: hardware decoders,
+      // ahead of the software ones added below.
+      std::shared_ptr<webrtc::VideoDecoderFactory> decoders =
+          reactor::CreateNvdecVideoDecoderFactory(lib);
+      for (int codec : {webrtc::kVideoCodecH264, webrtc::kVideoCodecVP8,
+                        webrtc::kVideoCodecVP9, webrtc::kVideoCodecAV1}) {
+        if (!reactor::NvdecDecodes(*lib, static_cast<webrtc::VideoCodecType>(codec)))
+          continue;
+        StandaloneBackend nv;
+        nv.codec = codec;
+        nv.decoder_name = "NVDEC";
+        nv.hardware = true;
+        nv.decoders = decoders;
+        ctx->backends.push_back(std::move(nv));
+      }
     }
   }
 #else

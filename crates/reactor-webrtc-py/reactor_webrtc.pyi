@@ -1104,10 +1104,11 @@ class PeerConnectionFactoryBuilder:
         validation as `with_send_playout_delay`."""
         ...
     def with_nvdec(self) -> None:
-        """Decode H.264 on the first visible NVIDIA GPU with NVDEC, ahead of the
-        software decoders (Linux; `CUDA_VISIBLE_DEVICES` picks the GPU). Never
-        fails the factory: without a GPU, a driver or H.264 decode on it, H.264
-        decodes as it would without this."""
+        """Decode video on the first visible NVIDIA GPU with NVDEC, ahead of the
+        software decoders, for each of H.264, VP8, VP9 (profile 0) and AV1
+        (main) it decodes (Linux; `CUDA_VISIBLE_DEVICES` picks the GPU). Never
+        fails the factory: without a GPU or driver, or for a codec the GPU does
+        not decode, video decodes as it would without this."""
         ...
     def with_openh264(self, lib_path: str) -> None:
         """Register the OpenH264 backend from a downloaded library path
@@ -1267,16 +1268,18 @@ class CodecCapabilities:
 class VideoCodecs:
     """The video codec backends this process can run, and the place to create
     standalone encoders and decoders on them. H.264 runs on VideoToolbox on
-    macOS and iOS, decodes on NVDEC on NVIDIA GPUs when asked (`nvdec=True`,
-    Linux), and runs on OpenH264 in a wheel built with the `openh264` feature
-    (`with_openh264`); VP8 and VP9 on libvpx; AV1 on libaom (encode) and
-    dav1d (decode)."""
+    macOS and iOS, and on OpenH264 in a wheel built with the `openh264`
+    feature (`with_openh264`); VP8 and VP9 on libvpx; AV1 on libaom (encode)
+    and dav1d (decode). Asked for (`nvdec=True`, Linux), NVDEC on an NVIDIA
+    GPU decodes each of them the GPU decodes, ahead of the software
+    decoders."""
 
     def __init__(self, nvdec: bool = False) -> None:
-        """`nvdec` adds NVDEC as the hardware H.264 decoder where the first
-        visible NVIDIA GPU decodes H.264 (Linux; `CUDA_VISIBLE_DEVICES` picks
-        it). Without one it is left out: `capabilities()` shows whether it is
-        there, as an `NVDEC` hardware decoder."""
+        """`nvdec` adds NVDEC as the hardware decoder of each of H.264, VP8,
+        VP9 and AV1 the first visible NVIDIA GPU decodes (Linux;
+        `CUDA_VISIBLE_DEVICES` picks it). A codec it does not decode is left
+        out: `capabilities()` lists an `NVDEC` hardware decoder per codec it is
+        there for."""
         ...
     @staticmethod
     def with_openh264(lib_path: str, nvdec: bool = False) -> VideoCodecs:

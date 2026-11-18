@@ -3357,10 +3357,10 @@ impl PeerConnectionFactoryBuilder {
         Ok(())
     }
 
-    /// Decode H.264 on the first visible NVIDIA GPU with NVDEC, ahead of the
-    /// software decoders (Linux; `CUDA_VISIBLE_DEVICES` picks the GPU). Never
-    /// fails the factory: without a GPU, driver or H.264 decode, H.264
-    /// decodes as it would without it.
+    /// Decode video on the first visible NVIDIA GPU with NVDEC, ahead of the
+    /// software decoders, for each of H.264, VP8, VP9 and AV1 it decodes
+    /// (Linux; `CUDA_VISIBLE_DEVICES` picks the GPU). Never fails the factory:
+    /// otherwise video decodes as it would without it.
     fn with_nvdec(&mut self) -> PyResult<()> {
         let b = self
             .pending

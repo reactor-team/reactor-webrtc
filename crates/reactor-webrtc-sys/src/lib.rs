@@ -209,9 +209,10 @@ pub struct ReactorFactoryOptions {
     /// through the `Reactor-SenderTransformHoldMs` field trial (libwebrtc patch
     /// 0012), so closing the sender drops the delegate's last reference there.
     pub sender_transform_hold_ms: c_int,
-    /// Nonzero: decode H.264 on the first visible NVIDIA GPU with NVDEC, ahead
-    /// of the software decoders (Linux). Without a GPU, driver or H.264
-    /// decode, H.264 decodes as it would without it.
+    /// Nonzero: decode video on the first visible NVIDIA GPU with NVDEC, ahead
+    /// of the software decoders, for each of H.264, VP8, VP9 and AV1 it
+    /// decodes (Linux). Without a GPU or driver, or for a codec the GPU does
+    /// not decode, video decodes as it would without it.
     pub use_nvdec: c_int,
 }
 
@@ -1347,10 +1348,10 @@ extern "C" {
 
     // ── Standalone video codecs ──────────────────────────────────────────────
     /// Collect the codec backends this process can run: for H264 VideoToolbox
-    /// on Apple, NVDEC (decode only) on the first visible NVIDIA GPU when
-    /// `use_nvdec` is nonzero and that GPU decodes H.264 (Linux), and OpenH264
-    /// from `openh264_lib_path` when it is not null; for VP8, VP9 and AV1
-    /// libwebrtc's builtin software codecs. Returns null,
+    /// on Apple and OpenH264 from `openh264_lib_path` when it is not null; for
+    /// VP8, VP9 and AV1 libwebrtc's builtin software codecs. With `use_nvdec`
+    /// nonzero, NVDEC on the first visible NVIDIA GPU is the hardware decoder
+    /// of each of these codecs that GPU decodes (Linux). Returns null,
     /// with the reason in `err`, when that library does not load or the build
     /// has no OpenH264 support. Free with
     /// [`reactor_webrtc_codec_context_destroy`]; encoders and decoders keep
