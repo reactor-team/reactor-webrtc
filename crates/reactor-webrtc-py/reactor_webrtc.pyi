@@ -1103,6 +1103,13 @@ class PeerConnectionFactoryBuilder:
         dropping the ~10 ms of render smoothing a default receiver adds. Same
         validation as `with_send_playout_delay`."""
         ...
+    def with_nvdec(self) -> None:
+        """Decode video on the first visible NVIDIA GPU with NVDEC, ahead of the
+        software decoders, for each of H.264, VP8, VP9 (profile 0) and AV1
+        (main) it decodes (Linux; `CUDA_VISIBLE_DEVICES` picks the GPU). Never
+        fails the factory: without a GPU or driver, or for a codec the GPU does
+        not decode, video decodes as it would without this."""
+        ...
     def with_openh264(self, lib_path: str) -> None:
         """Register the OpenH264 backend from a downloaded library path
         (attribution requirements apply; a failed load degrades to "no backend").
@@ -1263,15 +1270,23 @@ class VideoCodecs:
     standalone encoders and decoders on them. H.264 runs on VideoToolbox on
     macOS and iOS, and on OpenH264 in a wheel built with the `openh264`
     feature (`with_openh264`); VP8 and VP9 on libvpx; AV1 on libaom (encode)
-    and dav1d (decode)."""
+    and dav1d (decode). Asked for (`nvdec=True`, Linux), NVDEC on an NVIDIA
+    GPU decodes each of them the GPU decodes, ahead of the software
+    decoders."""
 
-    def __init__(self) -> None: ...
+    def __init__(self, nvdec: bool = False) -> None:
+        """`nvdec` adds NVDEC as the hardware decoder of each of H.264, VP8,
+        VP9 and AV1 the first visible NVIDIA GPU decodes (Linux;
+        `CUDA_VISIBLE_DEVICES` picks it). A codec it does not decode is left
+        out: `capabilities()` lists an `NVDEC` hardware decoder per codec it is
+        there for."""
+        ...
     @staticmethod
-    def with_openh264(lib_path: str) -> VideoCodecs:
+    def with_openh264(lib_path: str, nvdec: bool = False) -> VideoCodecs:
         """Add Cisco's OpenH264 loaded from `lib_path` as the software H.264
         backend; its binary license requires attribution in your app. Only in
         wheels built with the `openh264` feature. Raises when the library does
-        not load."""
+        not load. `nvdec` as for the constructor."""
         ...
     def capabilities(self) -> CodecCapabilities: ...
     def encoder(

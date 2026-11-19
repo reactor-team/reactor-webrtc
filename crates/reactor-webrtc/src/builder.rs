@@ -40,6 +40,7 @@ pub struct PeerConnectionFactoryBuilder {
     send_playout_delay: Option<PlayoutDelay>,
     receive_playout_delay: Option<PlayoutDelay>,
     sender_transform_hold: Option<std::time::Duration>,
+    nvdec: bool,
     #[cfg(feature = "openh264")]
     openh264: Option<std::path::PathBuf>,
 }
@@ -57,6 +58,7 @@ impl PeerConnectionFactoryBuilder {
             send_playout_delay: None,
             receive_playout_delay: None,
             sender_transform_hold: None,
+            nvdec: false,
             #[cfg(feature = "openh264")]
             openh264: None,
         }
@@ -271,6 +273,18 @@ impl PeerConnectionFactoryBuilder {
         self
     }
 
+    /// Decode video on the first visible NVIDIA GPU with NVDEC, ahead of the
+    /// software decoders, for each of H.264, VP8, VP9 (profile 0) and AV1
+    /// (main) that GPU decodes. Linux only: the CUDA driver and NVDEC are
+    /// loaded from the NVIDIA driver at run time, and `CUDA_VISIBLE_DEVICES`
+    /// picks the GPU. Like `with_openh264`, this never fails the factory:
+    /// without a GPU or a driver, for a codec the GPU does not decode, or on
+    /// another platform, video decodes as it would without this.
+    pub fn with_nvdec(mut self) -> Self {
+        self.nvdec = true;
+        self
+    }
+
     /// Finalise the factory. Fails on malformed options (an OpenH264 path
     /// with a NUL byte) or on factory/thread construction — the error carries
     /// the reason the glue reported.
@@ -318,6 +332,7 @@ impl PeerConnectionFactoryBuilder {
             sender_transform_hold_ms: self.sender_transform_hold.map_or(0, |d| {
                 d.as_millis().min(std::os::raw::c_int::MAX as u128) as std::os::raw::c_int
             }),
+            use_nvdec: self.nvdec as std::os::raw::c_int,
             #[cfg(feature = "openh264")]
             openh264_lib_path: openh264_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
             ..Default::default()

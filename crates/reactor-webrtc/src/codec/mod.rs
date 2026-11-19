@@ -24,10 +24,13 @@
 //!
 //! | Codec | Hardware | Software |
 //! |-------|----------|----------|
-//! | H.264 | VideoToolbox (macOS, iOS) | OpenH264, with the `openh264` feature ([`VideoCodecs::with_openh264`]) |
-//! | VP8 | — | libvpx |
-//! | VP9 | — | libvpx (profile 0) |
-//! | AV1 | — | libaom to encode, dav1d to decode (main profile) |
+//! | H.264 | VideoToolbox (macOS, iOS); NVDEC to decode | OpenH264, with the `openh264` feature ([`VideoCodecs::with_openh264`]) |
+//! | VP8 | NVDEC to decode | libvpx |
+//! | VP9 | NVDEC to decode | libvpx (profile 0) |
+//! | AV1 | NVDEC to decode | libaom to encode, dav1d to decode (main profile) |
+//!
+//! NVDEC decodes on an NVIDIA GPU (Linux), each codec the GPU decodes, when
+//! asked for with [`VideoCodecsBuilder::nvdec`].
 //!
 //! The software VP8, VP9 and AV1 codecs are the ones built into libwebrtc. A
 //! build without one of them (an AV1 encoder, say) leaves it out of
@@ -170,11 +173,71 @@ pub struct VideoCodecs {
     ctx: Arc<ContextHandle>,
 }
 
+/// The optional backends of a [`VideoCodecs`], from [`VideoCodecs::builder`].
+#[derive(Debug, Default, Clone)]
+pub struct VideoCodecsBuilder {
+    #[cfg(feature = "openh264")]
+    openh264: Option<std::path::PathBuf>,
+    nvdec: bool,
+}
+
+impl VideoCodecsBuilder {
+    /// Add Cisco's OpenH264 loaded from `lib_path` (see
+    /// [`crate::openh264::ensure_available`]) as the software H.264 backend.
+    /// [`build`](Self::build) fails when the library does not load.
+    ///
+    /// Cisco's binary license requires [`crate::openh264::OPENH264_ATTRIBUTION`]
+    /// in your app's licensing surface.
+    #[cfg(feature = "openh264")]
+    pub fn openh264(mut self, lib_path: &std::path::Path) -> Self {
+        self.openh264 = Some(lib_path.to_path_buf());
+        self
+    }
+
+    /// Add NVDEC as the hardware decoder of each of H.264, VP8, VP9 and AV1
+    /// the first visible NVIDIA GPU decodes (`CUDA_VISIBLE_DEVICES` picks it).
+    /// Linux only; it decodes, it does not encode. A codec the GPU does not
+    /// decode, or every codec without a GPU, is left out rather than failing
+    /// the build: [`VideoCodecs::capabilities`] lists an `NVDEC` hardware
+    /// decoder for each codec it is there for.
+    pub fn nvdec(mut self) -> Self {
+        self.nvdec = true;
+        self
+    }
+
+    /// Collect the backends.
+    pub fn build(self) -> Result<VideoCodecs, CodecError> {
+        #[cfg(feature = "openh264")]
+        let openh264 = match &self.openh264 {
+            Some(path) => {
+                let path = path
+                    .to_str()
+                    .ok_or_else(|| CodecError::InvalidInput("OpenH264 path is not UTF-8".into()))?;
+                Some(std::ffi::CString::new(path).map_err(|_| {
+                    CodecError::InvalidInput("OpenH264 path contains a NUL byte".into())
+                })?)
+            }
+            None => None,
+        };
+        #[cfg(feature = "openh264")]
+        let openh264_ptr = openh264.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
+        #[cfg(not(feature = "openh264"))]
+        let openh264_ptr = std::ptr::null();
+        VideoCodecs::create(openh264_ptr, self.nvdec)
+    }
+}
+
 impl VideoCodecs {
     /// The platform's own codecs: VideoToolbox on macOS and iOS, none
     /// elsewhere yet.
     pub fn new() -> Result<Self, CodecError> {
-        Self::create(std::ptr::null())
+        Self::create(std::ptr::null(), false)
+    }
+
+    /// Choose the optional backends: OpenH264, NVDEC. [`new`](Self::new) and
+    /// `with_openh264` are shorthands for it.
+    pub fn builder() -> VideoCodecsBuilder {
+        VideoCodecsBuilder::default()
     }
 
     /// The platform's codecs plus Cisco's OpenH264 loaded from `lib_path` (see
@@ -185,18 +248,18 @@ impl VideoCodecs {
     /// in your app's licensing surface.
     #[cfg(feature = "openh264")]
     pub fn with_openh264(lib_path: &std::path::Path) -> Result<Self, CodecError> {
-        let path = lib_path
-            .to_str()
-            .ok_or_else(|| CodecError::InvalidInput("OpenH264 path is not UTF-8".into()))?;
-        let c = std::ffi::CString::new(path)
-            .map_err(|_| CodecError::InvalidInput("OpenH264 path contains a NUL byte".into()))?;
-        Self::create(c.as_ptr())
+        Self::builder().openh264(lib_path).build()
     }
 
-    fn create(openh264: *const c_char) -> Result<Self, CodecError> {
+    fn create(openh264: *const c_char, nvdec: bool) -> Result<Self, CodecError> {
         let mut err = ErrorBuffer::new();
         let raw = unsafe {
-            reactor_webrtc_sys::reactor_webrtc_codec_context_create(openh264, err.ptr(), err.cap())
+            reactor_webrtc_sys::reactor_webrtc_codec_context_create(
+                openh264,
+                nvdec as std::os::raw::c_int,
+                err.ptr(),
+                err.cap(),
+            )
         };
         if raw.is_null() {
             return Err(CodecError::Unsupported(err.message("codec context")));

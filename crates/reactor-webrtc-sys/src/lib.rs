@@ -209,6 +209,11 @@ pub struct ReactorFactoryOptions {
     /// through the `Reactor-SenderTransformHoldMs` field trial (libwebrtc patch
     /// 0012), so closing the sender drops the delegate's last reference there.
     pub sender_transform_hold_ms: c_int,
+    /// Nonzero: decode video on the first visible NVIDIA GPU with NVDEC, ahead
+    /// of the software decoders, for each of H.264, VP8, VP9 and AV1 it
+    /// decodes (Linux). Without a GPU or driver, or for a codec the GPU does
+    /// not decode, video decodes as it would without it.
+    pub use_nvdec: c_int,
 }
 
 // Pins the layout of `ReactorFactoryOptions` against the C struct in
@@ -226,6 +231,7 @@ const _: () = {
     assert!(core::mem::offset_of!(ReactorFactoryOptions, dtls_in_stun) == 80);
     assert!(core::mem::offset_of!(ReactorFactoryOptions, sctp_initial_cwnd_mtus) == 112);
     assert!(core::mem::offset_of!(ReactorFactoryOptions, sender_transform_hold_ms) == 136);
+    assert!(core::mem::offset_of!(ReactorFactoryOptions, use_nvdec) == 140);
 };
 
 impl Default for ReactorFactoryOptions {
@@ -257,6 +263,7 @@ impl Default for ReactorFactoryOptions {
             sctp_delayed_ack_max_ms: 0,
             sctp_immediate_sack_under_cwnd_mtus: 0,
             sender_transform_hold_ms: 0,
+            use_nvdec: 0,
         }
     }
 }
@@ -1342,13 +1349,16 @@ extern "C" {
     // ── Standalone video codecs ──────────────────────────────────────────────
     /// Collect the codec backends this process can run: for H264 VideoToolbox
     /// on Apple and OpenH264 from `openh264_lib_path` when it is not null; for
-    /// VP8, VP9 and AV1 libwebrtc's builtin software codecs. Returns null,
+    /// VP8, VP9 and AV1 libwebrtc's builtin software codecs. With `use_nvdec`
+    /// nonzero, NVDEC on the first visible NVIDIA GPU is the hardware decoder
+    /// of each of these codecs that GPU decodes (Linux). Returns null,
     /// with the reason in `err`, when that library does not load or the build
     /// has no OpenH264 support. Free with
     /// [`reactor_webrtc_codec_context_destroy`]; encoders and decoders keep
     /// what they use alive past it.
     pub fn reactor_webrtc_codec_context_create(
         openh264_lib_path: *const c_char,
+        use_nvdec: c_int,
         err: *mut c_char,
         err_cap: c_int,
     ) -> *mut CodecContext;
