@@ -72,8 +72,10 @@ mod tests {
     }
 
     struct Pair {
-        _pc1: PeerConnection,
-        _pc2: PeerConnection,
+        /// The offerer.
+        pc1: PeerConnection,
+        /// The answerer.
+        pc2: PeerConnection,
         /// The offerer's channel.
         a: DataChannel,
         /// The answerer's channel, opened by the peer.
@@ -108,12 +110,7 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
         let b = s2.data_channels.lock().unwrap().pop().unwrap();
-        Pair {
-            _pc1: pc1,
-            _pc2: pc2,
-            a,
-            b,
-        }
+        Pair { pc1, pc2, a, b }
     }
 
     /// A latch a callback can wait on until the test opens it.
@@ -172,6 +169,68 @@ mod tests {
         })
     }
 
+    /// [`arrival`] for a large message, telling a stalled sender from a slow
+    /// one. It waits in slices of [`TRACE_SLICE`], noting each time how much
+    /// the sender still buffers and how many frames the chunking pump has
+    /// handed to libwebrtc; on a timeout it reports that trace with both
+    /// ends' SCTP association. The pump at the high-water mark with
+    /// libwebrtc's buffer still full means SCTP stopped sending (loss and
+    /// retransmission backoff, or a closed receive window); libwebrtc's
+    /// buffer drained while the queue stayed put means the pump missed the
+    /// event that resumes it.
+    fn arrival_traced(
+        rx: &mpsc::Receiver<(Vec<u8>, bool)>,
+        p: &Pair,
+        a_to_b: bool,
+        what: &str,
+        timeout: Duration,
+    ) -> (Vec<u8>, bool) {
+        let (sender, sender_pc, receiver_pc) = if a_to_b {
+            (&p.a, &p.pc1, &p.pc2)
+        } else {
+            (&p.b, &p.pc2, &p.pc1)
+        };
+        let started = Instant::now();
+        let mut trace = Vec::new();
+        loop {
+            let waited = started.elapsed();
+            if waited >= timeout {
+                break;
+            }
+            match rx.recv_timeout(TRACE_SLICE.min(timeout - waited)) {
+                Ok(arrived) => return arrived,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            let frames = sender.chunking_stats().map_or(0, |s| s.frames_sent);
+            trace.push(format!(
+                "{:>4.1}s buffered {} frames_sent {frames}",
+                started.elapsed().as_secs_f64(),
+                sender.buffered_amount(),
+            ));
+        }
+        let sctp = |pc: &PeerConnection| match pc.get_stats() {
+            Ok(report) => format!("{:?}", report.sctp),
+            Err(e) => format!("unavailable: {e}"),
+        };
+        panic!(
+            "{what} did not arrive in {timeout:?}: sender buffered_amount {} bytes, state {:?}\n\
+             progress:\n  {}\n\
+             sender chunking: {:?}\n\
+             sender sctp: {}\n\
+             receiver sctp: {}",
+            sender.buffered_amount(),
+            sender.state(),
+            trace.join("\n  "),
+            sender.chunking_stats(),
+            sctp(sender_pc),
+            sctp(receiver_pc),
+        )
+    }
+
+    /// How often [`arrival_traced`] notes the sender's progress.
+    const TRACE_SLICE: Duration = Duration::from_secs(5);
+
     fn pattern(seed: u64, len: usize) -> Vec<u8> {
         let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
         (0..len)
@@ -213,9 +272,10 @@ mod tests {
         for (i, &n) in sizes.iter().enumerate() {
             let msg = pattern(i as u64, n);
             p.a.send(&msg, true).expect("send a→b");
-            let (got, binary) = arrival(
+            let (got, binary) = arrival_traced(
                 &at_b,
-                &p.a,
+                &p,
+                true,
                 &format!("a→b {n} bytes"),
                 Duration::from_secs(60),
             );
@@ -223,9 +283,10 @@ mod tests {
             assert!(got == msg, "a→b {n} bytes: content differs");
 
             p.b.send(&msg, true).expect("send b→a");
-            let (got, _) = arrival(
+            let (got, _) = arrival_traced(
                 &at_a,
-                &p.b,
+                &p,
+                false,
                 &format!("b→a {n} bytes"),
                 Duration::from_secs(60),
             );
@@ -703,7 +764,7 @@ mod tests {
     #[cfg_attr(target_os = "windows", ignore)]
     fn close_from_on_message_reports_closing_after_the_handler_returns() {
         let (f1, f2) = (chunking(), chunking());
-        let Pair { _pc1, _pc2, a, b } = connect(&f1, &f2);
+        let Pair { pc1: _pc1, pc2: _pc2, a, b } = connect(&f1, &f2);
         assert!(b.is_chunked());
         let b = Arc::new(b);
         let events = Arc::new(Mutex::new(Vec::new()));
