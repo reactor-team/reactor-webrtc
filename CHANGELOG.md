@@ -25,6 +25,22 @@
 - That function refuses a picture whose I420 view has another size than the
   picture, instead of writing past the buffer sized for it.
 
+- **NVDEC converts its pictures to RGB on the GPU.** A small kernel, loaded
+  from PTX by the driver at run time (no NVIDIA toolkit to build), turns each
+  NV12 picture into packed RGB on the decoder's own CUDA stream, and the
+  picture leaves the GPU into page-locked memory. The media path's frame sink
+  hands an RGB24 picture to its callback as it is, and the standalone decoder
+  writes it to the caller's buffer, with no conversion on the CPU; BGRA is
+  reordered from it, and any other consumer reads it as I420. Each decoder
+  has its own stream, so several decode side by side. A driver that cannot
+  load the kernel gets NV12 pictures, converted on the CPU, as before. RGB
+  from the GPU differs from libyuv's by at most 2 per channel (it rounds in
+  floating point). Together with `decode_into` above, on an NVIDIA B200
+  against 0.30.0, a 1080p frame reaches Python in 1.08 ms instead of 2.58 ms
+  (H.264), 1.83 instead of 3.28 (VP8), 1.37 instead of 2.92 (VP9) and 1.22
+  instead of 2.71 (AV1); three 640x480 H.264 cameras decode side by side in
+  0.41-0.47 ms a frame instead of 0.77, with half the CPU.
+
 ### Removed
 
 - **`reactor_webrtc_video_decoder_decode`** and **`ReactorCodecDecodedFrame`**

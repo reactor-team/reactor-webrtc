@@ -191,3 +191,84 @@ async def test_a_stream_too_small_for_nvdec_decodes_in_software(
     assert "fallback from: NVDEC" in inbound.decoder_implementation, (
         inbound.decoder_implementation
     )
+
+
+@pytest.mark.parametrize("codec", CODECS, ids=ids)
+def test_nvdec_pictures_match_the_software_decoders(
+    codecs: rw.VideoCodecs, codec: rw.VideoCodec
+) -> None:
+    # NVDEC's pictures leave the GPU already RGB, converted there. The same
+    # stream decoded in software and converted on the CPU gives the same
+    # pictures, but for rounding: the GPU computes in floats, libyuv in fixed
+    # point.
+    require_nvdec(codecs, codec)
+    if not any(
+        s.codec == codec and not s.hardware for s in codecs.capabilities().decoders
+    ):
+        pytest.skip(f"no software {ids(codec)} decoder to compare with")
+    encoder = codecs.encoder(codec, W, H, bitrate_bps=2_000_000, framerate=30.0)
+    gpu = codecs.decoder(codec, backend=rw.CodecBackend.Hardware)
+    cpu = codecs.decoder(codec, backend=rw.CodecBackend.Software)
+    assert gpu.implementation == "NVDEC"
+    for i in range(10):
+        encoded = encoder.encode(frame(i), i * FRAME_US)
+        assert encoded is not None
+        a, b = gpu.decode(encoded.data), cpu.decode(encoded.data)
+        assert a is not None and b is not None
+        diff = int(np.abs(a.astype(np.int16) - b.astype(np.int16)).max())
+        assert diff <= 3, (
+            f"frame {i}: NVDEC and {cpu.implementation} differ by up to {diff}"
+        )
+
+
+@pytest.mark.parametrize("fmt", ["rgb24", "bgra"])
+async def test_a_peer_connection_hands_nvdec_pictures_to_the_sink(
+    factory, codecs: rw.VideoCodecs, fmt: str
+) -> None:
+    # A received stream NVDEC decodes reaches on_video_frame as the colour
+    # sent: RGB24 as the GPU converted it, BGRA reordered from it.
+    codec = rw.VideoCodec.Vp9
+    require_nvdec(codecs, codec)
+    received: list = []  # keeps the Track alive: dropping it removes the sink
+    pixels: list[tuple[int, int, int]] = []
+    bpp = 3 if fmt == "rgb24" else 4
+
+    def on_frame(data, width, height, *_):
+        i = ((height // 2) * width + width // 2) * bpp
+        p = data[i : i + 3]
+        r, g, b = (p[0], p[1], p[2]) if fmt == "rgb24" else (p[2], p[1], p[0])
+        assert len(data) == width * height * bpp
+        pixels.append((r, g, b))
+
+    def on_track(kind, track):
+        if kind == rw.MediaKind.Video:
+            received.append(track)
+            track.on_video_frame(on_frame, format=fmt)
+
+    sender = make_peer(factory)
+    receiver = make_peer(factory, on_track=on_track)
+    video = factory.create_video_track(f"nvdec-sink-{fmt}")
+    transceiver = sender.pc.add_transceiver(
+        rw.MediaKind.Video, rw.TransceiverDirection.SendOnly
+    )
+    await transceiver.set_codec_preferences([codec])
+    await transceiver.set_track(video)
+    assert await connect(sender, receiver), "peers did not connect within timeout"
+
+    red_bgra = bytes([0, 0, 255, 255]) * (320 * 240)
+    inbound = None
+    for i in range(300):
+        video.push_video_frame(red_bgra, 320, 240)
+        await asyncio.sleep(0.033)
+        if i % 15 == 0 and len(pixels) >= 30:
+            stats = await receiver.pc.get_stats()
+            inbound = next(
+                (s for s in stats.inbound_rtp if s.kind == rw.StreamKind.Video), None
+            )
+            break
+
+    assert len(pixels) >= 30, "too few frames reached the sink"
+    assert inbound is not None and inbound.decoder_implementation == "NVDEC"
+    r, g, b = pixels[-1]
+    # Through an encoder and back, red stays far from the other two channels.
+    assert r > 200 and g < 60 and b < 60, (r, g, b)

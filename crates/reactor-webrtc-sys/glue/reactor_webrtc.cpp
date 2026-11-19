@@ -109,6 +109,8 @@
 #include "rtc_base/time_utils.h"
 #include "third_party/libyuv/include/libyuv/convert.h"
 #include "third_party/libyuv/include/libyuv/convert_argb.h"
+#include "third_party/libyuv/include/libyuv/planar_functions.h"
+#include "rgb_frame_buffer.h"
 
 #ifdef REACTOR_WEBRTC_NVDEC
 #include "nvdec/nvdec_codec.h"
@@ -675,9 +677,21 @@ size_t PixelBytes(int width, int height, int pixel_format) {
 
 // Writes `buffer`'s picture to `dst` as packed `pixel_format` pixels: rows of
 // width*3 (RGB24) or width*4 (BGRA) bytes, no padding, PixelBytes in all.
-// False when the buffer gives no I420 view of itself, or one of another size.
+// RGB a decoder already made is copied as it is (BGRA reorders it); any other
+// picture goes through I420. False when the buffer gives no I420 view of
+// itself, or one of another size.
 bool WritePixels(webrtc::VideoFrameBuffer& buffer, int pixel_format,
                  uint8_t* dst) {
+  if (const reactor::RgbFrameBuffer* rgb =
+          reactor::RgbFrameBuffer::From(&buffer)) {
+    const int w = rgb->width(), h = rgb->height();
+    if (pixel_format == kPixelFormatRgb24) {
+      libyuv::CopyPlane(rgb->rgb(), rgb->stride(), dst, w * 3, w * 3, h);
+    } else {
+      libyuv::RAWToARGB(rgb->rgb(), rgb->stride(), dst, w * 4, w, h);
+    }
+    return true;
+  }
   webrtc::scoped_refptr<webrtc::I420BufferInterface> i420 = buffer.ToI420();
   if (!i420) return false;
   // `dst` was sized from `buffer`'s dimensions; never write past it.
@@ -717,8 +731,18 @@ class FrameSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
     webrtc::scoped_refptr<webrtc::VideoFrameBuffer> buffer =
         frame.video_frame_buffer();
     const int w = buffer->width(), h = buffer->height();
-    pixels_.resize(PixelBytes(w, h, pixel_format_));
-    if (!WritePixels(*buffer, pixel_format_, pixels_.data())) return;
+    const uint8_t* pixels = nullptr;
+    const reactor::RgbFrameBuffer* rgb =
+        reactor::RgbFrameBuffer::From(buffer.get());
+    if (rgb && pixel_format_ == kPixelFormatRgb24 && rgb->stride() == w * 3) {
+      // RGB the decoder made, rows packed as the callback takes them: handed
+      // over as it is, valid until the callback returns, as `pixels_` is.
+      pixels = rgb->rgb();
+    } else {
+      pixels_.resize(PixelBytes(w, h, pixel_format_));
+      if (!WritePixels(*buffer, pixel_format_, pixels_.data())) return;
+      pixels = pixels_.data();
+    }
     // A received frame lists the RTP packets it was built from; they share one
     // SSRC. 0 when the list is empty (a frame that did not come off the wire).
     const webrtc::RtpPacketInfos& packets = frame.packet_infos();
@@ -726,7 +750,7 @@ class FrameSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
     const int64_t convert_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                    std::chrono::steady_clock::now() - received)
                                    .count();
-    on_frame_(userdata_, pixels_.data(), w, h, ssrc, frame.rtp_timestamp(), convert_ns);
+    on_frame_(userdata_, pixels, w, h, ssrc, frame.rtp_timestamp(), convert_ns);
   }
 
  private:
