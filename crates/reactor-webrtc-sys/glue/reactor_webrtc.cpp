@@ -4126,22 +4126,35 @@ class StandaloneVideoDecoder : public webrtc::DecodedImageCallback {
  public:
   ~StandaloneVideoDecoder() override { Close(); }
 
+  // Opens the first backend in `candidates` that creates and configures a
+  // decoder. A hardware decoder followed in `candidates` by a software one of
+  // the codec (kCodecBackendAuto lists both) falls back to it, as a peer
+  // connection's does: on a stream the hardware does not decode (NVDEC
+  // answers WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE for a size, bit depth or
+  // decoder its GPU does not have), the software decoder takes over from that
+  // frame on. The decoder keeps the hardware backend's name.
   bool Open(std::shared_ptr<StandaloneCodecContext> ctx,
             const std::vector<StandaloneBackend*>& candidates, int codec,
             std::string* why) {
     ctx_ = std::move(ctx);
     codec_ = codec;
-    for (StandaloneBackend* b : candidates) {
-      std::unique_ptr<webrtc::VideoDecoder> dec;
-      {
-        std::lock_guard<std::mutex> lock(ctx_->create_mu);
-        InAutoreleasePool([&] {
-          dec = b->decoders->Create(ctx_->env, StandaloneFormat(codec_));
-        });
-      }
+    for (size_t i = 0; i < candidates.size(); ++i) {
+      StandaloneBackend* b = candidates[i];
+      std::unique_ptr<webrtc::VideoDecoder> dec = CreateOn(b);
       if (!dec) {
         *why += b->decoder_name + ": no decoder; ";
         continue;
+      }
+      if (b->hardware) {
+        for (size_t j = i + 1; j < candidates.size(); ++j) {
+          if (candidates[j]->hardware) continue;
+          if (std::unique_ptr<webrtc::VideoDecoder> software =
+                  CreateOn(candidates[j])) {
+            dec = webrtc::CreateVideoDecoderSoftwareFallbackWrapper(
+                ctx_->env, std::move(software), std::move(dec));
+          }
+          break;
+        }
       }
       decoder_ = std::move(dec);
       if (Configure()) {
@@ -4268,6 +4281,16 @@ class StandaloneVideoDecoder : public webrtc::DecodedImageCallback {
   bool hardware() const { return hardware_; }
 
  private:
+  // A decoder of this codec on `backend`, or null.
+  std::unique_ptr<webrtc::VideoDecoder> CreateOn(StandaloneBackend* backend) {
+    std::unique_ptr<webrtc::VideoDecoder> dec;
+    std::lock_guard<std::mutex> lock(ctx_->create_mu);
+    InAutoreleasePool([&] {
+      dec = backend->decoders->Create(ctx_->env, StandaloneFormat(codec_));
+    });
+    return dec;
+  }
+
   bool Configure() {
     webrtc::VideoDecoder::Settings settings;
     settings.set_codec_type(static_cast<webrtc::VideoCodecType>(codec_));

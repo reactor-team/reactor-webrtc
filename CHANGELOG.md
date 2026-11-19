@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.31.1 — standalone decoders fall back from NVDEC
+
+The prebuilt stays `webrtc-7907-a5ddff60-p14`: the fix is in the glue, which
+is built from source, and no libwebrtc patch changed.
+
+### Fixed
+
+- **A standalone decoder on `Backend::Auto` falls back to software on a stream
+  NVDEC does not decode,** as a peer connection's decoder does. NVDEC answers
+  a stream outside its limits (VP9 or AV1 below 128x128, a bit depth it does
+  not take) by asking for software, which the standalone decoder turned into
+  a failed decode on every key frame. Now the codec's software decoder takes
+  over from that frame on, and the decoder keeps NVDEC's name. A decoder
+  opened on `Backend::Hardware` still fails on such a stream: there is nothing
+  to fall back to.
+
 ## 0.31.0 — decoded pictures without copies, and RGB from NVDEC
 
 A decoded picture is converted once, straight into the buffer that holds it
