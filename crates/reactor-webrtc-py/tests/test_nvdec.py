@@ -4,7 +4,8 @@ Asking for NVDEC never fails: where no NVIDIA GPU is (any machine without
 one, macOS) the backend is left out and video decodes as before, and a codec
 the GPU does not decode stays in software. The tests that decode on NVDEC need
 a GPU that decodes the codec and are skipped elsewhere; the streams they decode
-come from the process's own encoders (OpenH264 for H.264 on Linux).
+come from the process's own encoders, so a codec this process cannot encode
+(H.264 on Linux without OpenH264) is skipped.
 """
 
 from __future__ import annotations
@@ -26,9 +27,7 @@ def ids(codec: rw.VideoCodec) -> str:
 
 
 @pytest.fixture(scope="module")
-def codecs(openh264_path: str | None) -> rw.VideoCodecs:
-    if openh264_path is not None:
-        return rw.VideoCodecs.with_openh264(openh264_path, nvdec=True)
+def codecs() -> rw.VideoCodecs:
     return rw.VideoCodecs(nvdec=True)
 
 
