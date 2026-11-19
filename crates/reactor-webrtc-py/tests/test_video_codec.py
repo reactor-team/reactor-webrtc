@@ -186,13 +186,31 @@ def test_each_picture_is_an_array_of_its_own(
         assert encoded is not None
         picture = decoder.decode(encoded.data)
         assert picture is not None
-        assert picture.flags.c_contiguous and picture.flags.owndata
+        assert picture.flags.c_contiguous and picture.flags.writeable
         pictures.append((picture, picture.copy()))
     for picture, snapshot in pictures:
         assert np.array_equal(picture, snapshot)
-    first = pictures[0][0]
-    first[:] = 0
-    assert not np.array_equal(pictures[1][0], first)
+    for a, b in zip(pictures, pictures[1:]):
+        assert not np.shares_memory(a[0], b[0])
+
+
+@pytest.mark.parametrize("codec", CODECS, ids=lambda c: str(c).rsplit(".", 1)[-1])
+def test_decode_does_not_trust_a_replaced_numpy_empty(
+    codecs: rw.VideoCodecs, codec: rw.VideoCodec, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The picture's memory comes from the binding, not from anything Python
+    # code can swap: an allocator that hands back one byte changes nothing.
+    _require(codecs, codec)
+    encoder = codecs.encoder(codec, W, H, bitrate_bps=2_000_000, framerate=30.0)
+    decoder = codecs.decoder(codec)
+    encoded = encoder.encode(frame(0), 0)
+    assert encoded is not None
+    monkeypatch.setattr(np, "empty", lambda *args, **kwargs: np.zeros(1, np.uint8))
+    picture = decoder.decode(encoded.data)
+    monkeypatch.undo()
+    assert picture is not None
+    assert picture.shape == (H, W, 3)
+    assert psnr(picture, frame(0)) >= MIN_PSNR_DB
 
 
 @pytest.mark.parametrize("codec", CODECS, ids=lambda c: str(c).rsplit(".", 1)[-1])

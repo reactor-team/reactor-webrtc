@@ -675,11 +675,14 @@ size_t PixelBytes(int width, int height, int pixel_format) {
 
 // Writes `buffer`'s picture to `dst` as packed `pixel_format` pixels: rows of
 // width*3 (RGB24) or width*4 (BGRA) bytes, no padding, PixelBytes in all.
-// False when the buffer gives no I420 view of itself.
+// False when the buffer gives no I420 view of itself, or one of another size.
 bool WritePixels(webrtc::VideoFrameBuffer& buffer, int pixel_format,
                  uint8_t* dst) {
   webrtc::scoped_refptr<webrtc::I420BufferInterface> i420 = buffer.ToI420();
   if (!i420) return false;
+  // `dst` was sized from `buffer`'s dimensions; never write past it.
+  if (i420->width() != buffer.width() || i420->height() != buffer.height())
+    return false;
   const int w = i420->width(), h = i420->height();
   if (pixel_format == kPixelFormatRgb24) {
     // libyuv "RAW" is R,G,B in memory == our RGB24 byte order.
@@ -3646,12 +3649,6 @@ struct ReactorCodecEncodedFrame {
   int32_t height;
 };
 
-struct ReactorCodecDecodedFrame {
-  const uint8_t* pixels;
-  size_t len;
-  int32_t width;
-  int32_t height;
-};
 }  // extern "C"
 
 static_assert(sizeof(ReactorCodecSupport) == 76,
@@ -3660,8 +3657,6 @@ static_assert(sizeof(ReactorVideoEncoderConfig) == 40,
               "ReactorVideoEncoderConfig changed size — update lib.rs too");
 static_assert(sizeof(void*) != 8 || sizeof(ReactorCodecEncodedFrame) == 32,
               "ReactorCodecEncodedFrame changed size — update lib.rs too");
-static_assert(sizeof(void*) != 8 || sizeof(ReactorCodecDecodedFrame) == 24,
-              "ReactorCodecDecodedFrame changed size — update lib.rs too");
 
 namespace {
 
@@ -4145,36 +4140,8 @@ class StandaloneVideoDecoder : public webrtc::DecodedImageCallback {
     return Configure();
   }
 
-  // 1 = a decoded frame in `out`, 0 = no picture for this input, -1 = error
-  // (in `why`). The pixels stay valid until the next call.
-  int Decode(const uint8_t* data, size_t len, bool key_frame, int pixel_format,
-             ReactorCodecDecodedFrame* out, std::string* why) {
-    std::optional<webrtc::VideoFrame> frame;
-    const int rc = DecodeFrame(data, len, key_frame, pixel_format, &frame, why);
-    if (rc <= 0) return rc;
-    bool converted = false;
-    InAutoreleasePool([&] {
-      webrtc::scoped_refptr<webrtc::VideoFrameBuffer> buffer =
-          frame->video_frame_buffer();
-      frame.reset();
-      const int w = buffer->width(), h = buffer->height();
-      pixels_.resize(PixelBytes(w, h, pixel_format));
-      if (!WritePixels(*buffer, pixel_format, pixels_.data())) return;
-      out->pixels = pixels_.data();
-      out->len = pixels_.size();
-      out->width = w;
-      out->height = h;
-      converted = true;
-    });
-    if (!converted) {
-      *why = "the decoded frame could not be converted";
-      return -1;
-    }
-    return 1;
-  }
-
-  // As Decode, converting the picture once, straight into the buffer that
-  // `alloc(userdata, width, height, bytes)` returns for its size. 1 with the
+  // Decodes one frame and converts its picture once, straight into the buffer
+  // that `alloc(userdata, width, height, bytes)` returns for its size. 1 with the
   // size in `width`/`height`, 0 = no picture for this input (`alloc` is not
   // called), -1 = error (in `why`), including `alloc` returning null.
   int DecodeInto(const uint8_t* data, size_t len, bool key_frame,
@@ -4303,7 +4270,6 @@ class StandaloneVideoDecoder : public webrtc::DecodedImageCallback {
   bool hardware_ = false;
   int codec_ = webrtc::kVideoCodecH264;
   uint32_t next_rtp_ = 0;
-  std::vector<uint8_t> pixels_;
 
   std::mutex mu_;
   std::condition_variable cv_;
@@ -4562,22 +4528,6 @@ int reactor_webrtc_video_decoder_info(void* dec, char* name, int cap) {
 int reactor_webrtc_video_decoder_reset(void* dec) {
   auto* d = reinterpret_cast<StandaloneVideoDecoder*>(dec);
   return d && d->Reset() ? 1 : 0;
-}
-
-int reactor_webrtc_video_decoder_decode(void* dec, const uint8_t* data,
-                                        size_t len, int key_frame,
-                                        int pixel_format,
-                                        ReactorCodecDecodedFrame* out,
-                                        char* err, int err_cap) {
-  auto* d = reinterpret_cast<StandaloneVideoDecoder*>(dec);
-  if (!d || !data || len == 0 || !out) {
-    write_error(err, err_cap, "invalid decode arguments");
-    return -1;
-  }
-  std::string why;
-  const int rc = d->Decode(data, len, key_frame != 0, pixel_format, out, &why);
-  if (rc < 0) write_error(err, err_cap, why);
-  return rc;
 }
 
 // Decode one encoded frame and convert its picture once, straight into the

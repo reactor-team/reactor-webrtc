@@ -22,6 +22,15 @@
   libvpx and dav1d alike, and a 720p frame about 0.35 ms sooner.
 - The media path's frame sink and the standalone decoder convert a picture to
   RGB24 or BGRA through one function, so both take the same route.
+- That function refuses a picture whose I420 view has another size than the
+  picture, instead of writing past the buffer sized for it.
+
+### Removed
+
+- **`reactor_webrtc_video_decoder_decode`** and **`ReactorCodecDecodedFrame`**
+  (`reactor_webrtc_sys`): nothing calls them since `VideoDecoder::decode`
+  goes through `reactor_webrtc_video_decoder_decode_into`, which they
+  duplicated.
 
 ## 0.30.0 — video decode on NVIDIA GPUs with NVDEC
 

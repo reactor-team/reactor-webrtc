@@ -9,8 +9,9 @@
 
 use ::reactor_webrtc as rw;
 use pyo3::exceptions::{PyImportError, PyOverflowError, PyTypeError, PyValueError};
+use pyo3::ffi;
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyByteArray, PyBytes};
 use rw::codec as rc;
 use std::sync::Mutex;
 
@@ -67,28 +68,33 @@ impl From<rw::VideoCodec> for VideoCodec {
     }
 }
 
-/// A new, uninitialised `uint8` array of shape `(height, width, 3)`, with the
-/// address and length of its data. The address comes from
-/// `__array_interface__`: the abi3 build has no buffer protocol to ask.
-fn picture_array(py: Python<'_>, width: u32, height: u32) -> PyResult<(Py<PyAny>, *mut u8, usize)> {
+/// A new, uninitialised bytearray of `len` bytes. It comes from the C API, not
+/// from anything Python code can replace, so its data really is `len` bytes.
+fn picture_buffer(py: Python<'_>, len: usize) -> PyResult<Bound<'_, PyByteArray>> {
+    let len = ffi::Py_ssize_t::try_from(len)
+        .map_err(|_| PyOverflowError::new_err("the picture is too large"))?;
+    // SAFETY: a null source asks CPython for `len` uninitialised bytes; the
+    // result is a new reference to a bytearray, or null with an error set.
+    unsafe {
+        Ok(Bound::from_owned_ptr_or_err(
+            py,
+            ffi::PyByteArray_FromStringAndSize(std::ptr::null(), len),
+        )?
+        .downcast_into_unchecked())
+    }
+}
+
+/// The picture in `buffer` as a `uint8` array of shape `(height, width, 3)`,
+/// a view of the bytearray rather than a copy.
+fn picture_array<'py>(
+    py: Python<'py>,
+    buffer: Bound<'py, PyByteArray>,
+    width: u32,
+    height: u32,
+) -> PyResult<Bound<'py, PyAny>> {
     let np = numpy(py)?;
-    let array = np.call_method1(
-        "empty",
-        (
-            (height as usize, width as usize, 3usize),
-            np.getattr("uint8")?,
-        ),
-    )?;
-    let address: usize = array
-        .getattr("__array_interface__")?
-        .get_item("data")?
-        .get_item(0)?
-        .extract()?;
-    Ok((
-        array.unbind(),
-        address as *mut u8,
-        width as usize * height as usize * 3,
-    ))
+    np.call_method1("frombuffer", (buffer, np.getattr("uint8")?))?
+        .call_method1("reshape", (height as usize, width as usize, 3usize))
 }
 
 fn numpy(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
@@ -524,7 +530,8 @@ impl VideoDecoder {
     /// Decode one encoded frame and return its picture as a numpy `uint8`
     /// array of shape `(H, W, 3)` (RGB), or `None` when the frame gave no
     /// picture. Runs with the GIL released. The backend writes the picture
-    /// straight into the array, which the caller owns and may write to.
+    /// straight into the memory behind the array, which the caller owns and
+    /// may write to.
     fn decode<'py>(
         &self,
         py: Python<'py>,
@@ -532,18 +539,21 @@ impl VideoDecoder {
     ) -> PyResult<Option<Bound<'py, PyAny>>> {
         numpy(py)?;
         let bytes = data.as_bytes();
-        // The picture's array, made once the backend knows its size; the GIL
-        // is taken only for that.
-        let mut array: Option<Py<PyAny>> = None;
+        // The picture's bytearray, made once the backend knows its size; the
+        // GIL is taken only for that. numpy wraps it once it holds the picture.
+        let mut buffer: Option<Py<PyByteArray>> = None;
         let mut failed: Option<PyErr> = None;
         let decoded = with_codec(py, &self.inner, |d| {
             d.decode_into(bytes, rw::PixelFormat::Rgb24, |width, height| {
-                Python::with_gil(|py| match picture_array(py, width, height) {
-                    Ok((made, address, len)) => {
-                        array = Some(made);
-                        // SAFETY: the array was just made with `len` bytes at
-                        // `address`, nothing else refers to it yet, and
-                        // `array` keeps it alive past the decode that writes it.
+                let len = width as usize * height as usize * 3;
+                Python::with_gil(|py| match picture_buffer(py, len) {
+                    Ok(made) => {
+                        let address = made.data();
+                        buffer = Some(made.unbind());
+                        // SAFETY: CPython just made the bytearray with `len`
+                        // bytes at `address`, no Python code has seen it, so
+                        // nothing resizes or reads it during the decode, and
+                        // `buffer` keeps it alive past the decode that writes it.
                         Some(unsafe { std::slice::from_raw_parts_mut(address, len) })
                     }
                     Err(e) => {
@@ -556,10 +566,12 @@ impl VideoDecoder {
         if let Some(e) = failed {
             return Err(e);
         }
-        Ok(decoded
-            .map_err(codec_err)?
-            .and(array)
-            .map(|made| made.into_bound(py)))
+        match (decoded.map_err(codec_err)?, buffer) {
+            (Some((width, height)), Some(buffer)) => {
+                picture_array(py, buffer.into_bound(py), width, height).map(Some)
+            }
+            _ => Ok(None),
+        }
     }
 
     fn __repr__(&self) -> String {
