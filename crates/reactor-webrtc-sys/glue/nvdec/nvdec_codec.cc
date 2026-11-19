@@ -564,9 +564,12 @@ class NvdecVideoDecoder : public webrtc::VideoDecoder {
       if (!block) return nullptr;
       release = [block] { std::free(block); };
     }
-    if (lib_->cu->cuMemcpyDtoHAsync(block, rgb_device_, bytes, stream_) !=
-            CUDA_SUCCESS ||
-        lib_->cu->cuStreamSynchronize(stream_) != CUDA_SUCCESS) {
+    const bool queued = lib_->cu->cuMemcpyDtoHAsync(block, rgb_device_, bytes,
+                                                    stream_) == CUDA_SUCCESS;
+    // Whatever was queued has finished before the block can go back to the
+    // pool, or the surface be unmapped, whether the copy queued or not.
+    const bool synced = lib_->cu->cuStreamSynchronize(stream_) == CUDA_SUCCESS;
+    if (!queued || !synced) {
       release();
       return nullptr;
     }
@@ -588,16 +591,22 @@ class NvdecVideoDecoder : public webrtc::VideoDecoder {
     copy.dstPitch = out->StrideY();
     copy.WidthInBytes = width_;
     copy.Height = height_;
-    if (lib_->cu->cuMemcpy2DAsync(&copy, stream_) != CUDA_SUCCESS) return false;
-
-    // Chroma follows the luma of the whole output surface.
-    copy.srcDevice = frame + static_cast<CUdeviceptr>(pitch) * surface_height_;
-    copy.dstHost = out->MutableDataUV();
-    copy.dstPitch = out->StrideUV();
-    copy.WidthInBytes = 2 * out->ChromaWidth();
-    copy.Height = out->ChromaHeight();
-    return lib_->cu->cuMemcpy2DAsync(&copy, stream_) == CUDA_SUCCESS &&
-           lib_->cu->cuStreamSynchronize(stream_) == CUDA_SUCCESS;
+    const bool luma = lib_->cu->cuMemcpy2DAsync(&copy, stream_) == CUDA_SUCCESS;
+    bool chroma = false;
+    if (luma) {
+      // Chroma follows the luma of the whole output surface.
+      copy.srcDevice =
+          frame + static_cast<CUdeviceptr>(pitch) * surface_height_;
+      copy.dstHost = out->MutableDataUV();
+      copy.dstPitch = out->StrideUV();
+      copy.WidthInBytes = 2 * out->ChromaWidth();
+      copy.Height = out->ChromaHeight();
+      chroma = lib_->cu->cuMemcpy2DAsync(&copy, stream_) == CUDA_SUCCESS;
+    }
+    // Whatever was queued has finished before `out` can go back to the pool,
+    // or the surface be unmapped, whether every copy queued or not.
+    const bool synced = lib_->cu->cuStreamSynchronize(stream_) == CUDA_SUCCESS;
+    return luma && chroma && synced;
   }
 
   std::shared_ptr<NvdecLibrary> lib_;
