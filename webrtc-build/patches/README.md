@@ -556,11 +556,14 @@ an app that wants a renderer brings its own.
 `build/config/apple/mobile_config.gni`, which `webrtc.gni` imports for iOS; gn's
 `&&` short-circuits, so the condition never reads it on other platforms.
 
-**Verify.** `build.sh tvos arm64 release` links `libwebrtc.a`; every member is
-`platform 3` (TVOS), `minos 18.0`. The archive carries the VideoToolbox H.264
-codecs (`RTCVideoEncoderH264.o`, `RTCVideoDecoderFactoryH264.o`, …), the
-ObjC↔native factories, `RTCNetworkMonitor.o` and the audio device
-(`audio_device_ios.o`, `voice_processing_audio_unit.o`, `RTCAudioSession.o`).
+**Verify.** `build.sh tvos arm64 release` archives `libwebrtc.a`; every member
+is `platform 3` (TVOS). The archive carries the VideoToolbox H.264 codecs
+(`RTCVideoEncoderH264.o`, `RTCVideoDecoderFactoryH264.o`, …), the ObjC↔native
+factories, `RTCNetworkMonitor.o` and the audio device (`audio_device_ios.o`,
+`voice_processing_audio_unit.o`, `RTCAudioSession.o`). Its object list is the
+iOS device build's (same commit, patches and SDK version) minus
+`RTCCameraPreviewView.o`, which upstream already leaves out of tvOS. With iOS,
+the patch changes nothing: the dep is still there.
 
 ---
 

@@ -192,15 +192,19 @@ gn_args() {
     # arm64-apple-tvos triple); the ios branch above supplies the rest.
     #   use_blink=true  → upstream asserts it for tvOS (Chrome on tvOS is
     #     Blink-only). WebRTC's own code never reads it. What it does change
-    #     here: the default deployment target and libyuv's JPEG path (both
-    #     undone below), and deprecation warnings (silenced).
-    #   ios_deployment_target="18.0" → the tvOS minimum: the same version the
-    #     ios build gets (upstream's non-Blink default).
+    #     here: libyuv's JPEG path (undone below) and deprecation warnings
+    #     (silenced).
+    #   ios_deployment_target="17.0" → the tvOS minimum. WebRTC's .gn gives
+    #     every iOS-family build 14.0, which is right for iOS but not tvOS: the
+    #     audio device uses tvOS 17.0 APIs unguarded
+    #     (AVAudioSessionCategoryOptionAllowBluetooth,
+    #     kAUVoiceIOProperty_MutedSpeechActivityEventListener), and Xcode 27's
+    #     libc++ no longer supports tvOS below 15. At 17.0 nothing warns.
     #   libyuv_disable_jpeg=true → no HAVE_JPEG / libjpeg references, as on iOS.
     args+=(
       "target_platform=\"tvos\""
       "use_blink=true"
-      "ios_deployment_target=\"18.0\""
+      "ios_deployment_target=\"17.0\""
       "libyuv_disable_jpeg=true"
     )
     # The host tools (protoc, …) are built for macOS: point them at MAC_SDK_PATH.

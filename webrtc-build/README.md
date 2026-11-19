@@ -58,7 +58,7 @@ match the stdlib the consumer's glue is compiled/linked with:
 |----|--------------------|-----------------------|----------------|
 | macOS | `false` | platform libc++ (Xcode) | `rtc_use_h264=false` (VideoToolbox HW is the intended path; not yet wired into the glue — see `crates/reactor-webrtc/README.md` → "Target support") |
 | iOS | `false` | platform libc++ | `ios_enable_code_signing=false`, `target_environment=device\|simulator`, `rtc_use_h264=false` |
-| tvOS | `false` | platform libc++ | the iOS args + `target_platform="tvos"`, `use_blink=true`, `ios_deployment_target="18.0"`, `libyuv_disable_jpeg=true` (see "tvOS" below) |
+| tvOS | `false` | platform libc++ | the iOS args + `target_platform="tvos"`, `use_blink=true`, `ios_deployment_target="17.0"`, `libyuv_disable_jpeg=true` (see "tvOS" below) |
 | Linux | **`true`** | **bundled libc++ (`__Cr`)** | bundled clang, `use_sysroot=true`, `rtc_use_x11=false`, `rtc_use_pipewire=false` |
 | Android | **`true`** | **bundled libc++ (`__Cr`)** | NDK, `android_static_analysis=off`, `rtc_use_h264=false` |
 | Windows | `false` | MSVC STL | (`build.ps1`, native depot_tools) |
@@ -137,11 +137,13 @@ MAC_SDK_PATH=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk \
 - gn has no tvOS `target_os`: it is `target_os="ios"` with
   `target_platform="tvos"`, which selects the AppleTVOS SDK and the
   `arm64-apple-tvos` triple. The library is compiled against Xcode's
-  AppleTVOS SDK (27.x is fine: a static library is never linked here) with a
-  tvOS **18.0** minimum, the same version the iOS build gets.
+  AppleTVOS SDK (27.x is fine: a static library is never linked here).
+- The minimum is tvOS **17.0**. WebRTC's `.gn` gives iOS-family builds 14.0,
+  but on tvOS the audio device uses two tvOS 17.0 APIs unguarded and Xcode 27's
+  libc++ no longer supports tvOS below 15; at 17.0 the build has no
+  availability warnings.
 - Upstream asserts `use_blink=true` for tvOS. WebRTC never reads it; `build.sh`
-  pins `ios_deployment_target` and sets `libyuv_disable_jpeg=true` so the two
-  things it does change match the iOS build.
+  sets `libyuv_disable_jpeg=true` so libyuv matches the iOS build.
 - `MAC_SDK_PATH` is needed with Xcode 27 for the same reason as on mac: the
   host tools (`protoc`, …) are macOS binaries.
 - Patch 0013 drops the `WebRTC.framework` bundle from the umbrella on tvOS; see
