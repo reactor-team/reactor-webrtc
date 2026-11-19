@@ -8,9 +8,13 @@
 //
 //   nvcc -ptx -O3 -arch=compute_80 nv12_to_rgb.cu -o nv12_to_rgb.ptx
 //
-// and paste the PTX into it. compute_80 PTX runs on every GPU NVDEC serves
-// here (Ampere and later); a driver too old for the PTX version fails the
-// load, and NVDEC then hands out NV12 pictures for the CPU to convert.
+// and paste the PTX into it, lowering its `.version` line to 7.0. nvcc writes
+// its own toolkit's PTX ISA version there, and a driver older than that
+// version fails the load; 7.0 (CUDA 11.0) is the first with sm_80, and the
+// kernel uses nothing newer, so CUDA 11.0 and later drivers load it (keep it
+// that way when changing it). compute_80 PTX runs on every GPU NVDEC
+// serves here (Ampere and later); a driver that fails the load leaves NVDEC
+// handing out NV12 pictures for the CPU to convert.
 
 __device__ __forceinline__ unsigned char sat(float v) {
   return (unsigned char)fminf(fmaxf(v + 0.5f, 0.f), 255.f);

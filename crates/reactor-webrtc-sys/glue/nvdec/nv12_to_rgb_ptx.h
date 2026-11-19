@@ -1,5 +1,6 @@
 // Generated from nv12_to_rgb.cu by
 //   nvcc -ptx -O3 -arch=compute_80 nv12_to_rgb.cu   (CUDA 13.2)
+// with its .version lowered to 7.0, so CUDA 11.0 and later drivers load it.
 // Regenerate it after changing that file; see its header.
 #pragma once
 
@@ -15,7 +16,7 @@ inline constexpr const char kNv12ToRgbPtx[] = R"PTX(
 // Based on NVVM 7.0.1
 //
 
-.version 9.2
+.version 7.0
 .target sm_80
 .address_size 64
 

@@ -99,8 +99,17 @@ class ScopedContext {
 
 // Page-locked host blocks of one size, for pictures copied off the GPU, reused
 // once the frame holding one is dropped. Frames out of a decoder keep its pool
-// alive, and it frees its blocks when the last goes.
+// alive, and it frees its blocks when the last goes. Page-locked memory is
+// taken from the whole system, so a pool owns at most kMaxBlocks blocks and
+// keeps at most kMaxIdle of them unused.
 class PinnedPool {
+  // Blocks owned at once, at most (about 100 MiB of 1080p pictures); past it
+  // pictures go to ordinary memory.
+  static constexpr size_t kMaxBlocks = 16;
+  // Unused blocks kept for reuse, at most; the rest are freed as they come
+  // back.
+  static constexpr size_t kMaxIdle = 4;
+
  public:
   PinnedPool(std::shared_ptr<NvdecLibrary> lib, size_t block_size)
       : lib_(std::move(lib)), block_size_(block_size) {}
@@ -110,7 +119,8 @@ class PinnedPool {
   }
   size_t block_size() const { return block_size_; }
 
-  // A block, or null when page-locked memory is unavailable.
+  // A block, or null when page-locked memory is unavailable or the pool
+  // already owns kMaxBlocks.
   void* Take() {
     {
       std::lock_guard<std::mutex> lock(mu_);
@@ -119,17 +129,29 @@ class PinnedPool {
         free_.pop_back();
         return block;
       }
+      if (owned_ >= kMaxBlocks) return nullptr;
+      ++owned_;
     }
     void* block = nullptr;
     if (!lib_->cuMemAllocHost || !lib_->cuMemFreeHost ||
         lib_->cuMemAllocHost(&block, block_size_) != CUDA_SUCCESS) {
+      std::lock_guard<std::mutex> lock(mu_);
+      --owned_;
       return nullptr;
     }
     return block;
   }
   void Give(void* block) {
-    std::lock_guard<std::mutex> lock(mu_);
-    free_.push_back(block);
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      if (free_.size() < kMaxIdle) {
+        free_.push_back(block);
+        return;
+      }
+      --owned_;
+    }
+    ScopedContext scope(*lib_);
+    lib_->cuMemFreeHost(block);
   }
 
  private:
@@ -137,6 +159,8 @@ class PinnedPool {
   const size_t block_size_;
   std::mutex mu_;
   std::vector<void*> free_;
+  // Blocks allocated and not yet freed, in use or in `free_`.
+  size_t owned_ = 0;
 };
 
 void SetWhy(std::string* why, std::string reason) {
@@ -501,6 +525,9 @@ class NvdecVideoDecoder : public webrtc::VideoDecoder {
           buffer_pool_.CreateNV12Buffer(width_, height_);
       if (nv12 && Copy(frame, pitch, nv12.get())) out = nv12;
     }
+    // A picture made has synced the stream; a failure may leave the kernel
+    // queued, reading the surface, so it finishes before the unmap.
+    if (!out) lib_->cu->cuStreamSynchronize(stream_);
     lib_->cuvid->cuvidUnmapVideoFrame(decoder_, frame);
     if (!out) {
       failed_ = true;
@@ -559,7 +586,7 @@ class NvdecVideoDecoder : public webrtc::VideoDecoder {
     if (block) {
       release = [pool, block] { pool->Give(block); };
     } else {
-      // No page-locked memory: an ordinary block, copied to more slowly.
+      // No page-locked block to spare: an ordinary one, copied to more slowly.
       block = std::malloc(bytes);
       if (!block) return nullptr;
       release = [block] { std::free(block); };
