@@ -1,10 +1,15 @@
 #include "nvdec_codec.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
+#include <functional>
+#include <memory>
+#include <mutex>
 #include <utility>
 #include <vector>
 
+#include "api/make_ref_counted.h"
 #include "api/video/encoded_image.h"
 #include "api/video/nv12_buffer.h"
 #include "api/video/video_frame.h"
@@ -13,6 +18,7 @@
 #include "api/video_codecs/video_decoder.h"
 #include "common_video/include/video_frame_buffer_pool.h"
 #include "modules/video_coding/include/video_error_codes.h"
+#include "rtc_base/logging.h"
 
 // The loader reports a library or symbol it cannot load on stderr by default.
 // A machine without an NVIDIA driver is an expected case here, not an error,
@@ -21,12 +27,22 @@
 #define FFNV_DEBUG_LOG_FUNC(logctx, msg, ...) ((void)0)
 #include "vendor/dynlink_loader.h"
 
+#include "../rgb_frame_buffer.h"
+#include "nv12_to_rgb_ptx.h"
+
 namespace reactor {
 
 class NvdecLibrary {
  public:
   ~NvdecLibrary() {
-    if (cu && context) cu->cuDevicePrimaryCtxRelease(device);
+    if (cu && context) {
+      if (rgb_module && cu->cuCtxPushCurrent(context) == CUDA_SUCCESS) {
+        cu->cuModuleUnload(rgb_module);
+        CUcontext popped = nullptr;
+        cu->cuCtxPopCurrent(&popped);
+      }
+      cu->cuDevicePrimaryCtxRelease(device);
+    }
     cuvid_free_functions(&cuvid);
     cuda_free_functions(&cu);
   }
@@ -35,6 +51,14 @@ class NvdecLibrary {
   CuvidFunctions* cuvid = nullptr;
   CUdevice device = 0;
   CUcontext context = nullptr;
+  // Page-locked host memory, which the vendored loader does not load; looked
+  // up in the same libcuda. Null on a driver without them.
+  CUresult (*cuMemAllocHost)(void**, size_t) = nullptr;
+  CUresult (*cuMemFreeHost)(void*) = nullptr;
+  // The NV12 to RGB kernel (nv12_to_rgb.cu), or null when it did not load:
+  // pictures then leave the GPU as NV12 and the CPU converts them.
+  CUmodule rgb_module = nullptr;
+  CUfunction nv12_to_rgb = nullptr;
   // Whether the GPU decodes a codec at 8-bit 4:2:0, and the coded sizes it
   // decodes it at, asked once at open.
   struct Caps {
@@ -71,6 +95,72 @@ class ScopedContext {
  private:
   const NvdecLibrary& lib_;
   bool pushed_ = false;
+};
+
+// Page-locked host blocks of one size, for pictures copied off the GPU, reused
+// once the frame holding one is dropped. Frames out of a decoder keep its pool
+// alive, and it frees its blocks when the last goes. Page-locked memory is
+// taken from the whole system, so a pool owns at most kMaxBlocks blocks and
+// keeps at most kMaxIdle of them unused.
+class PinnedPool {
+  // Blocks owned at once, at most (about 100 MiB of 1080p pictures); past it
+  // pictures go to ordinary memory.
+  static constexpr size_t kMaxBlocks = 16;
+  // Unused blocks kept for reuse, at most; the rest are freed as they come
+  // back.
+  static constexpr size_t kMaxIdle = 4;
+
+ public:
+  PinnedPool(std::shared_ptr<NvdecLibrary> lib, size_t block_size)
+      : lib_(std::move(lib)), block_size_(block_size) {}
+  ~PinnedPool() {
+    ScopedContext scope(*lib_);
+    for (void* block : free_) lib_->cuMemFreeHost(block);
+  }
+  size_t block_size() const { return block_size_; }
+
+  // A block, or null when page-locked memory is unavailable or the pool
+  // already owns kMaxBlocks.
+  void* Take() {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      if (!free_.empty()) {
+        void* block = free_.back();
+        free_.pop_back();
+        return block;
+      }
+      if (owned_ >= kMaxBlocks) return nullptr;
+      ++owned_;
+    }
+    void* block = nullptr;
+    if (!lib_->cuMemAllocHost || !lib_->cuMemFreeHost ||
+        lib_->cuMemAllocHost(&block, block_size_) != CUDA_SUCCESS) {
+      std::lock_guard<std::mutex> lock(mu_);
+      --owned_;
+      return nullptr;
+    }
+    return block;
+  }
+  void Give(void* block) {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      if (free_.size() < kMaxIdle) {
+        free_.push_back(block);
+        return;
+      }
+      --owned_;
+    }
+    ScopedContext scope(*lib_);
+    lib_->cuMemFreeHost(block);
+  }
+
+ private:
+  std::shared_ptr<NvdecLibrary> lib_;
+  const size_t block_size_;
+  std::mutex mu_;
+  std::vector<void*> free_;
+  // Blocks allocated and not yet freed, in use or in `free_`.
+  size_t owned_ = 0;
 };
 
 void SetWhy(std::string* why, std::string reason) {
@@ -159,15 +249,17 @@ const NvdecLibrary::Caps& CapsOf(const NvdecLibrary& lib,
 }
 
 // One stream of one codec. libwebrtc hands Decode() one frame at a time (an
-// H.264 access unit, a VP8 or VP9 frame, an AV1 temporal unit); with no
-// display delay the parser decodes it and maps the picture before
-// cuvidParseVideoData returns, so a frame comes out of the Decode() call that
-// put it in, as the software decoders do. A frame that is not shown (a hidden
-// VP9 or AV1 frame) gives no picture. The picture is copied from the GPU as
-// NV12; consumers that want I420 or RGB convert from there. A stream the GPU
-// does not decode (high bit depth, 4:2:2 or 4:4:4, a coded size outside its
-// limits) or a decoder it cannot create returns
-// WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE, for a software decoder to take over.
+// H.264 access unit, a VP8 or VP9 frame, an AV1 temporal unit); with no display
+// delay the parser decodes it and maps the picture before cuvidParseVideoData
+// returns, so a frame comes out of the Decode() call that put it in, as the
+// software decoders do. A frame that is not shown (a hidden VP9 or AV1 frame)
+// gives no picture. The picture is converted to RGB on the GPU and copied off
+// it as an RgbFrameBuffer, which the frame sink and the standalone decoder hand
+// out as it is and any other consumer reads as I420; where the kernel did not
+// load, it is copied off as NV12 instead. A stream the GPU does not decode
+// (high bit depth, 4:2:2 or 4:4:4, a coded size outside its limits) or a
+// decoder it cannot create returns WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE, for a
+// software decoder to take over.
 class NvdecVideoDecoder : public webrtc::VideoDecoder {
   // Pictures handed out and not yet dropped, at most; libvpx's decoders allow
   // as many.
@@ -187,6 +279,13 @@ class NvdecVideoDecoder : public webrtc::VideoDecoder {
       lock_ = nullptr;
       return false;
     }
+    // The decoder's own stream, so each decoder's copies and conversions run
+    // beside other decoders' instead of queueing behind them on the default
+    // stream. Without one, they run on the default stream.
+    if (lib_->cu->cuStreamCreate(&stream_, CU_STREAM_NON_BLOCKING) !=
+        CUDA_SUCCESS) {
+      stream_ = nullptr;
+    }
     return CreateParser();
   }
 
@@ -205,6 +304,15 @@ class NvdecVideoDecoder : public webrtc::VideoDecoder {
       lock_ = nullptr;
     }
     buffer_pool_.Release();
+    if (rgb_device_) {
+      lib_->cu->cuMemFree(rgb_device_);
+      rgb_device_ = 0;
+      rgb_bytes_ = 0;
+    }
+    if (stream_) {
+      lib_->cu->cuStreamDestroy(stream_);
+      stream_ = nullptr;
+    }
     return WEBRTC_VIDEO_CODEC_OK;
   }
 
@@ -400,6 +508,7 @@ class NvdecVideoDecoder : public webrtc::VideoDecoder {
     proc.progressive_frame = display->progressive_frame;
     proc.top_field_first = display->top_field_first;
     proc.second_field = display->repeat_first_field + 1;
+    proc.output_stream = stream_;
     CUdeviceptr frame = 0;
     unsigned int pitch = 0;
     if (lib_->cuvid->cuvidMapVideoFrame(decoder_, display->picture_index, &frame,
@@ -407,11 +516,20 @@ class NvdecVideoDecoder : public webrtc::VideoDecoder {
       failed_ = true;
       return 0;
     }
-    webrtc::scoped_refptr<webrtc::NV12Buffer> out =
-        buffer_pool_.CreateNV12Buffer(width_, height_);
-    const bool copied = out && Copy(frame, pitch, out.get());
+    // RGB made on the GPU, or else NV12 for the CPU to convert: the kernel
+    // did not load, or this picture's conversion failed.
+    webrtc::scoped_refptr<webrtc::VideoFrameBuffer> out;
+    if (lib_->nv12_to_rgb) out = ToRgb(frame, pitch);
+    if (!out) {
+      webrtc::scoped_refptr<webrtc::NV12Buffer> nv12 =
+          buffer_pool_.CreateNV12Buffer(width_, height_);
+      if (nv12 && Copy(frame, pitch, nv12.get())) out = nv12;
+    }
+    // A picture made has synced the stream; a failure may leave the kernel
+    // queued, reading the surface, so it finishes before the unmap.
+    if (!out) lib_->cu->cuStreamSynchronize(stream_);
     lib_->cuvid->cuvidUnmapVideoFrame(decoder_, frame);
-    if (!copied) {
+    if (!out) {
       failed_ = true;
       return 0;
     }
@@ -429,7 +547,66 @@ class NvdecVideoDecoder : public webrtc::VideoDecoder {
     return 1;
   }
 
-  // The mapped surface's luma and interleaved chroma planes into `out`.
+  // The mapped surface converted to packed RGB on the GPU and copied to a
+  // page-locked block, as an RgbFrameBuffer; null when a step fails. All of it
+  // runs on the decoder's stream, after the map's own work there.
+  webrtc::scoped_refptr<webrtc::VideoFrameBuffer> ToRgb(CUdeviceptr frame,
+                                                        unsigned int pitch) {
+    const size_t stride = static_cast<size_t>(width_) * 3;
+    const size_t bytes = stride * height_;
+    if (rgb_bytes_ != bytes) {
+      if (rgb_device_) lib_->cu->cuMemFree(rgb_device_);
+      rgb_device_ = 0;
+      rgb_bytes_ = 0;
+      if (lib_->cu->cuMemAlloc(&rgb_device_, bytes) != CUDA_SUCCESS) {
+        rgb_device_ = 0;
+        return nullptr;
+      }
+      rgb_bytes_ = bytes;
+    }
+    CUdeviceptr uv = frame + static_cast<CUdeviceptr>(pitch) * surface_height_;
+    unsigned int plane_pitch = pitch;
+    unsigned int out_pitch = static_cast<unsigned int>(stride);
+    int width = width_, height = height_;
+    void* args[] = {&frame, &plane_pitch, &uv,     &plane_pitch,
+                    &rgb_device_, &out_pitch, &width, &height};
+    constexpr unsigned int kBlockX = 32, kBlockY = 8;
+    if (lib_->cu->cuLaunchKernel(lib_->nv12_to_rgb,
+                                 (width + kBlockX - 1) / kBlockX,
+                                 (height + kBlockY - 1) / kBlockY, 1, kBlockX,
+                                 kBlockY, 1, 0, stream_, args,
+                                 nullptr) != CUDA_SUCCESS) {
+      return nullptr;
+    }
+    if (!rgb_pool_ || rgb_pool_->block_size() != bytes)
+      rgb_pool_ = std::make_shared<PinnedPool>(lib_, bytes);
+    std::shared_ptr<PinnedPool> pool = rgb_pool_;
+    void* block = pool->Take();
+    std::function<void()> release;
+    if (block) {
+      release = [pool, block] { pool->Give(block); };
+    } else {
+      // No page-locked block to spare: an ordinary one, copied to more slowly.
+      block = std::malloc(bytes);
+      if (!block) return nullptr;
+      release = [block] { std::free(block); };
+    }
+    const bool queued = lib_->cu->cuMemcpyDtoHAsync(block, rgb_device_, bytes,
+                                                    stream_) == CUDA_SUCCESS;
+    // Whatever was queued has finished before the block can go back to the
+    // pool, or the surface be unmapped, whether the copy queued or not.
+    const bool synced = lib_->cu->cuStreamSynchronize(stream_) == CUDA_SUCCESS;
+    if (!queued || !synced) {
+      release();
+      return nullptr;
+    }
+    return webrtc::make_ref_counted<RgbFrameBuffer>(
+        width_, height_, static_cast<const uint8_t*>(block),
+        static_cast<int>(stride), std::move(release));
+  }
+
+  // The mapped surface's luma and interleaved chroma planes into `out`, on
+  // the decoder's stream, after the map's own work there.
   bool Copy(CUdeviceptr frame, unsigned int pitch, webrtc::NV12Buffer* out) {
     CUDA_MEMCPY2D copy;
     memset(&copy, 0, sizeof(copy));
@@ -441,15 +618,22 @@ class NvdecVideoDecoder : public webrtc::VideoDecoder {
     copy.dstPitch = out->StrideY();
     copy.WidthInBytes = width_;
     copy.Height = height_;
-    if (lib_->cu->cuMemcpy2D(&copy) != CUDA_SUCCESS) return false;
-
-    // Chroma follows the luma of the whole output surface.
-    copy.srcDevice = frame + static_cast<CUdeviceptr>(pitch) * surface_height_;
-    copy.dstHost = out->MutableDataUV();
-    copy.dstPitch = out->StrideUV();
-    copy.WidthInBytes = 2 * out->ChromaWidth();
-    copy.Height = out->ChromaHeight();
-    return lib_->cu->cuMemcpy2D(&copy) == CUDA_SUCCESS;
+    const bool luma = lib_->cu->cuMemcpy2DAsync(&copy, stream_) == CUDA_SUCCESS;
+    bool chroma = false;
+    if (luma) {
+      // Chroma follows the luma of the whole output surface.
+      copy.srcDevice =
+          frame + static_cast<CUdeviceptr>(pitch) * surface_height_;
+      copy.dstHost = out->MutableDataUV();
+      copy.dstPitch = out->StrideUV();
+      copy.WidthInBytes = 2 * out->ChromaWidth();
+      copy.Height = out->ChromaHeight();
+      chroma = lib_->cu->cuMemcpy2DAsync(&copy, stream_) == CUDA_SUCCESS;
+    }
+    // Whatever was queued has finished before `out` can go back to the pool,
+    // or the surface be unmapped, whether every copy queued or not.
+    const bool synced = lib_->cu->cuStreamSynchronize(stream_) == CUDA_SUCCESS;
+    return luma && chroma && synced;
   }
 
   std::shared_ptr<NvdecLibrary> lib_;
@@ -458,6 +642,14 @@ class NvdecVideoDecoder : public webrtc::VideoDecoder {
   // The decoded pictures' buffers, reused once their consumers drop them.
   webrtc::VideoFrameBufferPool buffer_pool_{/*zero_initialize=*/false,
                                             kMaxBuffers};
+  // The stream this decoder's map, conversion and copies run on; null for the
+  // default stream.
+  CUstream stream_ = nullptr;
+  // The kernel's output on the GPU, and the page-locked blocks its pictures
+  // are copied to, both sized for the current picture.
+  CUdeviceptr rgb_device_ = 0;
+  size_t rgb_bytes_ = 0;
+  std::shared_ptr<PinnedPool> rgb_pool_;
   CUvideoctxlock lock_ = nullptr;
   CUvideoparser parser_ = nullptr;
   CUvideodecoder decoder_ = nullptr;
@@ -546,6 +738,21 @@ std::shared_ptr<NvdecLibrary> OpenNvdec(int device, std::string* why) {
     lib->vp8 = AskDecodes(*lib, cudaVideoCodec_VP8);
     lib->vp9 = AskDecodes(*lib, cudaVideoCodec_VP9);
     lib->av1 = AskDecodes(*lib, cudaVideoCodec_AV1);
+    lib->cuMemAllocHost = reinterpret_cast<CUresult (*)(void**, size_t)>(
+        FFNV_SYM_FUNC(lib->cu->lib, "cuMemAllocHost_v2"));
+    lib->cuMemFreeHost = reinterpret_cast<CUresult (*)(void*)>(
+        FFNV_SYM_FUNC(lib->cu->lib, "cuMemFreeHost"));
+    if (lib->cu->cuModuleLoadData(&lib->rgb_module, kNv12ToRgbPtx) !=
+            CUDA_SUCCESS ||
+        lib->cu->cuModuleGetFunction(&lib->nv12_to_rgb, lib->rgb_module,
+                                     "nv12_to_rgb24") != CUDA_SUCCESS) {
+      RTC_LOG(LS_WARNING)
+          << "NVDEC: the NV12 to RGB kernel did not load on GPU " << device
+          << "; its pictures are converted on the CPU instead";
+      if (lib->rgb_module) lib->cu->cuModuleUnload(lib->rgb_module);
+      lib->rgb_module = nullptr;
+      lib->nv12_to_rgb = nullptr;
+    }
   }
   if (!lib->h264.decodes && !lib->vp8.decodes && !lib->vp9.decodes &&
       !lib->av1.decodes) {

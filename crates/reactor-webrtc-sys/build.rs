@@ -191,6 +191,7 @@ fn archive_uses_relative_vtables(lib_dir: &Path) -> bool {
 /// Compile `glue/*.cpp` against the WebRTC public headers (+ vendored abseil).
 fn compile_glue(include_dir: &Path, is_debug_prebuilt: bool, relative_vtables: bool) {
     println!("cargo:rerun-if-changed=glue/reactor_webrtc.cpp");
+    println!("cargo:rerun-if-changed=glue/rgb_frame_buffer.h");
 
     let mut build = cc::Build::new();
     build
@@ -253,6 +254,7 @@ fn compile_glue(include_dir: &Path, is_debug_prebuilt: bool, relative_vtables: b
             // backend. REACTOR_WEBRTC_NVDEC gates its use in reactor_webrtc.cpp.
             println!("cargo:rerun-if-changed=glue/nvdec/nvdec_codec.cc");
             println!("cargo:rerun-if-changed=glue/nvdec/nvdec_codec.h");
+            println!("cargo:rerun-if-changed=glue/nvdec/nv12_to_rgb_ptx.h");
             build
                 .file("glue/nvdec/nvdec_codec.cc")
                 .define("REACTOR_WEBRTC_NVDEC", None);
