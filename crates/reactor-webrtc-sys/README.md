@@ -25,6 +25,12 @@ your target (`cargo build` just works for all published targets). Override with:
 `cargo check` and rlib builds always succeed without a native library;
 only the final link of a binary or test requires it.
 
+tvOS (`aarch64-apple-tvos`) has no published prebuilt yet; its archive would be
+`reactor-webrtc-tvos-arm64-device-release.tar.zst`. Build libwebrtc with
+`webrtc-build` and set `REACTOR_WEBRTC_LIB_DIR` to the staged directory
+(`lib/libwebrtc.a` + `include/`). Set `TVOS_DEPLOYMENT_TARGET` to the app's
+deployment target too: the C++ glue is otherwise compiled for the SDK's version.
+
 ## ABI
 
 The C ABI is defined in `glue/reactor_webrtc.cpp` and documented by the
