@@ -16,9 +16,9 @@ ROOT="$(cd "$HERE/.." && pwd)"
 # shellcheck disable=SC1090
 source "$ROOT/WEBRTC_VERSION"
 
-# iOS/visionOS: device and simulator differ by target environment (IOS_ENV).
+# iOS/tvOS/visionOS: device and simulator differ by target environment (IOS_ENV).
 VARIANT=""
-case "$OS" in ios|visionos) VARIANT="-${IOS_ENV:-device}" ;; esac
+case "$OS" in ios|visionos|tvos) VARIANT="-${IOS_ENV:-device}" ;; esac
 
 SRC="$HERE/src/src"
 OUT="$HERE/out/$OS-$ARCH$VARIANT-$PROFILE"

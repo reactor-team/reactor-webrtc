@@ -17,7 +17,7 @@ ROOT="$(cd "$HERE/.." && pwd)"
 source "$ROOT/WEBRTC_VERSION"
 
 VARIANT=""
-case "$OS" in ios|visionos) VARIANT="-${IOS_ENV:-device}" ;; esac
+case "$OS" in ios|visionos|tvos) VARIANT="-${IOS_ENV:-device}" ;; esac
 
 SRC="$HERE/src/src"
 OUT_OBJ="$HERE/out/$OS-$ARCH$VARIANT-$PROFILE/obj/third_party"
