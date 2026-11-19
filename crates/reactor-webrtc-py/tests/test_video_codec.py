@@ -172,6 +172,30 @@ def test_round_trip_matches_the_source(
 
 
 @pytest.mark.parametrize("codec", CODECS, ids=lambda c: str(c).rsplit(".", 1)[-1])
+def test_each_picture_is_an_array_of_its_own(
+    codecs: rw.VideoCodecs, codec: rw.VideoCodec
+) -> None:
+    # The backend writes each picture into a new array the caller owns: no
+    # view of a buffer the decoder reuses, so a later decode cannot change it.
+    _require(codecs, codec)
+    encoder = codecs.encoder(codec, W, H, bitrate_bps=2_000_000, framerate=30.0)
+    decoder = codecs.decoder(codec)
+    pictures = []
+    for i in range(3):
+        encoded = encoder.encode(frame(i), i * FRAME_US)
+        assert encoded is not None
+        picture = decoder.decode(encoded.data)
+        assert picture is not None
+        assert picture.flags.c_contiguous and picture.flags.owndata
+        pictures.append((picture, picture.copy()))
+    for picture, snapshot in pictures:
+        assert np.array_equal(picture, snapshot)
+    first = pictures[0][0]
+    first[:] = 0
+    assert not np.array_equal(pictures[1][0], first)
+
+
+@pytest.mark.parametrize("codec", CODECS, ids=lambda c: str(c).rsplit(".", 1)[-1])
 def test_key_frame_on_demand(codecs: rw.VideoCodecs, codec: rw.VideoCodec) -> None:
     _require(codecs, codec)
     encoder = codecs.encoder(codec, W, H)

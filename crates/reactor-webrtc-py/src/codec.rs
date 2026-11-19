@@ -10,7 +10,7 @@
 use ::reactor_webrtc as rw;
 use pyo3::exceptions::{PyImportError, PyOverflowError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyByteArray, PyBytes};
+use pyo3::types::PyBytes;
 use rw::codec as rc;
 use std::sync::Mutex;
 
@@ -65,6 +65,30 @@ impl From<rw::VideoCodec> for VideoCodec {
             rw::VideoCodec::H265 => VideoCodec::H265,
         }
     }
+}
+
+/// A new, uninitialised `uint8` array of shape `(height, width, 3)`, with the
+/// address and length of its data. The address comes from
+/// `__array_interface__`: the abi3 build has no buffer protocol to ask.
+fn picture_array(py: Python<'_>, width: u32, height: u32) -> PyResult<(Py<PyAny>, *mut u8, usize)> {
+    let np = numpy(py)?;
+    let array = np.call_method1(
+        "empty",
+        (
+            (height as usize, width as usize, 3usize),
+            np.getattr("uint8")?,
+        ),
+    )?;
+    let address: usize = array
+        .getattr("__array_interface__")?
+        .get_item("data")?
+        .get_item(0)?
+        .extract()?;
+    Ok((
+        array.unbind(),
+        address as *mut u8,
+        width as usize * height as usize * 3,
+    ))
 }
 
 fn numpy(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
@@ -499,31 +523,43 @@ impl VideoDecoder {
 
     /// Decode one encoded frame and return its picture as a numpy `uint8`
     /// array of shape `(H, W, 3)` (RGB), or `None` when the frame gave no
-    /// picture. Runs with the GIL released.
+    /// picture. Runs with the GIL released. The backend writes the picture
+    /// straight into the array, which the caller owns and may write to.
     fn decode<'py>(
         &self,
         py: Python<'py>,
         data: &Bound<'py, PyBytes>,
     ) -> PyResult<Option<Bound<'py, PyAny>>> {
-        let np = numpy(py)?;
+        numpy(py)?;
         let bytes = data.as_bytes();
+        // The picture's array, made once the backend knows its size; the GIL
+        // is taken only for that.
+        let mut array: Option<Py<PyAny>> = None;
+        let mut failed: Option<PyErr> = None;
         let decoded = with_codec(py, &self.inner, |d| {
-            d.decode(bytes, 0, rw::PixelFormat::Rgb24)
-        })
-        .map_err(codec_err)?;
-        let Some(picture) = decoded else {
-            return Ok(None);
-        };
-        // A bytearray, not bytes, so the array numpy wraps around it without
-        // another copy is writable.
-        let buffer = PyByteArray::new_bound(py, &picture.data);
-        let array = np
-            .call_method1("frombuffer", (buffer, np.getattr("uint8")?))?
-            .call_method1(
-                "reshape",
-                (picture.height as usize, picture.width as usize, 3usize),
-            )?;
-        Ok(Some(array))
+            d.decode_into(bytes, rw::PixelFormat::Rgb24, |width, height| {
+                Python::with_gil(|py| match picture_array(py, width, height) {
+                    Ok((made, address, len)) => {
+                        array = Some(made);
+                        // SAFETY: the array was just made with `len` bytes at
+                        // `address`, nothing else refers to it yet, and
+                        // `array` keeps it alive past the decode that writes it.
+                        Some(unsafe { std::slice::from_raw_parts_mut(address, len) })
+                    }
+                    Err(e) => {
+                        failed = Some(e);
+                        None
+                    }
+                })
+            })
+        });
+        if let Some(e) = failed {
+            return Err(e);
+        }
+        Ok(decoded
+            .map_err(codec_err)?
+            .and(array)
+            .map(|made| made.into_bound(py)))
     }
 
     fn __repr__(&self) -> String {

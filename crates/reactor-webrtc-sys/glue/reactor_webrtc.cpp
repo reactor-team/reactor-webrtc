@@ -667,6 +667,34 @@ class AudioFrameSink : public webrtc::AudioTrackSinkInterface {
 constexpr int kPixelFormatBgra = 0;
 constexpr int kPixelFormatRgb24 = 1;
 
+// The bytes a `pixel_format` picture of `width` x `height` takes, rows packed.
+size_t PixelBytes(int width, int height, int pixel_format) {
+  return static_cast<size_t>(width) * height *
+         (pixel_format == kPixelFormatRgb24 ? 3 : 4);
+}
+
+// Writes `buffer`'s picture to `dst` as packed `pixel_format` pixels: rows of
+// width*3 (RGB24) or width*4 (BGRA) bytes, no padding, PixelBytes in all.
+// False when the buffer gives no I420 view of itself.
+bool WritePixels(webrtc::VideoFrameBuffer& buffer, int pixel_format,
+                 uint8_t* dst) {
+  webrtc::scoped_refptr<webrtc::I420BufferInterface> i420 = buffer.ToI420();
+  if (!i420) return false;
+  const int w = i420->width(), h = i420->height();
+  if (pixel_format == kPixelFormatRgb24) {
+    // libyuv "RAW" is R,G,B in memory == our RGB24 byte order.
+    libyuv::I420ToRAW(i420->DataY(), i420->StrideY(), i420->DataU(),
+                      i420->StrideU(), i420->DataV(), i420->StrideV(), dst,
+                      w * 3, w, h);
+  } else {
+    // libyuv "ARGB" is B,G,R,A in memory == our BGRA byte order.
+    libyuv::I420ToARGB(i420->DataY(), i420->StrideY(), i420->DataU(),
+                       i420->StrideU(), i420->DataV(), i420->StrideV(), dst,
+                       w * 4, w, h);
+  }
+  return true;
+}
+
 // Bridges decoded frames from a (remote) video track to a C callback,
 // converting to the sink's pixel format (BGRA or RGB24) on the way out. The
 // frame's SSRC and RTP timestamp ride along so the binding can pair it with
@@ -683,23 +711,11 @@ class FrameSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
     // callback, on steady_clock: libwebrtc's TimeMicros is millisecond-coarse
     // on some platforms, which would read a sub-millisecond conversion as 0.
     const auto received = std::chrono::steady_clock::now();
-    webrtc::scoped_refptr<webrtc::I420BufferInterface> i420 =
-        frame.video_frame_buffer()->ToI420();
-    if (!i420) return;
-    const int w = i420->width(), h = i420->height();
-    if (pixel_format_ == kPixelFormatRgb24) {
-      pixels_.resize(static_cast<size_t>(w) * h * 3);
-      // libyuv "RAW" is R,G,B in memory == our RGB24 byte order.
-      libyuv::I420ToRAW(i420->DataY(), i420->StrideY(), i420->DataU(),
-                        i420->StrideU(), i420->DataV(), i420->StrideV(),
-                        pixels_.data(), w * 3, w, h);
-    } else {
-      pixels_.resize(static_cast<size_t>(w) * h * 4);
-      // libyuv "ARGB" is B,G,R,A in memory == our BGRA byte order.
-      libyuv::I420ToARGB(i420->DataY(), i420->StrideY(), i420->DataU(),
-                         i420->StrideU(), i420->DataV(), i420->StrideV(),
-                         pixels_.data(), w * 4, w, h);
-    }
+    webrtc::scoped_refptr<webrtc::VideoFrameBuffer> buffer =
+        frame.video_frame_buffer();
+    const int w = buffer->width(), h = buffer->height();
+    pixels_.resize(PixelBytes(w, h, pixel_format_));
+    if (!WritePixels(*buffer, pixel_format_, pixels_.data())) return;
     // A received frame lists the RTP packets it was built from; they share one
     // SSRC. 0 when the list is empty (a frame that did not come off the wire).
     const webrtc::RtpPacketInfos& packets = frame.packet_infos();
@@ -4130,9 +4146,74 @@ class StandaloneVideoDecoder : public webrtc::DecodedImageCallback {
   }
 
   // 1 = a decoded frame in `out`, 0 = no picture for this input, -1 = error
-  // (in `why`).
+  // (in `why`). The pixels stay valid until the next call.
   int Decode(const uint8_t* data, size_t len, bool key_frame, int pixel_format,
              ReactorCodecDecodedFrame* out, std::string* why) {
+    std::optional<webrtc::VideoFrame> frame;
+    const int rc = DecodeFrame(data, len, key_frame, pixel_format, &frame, why);
+    if (rc <= 0) return rc;
+    bool converted = false;
+    InAutoreleasePool([&] {
+      webrtc::scoped_refptr<webrtc::VideoFrameBuffer> buffer =
+          frame->video_frame_buffer();
+      frame.reset();
+      const int w = buffer->width(), h = buffer->height();
+      pixels_.resize(PixelBytes(w, h, pixel_format));
+      if (!WritePixels(*buffer, pixel_format, pixels_.data())) return;
+      out->pixels = pixels_.data();
+      out->len = pixels_.size();
+      out->width = w;
+      out->height = h;
+      converted = true;
+    });
+    if (!converted) {
+      *why = "the decoded frame could not be converted";
+      return -1;
+    }
+    return 1;
+  }
+
+  // As Decode, converting the picture once, straight into the buffer that
+  // `alloc(userdata, width, height, bytes)` returns for its size. 1 with the
+  // size in `width`/`height`, 0 = no picture for this input (`alloc` is not
+  // called), -1 = error (in `why`), including `alloc` returning null.
+  int DecodeInto(const uint8_t* data, size_t len, bool key_frame,
+                 int pixel_format,
+                 uint8_t* (*alloc)(void*, int32_t, int32_t, size_t),
+                 void* userdata, int32_t* width, int32_t* height,
+                 std::string* why) {
+    std::optional<webrtc::VideoFrame> frame;
+    const int rc = DecodeFrame(data, len, key_frame, pixel_format, &frame, why);
+    if (rc <= 0) return rc;
+    int result = -1;
+    InAutoreleasePool([&] {
+      webrtc::scoped_refptr<webrtc::VideoFrameBuffer> buffer =
+          frame->video_frame_buffer();
+      frame.reset();
+      const int w = buffer->width(), h = buffer->height();
+      uint8_t* dst = alloc(userdata, w, h, PixelBytes(w, h, pixel_format));
+      if (!dst) {
+        *why = "no buffer for the " + std::to_string(w) + "x" +
+               std::to_string(h) + " picture";
+        return;
+      }
+      if (!WritePixels(*buffer, pixel_format, dst)) {
+        *why = "the decoded frame could not be converted";
+        return;
+      }
+      *width = w;
+      *height = h;
+      result = 1;
+    });
+    return result;
+  }
+
+  // Decodes one frame into `*frame_out`: 1 with its picture, 0 with none,
+  // -1 on error (in `why`).
+  int DecodeFrame(const uint8_t* data, size_t len, bool key_frame,
+                  int pixel_format,
+                  std::optional<webrtc::VideoFrame>* frame_out,
+                  std::string* why) {
     if (!decoder_) {
       *why = "decoder is closed";
       return -1;
@@ -4157,7 +4238,7 @@ class StandaloneVideoDecoder : public webrtc::DecodedImageCallback {
     }
     int32_t rc = 0;
     InAutoreleasePool([&] { rc = decoder_->Decode(image, /*render_time_ms=*/0); });
-    std::optional<webrtc::VideoFrame> frame;
+    std::optional<webrtc::VideoFrame>& frame = *frame_out;
     {
       std::unique_lock<std::mutex> lock(mu_);
       if (rc == WEBRTC_VIDEO_CODEC_NO_OUTPUT && !done_) {
@@ -4179,36 +4260,7 @@ class StandaloneVideoDecoder : public webrtc::DecodedImageCallback {
       frame = std::move(decoded_);
       decoded_.reset();
     }
-    if (!frame) return 0;
-    bool converted = false;
-    InAutoreleasePool([&] {
-      webrtc::scoped_refptr<webrtc::I420BufferInterface> i420 =
-          frame->video_frame_buffer()->ToI420();
-      frame.reset();
-      if (!i420) return;
-      const int w = i420->width(), h = i420->height();
-      if (pixel_format == kPixelFormatRgb24) {
-        pixels_.resize(static_cast<size_t>(w) * h * 3);
-        libyuv::I420ToRAW(i420->DataY(), i420->StrideY(), i420->DataU(),
-                          i420->StrideU(), i420->DataV(), i420->StrideV(),
-                          pixels_.data(), w * 3, w, h);
-      } else {
-        pixels_.resize(static_cast<size_t>(w) * h * 4);
-        libyuv::I420ToARGB(i420->DataY(), i420->StrideY(), i420->DataU(),
-                           i420->StrideU(), i420->DataV(), i420->StrideV(),
-                           pixels_.data(), w * 4, w, h);
-      }
-      out->pixels = pixels_.data();
-      out->len = pixels_.size();
-      out->width = w;
-      out->height = h;
-      converted = true;
-    });
-    if (!converted) {
-      *why = "the decoded frame could not be converted";
-      return -1;
-    }
-    return 1;
+    return frame ? 1 : 0;
   }
 
   int32_t Decoded(webrtc::VideoFrame& frame) override {
@@ -4524,6 +4576,27 @@ int reactor_webrtc_video_decoder_decode(void* dec, const uint8_t* data,
   }
   std::string why;
   const int rc = d->Decode(data, len, key_frame != 0, pixel_format, out, &why);
+  if (rc < 0) write_error(err, err_cap, why);
+  return rc;
+}
+
+// Decode one encoded frame and convert its picture once, straight into the
+// buffer `alloc(userdata, width, height, bytes)` returns for its size: `bytes`
+// of packed `pixel_format` pixels. Returns 1 with the size in
+// `width`/`height`, 0 when the input gave no picture (`alloc` is not called),
+// -1 on error (reason in `err`), including `alloc` returning null.
+int reactor_webrtc_video_decoder_decode_into(
+    void* dec, const uint8_t* data, size_t len, int key_frame, int pixel_format,
+    uint8_t* (*alloc)(void*, int32_t, int32_t, size_t), void* userdata,
+    int32_t* width, int32_t* height, char* err, int err_cap) {
+  auto* d = reinterpret_cast<StandaloneVideoDecoder*>(dec);
+  if (!d || !data || len == 0 || !alloc || !width || !height) {
+    write_error(err, err_cap, "invalid decode arguments");
+    return -1;
+  }
+  std::string why;
+  const int rc = d->DecodeInto(data, len, key_frame != 0, pixel_format, alloc,
+                               userdata, width, height, &why);
   if (rc < 0) write_error(err, err_cap, why);
   return rc;
 }

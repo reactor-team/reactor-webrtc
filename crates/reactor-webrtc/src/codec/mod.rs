@@ -41,6 +41,27 @@
 //! accepts it, hardware first. Each encoder and decoder reports the backend it
 //! got ([`VideoEncoder::implementation`], [`VideoEncoder::is_hardware`]).
 //!
+//! # Decoding into your own buffer
+//!
+//! [`VideoDecoder::decode_into`] writes the picture to a buffer the caller
+//! hands over once the picture's size is known, converted once, in place,
+//! with no copy behind it. [`VideoDecoder::decode`] is the same call into a
+//! new `Vec`. Every backend takes it, hardware or software:
+//!
+//! ```no_run
+//! # use reactor_webrtc::codec::{VideoCodecs, VideoDecoder};
+//! # use reactor_webrtc::PixelFormat;
+//! # fn f(decoder: &mut VideoDecoder, data: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+//! let mut picture = Vec::new(); // reused from one frame to the next
+//! if let Some((width, height)) = decoder.decode_into(data, PixelFormat::Rgb24, |w, h| {
+//!     picture.resize(w as usize * h as usize * 3, 0);
+//!     Some(&mut picture[..])
+//! })? {
+//!     // `picture` holds the width x height RGB picture.
+//! }
+//! # Ok(()) }
+//! ```
+//!
 //! # Bitstream format
 //!
 //! One call to [`VideoEncoder::encode`] gives one encoded frame, and

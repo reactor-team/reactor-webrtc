@@ -1442,6 +1442,26 @@ extern "C" {
         err: *mut c_char,
         err_cap: c_int,
     ) -> c_int;
+    /// Decode one encoded frame and convert its picture once, straight into
+    /// the buffer `alloc(userdata, width, height, bytes)` returns for its
+    /// size: `bytes` of packed `pixel_format` pixels. `alloc` runs on the
+    /// calling thread, during the call, at most once. Returns 1 with the size
+    /// in `width`/`height`, 0 when the input gave no picture (`alloc` is not
+    /// called), -1 on error (reason in `err`), including `alloc` returning
+    /// null.
+    pub fn reactor_webrtc_video_decoder_decode_into(
+        decoder: *mut StandaloneVideoDecoder,
+        data: *const u8,
+        len: usize,
+        key_frame: c_int,
+        pixel_format: c_int,
+        alloc: unsafe extern "C" fn(*mut c_void, i32, i32, usize) -> *mut u8,
+        userdata: *mut c_void,
+        width: *mut i32,
+        height: *mut i32,
+        err: *mut c_char,
+        err_cap: c_int,
+    ) -> c_int;
 
     // ── Platform bootstrap ───────────────────────────────────────────────────
     /// Android: hand the JavaVM to libwebrtc (call from JNI_OnLoad).
