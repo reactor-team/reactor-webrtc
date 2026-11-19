@@ -1,6 +1,13 @@
 # Changelog
 
-## Unreleased
+## 0.30.0 — video decode on NVIDIA GPUs with NVDEC
+
+On a Linux machine with an NVIDIA GPU, video can now be decoded on NVDEC
+instead of the CPU, in a peer connection and in the standalone codecs. It is
+opt-in, and without a GPU nothing changes.
+
+The prebuilt stays `webrtc-7907-a5ddff60-p14`: NVDEC is in the glue, which is
+built from source, and no libwebrtc patch changed.
 
 ### Added
 
@@ -21,6 +28,16 @@
   The standalone codecs list it as the `NVDEC` hardware decoder of each codec
   it decodes. `CUDA_VISIBLE_DEVICES` picks the GPU. It decodes 8-bit 4:2:0,
   which is what WebRTC carries; it does not encode.
+
+### Changed
+
+- **`reactor_webrtc_sys` (breaking for direct users of the C API):**
+  - `ReactorFactoryOptions` gains a `use_nvdec` field, in the padding at its
+    end, so the struct stays 144 bytes. A struct literal that lists every
+    field must add it; `Default` sets it to 0.
+  - `reactor_webrtc_codec_context_create` takes a `use_nvdec` argument.
+
+  The `reactor_webrtc` crate and the Python package only add API.
 
 ## 0.29.0 — standalone video encoders and decoders
 
