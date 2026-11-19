@@ -1,6 +1,14 @@
 # Changelog
 
-## Unreleased
+## 0.31.0 — decoded pictures without copies, and RGB from NVDEC
+
+A decoded picture is converted once, straight into the buffer that holds it
+for the caller, with every decoder, and NVDEC makes its pictures RGB on the
+GPU. With NVDEC on an NVIDIA B200, a 1080p frame reaches Python in about
+1.1 ms instead of 2.6 ms.
+
+The prebuilt stays `webrtc-7907-a5ddff60-p14`: the changes are in the glue,
+which is built from source, and no libwebrtc patch changed.
 
 ### Added
 
@@ -24,7 +32,6 @@
   RGB24 or BGRA through one function, so both take the same route.
 - That function refuses a picture whose I420 view has another size than the
   picture, instead of writing past the buffer sized for it.
-
 - **NVDEC converts its pictures to RGB on the GPU.** A small kernel, loaded
   from PTX by the driver at run time (no NVIDIA toolkit to build), turns each
   NV12 picture into packed RGB on the decoder's own CUDA stream, and the
