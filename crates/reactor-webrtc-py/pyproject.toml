@@ -37,7 +37,10 @@ Repository = "https://github.com/reactor-team/reactor-webrtc"
 module-name = "reactor_webrtc"
 # Embed libwebrtc statically — the prebuilt archive linked at build time.
 # maturin build --release produces a self-contained .so / .dylib wheel.
-features = []
+# openh264: Cisco's prebuilt OpenH264, downloaded and verified at run time
+# by `ensure_openh264()` and registered with `with_openh264()`, so H.264
+# works where the platform has no codec of its own (Linux, Windows).
+features = ["openh264"]
 
 [tool.pytest.ini_options]
 # PeerConnection's signaling methods are natively awaitable; this lets test

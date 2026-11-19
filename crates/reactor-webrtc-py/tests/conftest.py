@@ -1,11 +1,26 @@
 """Shared fixtures for the reactor_webrtc Python test suite."""
 
+import sys
+
 import pytest
 import reactor_webrtc as rw
 
 
 @pytest.fixture(scope="session")
-def factory() -> rw.PeerConnectionFactory:
+def openh264_path() -> str | None:
+    """Cisco's OpenH264, downloaded once per machine, where the platform has no
+    H.264 of its own; ``None`` on macOS, where H.264 is VideoToolbox.
+
+    A download that fails fails the tests that use it rather than skipping
+    them: a wheel that cannot reach H.264 on Linux is the bug they catch.
+    """
+    if sys.platform == "darwin":
+        return None
+    return rw.ensure_openh264()
+
+
+@pytest.fixture(scope="session")
+def factory(openh264_path: str | None) -> rw.PeerConnectionFactory:
     """One PeerConnectionFactory for the entire test session.
 
     Session scope is intentional: libwebrtc starts a set of process-global
@@ -23,4 +38,8 @@ def factory() -> rw.PeerConnectionFactory:
     # NVDEC decodes H.264, VP8, VP9 and AV1 where an NVIDIA GPU does (a no-op
     # elsewhere).
     builder.with_nvdec()
+    # Built the way an application ships it: with OpenH264 registered where the
+    # platform needs it, so H.264 is negotiated and encoded on every platform.
+    if openh264_path is not None:
+        builder.with_openh264(openh264_path)
     return builder.build()

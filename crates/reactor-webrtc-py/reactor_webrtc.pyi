@@ -486,6 +486,32 @@ class StatsReport:
     #: The SCTP association; None before a data channel has created it.
     sctp: Optional[SctpStats]
 
+# ── OpenH264 ──────────────────────────────────────────────────────────────────
+
+def ensure_openh264(cache_dir: str | None = None) -> str:
+    """Download Cisco's prebuilt OpenH264 for this platform on first use,
+    verify it against the hash pinned in this build, cache it, and return its
+    path.
+
+    Pass the path to `PeerConnectionFactoryBuilder.with_openh264` and
+    `VideoCodecs.with_openh264`, so H.264 is negotiated and encoded where the
+    platform has no codec of its own (Linux, Windows). Later calls find the
+    library in the cache and touch no network. `cache_dir` overrides the
+    default cache directory.
+
+    Raises `RuntimeError` on a platform Cisco ships no binary for (macOS,
+    where H.264 is VideoToolbox), a failed download, or a hash mismatch.
+
+        builder = reactor_webrtc.PeerConnectionFactoryBuilder()
+        builder.with_openh264(reactor_webrtc.ensure_openh264())
+        factory = builder.build()
+    """
+    ...
+
+OPENH264_ATTRIBUTION: str
+"""The notice Cisco's binary license requires wherever the application shows
+its licensing notices, when it uses OpenH264."""
+
 # ── Frame metadata ────────────────────────────────────────────────────────────
 
 def time_micros() -> int:
