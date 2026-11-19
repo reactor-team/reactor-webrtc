@@ -526,6 +526,44 @@ both, 5 runs of 5 pass. The stack of the abort goes
 
 ---
 
+### 0013 — no WebRTC.framework bundle on tvOS
+
+`0013-tvos-skip-objc-framework-bundle.patch` · touches `BUILD.gn` (+4/-1 lines)
+
+**What.** The `//:webrtc` umbrella depends on `sdk:framework_objc` only when
+`target_platform != "tvos"`. iOS, and every other platform, is unchanged.
+
+**Why.** `build.sh tvos` is gn's iOS toolchain with `target_platform="tvos"`, so
+`is_ios` is true and the umbrella pulls in the `WebRTC.framework` bundle. Two of
+the targets that bundle links fail to compile against the AppleTVOS SDK:
+
+- `videocapture_objc`: `RTCCameraVideoCapturer.m` follows the device orientation
+  (`UIDeviceOrientation`, `-[UIDevice orientation]`,
+  `beginGeneratingDeviceOrientationNotifications`), all unavailable on tvOS.
+- `metal_objc`: `RTCMTLRenderer.h` declares its view as `UIView` under
+  `TARGET_OS_IOS` and `NSView` otherwise, and `TARGET_OS_IOS` is 0 on tvOS.
+
+The bundle is an `apple_framework_bundle_with_umbrella_header`, so it adds no
+object files to the `complete_static_lib` (see 0004), and neither target is
+reached any other way: `gn path //:webrtc //sdk:videocapture_objc` (and
+`//sdk:metal_objc`) only go through `sdk:framework_objc`. Dropping the dep
+therefore costs nothing in `libwebrtc.a`, and it also saves linking a tvOS
+`WebRTC` dylib nobody ships. Porting the camera capturer and the Metal view to
+tvOS would be real work (tvOS has cameras only through Continuity Camera), and
+an app that wants a renderer brings its own.
+
+**How it works.** `target_platform` is declared by
+`build/config/apple/mobile_config.gni`, which `webrtc.gni` imports for iOS; gn's
+`&&` short-circuits, so the condition never reads it on other platforms.
+
+**Verify.** `build.sh tvos arm64 release` links `libwebrtc.a`; every member is
+`platform 3` (TVOS), `minos 18.0`. The archive carries the VideoToolbox H.264
+codecs (`RTCVideoEncoderH264.o`, `RTCVideoDecoderFactoryH264.o`, …), the
+ObjC↔native factories, `RTCNetworkMonitor.o` and the audio device
+(`audio_device_ios.o`, `voice_processing_audio_unit.o`, `RTCAudioSession.o`).
+
+---
+
 ## Planned (not yet authored — need their target builds to validate)
 
 - **Symbol isolation** — keep WebRTC's C++ symbols from clashing when a consumer
