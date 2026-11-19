@@ -1,6 +1,6 @@
 //! [`VideoDecoder`]: encoded frames in decode order, raw pictures out.
 
-use std::os::raw::c_char;
+use std::os::raw::{c_char, c_void};
 use std::sync::Arc;
 
 use super::{
@@ -129,6 +129,47 @@ impl VideoDecoder {
         timestamp_us: i64,
         format: PixelFormat,
     ) -> Result<Option<DecodedFrame>, CodecError> {
+        let mut pixels = Vec::new();
+        let size = self.decode_into(data, format, |width, height| {
+            // Zeroed rather than uninitialised: a picture this size comes
+            // from the allocator as fresh zero pages, with no fill to pay.
+            pixels = vec![0; width as usize * height as usize * format.bytes_per_pixel()];
+            Some(&mut pixels[..])
+        })?;
+        Ok(size.map(|(width, height)| DecodedFrame {
+            data: pixels,
+            width,
+            height,
+            format,
+            timestamp_us,
+        }))
+    }
+
+    /// Decode one encoded frame and write its picture in `format` to the
+    /// buffer `buffer` returns for its size, converted once, in place, with
+    /// no copy behind it. Blocks until the backend is done with the frame.
+    ///
+    /// `buffer(width, height)` runs at most once, during the call, on the
+    /// calling thread, once the picture's size is known. It returns
+    /// `width * height * format.bytes_per_pixel()` bytes for rows without
+    /// padding, or `None` to give up. `Ok(Some((width, height)))` once the
+    /// buffer holds the picture; `Ok(None)` when the frame gave no picture,
+    /// and `buffer` is not called.
+    ///
+    /// This is [`decode`](Self::decode) without its `Vec`: a binding hands
+    /// over memory it already owns (a numpy array, a pooled buffer), and a
+    /// caller that keeps one buffer reuses it across frames. Every backend
+    /// takes it, hardware or software. The key frame contract is
+    /// [`decode`](Self::decode)'s; a buffer of the wrong size, or none, fails
+    /// the call with [`CodecError::InvalidInput`] after the frame has been
+    /// decoded, so the decoder then waits for a key frame. A panic in
+    /// `buffer` resumes once the backend is done with the frame.
+    pub fn decode_into<'b>(
+        &mut self,
+        data: &[u8],
+        format: PixelFormat,
+        buffer: impl FnOnce(u32, u32) -> Option<&'b mut [u8]>,
+    ) -> Result<Option<(u32, u32)>, CodecError> {
         if data.is_empty() {
             return Err(CodecError::InvalidInput("empty frame".into()));
         }
@@ -136,50 +177,42 @@ impl VideoDecoder {
         if self.needs_key_frame && !key_frame {
             return Err(CodecError::NeedKeyFrame);
         }
-        let mut out = reactor_webrtc_sys::ReactorCodecDecodedFrame {
-            pixels: std::ptr::null(),
-            len: 0,
-            width: 0,
-            height: 0,
+        // The buffer as a raw pointer and length: the glue writes to it during
+        // the call, inside the borrow `'b` the caller gave.
+        let mut state = BufferRequest {
+            buffer: Some(move |width, height| {
+                buffer(width, height).map(|b: &'b mut [u8]| (b.as_mut_ptr(), b.len()))
+            }),
+            refused: None,
+            panic: None,
         };
+        let (mut width, mut height) = (0i32, 0i32);
         let mut err = ErrorBuffer::new();
         let rc = unsafe {
-            reactor_webrtc_sys::reactor_webrtc_video_decoder_decode(
+            reactor_webrtc_sys::reactor_webrtc_video_decoder_decode_into(
                 self.raw,
                 data.as_ptr(),
                 data.len(),
                 key_frame as i32,
                 format.raw(),
-                &mut out,
+                provider_for(&state),
+                &mut state as *mut BufferRequest<_> as *mut c_void,
+                &mut width,
+                &mut height,
                 err.ptr(),
                 err.cap(),
             )
         };
+        if let Some(panic) = state.panic {
+            self.needs_key_frame = true;
+            std::panic::resume_unwind(panic);
+        }
         match rc {
             1 => {
                 if key_frame {
                     self.needs_key_frame = false;
                 }
-                let width = out.width.max(0) as u32;
-                let height = out.height.max(0) as u32;
-                let expected = width as usize * height as usize * format.bytes_per_pixel();
-                if out.pixels.is_null() || out.len != expected {
-                    self.needs_key_frame = true;
-                    return Err(CodecError::Backend(format!(
-                        "decoded {} bytes for a {width}x{height} picture",
-                        out.len
-                    )));
-                }
-                // SAFETY: the glue keeps `pixels` valid until the next call on
-                // this decoder, which `&mut self` rules out until we return.
-                let pixels = unsafe { std::slice::from_raw_parts(out.pixels, out.len) }.to_vec();
-                Ok(Some(DecodedFrame {
-                    data: pixels,
-                    width,
-                    height,
-                    format,
-                    timestamp_us,
-                }))
+                Ok(Some((width.max(0) as u32, height.max(0) as u32)))
             }
             0 => {
                 if key_frame {
@@ -189,8 +222,69 @@ impl VideoDecoder {
             }
             _ => {
                 self.needs_key_frame = true;
-                Err(CodecError::Backend(err.message("decode")))
+                Err(match state.refused {
+                    Some(why) => CodecError::InvalidInput(why),
+                    None => CodecError::Backend(err.message("decode")),
+                })
             }
+        }
+    }
+}
+
+/// What [`VideoDecoder::decode_into`] lends [`provide_buffer`]: the caller's
+/// buffer function, and why it gave no buffer, or how it panicked.
+struct BufferRequest<F> {
+    buffer: Option<F>,
+    refused: Option<String>,
+    panic: Option<Box<dyn std::any::Any + Send>>,
+}
+
+/// [`provide_buffer`] for `request`'s function type, which has no name to
+/// spell.
+fn provider_for<F>(
+    _request: &BufferRequest<F>,
+) -> unsafe extern "C" fn(*mut c_void, i32, i32, usize) -> *mut u8
+where
+    F: FnOnce(u32, u32) -> Option<(*mut u8, usize)>,
+{
+    provide_buffer::<F>
+}
+
+/// The glue's `alloc`: the buffer `request`'s function gives for a `width` x
+/// `height` picture of `bytes`, or null when it gives none, one of another
+/// size, or panics. A panic is kept for the caller to resume, so none unwinds
+/// through the glue.
+unsafe extern "C" fn provide_buffer<F>(
+    request: *mut c_void,
+    width: i32,
+    height: i32,
+    bytes: usize,
+) -> *mut u8
+where
+    F: FnOnce(u32, u32) -> Option<(*mut u8, usize)>,
+{
+    // SAFETY: `decode_into` passes its own `BufferRequest<F>`, alive for the
+    // call this runs in.
+    let request = unsafe { &mut *(request as *mut BufferRequest<F>) };
+    let Some(buffer) = request.buffer.take() else {
+        return std::ptr::null_mut();
+    };
+    let (width, height) = (width.max(0) as u32, height.max(0) as u32);
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| buffer(width, height))) {
+        Ok(Some((ptr, len))) if len == bytes && !ptr.is_null() => ptr,
+        Ok(Some((_, len))) => {
+            request.refused = Some(format!(
+                "a buffer of {len} bytes for a {width}x{height} picture, which takes {bytes}"
+            ));
+            std::ptr::null_mut()
+        }
+        Ok(None) => {
+            request.refused = Some(format!("no buffer for the {width}x{height} picture"));
+            std::ptr::null_mut()
+        }
+        Err(panic) => {
+            request.panic = Some(panic);
+            std::ptr::null_mut()
         }
     }
 }

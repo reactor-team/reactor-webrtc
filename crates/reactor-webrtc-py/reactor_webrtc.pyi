@@ -1406,7 +1406,9 @@ class VideoDecoder:
     def decode(self, data: bytes) -> Optional[NDArray[np.uint8]]:
         """Decode one encoded frame and return its picture as a writable uint8
         array of shape (H, W, 3), RGB. Blocks, with the GIL released, until the
-        backend is done with it.
+        backend is done with it. The backend writes the picture straight into
+        a new, C-contiguous array that the caller owns: no copy is made on the
+        way, and a later decode never changes it.
 
         `None` means the frame gave no picture, which a whole frame from
         `VideoEncoder` does not. Raises `CodecNeedsKeyFrame` for anything but

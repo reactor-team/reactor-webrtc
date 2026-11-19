@@ -1,5 +1,37 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`VideoDecoder::decode_into`** (Rust) and
+  **`reactor_webrtc_video_decoder_decode_into`** (`reactor_webrtc_sys`):
+  decode one frame and write its picture to a buffer the caller hands over
+  once the picture's size is known, converted once, in place. A caller that
+  keeps one buffer reuses it across frames. Every backend takes it, hardware
+  or software.
+
+### Changed
+
+- **Standalone decoding makes no copy of the picture after converting it.**
+  `VideoDecoder::decode` converts straight into the `Vec` it returns, and
+  Python's `VideoDecoder.decode` straight into the numpy array it returns,
+  for every backend. Before, the picture was converted into the glue's own
+  buffer and copied out, and Python copied it once more. On an NVIDIA B200, a
+  1080p frame decodes about 0.9 ms sooner in Python with NVDEC, OpenH264,
+  libvpx and dav1d alike, and a 720p frame about 0.35 ms sooner.
+- The media path's frame sink and the standalone decoder convert a picture to
+  RGB24 or BGRA through one function, so both take the same route.
+- That function refuses a picture whose I420 view has another size than the
+  picture, instead of writing past the buffer sized for it.
+
+### Removed
+
+- **`reactor_webrtc_video_decoder_decode`** and **`ReactorCodecDecodedFrame`**
+  (`reactor_webrtc_sys`): nothing calls them since `VideoDecoder::decode`
+  goes through `reactor_webrtc_video_decoder_decode_into`, which they
+  duplicated.
+
 ## 0.30.0 — video decode on NVIDIA GPUs with NVDEC
 
 On a Linux machine with an NVIDIA GPU, video can now be decoded on NVDEC

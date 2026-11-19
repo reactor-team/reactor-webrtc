@@ -498,3 +498,116 @@ fn bad_input_is_refused_before_the_codec() {
         assert!(encode(&mut encoder, 0).key_frame, "{codec:?} {backend:?}");
     }
 }
+
+#[test]
+fn decoding_into_a_buffer_gives_the_pictures_decode_gives() {
+    let codecs = codecs();
+    for (codec, backend) in cases(&codecs) {
+        for format in [PixelFormat::Rgb24, PixelFormat::Bgra] {
+            let (mut encoder, mut decoder) = open(&codecs, codec, backend);
+            let mut into = codecs.decoder_on(codec, backend).expect("decoder");
+            // One buffer for the whole stream, as a caller that reuses it.
+            let mut buffer = vec![0u8; (W * H) as usize * format.bytes_per_pixel()];
+            for i in 0..10 {
+                let encoded = encode(&mut encoder, i);
+                let decoded = decoder
+                    .decode(&encoded.data, encoded.timestamp_us, format)
+                    .expect("decode")
+                    .expect("a whole frame gave no picture");
+                let mut asked = None;
+                let size = into
+                    .decode_into(&encoded.data, format, |w, h| {
+                        asked = Some((w, h));
+                        Some(&mut buffer[..])
+                    })
+                    .expect("decode_into")
+                    .expect("a whole frame gave no picture");
+                assert_eq!(size, (W, H));
+                assert_eq!(asked, Some((W, H)));
+                assert!(
+                    buffer == decoded.data,
+                    "{codec:?} {backend:?} {format:?}: frame {i} differs from decode()"
+                );
+            }
+        }
+    }
+}
+
+/// A VP8 decoder and the first two frames of a stream, a key frame and an
+/// inter frame: VP8 runs in software on every platform.
+fn vp8_stream() -> (VideoDecoder, Vec<EncodedFrame>) {
+    let codecs = codecs();
+    let (mut encoder, decoder) = open(&codecs, VideoCodec::Vp8, Backend::Software);
+    let frames = (0..3).map(|i| encode(&mut encoder, i)).collect();
+    (decoder, frames)
+}
+
+fn rgb_buffer() -> Vec<u8> {
+    vec![0u8; (W * H * 3) as usize]
+}
+
+#[test]
+fn a_buffer_of_the_wrong_size_fails_the_call_and_the_decoder_waits_for_a_key_frame() {
+    let (mut decoder, frames) = vp8_stream();
+    let mut short = vec![0u8; (W * H * 3) as usize - 1];
+    let err = decoder
+        .decode_into(&frames[0].data, PixelFormat::Rgb24, |_, _| {
+            Some(&mut short[..])
+        })
+        .unwrap_err();
+    assert!(
+        matches!(&err, CodecError::InvalidInput(why) if why.contains("640x360")),
+        "{err:?}"
+    );
+    assert!(decoder.needs_key_frame());
+    let mut buffer = rgb_buffer();
+    assert!(matches!(
+        decoder.decode_into(&frames[1].data, PixelFormat::Rgb24, |_, _| Some(
+            &mut buffer[..]
+        )),
+        Err(CodecError::NeedKeyFrame)
+    ));
+    let size = decoder
+        .decode_into(&frames[0].data, PixelFormat::Rgb24, |_, _| {
+            Some(&mut buffer[..])
+        })
+        .expect("a key frame decodes again")
+        .expect("a picture");
+    assert_eq!(size, (W, H));
+}
+
+#[test]
+fn no_buffer_fails_the_call() {
+    let (mut decoder, frames) = vp8_stream();
+    let err = decoder
+        .decode_into(&frames[0].data, PixelFormat::Rgb24, |_, _| None)
+        .unwrap_err();
+    assert!(
+        matches!(&err, CodecError::InvalidInput(why) if why.contains("no buffer")),
+        "{err:?}"
+    );
+    assert!(decoder.needs_key_frame());
+}
+
+#[test]
+fn a_panic_for_the_buffer_resumes_once_the_backend_is_done() {
+    let (mut decoder, frames) = vp8_stream();
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = decoder.decode_into(
+            &frames[0].data,
+            PixelFormat::Rgb24,
+            |_, _| -> Option<&mut [u8]> { panic!("no memory today") },
+        );
+    }));
+    let payload = panicked.expect_err("the panic resumes in the caller");
+    assert_eq!(payload.downcast_ref::<&str>(), Some(&"no memory today"));
+    // The decoder is still whole: it waits for a key frame and takes one.
+    assert!(decoder.needs_key_frame());
+    let mut buffer = rgb_buffer();
+    decoder
+        .decode_into(&frames[0].data, PixelFormat::Rgb24, |_, _| {
+            Some(&mut buffer[..])
+        })
+        .expect("a key frame decodes after the panic")
+        .expect("a picture");
+}

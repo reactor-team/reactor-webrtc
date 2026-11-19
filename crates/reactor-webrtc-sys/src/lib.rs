@@ -801,17 +801,6 @@ pub struct ReactorCodecEncodedFrame {
     pub height: i32,
 }
 
-/// The output of [`reactor_webrtc_video_decoder_decode`]. `pixels` points into
-/// the decoder and stays valid until its next call. Layout must match
-/// `ReactorCodecDecodedFrame` in the glue.
-#[repr(C)]
-pub struct ReactorCodecDecodedFrame {
-    pub pixels: *const u8,
-    pub len: usize,
-    pub width: i32,
-    pub height: i32,
-}
-
 // The other half of the static_asserts next to these structs in the glue.
 const _: () = {
     assert!(core::mem::size_of::<ReactorCodecSupport>() == 76);
@@ -821,7 +810,6 @@ const _: () = {
 #[cfg(target_pointer_width = "64")]
 const _: () = {
     assert!(core::mem::size_of::<ReactorCodecEncodedFrame>() == 32);
-    assert!(core::mem::size_of::<ReactorCodecDecodedFrame>() == 24);
 };
 
 /// `pixel_format` for raw video frames: `width * height * 4` bytes, B,G,R,A in
@@ -1429,16 +1417,23 @@ extern "C" {
     /// Drop the decoder's references and configure it again. Returns 1 on
     /// success, 0 when the backend refused.
     pub fn reactor_webrtc_video_decoder_reset(decoder: *mut StandaloneVideoDecoder) -> c_int;
-    /// Decode one encoded frame and wait for its picture, converted to
-    /// `pixel_format`. Returns 1 with the picture in `out`, 0 when the input
-    /// gave none, -1 on error (reason in `err`).
-    pub fn reactor_webrtc_video_decoder_decode(
+    /// Decode one encoded frame and convert its picture once, straight into
+    /// the buffer `alloc(userdata, width, height, bytes)` returns for its
+    /// size: `bytes` of packed `pixel_format` pixels. `alloc` runs on the
+    /// calling thread, during the call, at most once. Returns 1 with the size
+    /// in `width`/`height`, 0 when the input gave no picture (`alloc` is not
+    /// called), -1 on error (reason in `err`), including `alloc` returning
+    /// null.
+    pub fn reactor_webrtc_video_decoder_decode_into(
         decoder: *mut StandaloneVideoDecoder,
         data: *const u8,
         len: usize,
         key_frame: c_int,
         pixel_format: c_int,
-        out: *mut ReactorCodecDecodedFrame,
+        alloc: unsafe extern "C" fn(*mut c_void, i32, i32, usize) -> *mut u8,
+        userdata: *mut c_void,
+        width: *mut i32,
+        height: *mut i32,
         err: *mut c_char,
         err_cap: c_int,
     ) -> c_int;
