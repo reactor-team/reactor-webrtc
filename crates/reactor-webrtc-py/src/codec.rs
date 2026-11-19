@@ -67,6 +67,15 @@ impl From<rw::VideoCodec> for VideoCodec {
     }
 }
 
+/// Experiment: whether `VideoDecoder.decode` converts in place
+/// (`REACTOR_EXP_DECODE_INTO=1`).
+fn decode_into_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("REACTOR_EXP_DECODE_INTO").is_ok_and(|v| !v.is_empty() && v != "0")
+    })
+}
+
 fn numpy(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     py.import_bound("numpy").map_err(|e| {
         PyImportError::new_err(format!(
@@ -507,6 +516,48 @@ impl VideoDecoder {
     ) -> PyResult<Option<Bound<'py, PyAny>>> {
         let np = numpy(py)?;
         let bytes = data.as_bytes();
+        if decode_into_enabled() {
+            // Experiment: the glue converts straight into a numpy array made
+            // for the picture's size, with the GIL taken only to make it.
+            let mut array: Option<Py<PyAny>> = None;
+            let mut alloc_err: Option<PyErr> = None;
+            let decoded = with_codec(py, &self.inner, |d| {
+                d.decode_into(bytes, rw::PixelFormat::Rgb24, &mut |w, h, _bytes| {
+                    Python::with_gil(|py| {
+                        let made = (|| -> PyResult<(Py<PyAny>, usize)> {
+                            let np = numpy(py)?;
+                            let arr = np.call_method1(
+                                "empty",
+                                ((h as usize, w as usize, 3usize), np.getattr("uint8")?),
+                            )?;
+                            let ptr: usize = arr
+                                .getattr("__array_interface__")?
+                                .get_item("data")?
+                                .get_item(0)?
+                                .extract()?;
+                            Ok((arr.unbind(), ptr))
+                        })();
+                        match made {
+                            Ok((arr, ptr)) => {
+                                array = Some(arr);
+                                ptr as *mut u8
+                            }
+                            Err(e) => {
+                                alloc_err = Some(e);
+                                std::ptr::null_mut()
+                            }
+                        }
+                    })
+                })
+            });
+            if let Some(e) = alloc_err {
+                return Err(e);
+            }
+            return match decoded.map_err(codec_err)? {
+                Some(_) => Ok(array.map(|a| a.into_bound(py))),
+                None => Ok(None),
+            };
+        }
         let decoded = with_codec(py, &self.inner, |d| {
             d.decode(bytes, 0, rw::PixelFormat::Rgb24)
         })

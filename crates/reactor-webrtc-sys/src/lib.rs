@@ -1443,6 +1443,24 @@ extern "C" {
         err_cap: c_int,
     ) -> c_int;
 
+    /// Experiment: decode one frame, writing its picture to the buffer
+    /// `alloc(userdata, width, height, bytes)` returns (null gives up).
+    /// Returns 1 with the size in `width`/`height`, 0 when the input gave no
+    /// picture, -1 on error (reason in `err`).
+    pub fn reactor_webrtc_video_decoder_decode_into(
+        decoder: *mut StandaloneVideoDecoder,
+        data: *const u8,
+        len: usize,
+        key_frame: c_int,
+        pixel_format: c_int,
+        alloc: unsafe extern "C" fn(*mut c_void, i32, i32, usize) -> *mut u8,
+        userdata: *mut c_void,
+        width: *mut i32,
+        height: *mut i32,
+        err: *mut c_char,
+        err_cap: c_int,
+    ) -> c_int;
+
     // ── Platform bootstrap ───────────────────────────────────────────────────
     /// Android: hand the JavaVM to libwebrtc (call from JNI_OnLoad).
     pub fn reactor_webrtc_android_init(vm: *mut std::ffi::c_void);

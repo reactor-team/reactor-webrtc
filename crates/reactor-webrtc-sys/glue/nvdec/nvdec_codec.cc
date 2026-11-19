@@ -21,6 +21,15 @@
 #define FFNV_DEBUG_LOG_FUNC(logctx, msg, ...) ((void)0)
 #include "vendor/dynlink_loader.h"
 #include "../decode_timing.h"
+#include "../frame_pixels.h"
+#include "nv12_to_rgb_ptx.h"
+
+#include <memory>
+#include <mutex>
+
+#include "api/make_ref_counted.h"
+
+#include "third_party/libyuv/include/libyuv/convert.h"
 
 namespace reactor {
 
@@ -36,6 +45,12 @@ class NvdecLibrary {
   CuvidFunctions* cuvid = nullptr;
   CUdevice device = 0;
   CUcontext context = nullptr;
+  // Experiment: page-locked host memory (not in the vendored loader, so
+  // looked up in the same libcuda) and the NV12 to RGB kernel.
+  CUresult (*cuMemAllocHost)(void**, size_t) = nullptr;
+  CUresult (*cuMemFreeHost)(void*) = nullptr;
+  CUmodule rgb_module = nullptr;
+  CUfunction nv12_to_rgb = nullptr;
   // Whether the GPU decodes a codec at 8-bit 4:2:0, and the coded sizes it
   // decodes it at, asked once at open.
   struct Caps {
@@ -72,6 +87,96 @@ class ScopedContext {
  private:
   const NvdecLibrary& lib_;
   bool pushed_ = false;
+};
+
+// Experiment: page-locked host blocks of one size, reused once the frame
+// holding one is dropped. Outlives its decoder while frames are out.
+class PinnedPool : public std::enable_shared_from_this<PinnedPool> {
+ public:
+  PinnedPool(std::shared_ptr<NvdecLibrary> lib, size_t block_size)
+      : lib_(std::move(lib)), block_size_(block_size) {}
+  ~PinnedPool() {
+    ScopedContext scope(*lib_);
+    for (void* b : free_) lib_->cuMemFreeHost(b);
+  }
+  size_t block_size() const { return block_size_; }
+  // A block, or null when page-locked memory is unavailable.
+  void* Take() {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      if (!free_.empty()) {
+        void* b = free_.back();
+        free_.pop_back();
+        return b;
+      }
+    }
+    if (!lib_->cuMemAllocHost) return nullptr;
+    void* b = nullptr;
+    DECODE_TIMING("nvdec.pinned_alloc");
+    if (lib_->cuMemAllocHost(&b, block_size_) != CUDA_SUCCESS) return nullptr;
+    return b;
+  }
+  void Give(void* b) {
+    std::lock_guard<std::mutex> lock(mu_);
+    free_.push_back(b);
+  }
+
+ private:
+  std::shared_ptr<NvdecLibrary> lib_;
+  const size_t block_size_;
+  std::mutex mu_;
+  std::vector<void*> free_;
+};
+
+// Experiment: an NV12 picture in a page-locked block of a PinnedPool.
+class PinnedNV12Buffer : public webrtc::NV12BufferInterface {
+ public:
+  static webrtc::scoped_refptr<PinnedNV12Buffer> Create(
+      std::shared_ptr<PinnedPool> pool, int width, int height) {
+    void* block = pool->Take();
+    if (!block) return nullptr;
+    return webrtc::make_ref_counted<PinnedNV12Buffer>(std::move(pool), block,
+                                                      width, height);
+  }
+  PinnedNV12Buffer(std::shared_ptr<PinnedPool> pool, void* block, int width,
+                   int height)
+      : pool_(std::move(pool)),
+        block_(static_cast<uint8_t*>(block)),
+        width_(width),
+        height_(height) {}
+  ~PinnedNV12Buffer() override { pool_->Give(block_); }
+
+  static size_t BytesFor(int width, int height) {
+    const size_t stride = static_cast<size_t>((width + 1) & ~1);
+    return stride * height + stride * ((height + 1) / 2);
+  }
+
+  int width() const override { return width_; }
+  int height() const override { return height_; }
+  int StrideY() const override { return (width_ + 1) & ~1; }
+  int StrideUV() const override { return (width_ + 1) & ~1; }
+  const uint8_t* DataY() const override { return block_; }
+  const uint8_t* DataUV() const override {
+    return block_ + static_cast<size_t>(StrideY()) * height_;
+  }
+  uint8_t* MutableDataY() { return block_; }
+  uint8_t* MutableDataUV() {
+    return block_ + static_cast<size_t>(StrideY()) * height_;
+  }
+  webrtc::scoped_refptr<webrtc::I420BufferInterface> ToI420() override {
+    auto i420 = webrtc::I420Buffer::Create(width_, height_);
+    libyuv::NV12ToI420(DataY(), StrideY(), DataUV(), StrideUV(),
+                       i420->MutableDataY(), i420->StrideY(),
+                       i420->MutableDataU(), i420->StrideU(),
+                       i420->MutableDataV(), i420->StrideV(), width_, height_);
+    return i420;
+  }
+
+ private:
+  std::shared_ptr<PinnedPool> pool_;
+  uint8_t* const block_;
+  const int width_;
+  const int height_;
 };
 
 void SetWhy(std::string* why, std::string reason) {
@@ -206,6 +311,11 @@ class NvdecVideoDecoder : public webrtc::VideoDecoder {
       lock_ = nullptr;
     }
     buffer_pool_.Release();
+    if (rgb_device_) {
+      lib_->cu->cuMemFree(rgb_device_);
+      rgb_device_ = 0;
+      rgb_bytes_ = 0;
+    }
     return WEBRTC_VIDEO_CODEC_OK;
   }
 
@@ -420,15 +530,38 @@ class NvdecVideoDecoder : public webrtc::VideoDecoder {
       failed_ = true;
       return 0;
     }
-    webrtc::scoped_refptr<webrtc::NV12Buffer> out;
-    {
-      DECODE_TIMING("nvdec.pool_alloc");
-      out = buffer_pool_.CreateNV12Buffer(width_, height_);
-    }
-    bool copied;
-    {
-      DECODE_TIMING("nvdec.copy_total");
-      copied = out && Copy(frame, pitch, out.get());
+    webrtc::scoped_refptr<webrtc::VideoFrameBuffer> out;
+    bool copied = false;
+    if (lib_->nv12_to_rgb) {
+      out = ToRgb(frame, pitch);
+      copied = out != nullptr;
+    } else if (reactor_frame_pixels::EnvOn("REACTOR_EXP_PINNED") &&
+               lib_->cuMemAllocHost) {
+      webrtc::scoped_refptr<PinnedNV12Buffer> pinned;
+      {
+        DECODE_TIMING("nvdec.pool_alloc");
+        pinned = PinnedNV12Buffer::Create(
+            PoolFor(nv12_pool_, PinnedNV12Buffer::BytesFor(width_, height_)),
+            width_, height_);
+      }
+      if (pinned) {
+        DECODE_TIMING("nvdec.copy_total");
+        copied = Copy(frame, pitch, pinned->MutableDataY(), pinned->StrideY(),
+                      pinned->MutableDataUV(), pinned->StrideUV());
+      }
+      out = pinned;
+    } else {
+      webrtc::scoped_refptr<webrtc::NV12Buffer> nv12;
+      {
+        DECODE_TIMING("nvdec.pool_alloc");
+        nv12 = buffer_pool_.CreateNV12Buffer(width_, height_);
+      }
+      if (nv12) {
+        DECODE_TIMING("nvdec.copy_total");
+        copied = Copy(frame, pitch, nv12->MutableDataY(), nv12->StrideY(),
+                      nv12->MutableDataUV(), nv12->StrideUV());
+      }
+      out = nv12;
     }
     {
       DECODE_TIMING("nvdec.unmap");
@@ -453,16 +586,80 @@ class NvdecVideoDecoder : public webrtc::VideoDecoder {
     return 1;
   }
 
-  // The mapped surface's luma and interleaved chroma planes into `out`.
-  bool Copy(CUdeviceptr frame, unsigned int pitch, webrtc::NV12Buffer* out) {
+  // The pool of `slot` when its blocks hold `bytes`, made anew otherwise.
+  std::shared_ptr<PinnedPool> PoolFor(std::shared_ptr<PinnedPool>& slot,
+                                      size_t bytes) {
+    if (!slot || slot->block_size() != bytes)
+      slot = std::make_shared<PinnedPool>(lib_, bytes);
+    return slot;
+  }
+
+  // Experiment: the mapped surface converted to RGB on the GPU and copied to
+  // a page-locked block (pageable memory when none is available).
+  webrtc::scoped_refptr<webrtc::VideoFrameBuffer> ToRgb(CUdeviceptr frame,
+                                                        unsigned int pitch) {
+    const size_t rgb_stride = static_cast<size_t>(width_) * 3;
+    const size_t bytes = rgb_stride * height_;
+    if (rgb_bytes_ != bytes) {
+      if (rgb_device_) lib_->cu->cuMemFree(rgb_device_);
+      rgb_device_ = 0;
+      rgb_bytes_ = 0;
+      if (lib_->cu->cuMemAlloc(&rgb_device_, bytes) != CUDA_SUCCESS) {
+        rgb_device_ = 0;
+        return nullptr;
+      }
+      rgb_bytes_ = bytes;
+    }
+    {
+      DECODE_TIMING("nvdec.rgb_kernel");
+      CUdeviceptr uv = frame + static_cast<CUdeviceptr>(pitch) * surface_height_;
+      unsigned int y_pitch = pitch, uv_pitch = pitch,
+                   out_pitch = static_cast<unsigned int>(rgb_stride);
+      int w = width_, h = height_;
+      void* args[] = {&frame, &y_pitch, &uv, &uv_pitch, &rgb_device_,
+                      &out_pitch, &w, &h};
+      const unsigned int bx = 32, by = 8;
+      if (lib_->cu->cuLaunchKernel(lib_->nv12_to_rgb, (w + bx - 1) / bx,
+                                   (h + by - 1) / by, 1, bx, by, 1, 0, nullptr,
+                                   args, nullptr) != CUDA_SUCCESS) {
+        return nullptr;
+      }
+    }
+    std::shared_ptr<PinnedPool> pool = PoolFor(rgb_pool_, bytes);
+    void* block = pool->Take();
+    std::function<void()> release;
+    if (block) {
+      release = [pool, block] { pool->Give(block); };
+    } else {
+      block = std::malloc(bytes);
+      if (!block) return nullptr;
+      release = [block] { std::free(block); };
+    }
+    {
+      // On the default stream, so it starts once the kernel is done.
+      DECODE_TIMING("nvdec.rgb_copy_d2h");
+      if (lib_->cu->cuMemcpyDtoH(block, rgb_device_, bytes) != CUDA_SUCCESS) {
+        release();
+        return nullptr;
+      }
+    }
+    return webrtc::make_ref_counted<reactor_frame_pixels::RgbFrameBuffer>(
+        width_, height_, static_cast<const uint8_t*>(block),
+        static_cast<int>(rgb_stride), std::move(release));
+  }
+
+  // The mapped surface's luma and interleaved chroma planes into the given
+  // host planes.
+  bool Copy(CUdeviceptr frame, unsigned int pitch, uint8_t* dst_y,
+            int stride_y, uint8_t* dst_uv, int stride_uv) {
     CUDA_MEMCPY2D copy;
     memset(&copy, 0, sizeof(copy));
     copy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
     copy.srcDevice = frame;
     copy.srcPitch = pitch;
     copy.dstMemoryType = CU_MEMORYTYPE_HOST;
-    copy.dstHost = out->MutableDataY();
-    copy.dstPitch = out->StrideY();
+    copy.dstHost = dst_y;
+    copy.dstPitch = stride_y;
     copy.WidthInBytes = width_;
     copy.Height = height_;
     {
@@ -472,10 +669,10 @@ class NvdecVideoDecoder : public webrtc::VideoDecoder {
 
     // Chroma follows the luma of the whole output surface.
     copy.srcDevice = frame + static_cast<CUdeviceptr>(pitch) * surface_height_;
-    copy.dstHost = out->MutableDataUV();
-    copy.dstPitch = out->StrideUV();
-    copy.WidthInBytes = 2 * out->ChromaWidth();
-    copy.Height = out->ChromaHeight();
+    copy.dstHost = dst_uv;
+    copy.dstPitch = stride_uv;
+    copy.WidthInBytes = 2 * ((width_ + 1) / 2);
+    copy.Height = (height_ + 1) / 2;
     DECODE_TIMING("nvdec.copy_uv");
     return lib_->cu->cuMemcpy2D(&copy) == CUDA_SUCCESS;
   }
@@ -486,6 +683,12 @@ class NvdecVideoDecoder : public webrtc::VideoDecoder {
   // The decoded pictures' buffers, reused once their consumers drop them.
   webrtc::VideoFrameBufferPool buffer_pool_{/*zero_initialize=*/false,
                                             kMaxBuffers};
+  // Experiment: page-locked pools for NV12 (REACTOR_EXP_PINNED) and RGB
+  // (REACTOR_EXP_GPU_RGB) pictures, and the kernel's device output.
+  std::shared_ptr<PinnedPool> nv12_pool_;
+  std::shared_ptr<PinnedPool> rgb_pool_;
+  CUdeviceptr rgb_device_ = 0;
+  size_t rgb_bytes_ = 0;
   CUvideoctxlock lock_ = nullptr;
   CUvideoparser parser_ = nullptr;
   CUvideodecoder decoder_ = nullptr;
@@ -574,6 +777,19 @@ std::shared_ptr<NvdecLibrary> OpenNvdec(int device, std::string* why) {
     lib->vp8 = AskDecodes(*lib, cudaVideoCodec_VP8);
     lib->vp9 = AskDecodes(*lib, cudaVideoCodec_VP9);
     lib->av1 = AskDecodes(*lib, cudaVideoCodec_AV1);
+    lib->cuMemAllocHost = reinterpret_cast<CUresult (*)(void**, size_t)>(
+        FFNV_SYM_FUNC(lib->cu->lib, "cuMemAllocHost_v2"));
+    lib->cuMemFreeHost = reinterpret_cast<CUresult (*)(void*)>(
+        FFNV_SYM_FUNC(lib->cu->lib, "cuMemFreeHost"));
+    if (reactor_frame_pixels::EnvOn("REACTOR_EXP_GPU_RGB")) {
+      if (lib->cu->cuModuleLoadData(&lib->rgb_module, kNv12ToRgbPtx) !=
+              CUDA_SUCCESS ||
+          lib->cu->cuModuleGetFunction(&lib->nv12_to_rgb, lib->rgb_module,
+                                       "nv12_to_rgb24") != CUDA_SUCCESS) {
+        fprintf(stderr, "[nvdec-exp] the NV12 to RGB kernel did not load\n");
+        lib->nv12_to_rgb = nullptr;
+      }
+    }
   }
   if (!lib->h264.decodes && !lib->vp8.decodes && !lib->vp9.decodes &&
       !lib->av1.decodes) {

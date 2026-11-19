@@ -195,6 +195,73 @@ impl VideoDecoder {
     }
 }
 
+impl VideoDecoder {
+    /// Experiment: [`decode`](Self::decode), writing the picture to the
+    /// buffer `alloc(width, height, bytes)` returns instead of a `Vec`, so it
+    /// is converted once, in place. `alloc` returning null fails the call.
+    /// `Ok(Some((width, height)))` once the buffer holds the picture.
+    pub fn decode_into(
+        &mut self,
+        data: &[u8],
+        format: PixelFormat,
+        alloc: &mut dyn FnMut(u32, u32, usize) -> *mut u8,
+    ) -> Result<Option<(u32, u32)>, CodecError> {
+        unsafe extern "C" fn tramp(
+            ud: *mut std::os::raw::c_void,
+            width: i32,
+            height: i32,
+            bytes: usize,
+        ) -> *mut u8 {
+            let alloc = unsafe { &mut *(ud as *mut &mut dyn FnMut(u32, u32, usize) -> *mut u8) };
+            alloc(width.max(0) as u32, height.max(0) as u32, bytes)
+        }
+        if data.is_empty() {
+            return Err(CodecError::InvalidInput("empty frame".into()));
+        }
+        let key_frame = is_key_frame(self.codec, data);
+        if self.needs_key_frame && !key_frame {
+            return Err(CodecError::NeedKeyFrame);
+        }
+        let mut alloc = alloc;
+        let (mut width, mut height) = (0i32, 0i32);
+        let mut err = ErrorBuffer::new();
+        let rc = unsafe {
+            reactor_webrtc_sys::reactor_webrtc_video_decoder_decode_into(
+                self.raw,
+                data.as_ptr(),
+                data.len(),
+                key_frame as i32,
+                format.raw(),
+                tramp,
+                &mut alloc as *mut &mut dyn FnMut(u32, u32, usize) -> *mut u8
+                    as *mut std::os::raw::c_void,
+                &mut width,
+                &mut height,
+                err.ptr(),
+                err.cap(),
+            )
+        };
+        match rc {
+            1 => {
+                if key_frame {
+                    self.needs_key_frame = false;
+                }
+                Ok(Some((width.max(0) as u32, height.max(0) as u32)))
+            }
+            0 => {
+                if key_frame {
+                    self.needs_key_frame = false;
+                }
+                Ok(None)
+            }
+            _ => {
+                self.needs_key_frame = true;
+                Err(CodecError::Backend(err.message("decode")))
+            }
+        }
+    }
+}
+
 impl Drop for VideoDecoder {
     fn drop(&mut self) {
         unsafe { reactor_webrtc_sys::reactor_webrtc_video_decoder_destroy(self.raw) }
