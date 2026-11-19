@@ -152,3 +152,42 @@ async def test_a_peer_connection_decodes_on_nvdec(
 
     assert inbound is not None and inbound.frames_decoded >= 30, "too few frames decoded"
     assert inbound.decoder_implementation == "NVDEC", inbound.decoder_implementation
+
+
+@pytest.mark.parametrize("codec", [rw.VideoCodec.Vp9, rw.VideoCodec.Av1], ids=ids)
+async def test_a_stream_too_small_for_nvdec_decodes_in_software(
+    factory, codecs: rw.VideoCodecs, codec: rw.VideoCodec
+) -> None:
+    # NVDEC decodes VP9 and AV1 from 128x128 up: a smaller stream, as
+    # libwebrtc sends under low bandwidth, falls back to the software decoder
+    # and keeps decoding.
+    require_nvdec(codecs, codec)
+    received: list = []  # keeps the Track alive: dropping it removes the sink
+
+    def on_track(kind, track):
+        if kind == rw.MediaKind.Video:
+            received.append(track)
+            track.on_video_frame(lambda *_: None)
+
+    sender = make_peer(factory)
+    receiver = make_peer(factory, on_track=on_track)
+    video = factory.create_video_track(f"nvdec-small-{ids(codec)}")
+    transceiver = sender.pc.add_transceiver(rw.MediaKind.Video, rw.TransceiverDirection.SendOnly)
+    await transceiver.set_codec_preferences([codec])
+    await transceiver.set_track(video)
+    assert await connect(sender, receiver), "peers did not connect within timeout"
+
+    inbound = None
+    for i in range(300):
+        video.push_video_frame(bytes([(i * 7) % 256]) * (96 * 96 * 4), 96, 96)
+        await asyncio.sleep(0.033)
+        if i % 15 == 0:
+            stats = await receiver.pc.get_stats()
+            inbound = next((s for s in stats.inbound_rtp if s.kind == rw.StreamKind.Video), None)
+            if inbound is not None and inbound.frames_decoded >= 30:
+                break
+
+    assert inbound is not None and inbound.frames_decoded >= 30, "too few frames decoded"
+    assert "fallback from: NVDEC" in inbound.decoder_implementation, (
+        inbound.decoder_implementation
+    )

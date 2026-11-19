@@ -84,6 +84,7 @@
 #include "api/video_codecs/video_codec.h"
 #include "api/video_codecs/video_decoder.h"
 #include "api/video_codecs/video_decoder_factory.h"
+#include "api/video_codecs/video_decoder_software_fallback_wrapper.h"
 #include "api/video_codecs/video_encoder.h"
 #include "api/video_codecs/video_encoder_factory.h"
 #if defined(WEBRTC_MAC)
@@ -3056,16 +3057,33 @@ class ReactorCompositeVideoDecoderFactory : public webrtc::VideoDecoderFactory {
       const webrtc::Environment& env,
       const webrtc::SdpVideoFormat& format) override {
     // Hardware first: NVDEC where the factory was asked for it and its GPU
-    // decodes the format (it lists only those), then the other decoders.
+    // decodes the format (it lists only those), then the other decoders. NVDEC
+    // falls back to the software decoder of the format on a stream it does
+    // not decode (a size, bit depth or decoder the GPU does not have).
+    std::unique_ptr<webrtc::VideoDecoder> software = CreateSoftware(env, format);
     if (nvdec_ && HasFormat(nvdec_->GetSupportedFormats(), format)) {
-      if (auto decoder = nvdec_->Create(env, format)) return decoder;
+      if (auto decoder = nvdec_->Create(env, format)) {
+        if (!software) return decoder;
+        return webrtc::CreateVideoDecoderSoftwareFallbackWrapper(
+            env, std::move(software), std::move(decoder));
+      }
     }
+    if (software) return software;
+    return std::make_unique<ReactorNullVideoDecoder>("ReactorNull_" + format.name);
+  }
+
+ private:
+  // The software (or, for H264 on Apple, VideoToolbox) decoder of `format`;
+  // null when there is none.
+  std::unique_ptr<webrtc::VideoDecoder> CreateSoftware(
+      const webrtc::Environment& env,
+      const webrtc::SdpVideoFormat& format) {
     if (IsBuiltinCodec(format)) return builtin_->Create(env, format);
     if (format.name == "H264") {
       if (openh264_) return openh264_->Create(env, format);
       if (apple_h264_) return apple_h264_->Create(env, format);
     }
-    return std::make_unique<ReactorNullVideoDecoder>("ReactorNull_" + format.name);
+    return nullptr;
   }
 };
 
@@ -4252,15 +4270,21 @@ extern "C" {
 // load, or one given to a build without OpenH264, fails the create. Nonzero
 // `use_nvdec` adds NVDEC as the hardware decoder of each of H264, VP8, VP9
 // and AV1 the first visible NVIDIA GPU decodes (Linux); a codec it does not
-// decode is left out, which the capabilities show. VP8, VP9 and AV1 run on libwebrtc's builtin software
-// codecs, in each direction the library was built with.
+// decode is left out, which the capabilities show. VP8, VP9 and AV1 run on
+// libwebrtc's builtin software codecs, in each direction the library was
+// built with.
 void* reactor_webrtc_codec_context_create(const char* openh264_lib_path,
                                           int use_nvdec, char* err,
                                           int err_cap) {
   auto ctx = std::make_shared<StandaloneCodecContext>();
 #ifdef REACTOR_WEBRTC_NVDEC
   if (use_nvdec) {
-    if (auto lib = reactor::OpenNvdec(/*device=*/0, nullptr)) {
+    std::string why;
+    auto lib = reactor::OpenNvdec(/*device=*/0, &why);
+    if (!lib) {
+      RTC_LOG(LS_INFO) << "NVDEC is not available to the standalone codecs: "
+                       << why;
+    } else {
       // One factory, an entry per codec the GPU decodes: hardware decoders,
       // ahead of the software ones added below.
       std::shared_ptr<webrtc::VideoDecoderFactory> decoders =

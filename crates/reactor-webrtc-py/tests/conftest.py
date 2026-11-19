@@ -20,6 +20,7 @@ def factory() -> rw.PeerConnectionFactory:
     two concurrent factory instances, which is equally unsafe.
     """
     builder = rw.PeerConnectionFactoryBuilder()
-    # NVDEC decodes H.264 where an NVIDIA GPU does (a no-op elsewhere).
+    # NVDEC decodes H.264, VP8, VP9 and AV1 where an NVIDIA GPU does (a no-op
+    # elsewhere).
     builder.with_nvdec()
     return builder.build()

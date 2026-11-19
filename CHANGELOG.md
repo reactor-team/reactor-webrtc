@@ -13,8 +13,11 @@
   CUDA driver and NVDEC are loaded from the NVIDIA driver at run time through
   the vendored, MIT-licensed `nv-codec-headers` loader, so nothing is linked
   and no NVIDIA toolkit is needed to build. On a machine without an NVIDIA
-  GPU, a driver or H.264 decode, or on another platform, the backend is left
-  out and video decodes as before; so does a codec the GPU does not decode.
+  GPU, a driver or decode of any of the four codecs, or on another platform,
+  the backend is left out and video decodes as before; so does a codec the
+  GPU does not decode. In a peer connection, a stream NVDEC does not decode
+  (a size outside the GPU's limits, 10-bit AV1, or no decoder left on the
+  GPU) falls back to the software decoder.
   The standalone codecs list it as the `NVDEC` hardware decoder of each codec
   it decodes. `CUDA_VISIBLE_DEVICES` picks the GPU. It decodes 8-bit 4:2:0,
   which is what WebRTC carries; it does not encode.
