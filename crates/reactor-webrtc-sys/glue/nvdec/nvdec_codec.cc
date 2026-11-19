@@ -20,6 +20,7 @@
 #define FFNV_LOG_FUNC(logctx, msg, ...) ((void)0)
 #define FFNV_DEBUG_LOG_FUNC(logctx, msg, ...) ((void)0)
 #include "vendor/dynlink_loader.h"
+#include "../decode_timing.h"
 
 namespace reactor {
 
@@ -212,6 +213,7 @@ class NvdecVideoDecoder : public webrtc::VideoDecoder {
                  int64_t /*render_time_ms*/) override {
     if (!parser_) return WEBRTC_VIDEO_CODEC_UNINITIALIZED;
     if (input.size() == 0) return WEBRTC_VIDEO_CODEC_ERR_PARAMETER;
+    DECODE_TIMING("nvdec.Decode_total");
     ScopedContext scope(*lib_);
     if (!scope.ok()) return WEBRTC_VIDEO_CODEC_ERROR;
 
@@ -227,7 +229,11 @@ class NvdecVideoDecoder : public webrtc::VideoDecoder {
     failed_ = false;
     fallback_ = false;
     produced_ = false;
-    const CUresult parsed = lib_->cuvid->cuvidParseVideoData(parser_, &packet);
+    CUresult parsed;
+    {
+      DECODE_TIMING("nvdec.parse_total");
+      parsed = lib_->cuvid->cuvidParseVideoData(parser_, &packet);
+    }
     if (parsed != CUDA_SUCCESS || failed_ || fallback_) {
       // Start over at the next key frame: a reference lost here would corrupt
       // every frame until then. libwebrtc asks the sender for one on error.
@@ -370,6 +376,7 @@ class NvdecVideoDecoder : public webrtc::VideoDecoder {
   }
 
   int HandleDecode(CUVIDPICPARAMS* picture) {
+    DECODE_TIMING("nvdec.decode_picture");
     if (!decoder_ ||
         lib_->cuvid->cuvidDecodePicture(decoder_, picture) != CUDA_SUCCESS) {
       failed_ = true;
@@ -384,6 +391,7 @@ class NvdecVideoDecoder : public webrtc::VideoDecoder {
       failed_ = true;
       return 0;
     }
+    DECODE_TIMING("nvdec.display_total");
     CUVIDGETDECODESTATUS status;
     memset(&status, 0, sizeof(status));
     if (lib_->cuvid->cuvidGetDecodeStatus &&
@@ -402,15 +410,30 @@ class NvdecVideoDecoder : public webrtc::VideoDecoder {
     proc.second_field = display->repeat_first_field + 1;
     CUdeviceptr frame = 0;
     unsigned int pitch = 0;
-    if (lib_->cuvid->cuvidMapVideoFrame(decoder_, display->picture_index, &frame,
-                                        &pitch, &proc) != CUDA_SUCCESS) {
+    CUresult mapped;
+    {
+      DECODE_TIMING("nvdec.map");
+      mapped = lib_->cuvid->cuvidMapVideoFrame(decoder_, display->picture_index,
+                                               &frame, &pitch, &proc);
+    }
+    if (mapped != CUDA_SUCCESS) {
       failed_ = true;
       return 0;
     }
-    webrtc::scoped_refptr<webrtc::NV12Buffer> out =
-        buffer_pool_.CreateNV12Buffer(width_, height_);
-    const bool copied = out && Copy(frame, pitch, out.get());
-    lib_->cuvid->cuvidUnmapVideoFrame(decoder_, frame);
+    webrtc::scoped_refptr<webrtc::NV12Buffer> out;
+    {
+      DECODE_TIMING("nvdec.pool_alloc");
+      out = buffer_pool_.CreateNV12Buffer(width_, height_);
+    }
+    bool copied;
+    {
+      DECODE_TIMING("nvdec.copy_total");
+      copied = out && Copy(frame, pitch, out.get());
+    }
+    {
+      DECODE_TIMING("nvdec.unmap");
+      lib_->cuvid->cuvidUnmapVideoFrame(decoder_, frame);
+    }
     if (!copied) {
       failed_ = true;
       return 0;
@@ -423,6 +446,7 @@ class NvdecVideoDecoder : public webrtc::VideoDecoder {
               .set_rtp_timestamp(static_cast<uint32_t>(display->timestamp))
               .set_timestamp_us(0)
               .build();
+      DECODE_TIMING("nvdec.callback");
       callback_->Decoded(decoded);
     }
     produced_ = true;
@@ -441,7 +465,10 @@ class NvdecVideoDecoder : public webrtc::VideoDecoder {
     copy.dstPitch = out->StrideY();
     copy.WidthInBytes = width_;
     copy.Height = height_;
-    if (lib_->cu->cuMemcpy2D(&copy) != CUDA_SUCCESS) return false;
+    {
+      DECODE_TIMING("nvdec.copy_y");
+      if (lib_->cu->cuMemcpy2D(&copy) != CUDA_SUCCESS) return false;
+    }
 
     // Chroma follows the luma of the whole output surface.
     copy.srcDevice = frame + static_cast<CUdeviceptr>(pitch) * surface_height_;
@@ -449,6 +476,7 @@ class NvdecVideoDecoder : public webrtc::VideoDecoder {
     copy.dstPitch = out->StrideUV();
     copy.WidthInBytes = 2 * out->ChromaWidth();
     copy.Height = out->ChromaHeight();
+    DECODE_TIMING("nvdec.copy_uv");
     return lib_->cu->cuMemcpy2D(&copy) == CUDA_SUCCESS;
   }
 

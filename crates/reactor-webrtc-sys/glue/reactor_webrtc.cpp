@@ -39,6 +39,7 @@
 
 #include <limits>
 
+#include "decode_timing.h"
 #include "api/stats/rtc_stats_collector_callback.h"
 #include "api/stats/rtc_stats_report.h"
 #include "api/stats/rtcstats_objects.h"
@@ -4133,6 +4134,7 @@ class StandaloneVideoDecoder : public webrtc::DecodedImageCallback {
   // (in `why`).
   int Decode(const uint8_t* data, size_t len, bool key_frame, int pixel_format,
              ReactorCodecDecodedFrame* out, std::string* why) {
+    DECODE_TIMING("codec.Decode_total");
     if (!decoder_) {
       *why = "decoder is closed";
       return -1;
@@ -4156,7 +4158,10 @@ class StandaloneVideoDecoder : public webrtc::DecodedImageCallback {
       decoded_.reset();
     }
     int32_t rc = 0;
-    InAutoreleasePool([&] { rc = decoder_->Decode(image, /*render_time_ms=*/0); });
+    {
+      DECODE_TIMING("codec.decoder_Decode");
+      InAutoreleasePool([&] { rc = decoder_->Decode(image, /*render_time_ms=*/0); });
+    }
     std::optional<webrtc::VideoFrame> frame;
     {
       std::unique_lock<std::mutex> lock(mu_);
@@ -4182,13 +4187,20 @@ class StandaloneVideoDecoder : public webrtc::DecodedImageCallback {
     if (!frame) return 0;
     bool converted = false;
     InAutoreleasePool([&] {
-      webrtc::scoped_refptr<webrtc::I420BufferInterface> i420 =
-          frame->video_frame_buffer()->ToI420();
+      webrtc::scoped_refptr<webrtc::I420BufferInterface> i420;
+      {
+        DECODE_TIMING("codec.to_i420");
+        i420 = frame->video_frame_buffer()->ToI420();
+      }
       frame.reset();
       if (!i420) return;
       const int w = i420->width(), h = i420->height();
       if (pixel_format == kPixelFormatRgb24) {
-        pixels_.resize(static_cast<size_t>(w) * h * 3);
+        {
+          DECODE_TIMING("codec.resize_rgb");
+          pixels_.resize(static_cast<size_t>(w) * h * 3);
+        }
+        DECODE_TIMING("codec.i420_to_rgb");
         libyuv::I420ToRAW(i420->DataY(), i420->StrideY(), i420->DataU(),
                           i420->StrideU(), i420->DataV(), i420->StrideV(),
                           pixels_.data(), w * 3, w, h);
