@@ -99,6 +99,15 @@ built from source, and no libwebrtc patch changed.
   The standalone codecs list it as the `NVDEC` hardware decoder of each codec
   it decodes. `CUDA_VISIBLE_DEVICES` picks the GPU. It decodes 8-bit 4:2:0,
   which is what WebRTC carries; it does not encode.
+- **tvOS as a build target** (arm64 device, tvOS 17+): `webrtc-build/build.sh
+  tvos arm64` builds libwebrtc for it and `reactor-webrtc-sys` links it for
+  `aarch64-apple-tvos`. No tvOS prebuilt is published yet, so a tvOS build
+  takes a local one through `REACTOR_WEBRTC_LIB_DIR`.
+
+### Changed
+
+- The prebuilt tag becomes `webrtc-7907-a5ddff60-p15`, for patch 0013. The
+  patch changes the build graph on tvOS only.
 
 ### Changed
 
