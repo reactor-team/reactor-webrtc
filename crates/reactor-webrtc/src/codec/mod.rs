@@ -124,10 +124,14 @@ pub use encoder::{EncodedFrame, VideoEncoder, VideoEncoderConfig};
 #[non_exhaustive]
 pub enum Backend {
     /// The hardware backend when there is one that accepts the settings, a
-    /// software one otherwise.
+    /// software one otherwise. A hardware decoder falls back to the codec's
+    /// software decoder, from that frame on, on a stream the hardware does
+    /// not decode (NVDEC below its minimum size, or a bit depth it does not
+    /// take); it keeps reporting the hardware backend's name.
     #[default]
     Auto,
-    /// Hardware only: creation fails when no hardware backend accepts them.
+    /// Hardware only: creation fails when no hardware backend accepts them,
+    /// and a decoder fails on a stream the hardware does not decode.
     Hardware,
     /// Software only.
     Software,

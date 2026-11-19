@@ -272,3 +272,40 @@ async def test_a_peer_connection_hands_nvdec_pictures_to_the_sink(
     r, g, b = pixels[-1]
     # Through an encoder and back, red stays far from the other two channels.
     assert r > 200 and g < 60 and b < 60, (r, g, b)
+
+
+@pytest.mark.parametrize("codec", [rw.VideoCodec.Vp9, rw.VideoCodec.Av1], ids=ids)
+def test_a_standalone_stream_too_small_for_nvdec_decodes_in_software(
+    codecs: rw.VideoCodecs, codec: rw.VideoCodec
+) -> None:
+    # NVDEC decodes VP9 and AV1 from 128x128 up. On Auto, a smaller stream
+    # falls back to the codec's software decoder, as a peer connection's does,
+    # and every frame decodes; the decoder keeps NVDEC's name.
+    require_nvdec(codecs, codec)
+    size = 96
+    encoder = codecs.encoder(codec, size, size, bitrate_bps=500_000, framerate=30.0)
+    decoder = codecs.decoder(codec)
+    assert decoder.implementation == "NVDEC"
+    for i in range(10):
+        src = np.ascontiguousarray(frame(i)[:size, :size])
+        encoded = encoder.encode(src, i * FRAME_US)
+        assert encoded is not None
+        picture = decoder.decode(encoded.data)
+        assert picture is not None, f"frame {i} gave no picture"
+        assert picture.shape == (size, size, 3)
+        assert psnr(src, picture) >= MIN_PSNR_DB, f"frame {i}: {psnr(src, picture):.1f} dB"
+
+
+@pytest.mark.parametrize("codec", [rw.VideoCodec.Vp9, rw.VideoCodec.Av1], ids=ids)
+def test_a_hardware_only_decoder_refuses_a_stream_too_small_for_nvdec(
+    codecs: rw.VideoCodecs, codec: rw.VideoCodec
+) -> None:
+    # Asking for hardware only leaves nothing to fall back to.
+    require_nvdec(codecs, codec)
+    size = 96
+    encoder = codecs.encoder(codec, size, size, bitrate_bps=500_000, framerate=30.0)
+    decoder = codecs.decoder(codec, backend=rw.CodecBackend.Hardware)
+    encoded = encoder.encode(np.ascontiguousarray(frame(0)[:size, :size]), 0)
+    assert encoded is not None
+    with pytest.raises(rw.CodecError):
+        decoder.decode(encoded.data)

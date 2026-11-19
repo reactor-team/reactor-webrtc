@@ -1228,9 +1228,14 @@ class CodecBackend:
     """Which backends a codec may be created on."""
 
     Auto: CodecBackend
-    """Hardware when a hardware backend accepts the settings, software otherwise."""
+    """Hardware when a hardware backend accepts the settings, software otherwise.
+    A hardware decoder falls back to the codec's software decoder, from that
+    frame on, on a stream the hardware does not decode (NVDEC below its minimum
+    size, or a bit depth it does not take); its `implementation` stays the
+    hardware backend's."""
     Hardware: CodecBackend
-    """Hardware only: creation raises `CodecUnsupported` without one."""
+    """Hardware only: creation raises `CodecUnsupported` without one, and a
+    decoder raises `CodecError` on a stream the hardware does not decode."""
     Software: CodecBackend
     """Software only."""
 
