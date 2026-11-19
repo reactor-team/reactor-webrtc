@@ -1,4 +1,7 @@
 [toolchain]
 channel = "1.97.1"
 components = ["rustfmt", "clippy"]
-targets = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
+# aarch64-apple-tvos ships a prebuilt std on this channel (`rustup target add`
+# needs no -Zbuild-std). No libwebrtc prebuilt is published for it yet: link a
+# local build with REACTOR_WEBRTC_LIB_DIR.
+targets = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin", "aarch64-apple-tvos"]
