@@ -106,8 +106,9 @@ built from source, and no libwebrtc patch changed.
 
 ### Changed
 
-- The prebuilt tag becomes `webrtc-7907-a5ddff60-p15`, for patch 0013. The
-  patch changes the build graph on tvOS only.
+- The prebuilt tag becomes `webrtc-7907-a5ddff60-p15`, for patches 0013 and
+  0014. 0013 changes the build graph on tvOS only. 0014 lets the Windows
+  build compile with Visual Studio 18.12 and changes no behavior.
 
 ### Changed
 

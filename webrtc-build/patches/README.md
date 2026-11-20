@@ -567,6 +567,46 @@ the patch changes nothing: the dep is still there.
 
 ---
 
+### 0014 — build `rtp_config.cc` with the Visual Studio 18.12 standard library
+
+`0014-rtp-config-emplace-rtx-value.patch` · touches `call/rtp_config.cc`
+(+5 lines)
+
+**What.** `RtpConfig::GetStreamConfig` fills `RtpStreamConfig::rtx` with
+`emplace(RtpStreamConfig::Rtx())` instead of `emplace()`. The value is the
+same: a default `Rtx`.
+
+**Why.** The Windows build stopped compiling when the `windows-2025-vs2026`
+runner image went from Visual Studio 18.11 to 18.12 (image 20261103 built,
+image 20261116 does not), with no change on our side:
+
+```
+call/rtp_config.cc(254,49): error: no matching member function for call to 'emplace'
+optional(408,23): note: candidate template ignored: requirement
+  'is_constructible_v<webrtc::RtpStreamConfig::Rtx>' was not satisfied [with _Types = <>]
+```
+
+`Rtx` is nested in `RtpStreamConfig`, has default member initializers, and is
+used as `std::optional<Rtx>` inside `RtpStreamConfig` itself. Asked while the
+enclosing struct is still incomplete, "is `Rtx` default-constructible?" is
+answered no, because the initializers are not parsed until the enclosing struct
+ends, and that answer sticks for the rest of the file. The MSVC 14.52 standard
+library constrains `emplace()` on the answer, and the error shows it false.
+That it asks while the struct is incomplete is inferred, not read from its
+headers: clang gives the same `false` in a small model that asks there. The
+libc++ and libstdc++ targets build the original line. Upstream `main` has the
+same code.
+
+**How it works.** `emplace(Rtx())` builds the default `Rtx` in the function
+body, where the struct is complete, and asks the library only for
+move-construction, which does not depend on the initializers.
+
+**Verify.** The `win-x64` job of `webrtc-build.yml` compiles
+`obj/call/rtp_interfaces/rtp_config.obj`. Drop this patch once upstream changes
+the line or the pinned milestone moves past it.
+
+---
+
 ## Planned (not yet authored — need their target builds to validate)
 
 - **Symbol isolation** — keep WebRTC's C++ symbols from clashing when a consumer
