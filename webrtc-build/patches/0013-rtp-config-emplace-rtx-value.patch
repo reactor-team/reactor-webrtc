@@ -1,0 +1,18 @@
+diff --git a/call/rtp_config.cc b/call/rtp_config.cc
+index 560ec099d6..f9385bb02f 100644
+--- a/call/rtp_config.cc
++++ b/call/rtp_config.cc
+@@ -251,7 +251,12 @@ RtpStreamConfig RtpConfig::GetStreamConfig(size_t index) const {
+   stream_config.raw_payload = raw_payload;
+   if (!rtx.ssrcs.empty()) {
+     RTC_DCHECK_EQ(ssrcs.size(), rtx.ssrcs.size());
+-    auto& stream_config_rtx = stream_config.rtx.emplace();
++    // Reactor: emplace a value, not emplace(). RtpStreamConfig holds an
++    // optional<Rtx> while it is still incomplete, and Rtx has default member
++    // initializers, so is_constructible_v<Rtx> is false. The MSVC STL shipped
++    // with Visual Studio 18.12 constrains emplace() on it.
++    auto& stream_config_rtx =
++        stream_config.rtx.emplace(RtpStreamConfig::Rtx());
+     stream_config_rtx.ssrc = rtx.ssrcs[index];
+     stream_config_rtx.payload_type = rtx.payload_type;
+   }
