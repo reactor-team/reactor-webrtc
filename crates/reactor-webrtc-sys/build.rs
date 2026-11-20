@@ -96,6 +96,18 @@ fn main() {
             link(&dir);
             return;
         }
+        if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("tvos") {
+            // No release has published a tvOS archive yet, so this is the
+            // expected outcome rather than a release still on its way.
+            println!(
+                "cargo:warning=reactor-webrtc-sys: no tvOS libwebrtc prebuilt is published \
+                 ({tag}/{asset} not found). Build one with webrtc-build \
+                 (`build.sh tvos arm64`) and set REACTOR_WEBRTC_LIB_DIR to its staged \
+                 dir (lib/libwebrtc.a + include/). Building API/check only — linking \
+                 will fail with undefined reactor_webrtc_* symbols."
+            );
+            return;
+        }
         println!(
             "cargo:warning=reactor-webrtc-sys: checksum for {tag}/{sha_asset} not \
              reachable (release not yet published?). \
@@ -226,7 +238,10 @@ fn compile_glue(include_dir: &Path, is_debug_prebuilt: bool, relative_vtables: b
                 .define("WEBRTC_MAC", None);
             compile_apple_hw_glue(include_dir, is_debug_prebuilt, &[]);
         }
-        "ios" => {
+        // gn builds tvOS as target_os="ios" with target_platform="tvos", so the
+        // archive carries the iOS defines; the headers find tvOS on their own
+        // (TARGET_OS_TV → build_config.h's IS_IOS_TVOS).
+        "ios" | "tvos" => {
             build
                 .define("WEBRTC_POSIX", None)
                 .define("WEBRTC_MAC", None)
@@ -288,6 +303,24 @@ fn compile_glue(include_dir: &Path, is_debug_prebuilt: bool, relative_vtables: b
     // std::__Cr::*. mac/ios use the platform libc++ (clang default) and windows
     // uses the MSVC STL — both already match their glue toolchain.
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+
+    // cc compiles the glue for TVOS_DEPLOYMENT_TARGET or, when that is unset,
+    // for the SDK's own version (e.g. 27.2 with Xcode 27.2), which is newer
+    // than the devices most apps support; the glue's libc++ and Objective-C
+    // calls are then free to use symbols an older tvOS lacks. As on iOS (see
+    // link_system_deps), the floor is the consumer's call, so say so rather
+    // than pick one.
+    if target_os == "tvos" {
+        println!("cargo:rerun-if-env-changed=TVOS_DEPLOYMENT_TARGET");
+        if env::var_os("TVOS_DEPLOYMENT_TARGET").is_none() {
+            println!(
+                "cargo:warning=reactor-webrtc-sys: TVOS_DEPLOYMENT_TARGET is unset, so the \
+                 C++ glue is compiled for the AppleTVOS SDK's version. Export it as the \
+                 app's deployment target (no lower than the libwebrtc archive's)."
+            );
+        }
+    }
+
     if matches!(target_os.as_str(), "linux" | "android") {
         let libcxx = include_dir.join("third_party/libc++/src/include");
         let cfg_site = include_dir.join("buildtools/third_party/libc++");
@@ -398,7 +431,13 @@ fn link_system_deps(lib_dir: &Path) {
                 println!("cargo:rustc-link-lib=framework={fw}");
             }
         }
-        "ios" => {
+        // tvOS links the same list. Every framework in it ships in the
+        // AppleTVOS SDK with an arm64-tvos stub (checked against
+        // AppleTVOS27.2.sdk); the ones tvOS lacks (AppKit, IOKit, OpenGL) are
+        // macOS-only and not listed here anyway. tvOS has no camera, but
+        // AVFoundation is still needed: the ObjC SDK's base types use it.
+        // The deployment-target note below applies with TVOS_DEPLOYMENT_TARGET.
+        "ios" | "tvos" => {
             // NOTE: `IPHONEOS_DEPLOYMENT_TARGET` is deliberately left unset here.
             // Unset, rustc stamps the output `LC_VERSION_MIN_IPHONEOS 10.0` while
             // every member of the prebuilt `libwebrtc.a` is built for 14.0, and
@@ -424,7 +463,7 @@ fn link_system_deps(lib_dir: &Path) {
                 "AVFoundation",
                 "Metal",
                 // `RTCNetworkMonitor` (the ObjC SDK's monitor, compiled in for
-                // iOS only) calls `nw_path_monitor_*` / `nw_interface_*`. Without
+                // iOS and tvOS only) calls `nw_path_monitor_*` / `nw_interface_*`. Without
                 // this, every iOS link fails with nine undefined `_nw_*` symbols.
                 // macOS does not need it: the mac prebuilt carries no
                 // `RTCNetworkMonitor.o` member and no undefined `_nw_*` symbols

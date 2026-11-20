@@ -526,6 +526,87 @@ both, 5 runs of 5 pass. The stack of the abort goes
 
 ---
 
+### 0013 — no WebRTC.framework bundle on tvOS
+
+`0013-tvos-skip-objc-framework-bundle.patch` · touches `BUILD.gn` (+4/-1 lines)
+
+**What.** The `//:webrtc` umbrella depends on `sdk:framework_objc` only when
+`target_platform != "tvos"`. iOS, and every other platform, is unchanged.
+
+**Why.** `build.sh tvos` is gn's iOS toolchain with `target_platform="tvos"`, so
+`is_ios` is true and the umbrella pulls in the `WebRTC.framework` bundle. Two of
+the targets that bundle links fail to compile against the AppleTVOS SDK:
+
+- `videocapture_objc`: `RTCCameraVideoCapturer.m` follows the device orientation
+  (`UIDeviceOrientation`, `-[UIDevice orientation]`,
+  `beginGeneratingDeviceOrientationNotifications`), all unavailable on tvOS.
+- `metal_objc`: `RTCMTLRenderer.h` declares its view as `UIView` under
+  `TARGET_OS_IOS` and `NSView` otherwise, and `TARGET_OS_IOS` is 0 on tvOS.
+
+The bundle is an `apple_framework_bundle_with_umbrella_header`, so it adds no
+object files to the `complete_static_lib` (see 0004), and neither target is
+reached any other way: `gn path //:webrtc //sdk:videocapture_objc` (and
+`//sdk:metal_objc`) only go through `sdk:framework_objc`. Dropping the dep
+therefore costs nothing in `libwebrtc.a`, and it also saves linking a tvOS
+`WebRTC` dylib nobody ships. Porting the camera capturer and the Metal view to
+tvOS would be real work (tvOS has cameras only through Continuity Camera), and
+an app that wants a renderer brings its own.
+
+**How it works.** `target_platform` is declared by
+`build/config/apple/mobile_config.gni`, which `webrtc.gni` imports for iOS; gn's
+`&&` short-circuits, so the condition never reads it on other platforms.
+
+**Verify.** `build.sh tvos arm64 release` archives `libwebrtc.a`; every member
+is `platform 3` (TVOS). The archive carries the VideoToolbox H.264 codecs
+(`RTCVideoEncoderH264.o`, `RTCVideoDecoderFactoryH264.o`, …), the ObjC↔native
+factories, `RTCNetworkMonitor.o` and the audio device (`audio_device_ios.o`,
+`voice_processing_audio_unit.o`, `RTCAudioSession.o`). Its object list is the
+iOS device build's (same commit, patches and SDK version) minus
+`RTCCameraPreviewView.o`, which upstream already leaves out of tvOS. With iOS,
+the patch changes nothing: the dep is still there.
+
+---
+
+### 0014 — build `rtp_config.cc` with the Visual Studio 18.12 standard library
+
+`0014-rtp-config-emplace-rtx-value.patch` · touches `call/rtp_config.cc`
+(+5 lines)
+
+**What.** `RtpConfig::GetStreamConfig` fills `RtpStreamConfig::rtx` with
+`emplace(RtpStreamConfig::Rtx())` instead of `emplace()`. The value is the
+same: a default `Rtx`.
+
+**Why.** The Windows build stopped compiling when the `windows-2025-vs2026`
+runner image went from Visual Studio 18.11 to 18.12 (image 20261103 built,
+image 20261116 does not), with no change on our side:
+
+```
+call/rtp_config.cc(254,49): error: no matching member function for call to 'emplace'
+optional(408,23): note: candidate template ignored: requirement
+  'is_constructible_v<webrtc::RtpStreamConfig::Rtx>' was not satisfied [with _Types = <>]
+```
+
+`Rtx` is nested in `RtpStreamConfig`, has default member initializers, and is
+used as `std::optional<Rtx>` inside `RtpStreamConfig` itself. Asked while the
+enclosing struct is still incomplete, "is `Rtx` default-constructible?" is
+answered no, because the initializers are not parsed until the enclosing struct
+ends, and that answer sticks for the rest of the file. The MSVC 14.52 standard
+library constrains `emplace()` on the answer, and the error shows it false.
+That it asks while the struct is incomplete is inferred, not read from its
+headers: clang gives the same `false` in a small model that asks there. The
+libc++ and libstdc++ targets build the original line. Upstream `main` has the
+same code.
+
+**How it works.** `emplace(Rtx())` builds the default `Rtx` in the function
+body, where the struct is complete, and asks the library only for
+move-construction, which does not depend on the initializers.
+
+**Verify.** The `win-x64` job of `webrtc-build.yml` compiles
+`obj/call/rtp_interfaces/rtp_config.obj`. Drop this patch once upstream changes
+the line or the pinned milestone moves past it.
+
+---
+
 ## Planned (not yet authored — need their target builds to validate)
 
 - **Symbol isolation** — keep WebRTC's C++ symbols from clashing when a consumer

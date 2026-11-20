@@ -1,0 +1,16 @@
+diff --git a/BUILD.gn b/BUILD.gn
+index 5bf2fd2cb9..1b8ed17339 100644
+--- a/BUILD.gn
++++ b/BUILD.gn
+@@ -601,7 +601,10 @@ if (!build_with_chromium) {
+       if (is_android) {
+         deps += [ "sdk/android" ]
+       }
+-      if (is_ios) {
++      # Reactor: not on tvOS. The WebRTC.framework bundle adds no object files
++      # to this complete_static_lib, and two of the targets it links
++      # (videocapture_objc, metal_objc) use UIKit APIs tvOS does not have.
++      if (is_ios && target_platform != "tvos") {
+         deps += [ "sdk:framework_objc" ]
+       }
+       if (is_mac || is_ios) {

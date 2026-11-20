@@ -58,6 +58,7 @@ match the stdlib the consumer's glue is compiled/linked with:
 |----|--------------------|-----------------------|----------------|
 | macOS | `false` | platform libc++ (Xcode) | `rtc_use_h264=false` (VideoToolbox HW is the intended path; not yet wired into the glue — see `crates/reactor-webrtc/README.md` → "Target support") |
 | iOS | `false` | platform libc++ | `ios_enable_code_signing=false`, `target_environment=device\|simulator`, `rtc_use_h264=false` |
+| tvOS | `false` | platform libc++ | the iOS args + `target_platform="tvos"`, `use_blink=true`, `ios_deployment_target="17.0"`, `libyuv_disable_jpeg=true` (see "tvOS" below) |
 | Linux | **`true`** | **bundled libc++ (`__Cr`)** | bundled clang, `use_sysroot=true`, `rtc_use_x11=false`, `rtc_use_pipewire=false` |
 | Android | **`true`** | **bundled libc++ (`__Cr`)** | NDK, `android_static_analysis=off`, `rtc_use_h264=false` |
 | Windows | `false` | MSVC STL | (`build.ps1`, native depot_tools) |
@@ -121,7 +122,38 @@ MAC_SDK_PATH=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk \
 
 Any SDK below 27 works: `ls /Library/Developer/CommandLineTools/SDKs/` lists
 the ones installed, and a Command Line Tools update can replace 26.5 with
-another. The variable only applies to mac builds.
+another. The variable applies to mac builds, and to the host tools of tvos
+builds.
+
+### tvOS (device)
+
+```bash
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+MAC_SDK_PATH=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk \
+  ./webrtc-build/build.sh tvos arm64 release    # → out/tvos-arm64-device-release
+./webrtc-build/package.sh tvos arm64 release
+```
+
+- gn has no tvOS `target_os`: it is `target_os="ios"` with
+  `target_platform="tvos"`, which selects the AppleTVOS SDK and the
+  `arm64-apple-tvos` triple. The library is compiled against Xcode's
+  AppleTVOS SDK (27.x is fine: a static library is never linked here).
+- The minimum is tvOS **17.0**. WebRTC's `.gn` gives iOS-family builds 14.0,
+  but on tvOS the audio device uses two tvOS 17.0 APIs unguarded and Xcode 27's
+  libc++ no longer supports tvOS below 15; at 17.0 the build has no
+  availability warnings.
+- Upstream asserts `use_blink=true` for tvOS. WebRTC never reads it; `build.sh`
+  sets `libyuv_disable_jpeg=true` so libyuv matches the iOS build.
+- `MAC_SDK_PATH` is needed with Xcode 27 for the same reason as on mac: the
+  host tools (`protoc`, …) are macOS binaries.
+- Patch 0013 drops the `WebRTC.framework` bundle from the umbrella on tvOS; see
+  [`patches/README.md`](patches/README.md). The archive is built from the same
+  targets as the iOS one, including the VideoToolbox H.264 codecs and the
+  `AVAudioSession`/VoiceProcessingIO audio device; the only difference in
+  their sources is `RTCCameraPreviewView`, which upstream already leaves out of
+  tvOS builds.
+- Not built: a simulator slice. `IOS_ENV=simulator` selects it
+  (`out/tvos-arm64-simulator-release`), untested.
 
 ### Verify the build actually links (real-link proof)
 
@@ -151,6 +183,8 @@ factories — VP8/VP9/AV1; H.264 is off via `rtc_use_h264=false`). Notes:
 
 Green today: `macos arm64/x64` · `ios device+sim` · `linux x64/arm64` ·
 `android arm64/x64` · `windows x64`. (`visionos` has no upstream gn `target_os`.)
+`tvos arm64 device` builds locally (above) but is not in the CI matrix or the
+published releases.
 
 **CI split**: the fast public checks (fmt / check / clippy, dev-mode) run on
 GitHub Actions (`.github/workflows/ci.yml`). The heavy per-target libwebrtc

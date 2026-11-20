@@ -4,17 +4,18 @@
 # ninja → assemble the static lib. See ./README.md.
 #
 # Usage: build.sh <os> <arch> [debug|release]
-#   os:   mac | ios | android | linux | linux-musl | win | visionos
+#   os:   mac | ios | tvos | android | linux | linux-musl | win | visionos
 #   arch: arm64 | x64 | arm | x86
 #
 # Env:
-#   IOS_ENV=device|simulator   (ios only; default device)
+#   IOS_ENV=device|simulator   (ios/tvos; default device)
 #   NINJA_TARGET=webrtc        (override the ninja target if needed)
 #   NINJA_JOBS=<count>          (limit parallel compiler processes)
-#   MAC_SDK_PATH=<dir>          (mac only: build against this SDK instead of
-#                                Xcode's; e.g. the Command Line Tools'
-#                                MacOSX26.5.sdk when Xcode's SDK is newer than
-#                                the bundled lld understands)
+#   MAC_SDK_PATH=<dir>          (mac and tvos: build against this macOS SDK
+#                                instead of Xcode's; e.g. the Command Line
+#                                Tools' MacOSX26.5.sdk when Xcode's SDK is newer
+#                                than the bundled lld understands. For tvos it
+#                                applies to the host tools only.)
 set -euo pipefail
 
 OS="${1:?usage: build.sh <os> <arch> [profile]}"
@@ -28,10 +29,10 @@ source "$ROOT/WEBRTC_VERSION"
 
 DEPOT="$HERE/depot_tools"
 SRC="$HERE/src"                       # gclient root (.gclient + src/)
-# iOS/visionOS device and simulator share os+arch but differ by target
+# iOS/tvOS/visionOS device and simulator share os+arch but differ by target
 # environment, so fold IOS_ENV into the target slug to keep their outputs apart.
 VARIANT=""
-case "$OS" in ios|visionos) VARIANT="-${IOS_ENV:-device}" ;; esac
+case "$OS" in ios|visionos|tvos) VARIANT="-${IOS_ENV:-device}" ;; esac
 OUT="$HERE/out/$OS-$ARCH$VARIANT-$PROFILE"
 # Keep the array nonempty for Bash 3.2's `set -u` behavior on macOS.
 NINJA_ARGS=(-C "$OUT")
@@ -53,6 +54,7 @@ esac
 case "$OS" in
   mac|macos)  GN_OS=mac ;;
   ios)        GN_OS=ios ;;
+  tvos)       GN_OS=ios ;;    # gn: target_os="ios" + target_platform="tvos"
   android)    GN_OS=android ;;
   linux|linux-musl) GN_OS=linux ;;
   win|windows) GN_OS=win ;;
@@ -71,16 +73,27 @@ if [ "$OS" = linux-musl ]; then
   [ -f "$REACTOR_MUSL_SYSROOT/usr/include/features.h" ] || { echo "missing musl sysroot headers" >&2; exit 1; }
 fi
 
+# MAC_SDK_PATH is the macOS SDK of a mac build, and of a tvos build's host tools
+# (protoc and the protobuf plugins are built and linked for macOS whatever the
+# target, so they hit the same lld/SDK mismatch).
+mac_sdk_honoured() { [ "$GN_OS" = mac ] || [ "$OS" = tvos ]; }
 # Resolved here, before the sync, so a relative or mistyped path fails now
 # rather than as a dangling SDK link that gn/ninja trip over much later.
-if [ -n "${MAC_SDK_PATH:-}" ] && [ "$GN_OS" != mac ]; then
-  echo "warning: MAC_SDK_PATH is only honoured for mac builds; ignoring it for $OS" >&2
+if [ -n "${MAC_SDK_PATH:-}" ] && ! mac_sdk_honoured; then
+  echo "warning: MAC_SDK_PATH is only honoured for mac and tvos builds; ignoring it for $OS" >&2
 fi
-if [ "$GN_OS" = mac ] && [ -n "${MAC_SDK_PATH:-}" ]; then
+if mac_sdk_honoured && [ -n "${MAC_SDK_PATH:-}" ]; then
   sdk="$(cd "$MAC_SDK_PATH" 2>/dev/null && pwd)" || { echo "MAC_SDK_PATH not found: $MAC_SDK_PATH" >&2; exit 2; }
   [ -f "$sdk/SDKSettings.json" ] || { echo "MAC_SDK_PATH is not a macOS SDK: $sdk" >&2; exit 2; }
   MAC_SDK_PATH="$sdk"
 fi
+# gn only accepts an SDK under the build dir (Chromium links Xcode's own SDK
+# into sdk/xcode_links for the same reason), so link MAC_SDK_PATH there and
+# leave the link's path in MAC_SDK_LINK.
+link_mac_sdk() {
+  MAC_SDK_LINK="$OUT/sdk/local_links/$(basename "$MAC_SDK_PATH")"
+  mkdir -p "$(dirname "$MAC_SDK_LINK")" && ln -sfn "$MAC_SDK_PATH" "$MAC_SDK_LINK"
+}
 
 # ── gn args (the heart of the build) ──────────────────────────────────────────
 # Base args shared by every target, then per-OS additions. Rationale:
@@ -113,16 +126,11 @@ gn_args() {
       # Hardware H.264 via VideoToolbox; no software OpenH264 needed.
       # Modern Xcode libc++ is the platform stdlib for both lib and glue.
       args+=("rtc_use_h264=false" "use_custom_libcxx=false" "symbol_level=1")
-      # gn only accepts an SDK under the build dir (Chromium links Xcode's own
-      # SDK into sdk/xcode_links for the same reason), so link the override there.
       if [ -n "${MAC_SDK_PATH:-}" ]; then
-        local link
-        link="$OUT/sdk/local_links/$(basename "$MAC_SDK_PATH")"
         # Returned, not left to set -e: this runs inside $(gn_args), where bash
         # clears errexit, so a failure would otherwise hand gn a dangling link.
-        mkdir -p "$(dirname "$link")" || return 1
-        ln -sfn "$MAC_SDK_PATH" "$link" || return 1
-        args+=("mac_sdk_path=\"$link\"")
+        link_mac_sdk || return 1
+        args+=("mac_sdk_path=\"$MAC_SDK_LINK\"")
       fi
       ;;
     ios)
@@ -179,6 +187,32 @@ gn_args() {
       args+=("use_custom_libcxx=false" "symbol_level=1")
       ;;
   esac
+  if [ "$OS" = tvos ]; then
+    # tvOS is gn's iOS toolchain with target_platform="tvos" (AppleTVOS SDK,
+    # arm64-apple-tvos triple); the ios branch above supplies the rest.
+    #   use_blink=true  → upstream asserts it for tvOS (Chrome on tvOS is
+    #     Blink-only). WebRTC's own code never reads it. What it does change
+    #     here: libyuv's JPEG path (undone below) and deprecation warnings
+    #     (silenced).
+    #   ios_deployment_target="17.0" → the tvOS minimum. WebRTC's .gn gives
+    #     every iOS-family build 14.0, which is right for iOS but not tvOS: the
+    #     audio device uses tvOS 17.0 APIs unguarded
+    #     (AVAudioSessionCategoryOptionAllowBluetooth,
+    #     kAUVoiceIOProperty_MutedSpeechActivityEventListener), and Xcode 27's
+    #     libc++ no longer supports tvOS below 15. At 17.0 nothing warns.
+    #   libyuv_disable_jpeg=true → no HAVE_JPEG / libjpeg references, as on iOS.
+    args+=(
+      "target_platform=\"tvos\""
+      "use_blink=true"
+      "ios_deployment_target=\"17.0\""
+      "libyuv_disable_jpeg=true"
+    )
+    # The host tools (protoc, …) are built for macOS: point them at MAC_SDK_PATH.
+    if [ -n "${MAC_SDK_PATH:-}" ]; then
+      link_mac_sdk || return 1
+      args+=("mac_sdk_path=\"$MAC_SDK_LINK\"")
+    fi
+  fi
   if [ "$OS" = linux-musl ]; then
     args+=(
       "reactor_musl=true"

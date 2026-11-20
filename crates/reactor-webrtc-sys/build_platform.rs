@@ -23,6 +23,20 @@ pub fn prebuilt_platform(
                 "ios-arm64-device"
             })
         }
+        // tvOS follows the iOS naming (`<os>-<arch>-<environment>`, the slug
+        // webrtc-build's package.sh gives an `IOS_ENV` variant):
+        //   aarch64-apple-tvos     → tvos-arm64-device
+        //   aarch64-apple-tvos-sim → tvos-arm64-simulator
+        // No release publishes either archive yet, so today the download probe
+        // fails and build.rs says so; link a local build with
+        // REACTOR_WEBRTC_LIB_DIR. Unlike iOS, the Intel simulator
+        // (x86_64-apple-tvos) maps to nothing: an arm64 archive cannot link
+        // into an x86_64 binary.
+        "tvos" => match (arch, abi) {
+            ("aarch64", "") => Some("tvos-arm64-device"),
+            ("aarch64", "sim") => Some("tvos-arm64-simulator"),
+            _ => None,
+        },
         "linux" => match (arch, target_env) {
             ("x86_64", "gnu") => Some("linux-x64"),
             ("aarch64", "gnu") => Some("linux-arm64"),
@@ -77,5 +91,22 @@ mod tests {
         ] {
             assert_eq!(prebuilt_platform(os, arch, abi, target_env), Some(expected));
         }
+    }
+
+    #[test]
+    fn tvos_archives_follow_the_ios_naming() {
+        // (arch, abi, env) as rustc reports them for each tvOS target.
+        // aarch64-apple-tvos
+        assert_eq!(
+            prebuilt_platform("tvos", "aarch64", "", ""),
+            Some("tvos-arm64-device")
+        );
+        // aarch64-apple-tvos-sim
+        assert_eq!(
+            prebuilt_platform("tvos", "aarch64", "sim", "sim"),
+            Some("tvos-arm64-simulator")
+        );
+        // x86_64-apple-tvos (Intel simulator): no archive, unlike x86_64-apple-ios.
+        assert_eq!(prebuilt_platform("tvos", "x86_64", "sim", "sim"), None);
     }
 }
