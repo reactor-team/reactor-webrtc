@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.32.0 — tvOS as a build target
+
+`reactor-webrtc-sys` builds for tvOS devices, against a libwebrtc built
+locally. Nothing changes on the other platforms beyond the new prebuilt tag.
+
+### Added
+
+- **tvOS as a build target** (arm64 device, tvOS 17+): `webrtc-build/build.sh
+  tvos arm64` builds libwebrtc for it and `reactor-webrtc-sys` links it for
+  `aarch64-apple-tvos`. No tvOS prebuilt is published yet, so a tvOS build
+  takes a local one through `REACTOR_WEBRTC_LIB_DIR`.
+
+### Changed
+
+- The prebuilt tag becomes `webrtc-7907-a5ddff60-p15`, for patches 0013 and
+  0014. 0013 changes the build graph on tvOS only. 0014 lets the Windows
+  build compile with Visual Studio 18.12 and changes no behavior.
+
 ## 0.31.1 — standalone decoders fall back from NVDEC
 
 The prebuilt stays `webrtc-7907-a5ddff60-p14`: the fix is in the glue, which
@@ -99,16 +117,6 @@ built from source, and no libwebrtc patch changed.
   The standalone codecs list it as the `NVDEC` hardware decoder of each codec
   it decodes. `CUDA_VISIBLE_DEVICES` picks the GPU. It decodes 8-bit 4:2:0,
   which is what WebRTC carries; it does not encode.
-- **tvOS as a build target** (arm64 device, tvOS 17+): `webrtc-build/build.sh
-  tvos arm64` builds libwebrtc for it and `reactor-webrtc-sys` links it for
-  `aarch64-apple-tvos`. No tvOS prebuilt is published yet, so a tvOS build
-  takes a local one through `REACTOR_WEBRTC_LIB_DIR`.
-
-### Changed
-
-- The prebuilt tag becomes `webrtc-7907-a5ddff60-p15`, for patches 0013 and
-  0014. 0013 changes the build graph on tvOS only. 0014 lets the Windows
-  build compile with Visual Studio 18.12 and changes no behavior.
 
 ### Changed
 
