@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **A tvOS app no longer references a camera API through libwebrtc.** The tvOS
+  build carried a helper category on `AVCaptureSession` that only the camera
+  capturer calls, and tvOS has no camera capturer. An app links libwebrtc with
+  `-ObjC`, which loads every category, so its binary referenced the class and
+  the App Store asked it for `NSCameraUsageDescription`. Patch 0015 leaves the
+  helper out of tvOS builds.
+
+### Changed
+
+- The prebuilt tag becomes `webrtc-7907-a5ddff60-p16`, for patch 0015. The
+  patch changes the tvOS build only, and no tvOS prebuilt is published: for
+  every published platform the build is the same as p15.
+
 ## 0.32.0 — tvOS as a build target
 
 `reactor-webrtc-sys` builds for tvOS devices, against a libwebrtc built
