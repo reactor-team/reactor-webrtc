@@ -1,0 +1,21 @@
+diff --git a/sdk/BUILD.gn b/sdk/BUILD.gn
+index c82d3d6345..471f7af24b 100644
+--- a/sdk/BUILD.gn
++++ b/sdk/BUILD.gn
+@@ -173,6 +173,16 @@ if (is_ios || is_mac) {
+           "objc/helpers/RTCCameraPreviewView.h",
+           "objc/helpers/RTCCameraPreviewView.m",
+         ]
++      } else {
++        # Reactor: not on tvOS. Only the camera capturer calls this category on
++        # AVCaptureSession, and tvOS builds no camera capturer. An app links
++        # libwebrtc with -ObjC, which loads every category, so the app would
++        # reference a camera API and the App Store would ask it for
++        # NSCameraUsageDescription.
++        sources -= [
++          "objc/helpers/AVCaptureSession+DevicePosition.h",
++          "objc/helpers/AVCaptureSession+DevicePosition.mm",
++        ]
+       }
+ 
+       frameworks += [ "UIKit.framework" ]
