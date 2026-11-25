@@ -562,8 +562,9 @@ is `platform 3` (TVOS). The archive carries the VideoToolbox H.264 codecs
 factories, `RTCNetworkMonitor.o` and the audio device (`audio_device_ios.o`,
 `voice_processing_audio_unit.o`, `RTCAudioSession.o`). Its object list is the
 iOS device build's (same commit, patches and SDK version) minus
-`RTCCameraPreviewView.o`, which upstream already leaves out of tvOS. With iOS,
-the patch changes nothing: the dep is still there.
+`RTCCameraPreviewView.o`, which upstream already leaves out of tvOS, and since
+0015 `AVCaptureSession+DevicePosition.o`. With iOS, the patch changes nothing:
+the dep is still there.
 
 ---
 
@@ -604,6 +605,51 @@ move-construction, which does not depend on the initializers.
 **Verify.** The `win-x64` job of `webrtc-build.yml` compiles
 `obj/call/rtp_interfaces/rtp_config.obj`. Drop this patch once upstream changes
 the line or the pinned milestone moves past it.
+
+---
+
+### 0015 — no capture-session helper on tvOS
+
+`0015-tvos-skip-capture-session-helper.patch` · touches `sdk/BUILD.gn`
+(+10 lines)
+
+**What.** On tvOS, `sdk:helpers_objc` no longer compiles
+`AVCaptureSession+DevicePosition.mm`. iOS, macOS and every other platform are
+unchanged.
+
+**Why.** The file is a category on `AVCaptureSession` with one method,
+`+devicePositionForSampleBuffer:`. Its only caller is
+`RTCCameraVideoCapturer.m`, which a tvOS build does not compile (see 0013).
+Upstream already leaves `RTCCameraPreviewView` out of tvOS in the same target
+and kept this file.
+
+Unused code in a static library is normally dropped at link. This one is not,
+because an app has to link libwebrtc with `-ObjC`: without it the linker drops
+libwebrtc's `UIDevice` category and the app crashes on launch. `-ObjC` loads
+every archive member that defines a class or a category, this one included, so
+the app's binary referenced `AVCaptureSession`. App Store processing refuses a
+build whose binary references a camera API and whose Info.plist has no
+`NSCameraUsageDescription` (ITMS-90683). A tvOS app that only receives video
+was refused for it on 23 November 2026.
+
+**How it works.** The removal is the `else` of upstream's own
+`target_platform != "tvos"` test, inside `if (is_ios)`, so `target_platform` is
+read only where `mobile_config.gni` declares it. `sources -=` fails `gn gen`
+when the file is not in the list, so the patch cannot go stale without the
+build saying so.
+
+**Verify.** `build.sh tvos arm64 release`: `libwebrtc.a` has no
+`AVCaptureSession+DevicePosition.o`, and the rest of its member list is what it
+was before the patch. No member references an `AVCapture*` symbol:
+`package.sh` checks that on every tvOS archive (`nm -A -u`) and refuses to
+package one that does, because CI builds no tvOS target.
+A tvOS dylib linked against it with `-ObjC` imports no `AVCapture` class; before
+the patch it imported `_OBJC_CLASS_$_AVCaptureSession`.
+
+Not verified: that the App Store accepts a tvOS build without the usage
+description, which takes a submission. Not covered: the audio device still
+reads `AVAudioSession.recordPermission` (`RTCAudioSession.o`), so whether a
+tvOS app is asked for `NSMicrophoneUsageDescription` is unknown.
 
 ---
 
