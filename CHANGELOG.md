@@ -16,6 +16,9 @@
 - The prebuilt tag becomes `webrtc-7907-a5ddff60-p16`, for patch 0015. The
   patch changes the tvOS build only, and no tvOS prebuilt is published: for
   every published platform the build is the same as p15.
+- `webrtc-build/package.sh` refuses a tvOS archive that references an
+  `AVCapture*` symbol, so a new camera reference fails the local tvOS build
+  instead of an App Store submission. Packaging other platforms is unchanged.
 
 ## 0.32.0 — tvOS as a build target
 

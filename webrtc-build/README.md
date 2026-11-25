@@ -149,9 +149,13 @@ MAC_SDK_PATH=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk \
 - Patch 0013 drops the `WebRTC.framework` bundle from the umbrella on tvOS; see
   [`patches/README.md`](patches/README.md). The archive is built from the same
   targets as the iOS one, including the VideoToolbox H.264 codecs and the
-  `AVAudioSession`/VoiceProcessingIO audio device; the only difference in
-  their sources is `RTCCameraPreviewView`, which upstream already leaves out of
-  tvOS builds.
+  `AVAudioSession`/VoiceProcessingIO audio device; the only differences in
+  their sources are `RTCCameraPreviewView`, which upstream already leaves out of
+  tvOS builds, and the capture-session helper, which patch 0015 leaves out.
+- `package.sh` refuses a tvOS archive in which any member references an
+  `AVCapture*` symbol. An app that links it would need a camera usage
+  description for the App Store (patch 0015), and CI builds no tvOS target, so
+  nothing else checks it.
 - Not built: a simulator slice. `IOS_ENV=simulator` selects it
   (`out/tvos-arm64-simulator-release`), untested.
 

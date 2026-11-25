@@ -38,6 +38,21 @@ if [ "$OS" = "android" ]; then
   echo "   JAR: $JAR_PATH → $STAGE/lib/libwebrtc.jar"
 fi
 
+# ── tvOS: no camera API in the archive ────────────────────────────────────────
+# An app links libwebrtc with -ObjC, which loads every member that defines a
+# class or a category. A member that references AVCapture* then puts a camera
+# API in the app, and the App Store asks it for NSCameraUsageDescription (patch
+# 0015). CI builds no tvOS target, so this is the only place it is checked.
+if [ "$OS" = "tvos" ]; then
+  CAMERA="$(nm -A -u "$STAGE/lib/libwebrtc.a" | awk '$NF ~ /AVCapture/')"
+  if [ -n "$CAMERA" ]; then
+    echo "package.sh: the tvOS libwebrtc.a references a camera API (patches/README.md, 0015):" >&2
+    echo "$CAMERA" >&2
+    exit 1
+  fi
+  echo "   tvOS: no AVCapture reference in libwebrtc.a"
+fi
+
 # ── Headers: mirror WebRTC's public .h tree (preserving paths) ────────────────
 # The static lib has no "install headers" step upstream; our glue needs the
 # source headers. Copy *.h/*.inc preserving directory structure.

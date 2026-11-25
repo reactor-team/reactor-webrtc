@@ -640,7 +640,9 @@ build saying so.
 
 **Verify.** `build.sh tvos arm64 release`: `libwebrtc.a` has no
 `AVCaptureSession+DevicePosition.o`, and the rest of its member list is what it
-was before the patch. `nm -A -u libwebrtc.a | grep AVCapture` prints nothing.
+was before the patch. No member references an `AVCapture*` symbol:
+`package.sh` checks that on every tvOS archive (`nm -A -u`) and refuses to
+package one that does, because CI builds no tvOS target.
 A tvOS dylib linked against it with `-ObjC` imports no `AVCapture` class; before
 the patch it imported `_OBJC_CLASS_$_AVCaptureSession`.
 
