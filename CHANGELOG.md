@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Added
+
+- **H.265 crosses a peer connection.** libwebrtc is built with
+  `rtc_use_h265=true` on every platform. It brings H.265's RTP packetizer and
+  depacketizer (RFC 7798) and its SDP negotiation (profile, tier, level,
+  `tx-mode`). Before, `rtc_use_h265` followed `proprietary_codecs`, which is
+  `false` outside Chromium. The H.265 that custom encoder slots advertise then
+  went out on the generic packetizer, which no other endpoint reads, and a
+  receiver had no depacketizer for it. No H.265 encoder or decoder comes with
+  it: a custom slot or a pre-encoded track supplies the bitstream, and a
+  received stream still reaches the null decoder.
+
 ### Fixed
 
 - **A tvOS app no longer references a camera API through libwebrtc.** The tvOS
@@ -13,9 +25,9 @@
 
 ### Changed
 
-- The prebuilt tag becomes `webrtc-7907-a5ddff60-p16`, for patch 0015. The
-  patch changes the tvOS build only, and no tvOS prebuilt is published: for
-  every published platform the build is the same as p15.
+- The prebuilt tag becomes `webrtc-7907-a5ddff60-p17`, for `rtc_use_h265=true`
+  on every platform. It also carries patch 0015, published as p16, which
+  changes the tvOS build only.
 - `webrtc-build/package.sh` refuses a tvOS archive that references an
   `AVCapture*` symbol, so a new camera reference fails the local tvOS build
   instead of an App Store submission. Packaging other platforms is unchanged.

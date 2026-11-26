@@ -141,6 +141,7 @@ rtc_enable_protobuf = true
 treat_warnings_as_errors = false
 use_rtti = true
 rtc_libvpx_build_vp9 = true
+rtc_use_h265 = true
 target_os = "win"
 target_cpu = "$CPU"
 is_clang = true

@@ -47,8 +47,14 @@ committed (see `../.gitignore`).
 
 Base (all targets): `is_debug=<profile>`, `is_component_build=false` (one static
 lib), `rtc_include_tests/examples/tools=false`, `rtc_enable_protobuf=true`,
-`use_rtti=true`, `rtc_libvpx_build_vp9=true`, `treat_warnings_as_errors=false`,
-`target_os`/`target_cpu`.
+`use_rtti=true`, `rtc_libvpx_build_vp9=true`, `rtc_use_h265=true`,
+`treat_warnings_as_errors=false`, `target_os`/`target_cpu`.
+
+`rtc_use_h265=true` builds H.265's RTP packetizer and depacketizer (RFC 7798)
+and its SDP negotiation (profile, tier, level, `tx-mode`). It brings no H.265
+encoder or decoder. Outside Chromium it defaults to `proprietary_codecs`, which
+is `false`: without it, a sender packetizes H.265 frames generically, which no
+other endpoint reads, and a receiver has no depacketizer for them.
 
 The **C++ standard library** choice (`use_custom_libcxx`) is per-OS, because the
 "platform" stdlib and how a modern one is reached differ by target — and it must
