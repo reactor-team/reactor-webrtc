@@ -106,6 +106,12 @@ link_mac_sdk() {
 #                                how we reach a modern one differs by target.
 #   rtc_include_tests/examples/tools=false → trim the build
 #   rtc_libvpx_build_vp9=true  → VP9 software codec
+#   rtc_use_h265=true          → H.265 RTP packetization (RFC 7798) and SDP
+#                                 negotiation. Outside Chromium it defaults to
+#                                 proprietary_codecs (false), which leaves an
+#                                 H.265 stream on the generic packetizer when
+#                                 sent and without a depacketizer when
+#                                 received. No H.265 codec comes with it.
 #   treat_warnings_as_errors=false → tolerate upstream warnings across milestones
 gn_args() {
   local args=(
@@ -118,6 +124,7 @@ gn_args() {
     "treat_warnings_as_errors=false"
     "use_rtti=true"
     "rtc_libvpx_build_vp9=true"
+    "rtc_use_h265=true"
     "target_os=\"$GN_OS\""
     "target_cpu=\"$CPU\""
   )
