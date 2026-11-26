@@ -214,6 +214,11 @@ pub struct ReactorFactoryOptions {
     /// decodes (Linux). Without a GPU or driver, or for a codec the GPU does
     /// not decode, video decodes as it would without it.
     pub use_nvdec: c_int,
+    /// Nonzero: encode video on the first visible NVIDIA GPU with NVENC, ahead
+    /// of the software encoders, for each of H.264 and AV1 it encodes (Linux).
+    /// Without a GPU, driver or encoder, or for a codec the GPU does not
+    /// encode, video encodes as it would without it.
+    pub use_nvenc: c_int,
 }
 
 // Pins the layout of `ReactorFactoryOptions` against the C struct in
@@ -224,7 +229,7 @@ pub struct ReactorFactoryOptions {
 #[cfg(target_pointer_width = "64")]
 const _: () = {
     assert!(
-        core::mem::size_of::<ReactorFactoryOptions>() == 144,
+        core::mem::size_of::<ReactorFactoryOptions>() == 152,
         "ReactorFactoryOptions changed size — update the C struct in \
          glue/reactor_webrtc.cpp and both assertions"
     );
@@ -232,6 +237,7 @@ const _: () = {
     assert!(core::mem::offset_of!(ReactorFactoryOptions, sctp_initial_cwnd_mtus) == 112);
     assert!(core::mem::offset_of!(ReactorFactoryOptions, sender_transform_hold_ms) == 136);
     assert!(core::mem::offset_of!(ReactorFactoryOptions, use_nvdec) == 140);
+    assert!(core::mem::offset_of!(ReactorFactoryOptions, use_nvenc) == 144);
 };
 
 impl Default for ReactorFactoryOptions {
@@ -264,6 +270,7 @@ impl Default for ReactorFactoryOptions {
             sctp_immediate_sack_under_cwnd_mtus: 0,
             sender_transform_hold_ms: 0,
             use_nvdec: 0,
+            use_nvenc: 0,
         }
     }
 }
@@ -1339,7 +1346,9 @@ extern "C" {
     /// on Apple and OpenH264 from `openh264_lib_path` when it is not null; for
     /// VP8, VP9 and AV1 libwebrtc's builtin software codecs. With `use_nvdec`
     /// nonzero, NVDEC on the first visible NVIDIA GPU is the hardware decoder
-    /// of each of these codecs that GPU decodes (Linux). Returns null,
+    /// of each of these codecs that GPU decodes (Linux); with `use_nvenc`
+    /// nonzero, NVENC on it is the hardware encoder of each of H264 and AV1
+    /// it encodes. Returns null,
     /// with the reason in `err`, when that library does not load or the build
     /// has no OpenH264 support. Free with
     /// [`reactor_webrtc_codec_context_destroy`]; encoders and decoders keep
@@ -1347,6 +1356,7 @@ extern "C" {
     pub fn reactor_webrtc_codec_context_create(
         openh264_lib_path: *const c_char,
         use_nvdec: c_int,
+        use_nvenc: c_int,
         err: *mut c_char,
         err_cap: c_int,
     ) -> *mut CodecContext;

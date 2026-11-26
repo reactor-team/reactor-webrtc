@@ -16,8 +16,9 @@ needed to build, so the same library runs on a machine with no NVIDIA GPU,
 where the loader fails and the NVDEC backend is not offered. This is how FFmpeg
 uses the same headers.
 
-`nvEncodeAPI.h` is here only because `dynlink_loader.h` includes it; NVENC is
-not used.
+`dynlink_loader.h` loads NVENC the same way, from `libnvidia-encode.so.1`,
+with `nvEncodeAPI.h` for its API; `../../nvenc/nvenc_codec.cc` uses them for
+the NVENC encoder.
 
 To update: copy the five files from a newer tag, unmodified, and update the tag
 above.

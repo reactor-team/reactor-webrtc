@@ -263,16 +263,21 @@ fn compile_glue(include_dir: &Path, is_debug_prebuilt: bool, relative_vtables: b
             build
                 .define("WEBRTC_POSIX", None)
                 .define("WEBRTC_LINUX", None);
-            // Video decode on NVIDIA GPUs (glue/nvdec). Always compiled: the
-            // CUDA driver and nvcuvid are dlopen'd at run time and nothing is
-            // linked, so a machine without an NVIDIA driver just doesn't get the
-            // backend. REACTOR_WEBRTC_NVDEC gates its use in reactor_webrtc.cpp.
+            // Video decode and encode on NVIDIA GPUs (glue/nvdec, glue/nvenc).
+            // Always compiled: the CUDA driver, nvcuvid and NVENC are dlopen'd
+            // at run time and nothing is linked, so a machine without an NVIDIA
+            // driver just doesn't get the backends. REACTOR_WEBRTC_NVDEC and
+            // REACTOR_WEBRTC_NVENC gate their use in reactor_webrtc.cpp.
             println!("cargo:rerun-if-changed=glue/nvdec/nvdec_codec.cc");
             println!("cargo:rerun-if-changed=glue/nvdec/nvdec_codec.h");
             println!("cargo:rerun-if-changed=glue/nvdec/nv12_to_rgb_ptx.h");
+            println!("cargo:rerun-if-changed=glue/nvenc/nvenc_codec.cc");
+            println!("cargo:rerun-if-changed=glue/nvenc/nvenc_codec.h");
             build
                 .file("glue/nvdec/nvdec_codec.cc")
-                .define("REACTOR_WEBRTC_NVDEC", None);
+                .file("glue/nvenc/nvenc_codec.cc")
+                .define("REACTOR_WEBRTC_NVDEC", None)
+                .define("REACTOR_WEBRTC_NVENC", None);
         }
         "windows" => {
             build.define("WEBRTC_WIN", None);

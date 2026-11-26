@@ -41,6 +41,7 @@ pub struct PeerConnectionFactoryBuilder {
     receive_playout_delay: Option<PlayoutDelay>,
     sender_transform_hold: Option<std::time::Duration>,
     nvdec: bool,
+    nvenc: bool,
     #[cfg(feature = "openh264")]
     openh264: Option<std::path::PathBuf>,
 }
@@ -59,6 +60,7 @@ impl PeerConnectionFactoryBuilder {
             receive_playout_delay: None,
             sender_transform_hold: None,
             nvdec: false,
+            nvenc: false,
             #[cfg(feature = "openh264")]
             openh264: None,
         }
@@ -285,6 +287,22 @@ impl PeerConnectionFactoryBuilder {
         self
     }
 
+    /// Encode video on the first visible NVIDIA GPU with NVENC, ahead of the
+    /// software encoders, for each of H.264 (constrained baseline) and AV1
+    /// (main) that GPU encodes; VP8 and VP9 have no NVENC encoder. Linux only:
+    /// the CUDA driver and NVENC are loaded from the NVIDIA driver at run time
+    /// (in a container, `NVIDIA_DRIVER_CAPABILITIES` must include `video`),
+    /// and `CUDA_VISIBLE_DEVICES` picks the GPU. Like `with_nvdec`, this never
+    /// fails the factory: without a GPU, a driver or an encoder (an A100,
+    /// H100 or B200 has none), for a codec the GPU does not encode, or on
+    /// another platform, video encodes as it would without this. A stream
+    /// NVENC cannot take (a size outside the GPU's limits, an odd size, no
+    /// session left) goes to the software encoder.
+    pub fn with_nvenc(mut self) -> Self {
+        self.nvenc = true;
+        self
+    }
+
     /// Finalise the factory. Fails on malformed options (an OpenH264 path
     /// with a NUL byte) or on factory/thread construction — the error carries
     /// the reason the glue reported.
@@ -333,6 +351,7 @@ impl PeerConnectionFactoryBuilder {
                 d.as_millis().min(std::os::raw::c_int::MAX as u128) as std::os::raw::c_int
             }),
             use_nvdec: self.nvdec as std::os::raw::c_int,
+            use_nvenc: self.nvenc as std::os::raw::c_int,
             #[cfg(feature = "openh264")]
             openh264_lib_path: openh264_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
             ..Default::default()

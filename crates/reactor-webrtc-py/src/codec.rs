@@ -248,14 +248,18 @@ pub struct VideoCodecs {
 impl VideoCodecs {
     /// The platform's own codecs plus the software ones built into libwebrtc.
     /// `nvdec` adds NVDEC as the hardware decoder of each of H.264, VP8, VP9
-    /// and AV1 the first visible NVIDIA GPU decodes (Linux); `capabilities()`
-    /// shows which.
+    /// and AV1 the first visible NVIDIA GPU decodes (Linux); `nvenc` adds
+    /// NVENC as the hardware encoder of each of H.264 and AV1 it encodes.
+    /// `capabilities()` shows which.
     #[new]
-    #[pyo3(signature = (nvdec=false))]
-    fn new(py: Python<'_>, nvdec: bool) -> PyResult<Self> {
+    #[pyo3(signature = (nvdec=false, nvenc=false))]
+    fn new(py: Python<'_>, nvdec: bool, nvenc: bool) -> PyResult<Self> {
         let mut builder = rc::VideoCodecs::builder();
         if nvdec {
             builder = builder.nvdec();
+        }
+        if nvenc {
+            builder = builder.nvenc();
         }
         let inner = py.allow_threads(|| builder.build()).map_err(codec_err)?;
         Ok(Self { inner })
@@ -266,12 +270,15 @@ impl VideoCodecs {
     /// library does not load.
     #[cfg(feature = "openh264")]
     #[staticmethod]
-    #[pyo3(signature = (lib_path, nvdec=false))]
-    fn with_openh264(py: Python<'_>, lib_path: &str, nvdec: bool) -> PyResult<Self> {
+    #[pyo3(signature = (lib_path, nvdec=false, nvenc=false))]
+    fn with_openh264(py: Python<'_>, lib_path: &str, nvdec: bool, nvenc: bool) -> PyResult<Self> {
         let path = std::path::PathBuf::from(lib_path);
         let mut builder = rc::VideoCodecs::builder().openh264(&path);
         if nvdec {
             builder = builder.nvdec();
+        }
+        if nvenc {
+            builder = builder.nvenc();
         }
         let inner = py.allow_threads(|| builder.build()).map_err(codec_err)?;
         Ok(Self { inner })

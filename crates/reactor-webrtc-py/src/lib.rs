@@ -3370,6 +3370,20 @@ impl PeerConnectionFactoryBuilder {
         Ok(())
     }
 
+    /// Encode video on the first visible NVIDIA GPU with NVENC, ahead of the
+    /// software encoders, for each of H.264 and AV1 it encodes (Linux;
+    /// `CUDA_VISIBLE_DEVICES` picks the GPU; in a container,
+    /// `NVIDIA_DRIVER_CAPABILITIES` must include `video`). Never fails the
+    /// factory: otherwise video encodes as it would without it.
+    fn with_nvenc(&mut self) -> PyResult<()> {
+        let b = self
+            .pending
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("builder already consumed by build()"))?;
+        self.pending = Some(b.with_nvenc());
+        Ok(())
+    }
+
     /// Register the OpenH264 backend from a downloaded library path (see the
     /// `openh264` module: attribution requirements apply). A failed load
     /// degrades to "no OpenH264 backend"; it never fails the factory.

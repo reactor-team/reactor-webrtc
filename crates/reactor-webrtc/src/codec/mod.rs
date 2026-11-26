@@ -24,13 +24,14 @@
 //!
 //! | Codec | Hardware | Software |
 //! |-------|----------|----------|
-//! | H.264 | VideoToolbox (macOS, iOS); NVDEC to decode | OpenH264, with the `openh264` feature ([`VideoCodecs::with_openh264`]) |
+//! | H.264 | VideoToolbox (macOS, iOS); NVENC to encode, NVDEC to decode | OpenH264, with the `openh264` feature ([`VideoCodecs::with_openh264`]) |
 //! | VP8 | NVDEC to decode | libvpx |
 //! | VP9 | NVDEC to decode | libvpx (profile 0) |
-//! | AV1 | NVDEC to decode | libaom to encode, dav1d to decode (main profile) |
+//! | AV1 | NVENC to encode, NVDEC to decode | libaom to encode, dav1d to decode (main profile) |
 //!
-//! NVDEC decodes on an NVIDIA GPU (Linux), each codec the GPU decodes, when
-//! asked for with [`VideoCodecsBuilder::nvdec`].
+//! NVDEC decodes and NVENC encodes on an NVIDIA GPU (Linux), each codec the
+//! GPU runs, when asked for with [`VideoCodecsBuilder::nvdec`] and
+//! [`VideoCodecsBuilder::nvenc`].
 //!
 //! The software VP8, VP9 and AV1 codecs are the ones built into libwebrtc. A
 //! build without one of them (an AV1 encoder, say) leaves it out of
@@ -204,6 +205,7 @@ pub struct VideoCodecsBuilder {
     #[cfg(feature = "openh264")]
     openh264: Option<std::path::PathBuf>,
     nvdec: bool,
+    nvenc: bool,
 }
 
 impl VideoCodecsBuilder {
@@ -230,6 +232,20 @@ impl VideoCodecsBuilder {
         self
     }
 
+    /// Add NVENC as the hardware encoder of each of H.264 (constrained
+    /// baseline) and AV1 (main) the first visible NVIDIA GPU encodes
+    /// (`CUDA_VISIBLE_DEVICES` picks it); VP8 and VP9 have no NVENC encoder.
+    /// Linux only. A codec the GPU does not encode, or every codec without a
+    /// GPU, a driver or an encoder (an A100, H100 or B200 has none), is left
+    /// out rather than failing the build: [`VideoCodecs::capabilities`] lists
+    /// an `NVENC` hardware encoder for each codec it is there for. An encoder
+    /// NVENC does not open (an odd size, one outside the GPU's limits, no
+    /// session left) is created on the codec's software backend instead.
+    pub fn nvenc(mut self) -> Self {
+        self.nvenc = true;
+        self
+    }
+
     /// Collect the backends.
     pub fn build(self) -> Result<VideoCodecs, CodecError> {
         #[cfg(feature = "openh264")]
@@ -248,7 +264,7 @@ impl VideoCodecsBuilder {
         let openh264_ptr = openh264.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
         #[cfg(not(feature = "openh264"))]
         let openh264_ptr = std::ptr::null();
-        VideoCodecs::create(openh264_ptr, self.nvdec)
+        VideoCodecs::create(openh264_ptr, self.nvdec, self.nvenc)
     }
 }
 
@@ -256,10 +272,10 @@ impl VideoCodecs {
     /// The platform's own codecs: VideoToolbox on macOS and iOS, none
     /// elsewhere yet.
     pub fn new() -> Result<Self, CodecError> {
-        Self::create(std::ptr::null(), false)
+        Self::create(std::ptr::null(), false, false)
     }
 
-    /// Choose the optional backends: OpenH264, NVDEC. [`new`](Self::new) and
+    /// Choose the optional backends: OpenH264, NVDEC, NVENC. [`new`](Self::new) and
     /// `with_openh264` are shorthands for it.
     pub fn builder() -> VideoCodecsBuilder {
         VideoCodecsBuilder::default()
@@ -276,12 +292,13 @@ impl VideoCodecs {
         Self::builder().openh264(lib_path).build()
     }
 
-    fn create(openh264: *const c_char, nvdec: bool) -> Result<Self, CodecError> {
+    fn create(openh264: *const c_char, nvdec: bool, nvenc: bool) -> Result<Self, CodecError> {
         let mut err = ErrorBuffer::new();
         let raw = unsafe {
             reactor_webrtc_sys::reactor_webrtc_codec_context_create(
                 openh264,
                 nvdec as std::os::raw::c_int,
+                nvenc as std::os::raw::c_int,
                 err.ptr(),
                 err.cap(),
             )
