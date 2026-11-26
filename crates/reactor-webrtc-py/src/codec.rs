@@ -249,7 +249,7 @@ impl VideoCodecs {
     /// The platform's own codecs plus the software ones built into libwebrtc.
     /// `nvdec` adds NVDEC as the hardware decoder of each of H.264, VP8, VP9
     /// and AV1 the first visible NVIDIA GPU decodes (Linux); `nvenc` adds
-    /// NVENC as the hardware encoder of each of H.264 and AV1 it encodes.
+    /// NVENC as the hardware encoder of each of H.264, H.265 and AV1 it encodes.
     /// `capabilities()` shows which.
     #[new]
     #[pyo3(signature = (nvdec=false, nvenc=false))]

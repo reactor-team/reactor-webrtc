@@ -32,6 +32,8 @@
 #define FFNV_DEBUG_LOG_FUNC(logctx, msg, ...) ((void)0)
 #include "../nvdec/vendor/dynlink_loader.h"
 
+#include "../h265_format.h"
+
 namespace reactor {
 
 class NvencLibrary {
@@ -59,7 +61,19 @@ class NvencLibrary {
     bool takes_iyuv = false;
   };
   Caps h264;
+  Caps hevc;
   Caps av1;
+
+  const Caps& CapsOf(webrtc::VideoCodecType codec) const {
+    switch (codec) {
+      case webrtc::kVideoCodecH265:
+        return hevc;
+      case webrtc::kVideoCodecAV1:
+        return av1;
+      default:
+        return h264;
+    }
+  }
 };
 
 namespace {
@@ -189,15 +203,18 @@ webrtc::SdpVideoFormat H264Format() {
 std::vector<webrtc::SdpVideoFormat> NvencFormats(const NvencLibrary& lib) {
   std::vector<webrtc::SdpVideoFormat> formats;
   if (lib.h264.encodes) formats.push_back(H264Format());
+  if (lib.hevc.encodes) formats.push_back(H265MainFormat());
   if (lib.av1.encodes) formats.push_back(webrtc::SdpVideoFormat::AV1Profile0());
   return formats;
 }
 
-// AV1 is sent with the dependency descriptor, which libwebrtc builds from the
-// frame's generic info rather than from codec specifics: one spatial and one
-// temporal layer, each frame referencing the one before, as libaom's encoder
-// describes its L1T1 stream (ScalableVideoControllerNoLayering).
-webrtc::FrameDependencyStructure Av1L1T1Structure(int width, int height) {
+// H.265 and AV1 carry no codec specifics libwebrtc reads: it builds their
+// dependency descriptor, when negotiated, from the frame's generic info. One
+// spatial and one temporal layer, each frame referencing the one before, as
+// libaom's encoder describes its L1T1 stream (ScalableVideoControllerNoLayering).
+// Without the descriptor the receiver orders frames by sequence number, which
+// gives the same references for this stream.
+webrtc::FrameDependencyStructure L1T1Structure(int width, int height) {
   webrtc::FrameDependencyStructure structure;
   structure.num_decode_targets = 1;
   structure.num_chains = 1;
@@ -217,12 +234,13 @@ webrtc::FrameDependencyStructure Av1L1T1Structure(int width, int height) {
   return structure;
 }
 
-// One stream of one codec on one NVENC session. Each Encode() uploads the
+// One stream of one codec (H.264, H.265 or AV1) on one NVENC session. Each Encode() uploads the
 // frame to the GPU and encodes it synchronously: the encoded frame is handed
 // to the callback before Encode() returns, as the software encoders do. The
 // stream has no B-frames and no periodic key frame (an infinite GOP), with a
 // key frame only when one is asked for, and carries its sequence header
-// (H.264 SPS/PPS, the AV1 sequence header OBU) on every key frame. Rate
+// (H.264 SPS/PPS, H.265 VPS/SPS/PPS, the AV1 sequence header OBU) on every
+// key frame. Rate
 // control is CBR at the rate SetRates() last gave, so the encoded size of each
 // frame stays near the target. InitEncode fails for a size the GPU does not
 // encode, an odd size (4:2:0 needs even dimensions) or a session the GPU
@@ -232,9 +250,7 @@ class NvencVideoEncoder : public webrtc::VideoEncoder {
  public:
   NvencVideoEncoder(std::shared_ptr<NvencLibrary> lib,
                     webrtc::VideoCodecType codec)
-      : lib_(std::move(lib)),
-        codec_(codec),
-        caps_(codec == webrtc::kVideoCodecAV1 ? lib_->av1 : lib_->h264) {}
+      : lib_(std::move(lib)), codec_(codec), caps_(lib_->CapsOf(codec)) {}
 
   ~NvencVideoEncoder() override { Release(); }
 
@@ -376,9 +392,11 @@ class NvencVideoEncoder : public webrtc::VideoEncoder {
 
     webrtc::CodecSpecificInfo info;
     info.codecType = codec_;
-    if (codec_ == webrtc::kVideoCodecH264) {
-      // H.264 QP, 0 to 51, as libwebrtc's own H.264 encoders report it.
+    if (codec_ != webrtc::kVideoCodecAV1) {
+      // H.264 and H.265 QP, 0 to 51, as libwebrtc's own encoders report it.
       image.qp_ = static_cast<int>(average_qp);
+    }
+    if (codec_ == webrtc::kVideoCodecH264) {
       info.codecSpecific.H264.packetization_mode =
           webrtc::H264PacketizationMode::NonInterleaved;
       info.codecSpecific.H264.temporal_idx = webrtc::kNoTemporalIdx;
@@ -393,7 +411,7 @@ class NvencVideoEncoder : public webrtc::VideoEncoder {
       generic.encoder_buffers = {webrtc::CodecBufferUsage(
           /*id=*/0, /*referenced=*/!is_key, /*updated=*/true)};
       info.generic_frame_info = generic;
-      if (is_key) info.template_structure = Av1L1T1Structure(width_, height_);
+      if (is_key) info.template_structure = L1T1Structure(width_, height_);
     }
     info.end_of_picture = true;
     callback_->OnEncodedImage(image, &info);
@@ -472,8 +490,14 @@ class NvencVideoEncoder : public webrtc::VideoEncoder {
   }
 
   const GUID& CodecGuid() const {
-    return codec_ == webrtc::kVideoCodecAV1 ? NV_ENC_CODEC_AV1_GUID
-                                            : NV_ENC_CODEC_H264_GUID;
+    switch (codec_) {
+      case webrtc::kVideoCodecH265:
+        return NV_ENC_CODEC_HEVC_GUID;
+      case webrtc::kVideoCodecAV1:
+        return NV_ENC_CODEC_AV1_GUID;
+      default:
+        return NV_ENC_CODEC_H264_GUID;
+    }
   }
 
   // The preset's configuration with this stream's choices on top, then the
@@ -505,6 +529,19 @@ class NvencVideoEncoder : public webrtc::VideoEncoder {
       av1.outputAnnexBFormat = 0;  // Low-overhead OBUs, what RTP carries.
       av1.inputBitDepth = NV_ENC_BIT_DEPTH_8;
       av1.outputBitDepth = NV_ENC_BIT_DEPTH_8;
+    } else if (codec_ == webrtc::kVideoCodecH265) {
+      config_.profileGUID = NV_ENC_HEVC_PROFILE_MAIN_GUID;
+      NV_ENC_CONFIG_HEVC& hevc = config_.encodeCodecConfig.hevcConfig;
+      hevc.idrPeriod = NVENC_INFINITE_GOPLENGTH;
+      hevc.repeatSPSPPS = 1;  // VPS, SPS and PPS on every key frame.
+      hevc.chromaFormatIDC = 1;
+      hevc.level = NV_ENC_LEVEL_AUTOSELECT;
+      hevc.tier = NV_ENC_TIER_HEVC_MAIN;
+      hevc.outputAUD = 0;
+      hevc.sliceMode = 0;
+      hevc.sliceModeData = 0;  // One slice per picture.
+      hevc.inputBitDepth = NV_ENC_BIT_DEPTH_8;
+      hevc.outputBitDepth = NV_ENC_BIT_DEPTH_8;
     } else {
       config_.profileGUID = NV_ENC_H264_PROFILE_BASELINE_GUID;
       NV_ENC_CONFIG_H264& h264 = config_.encodeCodecConfig.h264Config;
@@ -682,8 +719,8 @@ class NvencVideoEncoderFactory : public webrtc::VideoEncoderFactory {
   std::unique_ptr<webrtc::VideoEncoder> Create(
       const webrtc::Environment& /*env*/,
       const webrtc::SdpVideoFormat& format) override {
-    // Only a format listed: H.264 constrained baseline at any level, AV1
-    // main.
+    // Only a format listed: H.264 constrained baseline at any level, H.265
+    // Main, AV1 main.
     bool listed = false;
     for (const auto& f : NvencFormats(*lib_))
       if (f.IsSameCodec(format)) listed = true;
@@ -762,11 +799,13 @@ std::shared_ptr<NvencLibrary> OpenNvenc(int device, std::string* why) {
       return nullptr;
     }
     lib->h264 = AskEncodes(*lib, session, NV_ENC_CODEC_H264_GUID);
+    lib->hevc = AskEncodes(*lib, session, NV_ENC_CODEC_HEVC_GUID);
     lib->av1 = AskEncodes(*lib, session, NV_ENC_CODEC_AV1_GUID);
     lib->api.nvEncDestroyEncoder(session);
   }
-  if (!lib->h264.encodes && !lib->av1.encodes) {
-    SetWhy(why, "GPU " + std::to_string(device) + " encodes neither H.264 nor AV1");
+  if (!lib->h264.encodes && !lib->hevc.encodes && !lib->av1.encodes) {
+    SetWhy(why, "GPU " + std::to_string(device) +
+                    " encodes none of H.264, H.265 and AV1");
     return nullptr;
   }
   return lib;
@@ -776,6 +815,8 @@ bool NvencEncodes(const NvencLibrary& lib, webrtc::VideoCodecType codec) {
   switch (codec) {
     case webrtc::kVideoCodecH264:
       return lib.h264.encodes;
+    case webrtc::kVideoCodecH265:
+      return lib.hevc.encodes;
     case webrtc::kVideoCodecAV1:
       return lib.av1.encodes;
     default:

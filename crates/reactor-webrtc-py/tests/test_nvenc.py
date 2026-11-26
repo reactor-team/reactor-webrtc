@@ -1,4 +1,4 @@
-"""Video encode on NVIDIA GPUs with NVENC: H.264 and AV1.
+"""Video encode on NVIDIA GPUs with NVENC: H.264, H.265 and AV1.
 
 Asking for NVENC never fails: where no NVIDIA GPU with an encoder is (any
 machine without one, an A100, H100 or B200, macOS) the backend is left out and
@@ -6,7 +6,7 @@ video encodes as before, and a codec the GPU does not encode stays in
 software. The tests that encode on NVENC need a GPU that encodes the codec and
 are skipped elsewhere; the streams they encode are decoded by the process's own
 decoders (NVDEC where the GPU has it), so a codec this process cannot decode is
-skipped.
+skipped. H.265 has no software decoder: its stream decodes on NVDEC.
 """
 
 from __future__ import annotations
@@ -20,7 +20,11 @@ from test_loopback import connect, make_peer
 from test_video_codec import FRAME_US, MIN_PSNR_DB, frame, psnr
 
 W, H = 320, 180
-CODECS = [rw.VideoCodec.H264, rw.VideoCodec.Av1]
+CODECS = [rw.VideoCodec.H264, rw.VideoCodec.H265, rw.VideoCodec.Av1]
+
+
+def mime(codec: rw.VideoCodec) -> str:
+    return "video/" + ids(codec).upper()
 
 
 def ids(codec: rw.VideoCodec) -> str:
@@ -221,6 +225,8 @@ async def test_a_peer_connection_encodes_on_nvenc(
     assert inbound is not None and inbound.frames_decoded >= 30, (
         "too few frames decoded"
     )
+    # The codec asked for, not another one negotiated in its place.
+    assert inbound.codec_mime_type == mime(codec), inbound.codec_mime_type
     assert outbound is not None and outbound.encoder_implementation == "NVENC", (
         outbound and outbound.encoder_implementation
     )

@@ -111,6 +111,7 @@
 #include "third_party/libyuv/include/libyuv/convert.h"
 #include "third_party/libyuv/include/libyuv/convert_argb.h"
 #include "third_party/libyuv/include/libyuv/planar_functions.h"
+#include "h265_format.h"
 #include "rgb_frame_buffer.h"
 
 #ifdef REACTOR_WEBRTC_NVDEC
@@ -2757,11 +2758,11 @@ struct ReactorFactoryOptions {
   // Reactor-SenderTransformHoldMs field trial (patch 0012).
   int                          sender_transform_hold_ms;
   // Nonzero: decode video on the first visible NVIDIA GPU with NVDEC, ahead
-  // of the software decoders, for each of H.264, VP8, VP9 and AV1 it decodes
+  // of the software decoders, for each of H.264, H.265, VP8, VP9 and AV1 it decodes
   // (Linux). Otherwise video decodes as it would without it.
   int                          use_nvdec;
   // Nonzero: encode video on the first visible NVIDIA GPU with NVENC, ahead
-  // of the software encoders, for each of H.264 and AV1 it encodes (Linux).
+  // of the software encoders, for each of H.264, H.265 and AV1 it encodes (Linux).
   // Otherwise video encodes as it would without it.
   int                          use_nvenc;
 };
@@ -3786,9 +3787,12 @@ webrtc::SdpVideoFormat StandaloneH264Format() {
 }
 
 // The SDP format the backends of `codec` (a webrtc::VideoCodecType) are
-// created with. VP9 and AV1 use profile 0: 8-bit 4:2:0, what I420 carries.
+// created with. VP9 and AV1 use profile 0 and H.265 Main: 8-bit 4:2:0, what
+// I420 carries.
 webrtc::SdpVideoFormat StandaloneFormat(int codec) {
   switch (codec) {
+    case webrtc::kVideoCodecH265:
+      return reactor::H265MainFormat();
     case webrtc::kVideoCodecVP8:
       return webrtc::SdpVideoFormat::VP8();
     case webrtc::kVideoCodecVP9:
@@ -4103,6 +4107,12 @@ class StandaloneVideoEncoder : public webrtc::EncodedImageCallback {
         codec.SetScalabilityMode(webrtc::ScalabilityMode::kL1T1);
         codec.AV1()->automatic_resize_on = false;
         break;
+      case webrtc::kVideoCodecH265:
+        // No codec-specific settings: NVENC, its one encoder, reads the
+        // size, rates and QP range.
+        codec.qpMax = 51;
+        codec.SetScalabilityMode(webrtc::ScalabilityMode::kL1T1);
+        break;
       default:
         codec.qpMax = 51;
         *codec.H264() = webrtc::VideoEncoder::GetDefaultH264Settings();
@@ -4389,10 +4399,11 @@ extern "C" {
 // Collects the codec backends this process can run. `openh264_lib_path`
 // (may be null) is loaded as the software H264 backend; a path that does not
 // load, or one given to a build without OpenH264, fails the create. Nonzero
-// `use_nvdec` adds NVDEC as the hardware decoder of each of H264, VP8, VP9
-// and AV1 the first visible NVIDIA GPU decodes (Linux); nonzero `use_nvenc`
-// adds NVENC as the hardware encoder of each of H264 and AV1 it encodes. A
-// codec the GPU does not run is left out, which the capabilities show. VP8,
+// `use_nvdec` adds NVDEC as the hardware decoder of each of H264, H265, VP8,
+// VP9 and AV1 the first visible NVIDIA GPU decodes (Linux); nonzero
+// `use_nvenc` adds NVENC as the hardware encoder of each of H264, H265 and AV1
+// it encodes. A codec the GPU does not run is left out, which the
+// capabilities show; H265 runs on nothing else. VP8,
 // VP9 and AV1 run on libwebrtc's builtin software codecs, in each direction
 // the library was built with.
 void* reactor_webrtc_codec_context_create(const char* openh264_lib_path,
@@ -4412,7 +4423,8 @@ void* reactor_webrtc_codec_context_create(const char* openh264_lib_path,
       // within Encode().
       std::shared_ptr<webrtc::VideoEncoderFactory> encoders =
           reactor::CreateNvencVideoEncoderFactory(lib);
-      for (int codec : {webrtc::kVideoCodecH264, webrtc::kVideoCodecAV1}) {
+      for (int codec : {webrtc::kVideoCodecH264, webrtc::kVideoCodecH265,
+                        webrtc::kVideoCodecAV1}) {
         if (!reactor::NvencEncodes(*lib, static_cast<webrtc::VideoCodecType>(codec)))
           continue;
         StandaloneBackend nv;
@@ -4440,8 +4452,9 @@ void* reactor_webrtc_codec_context_create(const char* openh264_lib_path,
       // ahead of the software ones added below.
       std::shared_ptr<webrtc::VideoDecoderFactory> decoders =
           reactor::CreateNvdecVideoDecoderFactory(lib);
-      for (int codec : {webrtc::kVideoCodecH264, webrtc::kVideoCodecVP8,
-                        webrtc::kVideoCodecVP9, webrtc::kVideoCodecAV1}) {
+      for (int codec : {webrtc::kVideoCodecH264, webrtc::kVideoCodecH265,
+                        webrtc::kVideoCodecVP8, webrtc::kVideoCodecVP9,
+                        webrtc::kVideoCodecAV1}) {
         if (!reactor::NvdecDecodes(*lib, static_cast<webrtc::VideoCodecType>(codec)))
           continue;
         StandaloneBackend nv;

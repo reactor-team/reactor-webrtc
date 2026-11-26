@@ -204,6 +204,7 @@ fn archive_uses_relative_vtables(lib_dir: &Path) -> bool {
 fn compile_glue(include_dir: &Path, is_debug_prebuilt: bool, relative_vtables: bool) {
     println!("cargo:rerun-if-changed=glue/reactor_webrtc.cpp");
     println!("cargo:rerun-if-changed=glue/rgb_frame_buffer.h");
+    println!("cargo:rerun-if-changed=glue/h265_format.h");
 
     let mut build = cc::Build::new();
     build

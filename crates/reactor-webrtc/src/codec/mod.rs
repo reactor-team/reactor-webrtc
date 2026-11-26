@@ -3,8 +3,9 @@
 //!
 //! [`VideoCodecs`] collects the backends this process can run, and creates a
 //! [`VideoEncoder`] or a [`VideoDecoder`] for a [`VideoCodec`]. The codec is a
-//! parameter, not a separate API: [`VideoCodec::H264`], [`VideoCodec::Vp8`],
-//! [`VideoCodec::Vp9`] and [`VideoCodec::Av1`] run standalone, and
+//! parameter, not a separate API: [`VideoCodec::H264`], [`VideoCodec::H265`],
+//! [`VideoCodec::Vp8`], [`VideoCodec::Vp9`] and [`VideoCodec::Av1`] run
+//! standalone, and
 //! [`VideoCodecs::capabilities`] lists which of them this process can run in
 //! each direction.
 //!
@@ -25,6 +26,7 @@
 //! | Codec | Hardware | Software |
 //! |-------|----------|----------|
 //! | H.264 | VideoToolbox (macOS, iOS); NVENC to encode, NVDEC to decode | OpenH264, with the `openh264` feature ([`VideoCodecs::with_openh264`]) |
+//! | H.265 | NVENC to encode, NVDEC to decode (Main profile) | none |
 //! | VP8 | NVDEC to decode | libvpx |
 //! | VP9 | NVDEC to decode | libvpx (profile 0) |
 //! | AV1 | NVENC to encode, NVDEC to decode | libaom to encode, dav1d to decode (main profile) |
@@ -71,6 +73,7 @@
 //! | Codec | One encoded frame |
 //! |-------|-------------------|
 //! | H.264 | one access unit, Annex B (start codes), constrained baseline; a key frame carries its SPS and PPS |
+//! | H.265 | one access unit, Annex B (start codes), Main profile; a key frame carries its VPS, SPS and PPS |
 //! | VP8 | one frame, as the encoder emits it (RFC 6386) |
 //! | VP9 | one frame, as the encoder emits it; one spatial layer, so no superframe |
 //! | AV1 | one temporal unit of OBUs, each with its size field (low-overhead format); a key frame carries the sequence header |
@@ -221,7 +224,7 @@ impl VideoCodecsBuilder {
         self
     }
 
-    /// Add NVDEC as the hardware decoder of each of H.264, VP8, VP9 and AV1
+    /// Add NVDEC as the hardware decoder of each of H.264, H.265, VP8, VP9 and AV1
     /// the first visible NVIDIA GPU decodes (`CUDA_VISIBLE_DEVICES` picks it).
     /// Linux only; it decodes, it does not encode. A codec the GPU does not
     /// decode, or every codec without a GPU, is left out rather than failing
@@ -233,7 +236,7 @@ impl VideoCodecsBuilder {
     }
 
     /// Add NVENC as the hardware encoder of each of H.264 (constrained
-    /// baseline) and AV1 (main) the first visible NVIDIA GPU encodes
+    /// baseline), H.265 (Main) and AV1 (main) the first visible NVIDIA GPU encodes
     /// (`CUDA_VISIBLE_DEVICES` picks it); VP8 and VP9 have no NVENC encoder.
     /// Linux only. A codec the GPU does not encode, or every codec without a
     /// GPU, a driver or an encoder (an A100, H100 or B200 has none), is left
@@ -342,11 +345,11 @@ impl VideoCodecs {
 /// [`VideoCodecs::capabilities`]'s answer.
 fn check_codec(codec: VideoCodec) -> Result<(), CodecError> {
     match codec {
-        VideoCodec::H264 | VideoCodec::Vp8 | VideoCodec::Vp9 | VideoCodec::Av1 => Ok(()),
-        other => Err(CodecError::Unsupported(format!(
-            "{} is not available as a standalone codec",
-            other.name()
-        ))),
+        VideoCodec::H264
+        | VideoCodec::H265
+        | VideoCodec::Vp8
+        | VideoCodec::Vp9
+        | VideoCodec::Av1 => Ok(()),
     }
 }
 
@@ -358,7 +361,10 @@ pub(crate) fn is_key_frame(codec: VideoCodec, data: &[u8]) -> bool {
         VideoCodec::Vp8 => vp8_is_key_frame(data),
         VideoCodec::Vp9 => vp9_is_key_frame(data),
         VideoCodec::Av1 => av1_is_key_frame(data),
-        VideoCodec::H265 => false,
+        // An IRAP picture: BLA, IDR or CRA (NAL types 16 to 21).
+        VideoCodec::H265 => {
+            annex_b_nal_headers(data).any(|h| (16..=21).contains(&((h >> 1) & 0x3f)))
+        }
     }
 }
 
@@ -471,11 +477,16 @@ fn leb128(data: &[u8]) -> Option<(usize, &[u8])> {
 
 /// The `nal_unit_type` of each NAL unit in an Annex B buffer.
 fn h264_nal_types(data: &[u8]) -> impl Iterator<Item = u8> + '_ {
+    annex_b_nal_headers(data).map(|h| h & 0x1f)
+}
+
+/// The first header byte of each NAL unit in an Annex B stream.
+fn annex_b_nal_headers(data: &[u8]) -> impl Iterator<Item = u8> + '_ {
     // A start code is 00 00 01 (a four-byte 00 00 00 01 ends the same way);
     // the NAL header is the byte after it.
     data.windows(4)
         .filter(|w| w[0] == 0 && w[1] == 0 && w[2] == 1)
-        .map(|w| w[3] & 0x1f)
+        .map(|w| w[3])
 }
 
 /// A buffer the glue writes an error message into.
@@ -532,6 +543,26 @@ mod tests {
         let delta = [0, 0, 0, 1, 0x41, 0x9a, 0x00];
         assert!(!is_key_frame(VideoCodec::H264, &delta));
         assert!(!is_key_frame(VideoCodec::H264, &[]));
+    }
+
+    #[test]
+    fn finds_an_h265_irap_after_its_parameter_sets() {
+        // VPS (32), SPS (33), PPS (34), IDR_N_LP (20): the header's type is
+        // bits 1 to 6 of its first byte.
+        let key = [
+            0, 0, 0, 1, 0x40, 0x01, 0, 0, 0, 1, 0x42, 0x01, 0, 0, 1, 0x44, 0x01, 0, 0, 1, 0x28,
+            0x01, 0xaf,
+        ];
+        assert!(is_key_frame(VideoCodec::H265, &key));
+        // A CRA (21) starts a stream too.
+        assert!(is_key_frame(VideoCodec::H265, &[0, 0, 1, 0x2a, 0x01, 0xaf]));
+        // TRAIL_R (1), and a parameter set alone.
+        assert!(!is_key_frame(
+            VideoCodec::H265,
+            &[0, 0, 0, 1, 0x02, 0x01, 0xd0]
+        ));
+        assert!(!is_key_frame(VideoCodec::H265, &[0, 0, 0, 1, 0x40, 0x01]));
+        assert!(!is_key_frame(VideoCodec::H265, &[]));
     }
 
     #[test]
@@ -631,18 +662,17 @@ mod tests {
     }
 
     #[test]
-    fn refuses_codecs_it_does_not_run() {
+    fn takes_every_codec_some_backend_runs() {
+        // H.265 runs only on NVENC and NVDEC: without them, creating it fails
+        // for want of a backend, like any codec this process has none for.
         for codec in [
             VideoCodec::H264,
+            VideoCodec::H265,
             VideoCodec::Vp8,
             VideoCodec::Vp9,
             VideoCodec::Av1,
         ] {
             assert!(check_codec(codec).is_ok(), "{codec:?}");
         }
-        assert!(matches!(
-            check_codec(VideoCodec::H265),
-            Err(CodecError::Unsupported(_))
-        ));
     }
 }

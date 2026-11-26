@@ -3358,7 +3358,7 @@ impl PeerConnectionFactoryBuilder {
     }
 
     /// Decode video on the first visible NVIDIA GPU with NVDEC, ahead of the
-    /// software decoders, for each of H.264, VP8, VP9 and AV1 it decodes
+    /// software decoders, for each of H.264, H.265, VP8, VP9 and AV1 it decodes
     /// (Linux; `CUDA_VISIBLE_DEVICES` picks the GPU). Never fails the factory:
     /// otherwise video decodes as it would without it.
     fn with_nvdec(&mut self) -> PyResult<()> {
@@ -3371,7 +3371,7 @@ impl PeerConnectionFactoryBuilder {
     }
 
     /// Encode video on the first visible NVIDIA GPU with NVENC, ahead of the
-    /// software encoders, for each of H.264 and AV1 it encodes (Linux;
+    /// software encoders, for each of H.264, H.265 and AV1 it encodes (Linux;
     /// `CUDA_VISIBLE_DEVICES` picks the GPU; in a container,
     /// `NVIDIA_DRIVER_CAPABILITIES` must include `video`). Never fails the
     /// factory: otherwise video encodes as it would without it.

@@ -276,7 +276,7 @@ impl PeerConnectionFactoryBuilder {
     }
 
     /// Decode video on the first visible NVIDIA GPU with NVDEC, ahead of the
-    /// software decoders, for each of H.264, VP8, VP9 (profile 0) and AV1
+    /// software decoders, for each of H.264, H.265 (Main), VP8, VP9 (profile 0) and AV1
     /// (main) that GPU decodes. Linux only: the CUDA driver and NVDEC are
     /// loaded from the NVIDIA driver at run time, and `CUDA_VISIBLE_DEVICES`
     /// picks the GPU. Like `with_openh264`, this never fails the factory:
@@ -288,7 +288,7 @@ impl PeerConnectionFactoryBuilder {
     }
 
     /// Encode video on the first visible NVIDIA GPU with NVENC, ahead of the
-    /// software encoders, for each of H.264 (constrained baseline) and AV1
+    /// software encoders, for each of H.264 (constrained baseline), H.265 (Main) and AV1
     /// (main) that GPU encodes; VP8 and VP9 have no NVENC encoder. Linux only:
     /// the CUDA driver and NVENC are loaded from the NVIDIA driver at run time
     /// (in a container, `NVIDIA_DRIVER_CAPABILITIES` must include `video`),

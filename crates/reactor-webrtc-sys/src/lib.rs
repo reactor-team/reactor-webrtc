@@ -210,12 +210,12 @@ pub struct ReactorFactoryOptions {
     /// 0012), so closing the sender drops the delegate's last reference there.
     pub sender_transform_hold_ms: c_int,
     /// Nonzero: decode video on the first visible NVIDIA GPU with NVDEC, ahead
-    /// of the software decoders, for each of H.264, VP8, VP9 and AV1 it
+    /// of the software decoders, for each of H.264, H.265, VP8, VP9 and AV1 it
     /// decodes (Linux). Without a GPU or driver, or for a codec the GPU does
     /// not decode, video decodes as it would without it.
     pub use_nvdec: c_int,
     /// Nonzero: encode video on the first visible NVIDIA GPU with NVENC, ahead
-    /// of the software encoders, for each of H.264 and AV1 it encodes (Linux).
+    /// of the software encoders, for each of H.264, H.265 and AV1 it encodes (Linux).
     /// Without a GPU, driver or encoder, or for a codec the GPU does not
     /// encode, video encodes as it would without it.
     pub use_nvenc: c_int,
@@ -1347,7 +1347,7 @@ extern "C" {
     /// VP8, VP9 and AV1 libwebrtc's builtin software codecs. With `use_nvdec`
     /// nonzero, NVDEC on the first visible NVIDIA GPU is the hardware decoder
     /// of each of these codecs that GPU decodes (Linux); with `use_nvenc`
-    /// nonzero, NVENC on it is the hardware encoder of each of H264 and AV1
+    /// nonzero, NVENC on it is the hardware encoder of each of H264, H265 and AV1
     /// it encodes. Returns null,
     /// with the reason in `err`, when that library does not load or the build
     /// has no OpenH264 support. Free with
