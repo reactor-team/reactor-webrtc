@@ -13,6 +13,39 @@
   receiver had no depacketizer for it. No H.265 encoder or decoder comes with
   it: a custom slot or a pre-encoded track supplies the bitstream, and a
   received stream still reaches the null decoder.
+- **NVENC encodes H.264, H.265 and AV1 on NVIDIA GPUs** (Linux), opt-in:
+  `PeerConnectionFactoryBuilder::with_nvenc()` puts it ahead of the software
+  encoders in the factory, and `VideoCodecs::builder().nvenc()` adds an
+  `NVENC` hardware encoder to the standalone codecs; in Python,
+  `with_nvenc()` on the builder and `VideoCodecs(nvenc=True)`. Each codec is
+  offered where the first visible GPU encodes it (an RTX PRO 6000 or L20Z
+  does; an A100, H100 or B200 has no encoder). VP8 and VP9 have no NVENC
+  encoder.
+  - The encoder is synchronous and low-latency: ultra-low-latency tuning on
+    preset P4, CBR with a one-frame rate buffer, no B-frames, and an infinite
+    GOP with a key frame only when one is asked for. Each key frame carries its
+    sequence header. H.264 is constrained baseline in packetization mode 1, as
+    OpenH264 lists it. H.265 is Main profile, Main tier, listed at level 5.2
+    with `tx-mode=SRST`, as Chrome lists it. H.265 and AV1 carry the
+    dependency descriptor's L1T1 structure, as libaom does for AV1.
+  - NVENC is loaded at run time with `dlopen` from the NVIDIA driver
+    (`libnvidia-encode.so.1`, which a container mounts only with the `video`
+    driver capability), through the nv-codec-headers loader already vendored
+    for NVDEC. Nothing is linked. Without a GPU, a driver or an encoder, the
+    backend is left out and nothing fails.
+  - A stream NVENC does not take (an odd size, one outside the GPU's limits,
+    no encode session left) goes to the codec's software encoder, in a peer
+    connection and in the standalone codecs; a session that fails mid-stream
+    hands over to it in a peer connection.
+- **NVDEC decodes H.265** (Main, 8-bit 4:2:0) where the GPU does, with the
+  other four codecs, and so does the `NVDEC` standalone decoder.
+- **H.265 runs standalone**: `VideoCodec::H265` is no longer refused by
+  `VideoCodecs`, and runs where NVENC encodes it or NVDEC decodes it. It has
+  no software backend, so without them creating it still fails with
+  `CodecError::Unsupported`.
+- **ABI.** `ReactorFactoryOptions` gains `use_nvenc` at its end, so its size
+  grows from 144 to 152 and both sides assert its offset.
+  `reactor_webrtc_codec_context_create` takes a `use_nvenc` argument.
 
 ### Fixed
 

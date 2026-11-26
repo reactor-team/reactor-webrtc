@@ -27,6 +27,7 @@
 #define FFNV_DEBUG_LOG_FUNC(logctx, msg, ...) ((void)0)
 #include "vendor/dynlink_loader.h"
 
+#include "../h265_format.h"
 #include "../rgb_frame_buffer.h"
 #include "nv12_to_rgb_ptx.h"
 
@@ -70,6 +71,7 @@ class NvdecLibrary {
     unsigned int max_mb_count = 0;
   };
   Caps h264;
+  Caps hevc;
   Caps vp8;
   Caps vp9;
   Caps av1;
@@ -173,6 +175,8 @@ cudaVideoCodec CuvidCodec(webrtc::VideoCodecType codec) {
   switch (codec) {
     case webrtc::kVideoCodecH264:
       return cudaVideoCodec_H264;
+    case webrtc::kVideoCodecH265:
+      return cudaVideoCodec_HEVC;
     case webrtc::kVideoCodecVP8:
       return cudaVideoCodec_VP8;
     case webrtc::kVideoCodecVP9:
@@ -187,7 +191,7 @@ cudaVideoCodec CuvidCodec(webrtc::VideoCodecType codec) {
 // The formats NVDEC decodes on `lib`'s GPU. H.264 in the profiles it decodes,
 // at level 3.1, the level libwebrtc lists its own H.264 at (a decoder accepts
 // any level its profile allows); VP9 profile 0 and AV1 main, the 8-bit 4:2:0
-// ones.
+// ones; H.265 Main.
 std::vector<webrtc::SdpVideoFormat> NvdecFormats(const NvdecLibrary& lib) {
   std::vector<webrtc::SdpVideoFormat> formats;
   if (lib.h264.decodes) {
@@ -201,6 +205,7 @@ std::vector<webrtc::SdpVideoFormat> NvdecFormats(const NvdecLibrary& lib) {
                                             {"profile-level-id", profile_level_id}});
     }
   }
+  if (lib.hevc.decodes) formats.push_back(H265MainFormat());
   if (lib.vp8.decodes) formats.push_back(webrtc::SdpVideoFormat::VP8());
   if (lib.vp9.decodes) formats.push_back(webrtc::SdpVideoFormat::VP9Profile0());
   if (lib.av1.decodes) formats.push_back(webrtc::SdpVideoFormat::AV1Profile0());
@@ -237,6 +242,8 @@ const NvdecLibrary::Caps& CapsOf(const NvdecLibrary& lib,
   switch (codec) {
     case cudaVideoCodec_H264:
       return lib.h264;
+    case cudaVideoCodec_HEVC:
+      return lib.hevc;
     case cudaVideoCodec_VP8:
       return lib.vp8;
     case cudaVideoCodec_VP9:
@@ -735,6 +742,7 @@ std::shared_ptr<NvdecLibrary> OpenNvdec(int device, std::string* why) {
       return nullptr;
     }
     lib->h264 = AskDecodes(*lib, cudaVideoCodec_H264);
+    lib->hevc = AskDecodes(*lib, cudaVideoCodec_HEVC);
     lib->vp8 = AskDecodes(*lib, cudaVideoCodec_VP8);
     lib->vp9 = AskDecodes(*lib, cudaVideoCodec_VP9);
     lib->av1 = AskDecodes(*lib, cudaVideoCodec_AV1);
@@ -754,10 +762,10 @@ std::shared_ptr<NvdecLibrary> OpenNvdec(int device, std::string* why) {
       lib->nv12_to_rgb = nullptr;
     }
   }
-  if (!lib->h264.decodes && !lib->vp8.decodes && !lib->vp9.decodes &&
-      !lib->av1.decodes) {
+  if (!lib->h264.decodes && !lib->hevc.decodes && !lib->vp8.decodes &&
+      !lib->vp9.decodes && !lib->av1.decodes) {
     SetWhy(why, "GPU " + std::to_string(device) +
-                    " decodes none of H.264, VP8, VP9 and AV1");
+                    " decodes none of H.264, H.265, VP8, VP9 and AV1");
     return nullptr;
   }
   return lib;
@@ -767,6 +775,8 @@ bool NvdecDecodes(const NvdecLibrary& lib, webrtc::VideoCodecType codec) {
   switch (codec) {
     case webrtc::kVideoCodecH264:
       return lib.h264.decodes;
+    case webrtc::kVideoCodecH265:
+      return lib.hevc.decodes;
     case webrtc::kVideoCodecVP8:
       return lib.vp8.decodes;
     case webrtc::kVideoCodecVP9:

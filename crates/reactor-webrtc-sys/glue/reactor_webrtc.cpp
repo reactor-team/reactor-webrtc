@@ -87,6 +87,7 @@
 #include "api/video_codecs/video_decoder_software_fallback_wrapper.h"
 #include "api/video_codecs/video_encoder.h"
 #include "api/video_codecs/video_encoder_factory.h"
+#include "api/video_codecs/video_encoder_software_fallback_wrapper.h"
 #if defined(WEBRTC_MAC)
 // Real VideoToolbox H.264 -- see
 // webrtc-build/patches/0004-webrtc-add-apple-videotoolbox-h264.patch for the
@@ -110,10 +111,15 @@
 #include "third_party/libyuv/include/libyuv/convert.h"
 #include "third_party/libyuv/include/libyuv/convert_argb.h"
 #include "third_party/libyuv/include/libyuv/planar_functions.h"
+#include "h265_format.h"
 #include "rgb_frame_buffer.h"
 
 #ifdef REACTOR_WEBRTC_NVDEC
 #include "nvdec/nvdec_codec.h"
+#include "rtc_base/logging.h"
+#endif
+#ifdef REACTOR_WEBRTC_NVENC
+#include "nvenc/nvenc_codec.h"
 #include "rtc_base/logging.h"
 #endif
 #ifdef REACTOR_WEBRTC_OPENH264
@@ -2752,9 +2758,13 @@ struct ReactorFactoryOptions {
   // Reactor-SenderTransformHoldMs field trial (patch 0012).
   int                          sender_transform_hold_ms;
   // Nonzero: decode video on the first visible NVIDIA GPU with NVDEC, ahead
-  // of the software decoders, for each of H.264, VP8, VP9 and AV1 it decodes
+  // of the software decoders, for each of H.264, H.265, VP8, VP9 and AV1 it decodes
   // (Linux). Otherwise video decodes as it would without it.
   int                          use_nvdec;
+  // Nonzero: encode video on the first visible NVIDIA GPU with NVENC, ahead
+  // of the software encoders, for each of H.264, H.265 and AV1 it encodes (Linux).
+  // Otherwise video encodes as it would without it.
+  int                          use_nvenc;
 };
 }
 
@@ -2762,7 +2772,7 @@ struct ReactorFactoryOptions {
 // which carries the same numbers. Both build from one checkout, so no ABI
 // version guards this struct; it only grows at its end, behind `size`. The
 // offsets catch a field added on one side only within a run of ints.
-static_assert(sizeof(void*) != 8 || sizeof(ReactorFactoryOptions) == 144,
+static_assert(sizeof(void*) != 8 || sizeof(ReactorFactoryOptions) == 152,
               "ReactorFactoryOptions changed size — update the repr(C) mirror "
               "in reactor-webrtc-sys/src/lib.rs and both assertions");
 static_assert(sizeof(void*) != 8 ||
@@ -2773,6 +2783,8 @@ static_assert(sizeof(void*) != 8 ||
               offsetof(ReactorFactoryOptions, sender_transform_hold_ms) == 136);
 static_assert(sizeof(void*) != 8 ||
               offsetof(ReactorFactoryOptions, use_nvdec) == 140);
+static_assert(sizeof(void*) != 8 ||
+              offsetof(ReactorFactoryOptions, use_nvenc) == 144);
 
 struct ReactorEncoderState {
   reactor_video_encode_cb        cb;
@@ -2930,13 +2942,17 @@ class ReactorVideoEncoder : public webrtc::VideoEncoder {
 // The single video encoder factory every PeerConnectionFactory gets. Routes
 // per encoder instance first, then per format:
 //   1. custom slot (registry / inline encoder) → ReactorVideoEncoder;
-//   2. H264 with a real backend → OpenH264, then Apple VideoToolbox;
-//   3. everything else → the builtin VP8/VP9/AV1 encoder.
+//   2. NVENC, where the factory was asked for it and its GPU encodes the
+//      format (H264, AV1), unless the instance asked for a named H264
+//      backend; it falls back to the software encoder of step 3 or 4;
+//   3. H264 with a real backend → OpenH264, then Apple VideoToolbox;
+//   4. everything else → the builtin VP8/VP9/AV1 encoder.
 // `openh264` is only non-null when the library actually loaded; `apple_h264`
-// only on Apple platforms.
+// only on Apple platforms; `nvenc` only when NVENC opened.
 class ReactorCompositeVideoEncoderFactory : public webrtc::VideoEncoderFactory {
   std::shared_ptr<ReactorEncoderState>       state_;  // may be null
   std::unique_ptr<webrtc::VideoEncoderFactory> builtin_;
+  std::unique_ptr<webrtc::VideoEncoderFactory> nvenc_;       // may be null
   std::unique_ptr<webrtc::VideoEncoderFactory> openh264_;    // may be null
   std::unique_ptr<webrtc::VideoEncoderFactory> apple_h264_;  // may be null
   std::atomic<uint64_t>                       next_id_{0};
@@ -2951,10 +2967,12 @@ class ReactorCompositeVideoEncoderFactory : public webrtc::VideoEncoderFactory {
  public:
   ReactorCompositeVideoEncoderFactory(
       std::shared_ptr<ReactorEncoderState> state,
+      std::unique_ptr<webrtc::VideoEncoderFactory> nvenc,
       std::unique_ptr<webrtc::VideoEncoderFactory> openh264,
       std::unique_ptr<webrtc::VideoEncoderFactory> apple_h264)
       : state_(std::move(state)),
         builtin_(webrtc::CreateBuiltinVideoEncoderFactory()),
+        nvenc_(std::move(nvenc)),
         openh264_(std::move(openh264)),
         apple_h264_(std::move(apple_h264)) {}
 
@@ -2964,6 +2982,7 @@ class ReactorCompositeVideoEncoderFactory : public webrtc::VideoEncoderFactory {
       for (const auto& fmt : f->GetSupportedFormats())
         if (!HasFormat(formats, fmt)) formats.push_back(fmt);
     };
+    if (nvenc_) merge(nvenc_.get());
     if (openh264_) merge(openh264_.get());
     if (apple_h264_) merge(apple_h264_.get());
     // Custom slots deliver their own bitstream: advertise H264 (and H265, as
@@ -2991,11 +3010,35 @@ class ReactorCompositeVideoEncoderFactory : public webrtc::VideoEncoderFactory {
         !(state_->use_builtin && state_->use_builtin(state_->userdata, id))) {
       return std::make_unique<ReactorVideoEncoder>(state_, id);
     }
-    if (format.name == "H264") {
-      int pref = 0;  // 0 = auto, 1 = VideoToolbox, 2 = OpenH264
-      if (state_ && state_->video_backend_for) {
-        pref = state_->video_backend_for(state_->userdata, id);
+    int pref = 0;  // H264 only: 0 = auto, 1 = VideoToolbox, 2 = OpenH264
+    if (format.name == "H264" && state_ && state_->video_backend_for) {
+      pref = state_->video_backend_for(state_->userdata, id);
+    }
+    // Hardware first: NVENC, unless the instance named an H264 backend, with
+    // the format's software encoder behind it. It takes over when NVENC does
+    // not initialise (a size the GPU does not encode, no session left) or
+    // fails mid-stream.
+    if (pref == 0 && nvenc_ && HasFormat(nvenc_->GetSupportedFormats(), format)) {
+      if (auto hardware = nvenc_->Create(env, format)) {
+        std::unique_ptr<webrtc::VideoEncoder> software =
+            CreateSoftware(env, format, pref);
+        if (!software) return hardware;
+        return webrtc::CreateVideoEncoderSoftwareFallbackWrapper(
+            env, std::move(software), std::move(hardware),
+            /*prefer_temporal_support=*/false);
       }
+    }
+    return CreateSoftware(env, format, pref);
+  }
+
+ private:
+  // The software (or, for H264 on Apple, VideoToolbox) encoder of `format`,
+  // H264 on the backend `pref` names where it is available; null when there
+  // is none.
+  std::unique_ptr<webrtc::VideoEncoder> CreateSoftware(
+      const webrtc::Environment& env, const webrtc::SdpVideoFormat& format,
+      int pref) {
+    if (format.name == "H264") {
       std::unique_ptr<webrtc::VideoEncoder> enc;
       if (pref == 1 && apple_h264_) enc = apple_h264_->Create(env, format);
       if (pref == 2 && openh264_) enc = openh264_->Create(env, format);
@@ -3305,6 +3348,19 @@ void* reactor_webrtc_factory_create(const ReactorFactoryOptions* opts,
   }
 #endif
 
+  std::unique_ptr<webrtc::VideoEncoderFactory> nvenc_enc;
+#ifdef REACTOR_WEBRTC_NVENC
+  if (opts->use_nvenc) {
+    std::string why;
+    if (auto lib = reactor::OpenNvenc(/*device=*/0, &why)) {
+      nvenc_enc = reactor::CreateNvencVideoEncoderFactory(std::move(lib));
+    } else {
+      RTC_LOG(LS_INFO) << "NVENC is not available, video encodes in software: "
+                       << why;
+    }
+  }
+#endif
+
   // Encoder-callback ownership is taken HERE — after every fallible step
   // above: an earlier return (bad options, OpenH264 path in a non-OpenH264
   // build, thread start) never constructs the state and never frees its
@@ -3343,7 +3399,8 @@ void* reactor_webrtc_factory_create(const ReactorFactoryOptions* opts,
       webrtc::CreateBuiltinAudioEncoderFactory(),
       webrtc::CreateBuiltinAudioDecoderFactory(),
       std::make_unique<ReactorCompositeVideoEncoderFactory>(
-          state, std::move(openh264_enc), std::move(apple_enc)),
+          state, std::move(nvenc_enc), std::move(openh264_enc),
+          std::move(apple_enc)),
       std::make_unique<ReactorCompositeVideoDecoderFactory>(
           std::move(nvdec_dec), std::move(openh264_dec), std::move(apple_dec),
           state),
@@ -3730,9 +3787,12 @@ webrtc::SdpVideoFormat StandaloneH264Format() {
 }
 
 // The SDP format the backends of `codec` (a webrtc::VideoCodecType) are
-// created with. VP9 and AV1 use profile 0: 8-bit 4:2:0, what I420 carries.
+// created with. VP9 and AV1 use profile 0 and H.265 Main: 8-bit 4:2:0, what
+// I420 carries.
 webrtc::SdpVideoFormat StandaloneFormat(int codec) {
   switch (codec) {
+    case webrtc::kVideoCodecH265:
+      return reactor::H265MainFormat();
     case webrtc::kVideoCodecVP8:
       return webrtc::SdpVideoFormat::VP8();
     case webrtc::kVideoCodecVP9:
@@ -4047,6 +4107,12 @@ class StandaloneVideoEncoder : public webrtc::EncodedImageCallback {
         codec.SetScalabilityMode(webrtc::ScalabilityMode::kL1T1);
         codec.AV1()->automatic_resize_on = false;
         break;
+      case webrtc::kVideoCodecH265:
+        // No codec-specific settings: NVENC, its one encoder, reads the
+        // size, rates and QP range.
+        codec.qpMax = 51;
+        codec.SetScalabilityMode(webrtc::ScalabilityMode::kL1T1);
+        break;
       default:
         codec.qpMax = 51;
         *codec.H264() = webrtc::VideoEncoder::GetDefaultH264Settings();
@@ -4333,15 +4399,47 @@ extern "C" {
 // Collects the codec backends this process can run. `openh264_lib_path`
 // (may be null) is loaded as the software H264 backend; a path that does not
 // load, or one given to a build without OpenH264, fails the create. Nonzero
-// `use_nvdec` adds NVDEC as the hardware decoder of each of H264, VP8, VP9
-// and AV1 the first visible NVIDIA GPU decodes (Linux); a codec it does not
-// decode is left out, which the capabilities show. VP8, VP9 and AV1 run on
-// libwebrtc's builtin software codecs, in each direction the library was
-// built with.
+// `use_nvdec` adds NVDEC as the hardware decoder of each of H264, H265, VP8,
+// VP9 and AV1 the first visible NVIDIA GPU decodes (Linux); nonzero
+// `use_nvenc` adds NVENC as the hardware encoder of each of H264, H265 and AV1
+// it encodes. A codec the GPU does not run is left out, which the
+// capabilities show; H265 runs on nothing else. VP8,
+// VP9 and AV1 run on libwebrtc's builtin software codecs, in each direction
+// the library was built with.
 void* reactor_webrtc_codec_context_create(const char* openh264_lib_path,
-                                          int use_nvdec, char* err,
-                                          int err_cap) {
+                                          int use_nvdec, int use_nvenc,
+                                          char* err, int err_cap) {
   auto ctx = std::make_shared<StandaloneCodecContext>();
+#ifdef REACTOR_WEBRTC_NVENC
+  if (use_nvenc) {
+    std::string why;
+    auto lib = reactor::OpenNvenc(/*device=*/0, &why);
+    if (!lib) {
+      RTC_LOG(LS_INFO) << "NVENC is not available to the standalone codecs: "
+                       << why;
+    } else {
+      // One factory, an entry per codec the GPU encodes: hardware encoders,
+      // ahead of the software ones added below. NVENC delivers each frame
+      // within Encode().
+      std::shared_ptr<webrtc::VideoEncoderFactory> encoders =
+          reactor::CreateNvencVideoEncoderFactory(lib);
+      for (int codec : {webrtc::kVideoCodecH264, webrtc::kVideoCodecH265,
+                        webrtc::kVideoCodecAV1}) {
+        if (!reactor::NvencEncodes(*lib, static_cast<webrtc::VideoCodecType>(codec)))
+          continue;
+        StandaloneBackend nv;
+        nv.codec = codec;
+        nv.encoder_name = "NVENC";
+        nv.hardware = true;
+        nv.synchronous = true;
+        nv.encoders = encoders;
+        ctx->backends.push_back(std::move(nv));
+      }
+    }
+  }
+#else
+  (void)use_nvenc;
+#endif
 #ifdef REACTOR_WEBRTC_NVDEC
   if (use_nvdec) {
     std::string why;
@@ -4354,8 +4452,9 @@ void* reactor_webrtc_codec_context_create(const char* openh264_lib_path,
       // ahead of the software ones added below.
       std::shared_ptr<webrtc::VideoDecoderFactory> decoders =
           reactor::CreateNvdecVideoDecoderFactory(lib);
-      for (int codec : {webrtc::kVideoCodecH264, webrtc::kVideoCodecVP8,
-                        webrtc::kVideoCodecVP9, webrtc::kVideoCodecAV1}) {
+      for (int codec : {webrtc::kVideoCodecH264, webrtc::kVideoCodecH265,
+                        webrtc::kVideoCodecVP8, webrtc::kVideoCodecVP9,
+                        webrtc::kVideoCodecAV1}) {
         if (!reactor::NvdecDecodes(*lib, static_cast<webrtc::VideoCodecType>(codec)))
           continue;
         StandaloneBackend nv;

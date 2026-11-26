@@ -1105,10 +1105,21 @@ class PeerConnectionFactoryBuilder:
         ...
     def with_nvdec(self) -> None:
         """Decode video on the first visible NVIDIA GPU with NVDEC, ahead of the
-        software decoders, for each of H.264, VP8, VP9 (profile 0) and AV1
+        software decoders, for each of H.264, H.265 (Main), VP8, VP9 (profile 0) and AV1
         (main) it decodes (Linux; `CUDA_VISIBLE_DEVICES` picks the GPU). Never
         fails the factory: without a GPU or driver, or for a codec the GPU does
         not decode, video decodes as it would without this."""
+        ...
+    def with_nvenc(self) -> None:
+        """Encode video on the first visible NVIDIA GPU with NVENC, ahead of the
+        software encoders, for each of H.264 (constrained baseline), H.265 (Main) and AV1
+        (main) it encodes; VP8 and VP9 have no NVENC encoder (Linux;
+        `CUDA_VISIBLE_DEVICES` picks the GPU; in a container,
+        `NVIDIA_DRIVER_CAPABILITIES` must include `video`). Never fails the
+        factory: without a GPU, a driver or an encoder (an A100, H100 or B200
+        has none), or for a codec the GPU does not encode, video encodes as it
+        would without this. A stream NVENC cannot take (an odd size, one outside
+        the GPU's limits, no session left) goes to the software encoder."""
         ...
     def with_openh264(self, lib_path: str) -> None:
         """Register the OpenH264 backend from a downloaded library path
@@ -1202,6 +1213,8 @@ class PeerConnectionFactory:
 #
 #   H.264  one access unit, Annex B (start codes), constrained baseline; a key
 #          frame carries its SPS and PPS
+#   H.265  one access unit, Annex B (start codes), Main profile; a key frame
+#          carries its VPS, SPS and PPS (NVENC and NVDEC only)
 #   VP8    one frame, as the encoder emits it
 #   VP9    one frame, as the encoder emits it; one spatial layer, no superframe
 #   AV1    one temporal unit of OBUs, each with its size field (low-overhead
@@ -1275,23 +1288,28 @@ class VideoCodecs:
     standalone encoders and decoders on them. H.264 runs on VideoToolbox on
     macOS and iOS, and on OpenH264 in a wheel built with the `openh264`
     feature (`with_openh264`); VP8 and VP9 on libvpx; AV1 on libaom (encode)
-    and dav1d (decode). Asked for (`nvdec=True`, Linux), NVDEC on an NVIDIA
-    GPU decodes each of them the GPU decodes, ahead of the software
-    decoders."""
+    and dav1d (decode). Asked for (Linux), NVDEC on an NVIDIA GPU decodes
+    (`nvdec=True`) and NVENC encodes (`nvenc=True`) each of them the GPU runs,
+    ahead of the software codecs."""
 
-    def __init__(self, nvdec: bool = False) -> None:
-        """`nvdec` adds NVDEC as the hardware decoder of each of H.264, VP8,
+    def __init__(self, nvdec: bool = False, nvenc: bool = False) -> None:
+        """`nvdec` adds NVDEC as the hardware decoder of each of H.264, H.265, VP8,
         VP9 and AV1 the first visible NVIDIA GPU decodes (Linux;
-        `CUDA_VISIBLE_DEVICES` picks it). A codec it does not decode is left
-        out: `capabilities()` lists an `NVDEC` hardware decoder per codec it is
-        there for."""
+        `CUDA_VISIBLE_DEVICES` picks it). `nvenc` adds NVENC as the hardware
+        encoder of each of H.264, H.265 and AV1 it encodes; an encoder NVENC does not
+        open (an odd size, one outside the GPU's limits, no session left) is
+        created on the software backend instead. A codec the GPU does not run
+        is left out: `capabilities()` lists an `NVDEC` hardware decoder or an
+        `NVENC` hardware encoder per codec it is there for."""
         ...
     @staticmethod
-    def with_openh264(lib_path: str, nvdec: bool = False) -> VideoCodecs:
+    def with_openh264(
+        lib_path: str, nvdec: bool = False, nvenc: bool = False
+    ) -> VideoCodecs:
         """Add Cisco's OpenH264 loaded from `lib_path` as the software H.264
         backend; its binary license requires attribution in your app. Only in
         wheels built with the `openh264` feature. Raises when the library does
-        not load. `nvdec` as for the constructor."""
+        not load. `nvdec` and `nvenc` as for the constructor."""
         ...
     def capabilities(self) -> CodecCapabilities: ...
     def encoder(

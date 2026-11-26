@@ -80,7 +80,8 @@ def test_exceptions_form_a_hierarchy() -> None:
     assert issubclass(rw.CodecNeedsKeyFrame, rw.CodecError)
 
 
-def test_h265_is_not_a_standalone_codec(codecs: rw.VideoCodecs) -> None:
+def test_h265_has_no_backend_without_nvenc_and_nvdec(codecs: rw.VideoCodecs) -> None:
+    # H.265 runs only on NVENC and NVDEC, which these codecs did not ask for.
     with pytest.raises(rw.CodecUnsupported):
         codecs.encoder(rw.VideoCodec.H265, W, H)
     with pytest.raises(rw.CodecUnsupported):
@@ -101,7 +102,9 @@ def test_bad_encoder_settings_raise_value_error(codecs: rw.VideoCodecs) -> None:
 
 
 @pytest.mark.parametrize("value", [-1, -W, 2**32])
-def test_out_of_range_settings_raise_value_error(codecs: rw.VideoCodecs, value: int) -> None:
+def test_out_of_range_settings_raise_value_error(
+    codecs: rw.VideoCodecs, value: int
+) -> None:
     # Not OverflowError: a negative or too large size or bitrate is a bad
     # setting like any other.
     _require(codecs, rw.VideoCodec.Vp8)
